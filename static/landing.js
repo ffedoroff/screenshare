@@ -50,7 +50,7 @@ createButton.addEventListener('click', async () => {
     if (!data || typeof data.roomId !== 'string' || !data.roomId) {
       throw new Error('в ответе нет roomId');
     }
-    location.href = `/room/${data.roomId}`;
+    location.href = `/r/${data.roomId}`;
   } catch (err) {
     console.error('Не удалось создать комнату:', err);
     showMessage('Не удалось создать комнату. Проверьте соединение и попробуйте снова.');

@@ -6,14 +6,14 @@
 # здесь replicas: 1 и strategy.type: Recreate. Причина — состояние комнат
 # живёт в памяти ОДНОГО процесса (`src/state.rs`, HashMap за std::sync::Mutex):
 # при двух репликах broadcaster и зрители могли бы попасть на разные поды и
-# никогда не увидеть друг друга. Плюс SQLite-файл истории чата — один писатель
-# (WAL не спасает от двух процессов на разных подах при обычном локальном
-# volume/ReadWriteOnce PVC). Recreate = на деплое старый под гасится, новый
-# поднимается — активные трансляции на несколько секунд рвутся, это ожидаемо
-# и описано в README.md.
+# никогда не увидеть друг друга. Recreate = на деплое старый под гасится,
+# новый поднимается — активные трансляции на несколько секунд рвутся, это
+# ожидаемо и описано в README.md.
 #
-# Миграций/initContainer нет: sqlx-миграции (`sqlx::migrate!`) вшиты в бинарь
-# на этапе компиляции и применяются сами при старте процесса (см. src/db.rs).
+# Полная эфемерность: приложение ничего не пишет на диск (ни истории чата,
+# ни сессий) — всё состояние комнаты живёт только в памяти процесса и
+# исчезает с ней (рестарт/реапер пустой комнаты). Поэтому здесь сознательно
+# нет volume/volumeMount и PVC: писать некуда, и это правильно, а не упущение.
 apiVersion: apps/v1
 kind: Deployment
 metadata: { name: chat, namespace: chat-prod }
@@ -32,11 +32,8 @@ spec:
         imagePullPolicy: IfNotPresent
         env:
         - { name: PORT, value: "8080" }
-        - { name: DATABASE_URL, value: "sqlite:///data/screenshare.db?mode=rwc" }
         - { name: STATIC_DIR, value: "/app/static" }
         ports: [ { containerPort: 8080 } ]
-        volumeMounts:
-        - { name: data, mountPath: /data }
         readinessProbe: { httpGet: { path: /healthz, port: 8080 }, periodSeconds: 3 }
         livenessProbe:  { httpGet: { path: /healthz, port: 8080 }, initialDelaySeconds: 10, periodSeconds: 10 }
         resources:
@@ -44,6 +41,3 @@ spec:
           # никакого медиатрафика через backend не проходит) — лимиты скромные.
           requests: { memory: 32Mi, cpu: 50m }
           limits:   { memory: 128Mi, cpu: 250m }
-      volumes:
-      - name: data
-        persistentVolumeClaim: { claimName: chat-data }

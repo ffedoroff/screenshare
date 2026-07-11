@@ -7,7 +7,7 @@
 // браузеры не скачивает, используется channel: 'chrome').
 //
 // Сценарий: главная страница -> имя «Вася» -> «Создать комнату» -> дождаться
-// перехода на /room/<id>; ещё двое участников («Петя», «Оля») открывают эту
+// перехода на /r/<id>; ещё двое участников («Петя», «Оля») открывают эту
 // же ссылку; у всех троих по 3 тайла. Вася включает камеру и микрофон —
 // у остальных живое видео в его тайле и speaking-индикация. Петя шарит
 // экран — у Васи и Оли главная зона показывает поток, у Оли кнопка «Экран»
@@ -109,8 +109,8 @@ async function main() {
       await vasyaPage.goto(server.baseUrl);
       await vasyaPage.fill('#name-input', 'Вася');
       await vasyaPage.click('#create-room-button');
-      await vasyaPage.waitForURL(/\/room\/[^/]+$/, { timeout: 10_000 });
-      const match = vasyaPage.url().match(/\/room\/([^/]+)$/);
+      await vasyaPage.waitForURL(/\/r\/[^/]+$/, { timeout: 10_000 });
+      const match = vasyaPage.url().match(/\/r\/([^/]+)$/);
       assert.ok(match, `не удалось извлечь roomId из URL: ${vasyaPage.url()}`);
       roomId = match[1];
       await waitForOverlayHidden(vasyaPage);
@@ -123,7 +123,7 @@ async function main() {
       return;
     }
 
-    const roomUrl = `${server.baseUrl}/room/${roomId}`;
+    const roomUrl = `${server.baseUrl}/r/${roomId}`;
 
     // --- Петя и Оля открывают ту же ссылку ---
     const petyaContext = await browser.newContext();
@@ -277,9 +277,121 @@ async function main() {
       skip('Вася выключает камеру', 'камера не была успешно включена ранее');
     }
 
+    // --- Попап «Поделиться»: QR (серверный SVG) + ссылка вида /r/<id> ---
+    await step('Вася открывает попап «Поделиться» — QR грузится, ссылка ведёт на /r/<id>', async () => {
+      await vasyaPage.click('#share-button');
+      await vasyaPage.waitForSelector('#share-popup:not(.hidden)', { timeout: 5000 });
+
+      const qrSrc = await vasyaPage.getAttribute('#share-popup-qr', 'src');
+      assert.ok(
+        qrSrc && qrSrc.includes(`/qr.svg?room=${roomId}`),
+        `src у QR-картинки должен указывать на /qr.svg?room=${roomId}, получено: ${qrSrc}`
+      );
+
+      // Картинка реально загрузилась (не просто есть атрибут src).
+      await vasyaPage.waitForFunction(
+        () => (document.getElementById('share-popup-qr')?.naturalWidth || 0) > 0,
+        undefined,
+        { polling: 100, timeout: 5000 }
+      );
+
+      // И отдельно — что сервер реально отдаёт SVG с 200 (а не просто картинка
+      // как-то отрендерилась благодаря кэшу браузера).
+      const qrUrl = new URL(qrSrc, roomUrl).toString();
+      const res = await fetch(qrUrl);
+      assert.equal(res.status, 200, `GET ${qrUrl} должен вернуть 200, получено ${res.status}`);
+      assert.match(
+        res.headers.get('content-type') || '',
+        /image\/svg\+xml/,
+        'content-type ответа /qr.svg должен быть image/svg+xml'
+      );
+
+      const linkText = (await vasyaPage.textContent('#share-popup-link')) || '';
+      assert.match(
+        linkText.trim(),
+        new RegExp(`/r/${roomId}$`),
+        `ссылка в попапе должна быть вида /r/${roomId}, получено: ${linkText}`
+      );
+
+      await vasyaPage.click('#share-popup-close');
+      // Не page.waitForSelector('#share-popup.hidden') — по умолчанию он ждёт
+      // видимость совпавшего элемента, а .hidden — это display:none (см.
+      // такой же приём в helpers.mjs::waitForOverlayHidden), поэтому такой
+      // селектор никогда бы не срезолвился.
+      await vasyaPage.waitForFunction(
+        () => document.getElementById('share-popup')?.classList.contains('hidden'),
+        undefined,
+        { polling: 100, timeout: 5000 }
+      );
+    });
+
     await vasyaContext.close();
     await petyaContext.close();
     await olyaContext.close();
+
+    // --- Мобильный смоук: узкий вьюпорт, новая (отдельная) комната ---
+    // Экран не проверяем намеренно: на реальных мобильных браузерах
+    // getDisplayMedia недоступен вовсе и кнопка «Экран» скрывается (см.
+    // room.js), а этот тест эмулирует вьюпорт/тач в том же десктопном
+    // Chrome, где API формально есть — проверка кнопки тут ничего бы не
+    // сказала ни про десктоп (уже покрыт выше), ни про настоящий мобильный
+    // Chrome/Safari.
+    await step(
+      'Мобильный смоук (390x844, touch): участник заходит в комнату, панель управления видима, страница без горизонтального скролла, микрофон переключается',
+      async () => {
+        const res = await fetch(`${server.baseUrl}/api/rooms`, { method: 'POST' });
+        assert.ok(res.ok, `POST /api/rooms ответил статусом ${res.status}`);
+        const data = await res.json();
+        const mobileRoomId = data.roomId;
+
+        const mobileContext = await browser.newContext({
+          viewport: { width: 390, height: 844 },
+          isMobile: true,
+          hasTouch: true,
+          deviceScaleFactor: 3,
+        });
+        try {
+          await installMediaStubs(mobileContext);
+          const mobilePage = await mobileContext.newPage();
+
+          await mobilePage.goto(`${server.baseUrl}/r/${mobileRoomId}`);
+          await waitForOverlayHidden(mobilePage);
+          await waitForTileCount(mobilePage, 1);
+
+          const overflowInfo = await mobilePage.evaluate(() => ({
+            scrollWidth: document.documentElement.scrollWidth,
+            clientWidth: document.documentElement.clientWidth,
+          }));
+          assert.ok(
+            overflowInfo.scrollWidth <= overflowInfo.clientWidth + 1,
+            `документ не должен иметь горизонтальный скролл: scrollWidth=${overflowInfo.scrollWidth}, clientWidth=${overflowInfo.clientWidth}`
+          );
+
+          const panelBox = await mobilePage.locator('.control-panel').boundingBox();
+          assert.ok(panelBox, 'панель управления должна быть видима во вьюпорте');
+          assert.ok(
+            panelBox.x >= -1 && panelBox.x + panelBox.width <= 390 + 1,
+            `панель управления должна помещаться по ширине вьюпорта (390px): ${JSON.stringify(panelBox)}`
+          );
+          assert.ok(
+            panelBox.y + panelBox.height <= 844 + 1,
+            `панель управления должна помещаться по высоте вьюпорта (844px): ${JSON.stringify(panelBox)}`
+          );
+
+          const tileBox = await mobilePage.locator('.tile').first().boundingBox();
+          assert.ok(tileBox, 'хотя бы один тайл участника должен быть видим');
+
+          await mobilePage.click('#mic-button');
+          await mobilePage.waitForFunction(
+            () => document.getElementById('mic-button')?.getAttribute('aria-pressed') === 'true',
+            undefined,
+            { polling: 100, timeout: 5000 }
+          );
+        } finally {
+          await mobileContext.close();
+        }
+      }
+    );
   } finally {
     if (browser) await browser.close();
     await server.stop();

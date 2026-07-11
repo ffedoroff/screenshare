@@ -11,8 +11,6 @@ import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import fs from 'node:fs';
-import os from 'node:os';
-import crypto from 'node:crypto';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.resolve(HERE, '..');
@@ -31,20 +29,24 @@ function ok(cond, name) {
 }
 
 // --- Управление серверным процессом -------------------------------------
+//
+// Сервер полностью эфемерен (никакой БД/файлов на диске), поэтому здесь не
+// нужна временная SQLite и её уборка — только сам процесс(ы). Кроме
+// основного сервера на PORT, тест CHAT_HISTORY_CAP поднимает второй,
+// короткоживущий инстанс на отдельном порту — оба процесса трекаются в
+// `serverProcs` и гарантированно убиваются в `cleanup()`.
 
-const dbPath = path.join(os.tmpdir(), `screenshare-test-${process.pid}-${crypto.randomUUID()}.db`);
-const dbSidecars = ['', '-wal', '-shm', '-journal'].map((suf) => dbPath + suf);
 let serverProc = null;
+const serverProcs = [];
 let cleaned = false;
 
 function cleanup() {
   if (cleaned) return;
   cleaned = true;
-  if (serverProc && serverProc.exitCode === null && !serverProc.killed) {
-    try { serverProc.kill('SIGKILL'); } catch { /* уже мёртв */ }
-  }
-  for (const f of dbSidecars) {
-    try { fs.rmSync(f, { force: true }); } catch { /* нет файла — и хорошо */ }
+  for (const p of serverProcs) {
+    if (p.exitCode === null && !p.killed) {
+      try { p.kill('SIGKILL'); } catch { /* уже мёртв */ }
+    }
   }
 }
 // Гарантия уборки при любом исходе процесса (в т.ч. при непойманном исключении).
@@ -60,43 +62,50 @@ function buildServer() {
   }
 }
 
-function startServer() {
+// Поднять сервер на заданном порту с дополнительными переменными окружения.
+// Возвращает child process; вызывающий код сам решает, ждать ли готовности
+// и когда убивать (плюс подстраховка — все процессы убиваются в cleanup()).
+function spawnServer(port, extraEnv = {}) {
   const bin = path.join(PROJECT_DIR, 'target', 'debug', 'screenshare');
   if (!fs.existsSync(bin)) {
     throw new Error(`бинарник не найден: ${bin}`);
   }
-  console.log(`Запуск сервера на порту ${PORT} (БД: ${dbPath})...`);
-  serverProc = spawn(bin, [], {
+  const proc = spawn(bin, [], {
     cwd: PROJECT_DIR,
     env: {
       ...process.env,
-      PORT: String(PORT),
-      DATABASE_URL: `sqlite://${dbPath}?mode=rwc`,
-      EMPTY_ROOM_TTL_SECONDS: String(EMPTY_ROOM_TTL_SECONDS),
+      PORT: String(port),
       RUST_LOG: 'error',
+      ...extraEnv,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let out = '';
-  serverProc.stdout.on('data', (d) => { out += d; });
-  serverProc.stderr.on('data', (d) => { out += d; });
-  serverProc.on('exit', (code, signal) => {
+  proc.stdout.on('data', (d) => { out += d; });
+  proc.stderr.on('data', (d) => { out += d; });
+  proc.on('exit', (code, signal) => {
     if (!cleaned && code !== 0 && code !== null) {
-      console.error(`Сервер неожиданно завершился (code=${code}, signal=${signal}):\n${out}`);
+      console.error(`Сервер (порт ${port}) неожиданно завершился (code=${code}, signal=${signal}):\n${out}`);
     }
   });
-  return () => out; // для отладки при необходимости
+  serverProcs.push(proc);
+  return proc;
 }
 
-async function waitForReady(timeoutMs = 15000) {
+function startServer() {
+  console.log(`Запуск сервера на порту ${PORT}...`);
+  serverProc = spawnServer(PORT, { EMPTY_ROOM_TTL_SECONDS: String(EMPTY_ROOM_TTL_SECONDS) });
+}
+
+async function waitForReady(configUrl, proc, timeoutMs = 15000) {
   const deadline = Date.now() + timeoutMs;
   let lastErr;
   while (Date.now() < deadline) {
-    if (serverProc.exitCode !== null) {
-      throw new Error(`сервер упал до готовности (exit code ${serverProc.exitCode})`);
+    if (proc.exitCode !== null) {
+      throw new Error(`сервер упал до готовности (exit code ${proc.exitCode})`);
     }
     try {
-      const res = await fetch(CONFIG_URL);
+      const res = await fetch(configUrl);
       if (res.ok) return;
     } catch (e) {
       lastErr = e;
@@ -112,13 +121,13 @@ function sleep(ms) {
 
 // --- HTTP: создание комнаты ------------------------------------------------
 
-async function createRoom(body) {
+async function createRoom(body, roomsUrl = ROOMS_URL) {
   const opts = { method: 'POST' };
   if (body !== undefined) {
     opts.headers = { 'Content-Type': 'application/json' };
     opts.body = JSON.stringify(body);
   }
-  const res = await fetch(ROOMS_URL, opts);
+  const res = await fetch(roomsUrl, opts);
   let json = null;
   try { json = await res.json(); } catch { /* не JSON — ниже проверим статус */ }
   return { status: res.status, roomId: json && json.roomId };
@@ -126,9 +135,9 @@ async function createRoom(body) {
 
 // --- WS-клиент для теста --------------------------------------------------
 
-function connect() {
+function connect(wsUrl = URL) {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(URL);
+    const ws = new WebSocket(wsUrl);
     const queue = [];
     const waiters = [];
     ws.onmessage = (e) => {
@@ -153,8 +162,8 @@ function connect() {
 
 // Подключиться и войти в комнату одним шагом; возвращает { peer, joined }
 // (без ожидания chat-history — вызывающий код сам решает, ждать её или нет).
-async function join(roomId, name) {
-  const peer = await connect();
+async function join(roomId, name, wsUrl = URL) {
+  const peer = await connect(wsUrl);
   const msg = { type: 'join-room', roomId };
   if (name !== undefined) msg.name = name;
   peer.send(msg);
@@ -463,6 +472,101 @@ async function runTests() {
     const m = await late.next();
     ok(m.type === 'room-not-found', 'комната удалена реапером после истечения TTL пустоты');
   }
+
+  // --- 12. Короткая страница комнаты /r/{roomId} ---
+  console.log('12. GET /r/<roomId>');
+  {
+    const { roomId: pageRoomId } = await createRoom();
+    const res = await fetch(`http://localhost:${PORT}/r/${pageRoomId}`);
+    ok(res.status === 200, `GET /r/${pageRoomId} -> 200`);
+    ok((res.headers.get('content-type') || '').includes('text/html'), 'ответ /r/<id> — HTML');
+  }
+
+  // --- 13. QR-код /qr.svg?room=<roomId> ---
+  console.log('13. GET /qr.svg');
+  {
+    const res = await fetch(`http://localhost:${PORT}/qr.svg?room=abcd2345`);
+    ok(res.status === 200, 'GET /qr.svg?room=abcd2345 -> 200');
+    ok((res.headers.get('content-type') || '').includes('image/svg+xml'), 'content-type image/svg+xml');
+    const body = await res.text();
+    ok(body.includes('<svg'), 'тело ответа содержит <svg');
+
+    const bad = await fetch(`http://localhost:${PORT}/qr.svg?room=${encodeURIComponent('../evil')}`);
+    ok(bad.status === 400, '?room=../evil -> 400');
+
+    const missing = await fetch(`http://localhost:${PORT}/qr.svg`);
+    ok(missing.status === 400, 'без параметра room -> 400');
+  }
+
+  // --- 14. Чат-история: порядок сообщений для нового участника ---
+  console.log('14. chat-history: явный порядок для нескольких сообщений');
+  {
+    const { roomId: hRoom } = await createRoom();
+    const { peer: h1 } = await join(hRoom, 'H1');
+    await h1.next(); // chat-history пустая
+    const { peer: h2 } = await join(hRoom, 'H2');
+    await h1.next(); // peer-joined
+    await h2.next(); // chat-history пустая
+
+    await sendChatAndDrain(h1, 'первое', [h1, h2]);
+    await sendChatAndDrain(h2, 'второе', [h1, h2]);
+
+    const { peer: h3 } = await join(hRoom, 'H3');
+    await Promise.all([h1.next(), h2.next()]); // peer-joined обоим
+    const hist = await h3.next();
+    ok(
+      hist.type === 'chat-history' && hist.messages.length === 2
+      && hist.messages[0].text === 'первое' && hist.messages[1].text === 'второе',
+      'третий участник получил оба сообщения в порядке отправки',
+    );
+
+    h1.ws.close();
+    h2.ws.close();
+    h3.ws.close();
+  }
+
+  // --- 15. CHAT_HISTORY_CAP: кап истории вытесняет старые сообщения ---
+  console.log('15. CHAT_HISTORY_CAP: кап истории');
+  {
+    const capPort = PORT + 1;
+    const capConfigUrl = `http://localhost:${capPort}/config`;
+    const capRoomsUrl = `http://localhost:${capPort}/api/rooms`;
+    const capWsUrl = `ws://localhost:${capPort}/ws`;
+    const capProc = spawnServer(capPort, { CHAT_HISTORY_CAP: '3' });
+    try {
+      await waitForReady(capConfigUrl, capProc);
+      const { roomId: capRoom } = await createRoom(undefined, capRoomsUrl);
+      const { peer: c1 } = await join(capRoom, 'C1', capWsUrl);
+      await c1.next(); // chat-history пустая
+
+      for (let i = 0; i < 5; i++) {
+        await sendChatAndDrain(c1, `msg${i}`, [c1]);
+      }
+
+      const { peer: c2 } = await join(capRoom, 'C2', capWsUrl);
+      await c1.next(); // peer-joined
+      const hist = await c2.next();
+      ok(hist.type === 'chat-history' && hist.messages.length === 3,
+        `история капнута до CHAT_HISTORY_CAP=3 (получено ${hist.messages.length})`);
+      ok(hist.messages.map((m) => m.text).join(',') === 'msg2,msg3,msg4',
+        'в истории именно последние 3 сообщения по порядку отправки');
+
+      c1.ws.close();
+      c2.ws.close();
+    } finally {
+      if (capProc.exitCode === null && !capProc.killed) {
+        try { capProc.kill('SIGKILL'); } catch { /* уже мёртв */ }
+      }
+    }
+  }
+
+  // --- 16. Эфемерность: сервер не оставил файлов БД в CWD ---
+  console.log('16. эфемерность: нет файлов БД');
+  {
+    const dbFiles = fs.readdirSync(PROJECT_DIR).filter((f) => f.endsWith('.db') || f.includes('.db-'));
+    ok(dbFiles.length === 0,
+      `нет файлов БД в ${PROJECT_DIR} (найдено: ${dbFiles.join(', ') || 'ничего'})`);
+  }
 }
 
 // --- main --------------------------------------------------------------
@@ -471,7 +575,7 @@ async function main() {
   buildServer();
   startServer();
   try {
-    await waitForReady();
+    await waitForReady(CONFIG_URL, serverProc);
     await runTests();
   } finally {
     console.log(`\nИтого: ${passed} ok, ${failed} fail`);

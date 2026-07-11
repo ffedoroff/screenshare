@@ -8,8 +8,7 @@
 // тестовый арнесс со стороны страницы (addInitScript) и драйвер сервера.
 
 import { spawn, execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, existsSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
@@ -107,17 +106,13 @@ export async function buildServer() {
 export function createServerController(port, extraEnv = {}) {
   const baseUrl = `http://localhost:${port}`;
   let serverProcess = null;
-  let dbTmpDir = null;
 
   async function start() {
-    dbTmpDir = mkdtempSync(path.join(tmpdir(), 'screenshare-e2e-'));
-    const dbPath = path.join(dbTmpDir, 'test.db');
     serverProcess = spawn(BINARY_PATH, [], {
       cwd: REPO_ROOT,
       env: {
         ...process.env,
         PORT: String(port),
-        DATABASE_URL: `sqlite://${dbPath}?mode=rwc`,
         ...extraEnv,
       },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -161,10 +156,6 @@ export function createServerController(port, extraEnv = {}) {
       }, 3000);
     });
     serverProcess = null;
-    if (dbTmpDir) {
-      rmSync(dbTmpDir, { recursive: true, force: true });
-      dbTmpDir = null;
-    }
   }
 
   return { baseUrl, start, stop };

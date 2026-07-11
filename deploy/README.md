@@ -8,7 +8,6 @@ IaC этого проекта. Применяется **админом** (не C
 
 ```bash
 kubectl apply -f deploy/manifests/namespace.yaml
-kubectl apply -f deploy/manifests/pvc.yaml
 kubectl apply -f deploy/manifests/rbac.yaml
 kubectl apply -f deploy/manifests/deployment.yaml   # image: chat:PLACEHOLDER — под не поднимется,
                                                      # пока CI не задеплоит первый реальный тег
@@ -29,7 +28,7 @@ kubectl apply -f deploy/manifests/ingress.yaml
 
 Push в `main` → `.github/workflows/deploy-prod.yml`:
 
-1. Job `test`: прогоняет тесты протокола сигналинга (43 проверки; сам собирает
+1. Job `test`: прогоняет тесты протокола сигналинга (65 проверок; сам собирает
    `cargo build`). Красные тесты не пускают деплой.
 2. Job `deploy` (`needs: test`): собирает образ (`docker buildx build
    --provenance=false --sbom=false --platform linux/amd64`, кэш GHA),
@@ -48,11 +47,14 @@ CI ничего не знает про манифесты выше — они н
 
 - **`replicas: 1` + `strategy.type: Recreate`**, не обычный
   zero-downtime-шаблон (`replicas: 2` + `RollingUpdate`). Причина — комнаты
-  живут в памяти одного процесса и SQLite-история — с одним писателем; см.
-  комментарий в `deploy/manifests/deployment.yaml`. Практическое следствие:
-  каждый деплой на несколько секунд обрывает активные трансляции.
-- Миграций/`initContainer` нет — sqlx-миграции вшиты в бинарь и применяются
-  сами при старте (`src/db.rs`).
+  живут в памяти одного процесса (`src/state.rs`); см. комментарий в
+  `deploy/manifests/deployment.yaml`. Практическое следствие: каждый деплой
+  на несколько секунд обрывает активные трансляции.
+- **Никакого хранилища на диске.** Приложение полностью эфемерно: история
+  чата и состояние комнат живут только в памяти процесса и умирают вместе с
+  комнатой (реапер TTL) или с рестартом пода. Поэтому в манифестах
+  сознательно нет PVC/volume — их удалили вместе с уходом SQLite из
+  приложения, писать на диск больше нечего.
 - Секретов приложению не нужно (TURN, если понадобится, — через `Secret` +
   `envFrom`, аналогично другим проектам сервера).
 

@@ -7,12 +7,10 @@ use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::Response;
-use sqlx::SqlitePool;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::db::{self, ChatWriteJob, ChatWriteTx};
-use crate::protocol::{ClientMessage, PeerInfo, ServerMessage};
+use crate::protocol::{ChatHistoryEntry, ClientMessage, PeerInfo, ServerMessage};
 use crate::state::{
     generate_peer_id, now_ms, send_to, AppState, Participant, PeerTx, SharedRooms,
     MAX_PARTICIPANTS,
@@ -61,13 +59,13 @@ enum Flow {
 }
 
 pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
-    ws.on_upgrade(move |socket| handle_socket(socket, state.rooms, state.db, state.chat_tx))
+    ws.on_upgrade(move |socket| handle_socket(socket, state.rooms, state.chat_history_cap))
 }
 
 /// Одно WS-соединение = одна задача tokio. Исходящие сообщения пиру идут
 /// через mpsc-канал: другие задачи кладут в канал, а писать в сокет может
 /// только эта задача (select ниже) — так исключаются гонки записи.
-async fn handle_socket(mut socket: WebSocket, rooms: SharedRooms, db: SqlitePool, chat_tx: ChatWriteTx) {
+async fn handle_socket(mut socket: WebSocket, rooms: SharedRooms, chat_history_cap: usize) {
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
     // Комната/пир этого соединения; None до join-room.
     let mut me: Option<PeerCtx> = None;
@@ -142,8 +140,8 @@ async fn handle_socket(mut socket: WebSocket, rooms: SharedRooms, db: SqlitePool
                         match serde_json::from_str::<ClientMessage>(&text) {
                             Ok(msg) => {
                                 let flow = handle_message(
-                                    msg, &mut me, &tx, &rooms, &db, &chat_tx, &mut chat_times,
-                                ).await;
+                                    msg, &mut me, &tx, &rooms, chat_history_cap, &mut chat_times,
+                                );
                                 if flow == Flow::Stop {
                                     // Не рвём сразу: даём писателю дослать очередь.
                                     closing = true;
@@ -179,19 +177,15 @@ async fn handle_socket(mut socket: WebSocket, rooms: SharedRooms, db: SqlitePool
     }
 }
 
-/// Обработка одного сообщения клиента.
-///
-/// Асинхронна из-за обращений к БД (чтение истории при `join-room`) — но, как
-/// и раньше, ни одно `.await` не происходит ПОКА держится `std::sync::Mutex`
-/// над комнатами: критические секции остаются короткими и синхронными, а DB
-/// I/O — строго до захвата мьютекса или уже после его освобождения.
-async fn handle_message(
+/// Обработка одного сообщения клиента. Целиком синхронна: всё состояние —
+/// в памяти под `std::sync::Mutex`, никакого I/O на диск или к внешнему
+/// хранилищу.
+fn handle_message(
     msg: ClientMessage,
     me: &mut Option<PeerCtx>,
     tx: &PeerTx,
     rooms: &SharedRooms,
-    db: &SqlitePool,
-    chat_tx: &ChatWriteTx,
+    chat_history_cap: usize,
     chat_times: &mut VecDeque<Instant>,
 ) -> Flow {
     match msg {
@@ -202,65 +196,56 @@ async fn handle_message(
             }
             let name = sanitize_name(name);
 
-            // Синхронная часть целиком под мьютексом, без .await внутри.
-            let session_id = {
-                let mut rooms_guard = rooms.lock().unwrap();
-                let Some(room) = rooms_guard.get_mut(&room_id) else {
-                    send_to(tx, ServerMessage::RoomNotFound); // комната не создана или уже удалена реапером
-                    return Flow::Continue; // сокет закроет писатель
-                };
-                if room.participants.len() >= MAX_PARTICIPANTS {
-                    send_to(tx, ServerMessage::RoomFull);
-                    return Flow::Continue;
-                }
-
-                let peer_id = generate_peer_id();
-
-                // Другие уже подключённые участники — до вставки нового.
-                let peers: Vec<PeerInfo> = room
-                    .participants
-                    .iter()
-                    .map(|(id, p)| PeerInfo { peer_id: id.clone(), name: p.name.clone() })
-                    .collect();
-                let screen_owner = room.screen_owner.clone();
-
-                room.participants.insert(
-                    peer_id.clone(),
-                    Participant { tx: tx.clone(), name: name.clone() },
-                );
-                // Вход в опустевшую-но-живую комнату снимает отметку TTL.
-                room.emptied_at = None;
-
-                let count = room.participants.len();
-                info!(room = %room_id, peer = %peer_id, count, "участник подключился");
-
-                // Уведомляем остальных о новом участнике; сам новый участник
-                // узнаёт о них через список `peers` в своём `joined`.
-                for (id, p) in room.participants.iter() {
-                    if id != &peer_id {
-                        send_to(&p.tx, ServerMessage::PeerJoined {
-                            peer_id: peer_id.clone(),
-                            name: name.clone(),
-                        });
-                    }
-                }
-                send_to(tx, ServerMessage::Joined { peer_id: peer_id.clone(), peers, screen_owner });
-
-                let session_id = room.session_id;
-                *me = Some(PeerCtx { room_id: room_id.clone(), peer_id, name });
-                session_id
+            let mut rooms_guard = rooms.lock().unwrap();
+            let Some(room) = rooms_guard.get_mut(&room_id) else {
+                send_to(tx, ServerMessage::RoomNotFound); // комната не создана или уже удалена реапером
+                return Flow::Continue; // сокет закроет писатель
             };
-
-            // История чата — сразу после `joined`, но уже вне критической
-            // секции (запрос к БД не должен идти поперёк мьютекса).
-            // `flush_and_fetch_history` сначала дожидается, пока писатель
-            // обработает все более ранние сообщения чата, и только потом
-            // читает — иначе только что отправленное сообщение могло бы не
-            // попасть в выдачу из-за гонки с фоновой записью.
-            match db::flush_and_fetch_history(chat_tx, db, session_id).await {
-                Ok(messages) => send_to(tx, ServerMessage::ChatHistory { messages }),
-                Err(e) => warn!(room = %room_id, "не удалось прочитать историю чата: {e}"),
+            if room.participants.len() >= MAX_PARTICIPANTS {
+                send_to(tx, ServerMessage::RoomFull);
+                return Flow::Continue;
             }
+
+            let peer_id = generate_peer_id();
+
+            // Другие уже подключённые участники — до вставки нового.
+            let peers: Vec<PeerInfo> = room
+                .participants
+                .iter()
+                .map(|(id, p)| PeerInfo { peer_id: id.clone(), name: p.name.clone() })
+                .collect();
+            let screen_owner = room.screen_owner.clone();
+
+            room.participants.insert(
+                peer_id.clone(),
+                Participant { tx: tx.clone(), name: name.clone() },
+            );
+            // Вход в опустевшую-но-живую комнату снимает отметку TTL.
+            room.emptied_at = None;
+
+            let count = room.participants.len();
+            info!(room = %room_id, peer = %peer_id, count, "участник подключился");
+
+            // Уведомляем остальных о новом участнике; сам новый участник
+            // узнаёт о них через список `peers` в своём `joined`.
+            for (id, p) in room.participants.iter() {
+                if id != &peer_id {
+                    send_to(&p.tx, ServerMessage::PeerJoined {
+                        peer_id: peer_id.clone(),
+                        name: name.clone(),
+                    });
+                }
+            }
+            send_to(tx, ServerMessage::Joined { peer_id: peer_id.clone(), peers, screen_owner });
+
+            // История чата — сразу после `joined`, из памяти комнаты (тот же
+            // мьютекс, что и запись — гонка «вошёл сразу после сообщения»
+            // невозможна в принципе).
+            let messages: Vec<ChatHistoryEntry> = room.chat_history.iter().cloned().collect();
+            send_to(tx, ServerMessage::ChatHistory { messages });
+
+            drop(rooms_guard);
+            *me = Some(PeerCtx { room_id: room_id.clone(), peer_id, name });
         }
 
         // Релей: содержимое не разбираем, только маршрутизируем внутри
@@ -291,7 +276,7 @@ async fn handle_message(
         }
 
         ClientMessage::Chat { text } => {
-            handle_chat(text, me, tx, rooms, chat_tx, chat_times);
+            handle_chat(text, me, tx, rooms, chat_history_cap, chat_times);
         }
 
         ClientMessage::ShareStart => {
@@ -353,15 +338,17 @@ fn handle_share_stop(me: &Option<PeerCtx>, rooms: &SharedRooms) {
 }
 
 /// Обработка `chat`: валидация, rate-limit, широковещательная рассылка
-/// участникам комнаты (включая отправителя) и постановка в очередь на запись
-/// в БД (см. `db::run_chat_writer` — единственный писатель, чтобы порядок и
-/// полнота истории не зависели от гонки конкурентных вставок).
+/// участникам комнаты (включая отправителя) и запись в историю комнаты в
+/// памяти (`Room::chat_history`, с вытеснением старых при переполнении
+/// `chat_history_cap`). Рассылка и запись в историю — под одним и тем же
+/// мьютексом комнаты, поэтому гонка «участник вошёл сразу после отправки
+/// сообщения» невозможна в принципе (в отличие от прежней схемы с БД).
 fn handle_chat(
     text: String,
     me: &Option<PeerCtx>,
     tx: &PeerTx,
     rooms: &SharedRooms,
-    chat_tx: &ChatWriteTx,
+    chat_history_cap: usize,
     chat_times: &mut VecDeque<Instant>,
 ) {
     let Some(ctx) = me.as_ref() else {
@@ -387,37 +374,32 @@ fn handle_chat(
     let name = ctx.name.clone();
     let ts = now_ms();
 
-    // Под мьютексом только собираем получателей и session_id; сама отправка —
-    // синхронный send в mpsc-канал (не блокирует), запись в БД — вне мьютекса
-    // и через отдельный канал единственному писателю, чтобы доставка не
-    // ждала диск (см. `db::run_chat_writer`).
-    let (recipients, session_id) = {
-        let rooms_guard = rooms.lock().unwrap();
-        let Some(room) = rooms_guard.get(&room_id) else {
-            debug!(room = %room_id, "chat в уже закрытую комнату — игнорируем");
-            return;
-        };
-        let recipients: Vec<PeerTx> = room.participants.values().map(|p| p.tx.clone()).collect();
-        (recipients, room.session_id)
-    };
-
     let chat_msg = ServerMessage::Chat {
         from_peer_id: from_peer_id.clone(),
         name: name.clone(),
         text: text.clone(),
         ts,
     };
-    for peer_tx in &recipients {
-        send_to(peer_tx, chat_msg.clone());
-    }
 
-    let _ = chat_tx.send(ChatWriteJob::Insert {
-        session_id,
-        peer_id: from_peer_id,
-        name,
-        text,
-        ts,
-    });
+    let mut rooms_guard = rooms.lock().unwrap();
+    let Some(room) = rooms_guard.get_mut(&room_id) else {
+        debug!(room = %room_id, "chat в уже закрытую комнату — игнорируем");
+        return;
+    };
+    for p in room.participants.values() {
+        send_to(&p.tx, chat_msg.clone());
+    }
+    if chat_history_cap > 0 {
+        while room.chat_history.len() >= chat_history_cap {
+            room.chat_history.pop_front();
+        }
+        room.chat_history.push_back(ChatHistoryEntry {
+            from_peer_id,
+            name,
+            text,
+            ts,
+        });
+    }
 }
 
 /// Скользящий счётчик: не более `CHAT_RATE_LIMIT` сообщений за

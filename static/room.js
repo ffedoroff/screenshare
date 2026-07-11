@@ -27,11 +27,30 @@ const roomMessageEl = document.getElementById('room-message');
 const micButton = document.getElementById('mic-button');
 const cameraButton = document.getElementById('camera-button');
 const screenButton = document.getElementById('screen-button');
-const copyLinkButton = document.getElementById('copy-link-button');
+const shareButton = document.getElementById('share-button');
 const leaveButton = document.getElementById('leave-button');
+const sharePopupEl = document.getElementById('share-popup');
+const sharePopupBackdropEl = document.getElementById('share-popup-backdrop');
+const sharePopupCloseEl = document.getElementById('share-popup-close');
+const sharePopupQrEl = document.getElementById('share-popup-qr');
+const sharePopupLinkEl = document.getElementById('share-popup-link');
+const sharePopupCopyButtonEl = document.getElementById('share-popup-copy-button');
 
-// roomId — последний сегмент пути, например /room/abc123 -> "abc123".
+// roomId — последний сегмент пути, например /r/abc123 -> "abc123".
 const roomId = location.pathname.split('/').filter(Boolean).pop();
+
+// Мобильные браузеры (Android Chrome, iOS Safari) не реализуют
+// getDisplayMedia — нативного захвата экрана из веба на них нет вообще (это
+// не вопрос разрешений, метода просто нет в API). Кнопку «Экран» в таком
+// случае не дизейблим (это подразумевало бы «временно недоступно»), а прячем
+// совсем — не обещаем функциональность, которой на этом устройстве не
+// существует в принципе.
+const screenShareSupported = !!(
+  navigator.mediaDevices && typeof navigator.mediaDevices.getDisplayMedia === 'function'
+);
+if (!screenShareSupported) {
+  screenButton.classList.add('hidden');
+}
 
 // --- Общее состояние комнаты/сигналинга ---
 let signaling = null;
@@ -692,7 +711,12 @@ cameraButton.addEventListener('click', async () => {
     let stream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 640 }, height: { ideal: 360 }, frameRate: { ideal: 15 } },
+        video: {
+          width: { ideal: 640 },
+          height: { ideal: 360 },
+          frameRate: { ideal: 15 },
+          facingMode: 'user', // на телефоне — фронтальная камера по умолчанию
+        },
       });
     } catch (err) {
       console.warn('Доступ к камере отклонён:', err);
@@ -784,16 +808,14 @@ function stopScreenShare() {
   updateScreenButtonState();
 }
 
-// ---------- Скопировать ссылку ----------
+// ---------- Поделиться (попап с QR + ссылка) ----------
 
-copyLinkButton.addEventListener('click', async () => {
-  const text = location.href;
-  let success = false;
+/** Скопировать текст в буфер обмена с фоллбэком для окружений без Clipboard API. */
+async function copyTextToClipboard(text) {
   try {
     await navigator.clipboard.writeText(text);
-    success = true;
+    return true;
   } catch (err) {
-    // Фоллбэк для окружений без Clipboard API / без разрешения.
     try {
       const tmpInput = document.createElement('input');
       tmpInput.value = text;
@@ -803,21 +825,46 @@ copyLinkButton.addEventListener('click', async () => {
       tmpInput.focus();
       tmpInput.select();
       tmpInput.setSelectionRange(0, text.length);
-      success = document.execCommand('copy');
+      const success = document.execCommand('copy');
       tmpInput.remove();
+      return success;
     } catch (execErr) {
       console.error('Не удалось скопировать ссылку:', execErr);
+      return false;
     }
   }
+}
 
+function onSharePopupKeydown(event) {
+  if (event.key === 'Escape') closeSharePopup();
+}
+
+function openSharePopup() {
+  const link = location.href;
+  // QR — серверный SVG (см. GET /qr.svg?room=<id> в src/main.rs), кодирует ту
+  // же короткую ссылку /r/<roomId>.
+  sharePopupQrEl.src = `/qr.svg?room=${encodeURIComponent(roomId)}`;
+  sharePopupLinkEl.textContent = link;
+  sharePopupEl.classList.remove('hidden');
+  document.addEventListener('keydown', onSharePopupKeydown);
+}
+
+function closeSharePopup() {
+  sharePopupEl.classList.add('hidden');
+  document.removeEventListener('keydown', onSharePopupKeydown);
+}
+
+shareButton.addEventListener('click', openSharePopup);
+sharePopupCloseEl.addEventListener('click', closeSharePopup);
+sharePopupBackdropEl.addEventListener('click', closeSharePopup);
+
+sharePopupCopyButtonEl.addEventListener('click', async () => {
+  const success = await copyTextToClipboard(location.href);
   if (success) {
-    const label = copyLinkButton.querySelector('.control-button-label');
-    const original = label.textContent;
-    label.textContent = 'Скопировано';
-    copyLinkButton.classList.add('control-button--on');
+    const original = sharePopupCopyButtonEl.textContent;
+    sharePopupCopyButtonEl.textContent = 'Скопировано';
     setTimeout(() => {
-      label.textContent = original;
-      copyLinkButton.classList.remove('control-button--on');
+      sharePopupCopyButtonEl.textContent = original;
     }, 1500);
   }
 });

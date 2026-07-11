@@ -2,7 +2,7 @@
 <html lang="ru">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>Комната — созвон</title>
   <link rel="stylesheet" href="/static/style.css" />
 </head>
@@ -35,21 +35,37 @@
     <div id="room-message" class="room-message hidden"></div>
 
     <div class="control-panel">
-      <button id="mic-button" class="control-button" type="button" aria-pressed="false">
-        <span class="control-button-icon">🎤</span><span class="control-button-label">Микрофон</span>
+      <button id="mic-button" class="control-button" type="button" aria-pressed="false" aria-label="Микрофон">
+        <span class="control-button-icon" aria-hidden="true">🎤</span><span class="control-button-label">Микрофон</span>
       </button>
-      <button id="camera-button" class="control-button" type="button" aria-pressed="false">
-        <span class="control-button-icon">📷</span><span class="control-button-label">Камера</span>
+      <button id="camera-button" class="control-button" type="button" aria-pressed="false" aria-label="Камера">
+        <span class="control-button-icon" aria-hidden="true">📷</span><span class="control-button-label">Камера</span>
       </button>
-      <button id="screen-button" class="control-button" type="button" aria-pressed="false">
-        <span class="control-button-icon">🖥️</span><span class="control-button-label">Экран</span>
+      <!-- Кнопка «Экран» прячется скриптом (room.js), если у браузера нет
+           navigator.mediaDevices.getDisplayMedia — так на мобильных
+           (Android Chrome, iOS Safari), где веб-API захвата экрана не
+           реализовано в принципе. -->
+      <button id="screen-button" class="control-button" type="button" aria-pressed="false" aria-label="Экран">
+        <span class="control-button-icon" aria-hidden="true">🖥️</span><span class="control-button-label">Экран</span>
       </button>
-      <button id="copy-link-button" class="control-button" type="button">
-        <span class="control-button-icon">🔗</span><span class="control-button-label">Скопировать ссылку</span>
+      <button id="share-button" class="control-button" type="button" aria-label="Поделиться ссылкой на комнату">
+        <span class="control-button-icon" aria-hidden="true">🔗</span><span class="control-button-label">Поделиться</span>
       </button>
-      <button id="leave-button" class="control-button control-button--danger" type="button">
-        <span class="control-button-icon">🚪</span><span class="control-button-label">Покинуть</span>
+      <button id="leave-button" class="control-button control-button--danger" type="button" aria-label="Покинуть комнату">
+        <span class="control-button-icon" aria-hidden="true">🚪</span><span class="control-button-label">Покинуть</span>
       </button>
+    </div>
+
+    <!-- Попап «Поделиться»: QR-код (серверный SVG) + ссылка текстом + копирование. -->
+    <div id="share-popup" class="share-popup hidden" role="dialog" aria-modal="true" aria-labelledby="share-popup-title">
+      <div id="share-popup-backdrop" class="share-popup-backdrop"></div>
+      <div class="share-popup-card">
+        <button id="share-popup-close" class="share-popup-close" type="button" aria-label="Закрыть">✕</button>
+        <h2 id="share-popup-title">Поделиться комнатой</h2>
+        <img id="share-popup-qr" class="share-popup-qr" src="" alt="QR-код со ссылкой на комнату" width="280" height="280" />
+        <div id="share-popup-link" class="share-popup-link"></div>
+        <button id="share-popup-copy-button" class="share-popup-copy-button" type="button">Скопировать</button>
+      </div>
     </div>
   </div>
 

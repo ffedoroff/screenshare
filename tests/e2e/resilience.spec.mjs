@@ -4,7 +4,7 @@
 // шаринг экрана — замок на одного участника, комната живёт, пока не
 // опустеет + EMPTY_ROOM_TTL_SECONDS для пустой). Тот же самодостаточный
 // стиль, что и basic.spec.mjs/старый resilience.spec.mjs: свой мини-раннер,
-// свой сервер (порт 3333, отдельная временная SQLite), реальный Chrome через
+// свой сервер (порт 3333, состояние целиком в памяти процесса), реальный Chrome через
 // playwright-core, синтетические медиастабы по умолчанию (см. helpers.mjs).
 //
 // Сервер этого файла запускается с EMPTY_ROOM_TTL_SECONDS=5 (не 3 — см.
@@ -185,7 +185,7 @@ async function main() {
       console.log('FAIL - критическая ошибка: комната не создана, дальнейшие сценарии невозможны');
       return;
     }
-    const roomUrl = `${server.baseUrl}/room/${roomId}`;
+    const roomUrl = `${server.baseUrl}/r/${roomId}`;
 
     const vasyaContext = await browser.newContext();
     const petyaContext = await browser.newContext();
@@ -463,7 +463,7 @@ async function main() {
     let tolyaPage = null;
     const rateLimitPrepOk = await step('(ж, подготовка) новая комната — Нина и Толя заходят', async () => {
       const newRoomId = await createRoomViaApi(server.baseUrl);
-      const newRoomUrl = `${server.baseUrl}/room/${newRoomId}`;
+      const newRoomUrl = `${server.baseUrl}/r/${newRoomId}`;
 
       const ninaContext = await browser.newContext();
       const tolyaContext = await browser.newContext();

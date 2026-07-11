@@ -1,13 +1,19 @@
 //! Точка входа: HTTP-сервер на axum.
 //!
-//! Backend делает ровно две вещи (по спецификации):
+//! Backend делает ровно три вещи (по спецификации):
 //!   1. Signaling-релей поверх WebSocket (`/ws`) — см. `ws.rs`. Сюда же
-//!      подмешан текстовый чат комнаты с историей в SQLite (`db.rs`).
-//!   2. Раздача статики фронтенда (`/`, `/room/{id}`, `/static/...`).
+//!      подмешан текстовый чат комнаты — история целиком в памяти комнаты
+//!      (`state::Room::chat_history`), никакого хранения на диске.
+//!   2. Раздача статики фронтенда (`/`, `/r/{id}`, `/static/...`).
+//!   3. `GET /qr.svg?room=<id>` — QR-код на короткую ссылку комнаты.
 //! Плюс крошечный `/config` с ICE-серверами из переменных окружения.
 //! Медиа через сервер по-прежнему не проходит.
+//!
+//! Приватность: на диске не остаётся ничего — ни IP/портов клиентов (в
+//! tracing-логах фигурируют только room/peer id), ни истории чата, ни какой
+//! бы то ни было информации о сессии. Комната умирает — умирает вся её
+//! память (участники, имена, история).
 
-mod db;
 mod protocol;
 mod state;
 mod ws;
@@ -16,11 +22,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::extract::{Path, State};
-use axum::http::{header, StatusCode};
+use axum::extract::{Path, Query, State};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use qrcode::render::svg;
+use qrcode::QrCode;
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -45,11 +53,6 @@ async fn main() {
 
     let rooms = Arc::new(Mutex::new(HashMap::new()));
 
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "sqlite://screenshare.db?mode=rwc".to_string());
-    info!(url = %database_url, "подключение к БД истории чата");
-    let db = db::init_pool(&database_url).await;
-
     // Сколько пустая комната (никого не подключилось / все вышли) живёт до
     // удаления реапером. Дефолт 120с — время создателю перейти по ссылке;
     // в тестах выставляется значительно короче.
@@ -60,23 +63,26 @@ async fn main() {
     let empty_room_ttl = Duration::from_secs(empty_room_ttl_secs);
     tokio::spawn(state::reap_empty_rooms(rooms.clone(), empty_room_ttl));
 
-    // Единственный писатель истории чата в БД — сериализует вставки (см.
-    // `db::run_chat_writer`), чтобы `join-room` мог достоверно дождаться
-    // всех более ранних сообщений перед чтением истории (`flush_and_fetch_history`).
-    let (chat_tx, chat_rx) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(db::run_chat_writer(db.clone(), chat_rx));
+    // Сколько последних сообщений чата держать в памяти комнаты (см.
+    // `state::Room::chat_history`). В тестах выставляется маленьким, чтобы
+    // проверить вытеснение старых сообщений без отправки полусотни сообщений.
+    let chat_history_cap: usize = std::env::var("CHAT_HISTORY_CAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
 
-    let state = AppState { rooms, db, chat_tx };
+    let state = AppState { rooms, chat_history_cap };
 
     let app = Router::new()
         // Страница входа/лендинга.
         .route("/", get(|| page("index.html")))
         // Страница комнаты: roomId фронтенд читает из URL сам.
-        .route("/room/{room_id}", get(|_: Path<String>| page("room.html")))
+        .route("/r/{room_id}", get(|_: Path<String>| page("room.html")))
         .route("/api/rooms", post(create_room))
         .route("/config", get(ice_config))
         .route("/healthz", get(healthz))
         .route("/version.json", get(version_json))
+        .route("/qr.svg", get(qr_svg))
         .route("/ws", get(ws::ws_handler))
         .route("/static/{*path}", get(static_file))
         .with_state(state);
@@ -129,21 +135,10 @@ async fn shutdown_signal() {
 async fn create_room(State(state): State<AppState>) -> Response {
     let room_id = state::generate_room_id();
 
-    // Сессия чата заводится в БД ДО захвата мьютекса комнат: вставка в
-    // HashMap синхронна и не должна ждать диск.
-    let session_id = match db::create_session(&state.db, &room_id, state::now_ms()).await {
-        Ok(id) => id,
-        Err(e) => {
-            tracing::error!("не удалось создать сессию комнаты в БД: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error, try again").into_response();
-        }
-    };
-
     let mut rooms_guard = state.rooms.lock().unwrap();
-    // Коллизия 8-символьного id астрономически маловероятна (32^8 вариантов).
-    // В отличие от циклической перегенерации под мьютексом, здесь id уже ушёл
-    // в БД вместе с сессией, поэтому в теоретическом проигрышном случае просто
-    // отказываем: клиент повторит запрос.
+    // Коллизия 8-символьного id астрономически маловероятна (32^8 вариантов);
+    // в теоретическом проигрышном случае просто отказываем — клиент повторит
+    // запрос.
     if rooms_guard.contains_key(&room_id) {
         drop(rooms_guard);
         warn!(room = %room_id, "коллизия roomId при создании — отказ");
@@ -154,7 +149,7 @@ async fn create_room(State(state): State<AppState>) -> Response {
         Room {
             participants: HashMap::new(),
             screen_owner: None,
-            session_id,
+            chat_history: std::collections::VecDeque::new(),
             // Сразу помечена «пустой»: если никто не подключится за TTL,
             // реапер её удалит.
             emptied_at: Some(Instant::now()),
@@ -232,4 +227,65 @@ async fn ice_config() -> Json<serde_json::Value> {
         }
     }
     Json(json!({ "iceServers": servers }))
+}
+
+/// `GET /qr.svg?room=<roomId>`: QR-код, кодирующий короткую ссылку на комнату
+/// (`<proto>://<host>/r/<room>`). Комната может не существовать — не
+/// проверяем: QR на мёртвую/ещё не созданную комнату безвреден, а лишний
+/// поход в состояние комнат тут ни к чему.
+async fn qr_svg(Query(params): Query<HashMap<String, String>>, headers: HeaderMap) -> Response {
+    let Some(room) = params.get("room") else {
+        return (StatusCode::BAD_REQUEST, "missing room param").into_response();
+    };
+    if !is_valid_room_id(room) {
+        return (StatusCode::BAD_REQUEST, "invalid room id").into_response();
+    }
+
+    let host = headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("localhost");
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|h| h.to_str().ok())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if host.starts_with("localhost") || host.starts_with("127.") {
+                "http".to_string()
+            } else {
+                "https".to_string()
+            }
+        });
+    let url = format!("{proto}://{host}/r/{room}");
+
+    let code = match QrCode::new(url.as_bytes()) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("не удалось построить QR-код: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "qr encode error").into_response();
+        }
+    };
+    // Классический вид: чёрные модули на белом фоне (не белые на прозрачном —
+    // такие сканеры часто не читают), quiet zone 4 модуля (дефолт крейта).
+    let svg_body = code
+        .render()
+        .dark_color(svg::Color("#000000"))
+        .light_color(svg::Color("#ffffff"))
+        .build();
+
+    (
+        [
+            (header::CONTENT_TYPE, "image/svg+xml"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        svg_body,
+    )
+        .into_response()
+}
+
+/// `room` валиден по `^[a-z0-9]{8}$` (то же множество символов, что генерирует
+/// `state::generate_room_id`, плюс цифры 0/1, которые генератор не использует,
+/// но которые не вредно принять во входной валидации).
+fn is_valid_room_id(room: &str) -> bool {
+    room.len() == 8 && room.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
 }

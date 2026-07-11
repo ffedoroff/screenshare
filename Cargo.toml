@@ -17,6 +17,7 @@ uuid = { version = "1", features = ["v4"] }
 # Логирование
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# Хранение истории чата в SQLite. Без макро-фич (query!/query_as!) — они
-# проверяют SQL при сборке против живой БД, а нам нужен чистый runtime-sqlx.
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+# QR-код для /qr.svg: чистый Rust. Без default-фич — они тянут декодер
+# растровых изображений (крейт image), который нам не нужен; берём только
+# "svg" (рендер в SVG).
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
