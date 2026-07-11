@@ -109,3 +109,85 @@ class Signaling {
     }
   }
 }
+
+/**
+ * Определение «кто сейчас говорит» по входящим аудиотрекам — общая часть для
+ * broadcaster.js (входящие микрофоны зрителей) и viewer.js (ретранслированные
+ * чужие микрофоны + трек вещающего). Никакой связи с сигналингом или счётчиком
+ * «живых» треков (см. static/broadcaster.js) — честный анализ громкости через
+ * Web Audio API (AnalyserNode), поэтому корректно отличает
+ * `track.enabled = false` (тишина) от реально живого, но молчащего микрофона.
+ *
+ * AudioContext создаётся лениво (по первому вызову monitorTrack) — раньше
+ * нельзя: без пользовательского жеста браузер создаёт его в состоянии
+ * suspended. Резюмируем его при первом клике/нажатии клавиши на странице —
+ * это не мешает штатному автоплей-паттерну страницы (video/audio autoplay
+ * элементы не зависят от AudioContext).
+ */
+const SpeakingDetection = (() => {
+  // Порог RMS амплитуды сигнала, выше которого считаем, что источник говорит.
+  // Подобран эмпирически: обычная речь через микрофон даёт RMS заметно выше,
+  // фоновый шум/тишина — ниже.
+  const RMS_THRESHOLD = 0.02;
+  const POLL_INTERVAL_MS = 200;
+
+  let audioCtx = null;
+
+  function getAudioContext() {
+    if (!audioCtx) {
+      const Ctor = window.AudioContext || window.webkitAudioContext;
+      audioCtx = new Ctor();
+      const resumeOnce = () => {
+        if (audioCtx && audioCtx.state === 'suspended') {
+          audioCtx.resume().catch((err) => console.warn('Не удалось возобновить AudioContext:', err));
+        }
+        document.removeEventListener('click', resumeOnce);
+        document.removeEventListener('keydown', resumeOnce);
+      };
+      document.addEventListener('click', resumeOnce);
+      document.addEventListener('keydown', resumeOnce);
+    }
+    return audioCtx;
+  }
+
+  /**
+   * Начать мониторинг уровня звука одного аудиотрека. `onChange(speaking)`
+   * вызывается только при смене состояния (не на каждый замер). Возвращает
+   * функцию `stop()` — останавливает опрос и отключает узлы Web Audio;
+   * если на момент остановки трек считался «говорящим», перед остановкой
+   * будет вызван `onChange(false)`.
+   */
+  function monitorTrack(track, onChange) {
+    const ctx = getAudioContext();
+    const source = ctx.createMediaStreamSource(new MediaStream([track]));
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 512;
+    source.connect(analyser);
+
+    const buffer = new Float32Array(analyser.fftSize);
+    let speaking = false;
+    const timer = setInterval(() => {
+      analyser.getFloatTimeDomainData(buffer);
+      let sumSquares = 0;
+      for (let i = 0; i < buffer.length; i++) sumSquares += buffer[i] * buffer[i];
+      const rms = Math.sqrt(sumSquares / buffer.length);
+      const isSpeaking = rms > RMS_THRESHOLD;
+      if (isSpeaking !== speaking) {
+        speaking = isSpeaking;
+        onChange(speaking);
+      }
+    }, POLL_INTERVAL_MS);
+
+    return function stop() {
+      clearInterval(timer);
+      try {
+        source.disconnect();
+      } catch (err) {
+        // уже отключено — не страшно
+      }
+      if (speaking) onChange(false);
+    };
+  }
+
+  return { monitorTrack };
+})();

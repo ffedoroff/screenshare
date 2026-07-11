@@ -422,6 +422,17 @@ async function main() {
     };
     await viewer1Context.addInitScript(installMicStub(), micStubArg);
     await viewer2Context.addInitScript(installMicStub(), micStubArg);
+    // Имена зрителей — заранее в localStorage (chat.js: NAME_STORAGE_KEY =
+    // 'screenshare-name'), чтобы broadcaster узнал их из join-room и подписал
+    // ими источники ретранслируемого аудио (см. индикатор «кто говорит» ниже).
+    // addInitScript выполняется до любого скрипта страницы при каждой
+    // навигации — значение уже будет в localStorage к моменту init() в viewer.js.
+    await viewer1Context.addInitScript((name) => {
+      localStorage.setItem('screenshare-name', name);
+    }, 'Вася');
+    await viewer2Context.addInitScript((name) => {
+      localStorage.setItem('screenshare-name', name);
+    }, 'Петя');
     const viewer1Page = await viewer1Context.newPage();
     const viewer2Page = await viewer2Context.newPage();
 
@@ -575,6 +586,32 @@ async function main() {
         assert.equal(micButtonOn, true, 'кнопка микрофона у зрителя №1 должна быть в состоянии «включено»');
       });
 
+      // Аудио-хаб (п.9 плана): микрофон зрителя №1 ретранслируется вещающим
+      // всем ОСТАЛЬНЫМ зрителям (не через сервер — броадкастер добавляет
+      // трек в PeerConnection зрителя №2). Плюс индикатор «кто говорит» —
+      // честный анализ громкости (осциллятор синтетического микрофона звучит
+      // постоянно, поэтому детектор должен сработать стабильно) и подпись
+      // из stream-info (имя «Вася» взято из localStorage перед goto).
+      await step('у зрителя №2 появляется скрытый <audio> с чужим (ретранслированным) треком и индикатор «Говорят: Вася»', async () => {
+        await viewer2Page.waitForFunction(
+          () => document.querySelectorAll('audio[data-stream-id]').length > 0,
+          undefined,
+          { polling: 100, timeout: 5000 }
+        );
+
+        await viewer2Page.waitForFunction(
+          () => (document.getElementById('speaking-indicator')?.textContent || '').includes('Вася'),
+          undefined,
+          { polling: 100, timeout: 5000 }
+        );
+
+        await broadcasterPage.waitForFunction(
+          () => (document.getElementById('speaking-indicator')?.textContent || '').includes('Вася'),
+          undefined,
+          { polling: 100, timeout: 5000 }
+        );
+      });
+
       await step('зритель №1 выключает микрофон повторным кликом — кнопка меняет состояние, индикатор у вещающего не падает', async () => {
         await viewer1Page.click('#mic-button');
 
@@ -592,6 +629,23 @@ async function main() {
         assert.ok(
           micIndicatorText.includes('1'),
           `индикатор микрофонов должен остаться «...1», получено «${micIndicatorText}»`
+        );
+      });
+
+      // track.enabled = false отдаёт тишину на приёмнике (в отличие от
+      // счётчика «микрофонов» выше — детектор уровня звука это отличает),
+      // поэтому индикатор «Говорят» должен погаснуть у обоих слушателей.
+      await step('после выключения микрофона индикатор «Говорят» гаснет у зрителя №2 и у вещающего', async () => {
+        await viewer2Page.waitForFunction(
+          () => document.getElementById('speaking-indicator')?.classList.contains('hidden'),
+          undefined,
+          { polling: 100, timeout: 4000 }
+        );
+
+        await broadcasterPage.waitForFunction(
+          () => document.getElementById('speaking-indicator')?.classList.contains('hidden'),
+          undefined,
+          { polling: 100, timeout: 4000 }
         );
       });
     } else {

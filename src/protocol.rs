@@ -29,6 +29,11 @@ pub enum ClientMessage {
     Answer { target_peer_id: String, sdp: Value },
     /// ICE-кандидат (trickle) любому пиру своей комнаты.
     IceCandidate { target_peer_id: String, candidate: Value },
+    /// Информация об аудиопотоке (аудио-хаб) — опаковый JSON, сервер не
+    /// разбирает содержимое `info`, только релеит как offer/answer/ICE.
+    /// Используется broadcaster'ом, чтобы сообщить зрителю соответствие
+    /// `streamId -> { peerId, name }` для ретранслируемых чужих аудиотреков.
+    StreamInfo { target_peer_id: String, info: Value },
     /// Текстовое сообщение в чат комнаты — от любого участника.
     Chat { text: String },
     /// Явный выход (эквивалентен закрытию сокета).
@@ -48,7 +53,9 @@ pub enum ServerMessage {
         viewer_count: usize,
     },
     /// Broadcaster'у: подключился новый зритель — пора слать оффер.
-    PeerJoined { peer_id: String },
+    /// `name` — имя зрителя из `join-room` (то же, что уходит в чат), нужно
+    /// broadcaster'у, чтобы подписывать источник ретранслируемого аудио.
+    PeerJoined { peer_id: String, name: Option<String> },
     /// Broadcaster'у: зритель ушёл.
     PeerLeft { peer_id: String },
     /// Зрителю: оффер от broadcaster'а.
@@ -57,6 +64,9 @@ pub enum ServerMessage {
     Answer { from_peer_id: String, sdp: Value },
     /// Целевому пиру: ICE-кандидат от другого пира.
     IceCandidate { from_peer_id: String, candidate: Value },
+    /// Целевому пиру: информация об аудиопотоке от другого пира (релей
+    /// `stream-info`, см. `ClientMessage::StreamInfo`).
+    StreamInfo { from_peer_id: String, info: Value },
     /// Зрителю: в комнате уже максимум зрителей.
     RoomFull,
     /// Зрителю: комнаты нет (не создана или уже закрыта).

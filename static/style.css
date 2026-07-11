@@ -203,6 +203,26 @@ body {
   color: var(--text-muted);
 }
 
+/* ---------- Индикатор "кто говорит" ---------- */
+
+.speaking-indicator {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--success);
+}
+
+.speaking-indicator--viewer {
+  position: fixed;
+  top: 16px;
+  left: 16px;
+  z-index: 30;
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--success);
+  box-shadow: var(--shadow);
+}
+
 .status-message {
   min-height: 1.4em;
   font-size: 0.95rem;

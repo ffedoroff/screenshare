@@ -19,6 +19,7 @@ const overlayText = document.getElementById('overlay-text');
 const playButton = document.getElementById('play-button');
 const micButton = document.getElementById('mic-button');
 const micMessageEl = document.getElementById('mic-message');
+const speakingIndicatorEl = document.getElementById('speaking-indicator');
 
 // roomId — последний сегмент пути, например /room/abc123 -> "abc123".
 const roomId = location.pathname.split('/').filter(Boolean).pop();
@@ -41,6 +42,20 @@ let micStream = null;
 let micTrack = null;
 let micRequestInProgress = false;
 let micMessageTimer = null;
+
+// --- Аудио-хаб: чужие ретранслированные микрофоны + индикатор "кто говорит" ---
+// Ключ '__broadcaster__' — фиксированный ключ для трека самого вещающего (его
+// стрим отличаем не по id, а по наличию видеодорожки — см. handleAudioTrack).
+const BROADCASTER_KEY = '__broadcaster__';
+// streamId -> <audio> со скрытым ретранслированным микрофоном другого зрителя.
+const relayedAudioEls = new Map();
+// ключ (streamId либо BROADCASTER_KEY) -> функция stop() монитора уровня звука.
+const speakingMonitors = new Map();
+// ключи (streamId либо BROADCASTER_KEY), которые сейчас "говорят".
+const speakingKeys = new Set();
+// streamId -> { peerId, name } из stream-info (заполняется независимо от
+// порядка появления самого трека — подписи разрешаются в момент рендера).
+const streamInfoMap = new Map();
 
 function showOverlay({ title, text = '', spinner = false, showPlayButton = false }) {
   overlay.classList.remove('hidden');
@@ -146,6 +161,18 @@ function registerSignalingHandlers(iceServers) {
     await peer.handleCandidate(candidate);
   });
 
+  // Аудио-хаб: вещающий присылает соответствие streamId -> {peerId, name} для
+  // ретранслируемых чужих микрофонов. Может прийти раньше или позже самого
+  // ontrack — подписи разрешаются лениво в момент рендера индикатора, так что
+  // порядок не важен (см. speakerLabel).
+  signaling.on('stream-info', ({ info }) => {
+    if (!info || typeof info !== 'object') return;
+    for (const [streamId, meta] of Object.entries(info)) {
+      streamInfoMap.set(streamId, meta);
+    }
+    renderSpeakingIndicator();
+  });
+
   signaling.on('broadcaster-left', () => {
     terminalState = true;
     showOverlay({ title: 'Трансляция завершена', text: 'Вещающий закончил трансляцию.' });
@@ -169,13 +196,22 @@ function createPeerConnection(iceServers, broadcasterPeerId) {
     signaling,
     targetPeerId: broadcasterPeerId,
     onTrack: (event) => {
-      hideOverlay();
-      if (remoteVideo.srcObject !== event.streams[0]) {
-        remoteVideo.srcObject = event.streams[0];
+      const track = event.track;
+
+      if (track.kind === 'video') {
+        hideOverlay();
+        if (remoteVideo.srcObject !== event.streams[0]) {
+          remoteVideo.srcObject = event.streams[0];
+        }
+        attemptPlay();
+        // Кнопка микрофона видна только после успешного подключения к трансляции.
+        micButton.classList.remove('hidden');
+        return;
       }
-      attemptPlay();
-      // Кнопка микрофона видна только после успешного подключения к трансляции.
-      micButton.classList.remove('hidden');
+
+      if (track.kind === 'audio') {
+        handleAudioTrack(event.streams[0] || null, track);
+      }
     },
     onStateChange: (connectionState) => {
       if (connectionState === 'failed' && !terminalState) {
@@ -211,12 +247,106 @@ playButton.addEventListener('click', () => {
   });
 });
 
+// Входящий аудиотрек через RtcPeer с broadcaster'ом — это либо звук самого
+// вещающего (та же MediaStream, что несёт видео — узнаём по наличию видеодорожки
+// в стриме, а не по конкретному id: порядок ontrack video/audio не гарантирован),
+// либо чужой микрофон, ретранслированный через аудио-хаб (у него всегда своя
+// отдельная MediaStream). В обоих случаях подключаем детектор уровня звука; для
+// чужого микрофона дополнительно заводим скрытый <audio autoplay>, чтобы его
+// вообще было слышно (звук вещающего и так слышен через <video>).
+function handleAudioTrack(stream, track) {
+  const streamId = stream ? stream.id : track.id;
+  const isBroadcasterTrack = !!(stream && stream.getVideoTracks().length > 0);
+  const key = isBroadcasterTrack ? BROADCASTER_KEY : streamId;
+
+  if (!isBroadcasterTrack) {
+    let audioEl = relayedAudioEls.get(streamId);
+    if (!audioEl) {
+      audioEl = document.createElement('audio');
+      audioEl.autoplay = true;
+      audioEl.dataset.streamId = streamId;
+      audioEl.style.display = 'none';
+      document.body.appendChild(audioEl);
+      relayedAudioEls.set(streamId, audioEl);
+    }
+    const audioStream = stream || new MediaStream([track]);
+    if (audioEl.srcObject !== audioStream) {
+      audioEl.srcObject = audioStream;
+      const playPromise = audioEl.play();
+      if (playPromise) {
+        playPromise.catch((err) => console.warn('Не удалось запустить ретранслированное аудио:', err));
+      }
+    }
+  }
+
+  if (!speakingMonitors.has(key)) {
+    const stop = SpeakingDetection.monitorTrack(track, (speaking) => setSpeakingKey(key, speaking));
+    speakingMonitors.set(key, stop);
+  }
+
+  track.onended = () => {
+    if (!isBroadcasterTrack) removeRelayedAudio(streamId);
+    stopSpeakingMonitor(key);
+  };
+}
+
+function removeRelayedAudio(streamId) {
+  const audioEl = relayedAudioEls.get(streamId);
+  if (audioEl) {
+    audioEl.srcObject = null;
+    audioEl.remove();
+    relayedAudioEls.delete(streamId);
+  }
+}
+
+function stopSpeakingMonitor(key) {
+  const stop = speakingMonitors.get(key);
+  if (stop) {
+    stop();
+    speakingMonitors.delete(key);
+  }
+  speakingKeys.delete(key);
+  renderSpeakingIndicator();
+}
+
+function setSpeakingKey(key, speaking) {
+  if (speaking) speakingKeys.add(key);
+  else speakingKeys.delete(key);
+  renderSpeakingIndicator();
+}
+
+function speakerLabel(key) {
+  if (key === BROADCASTER_KEY) return 'Вещающий';
+  const info = streamInfoMap.get(key);
+  if (info && info.name) return info.name;
+  if (info && info.peerId) return `Гость-${info.peerId.slice(-4)}`;
+  return 'Гость';
+}
+
+function renderSpeakingIndicator() {
+  if (speakingKeys.size === 0) {
+    speakingIndicatorEl.textContent = '';
+    speakingIndicatorEl.classList.add('hidden');
+    return;
+  }
+  const names = Array.from(speakingKeys, speakerLabel);
+  speakingIndicatorEl.textContent = `Говорят: ${names.join(', ')}`;
+  speakingIndicatorEl.classList.remove('hidden');
+}
+
 function cleanupPeer() {
   if (peer) {
     peer.close();
     peer = null;
   }
   stopMic();
+
+  for (const stop of speakingMonitors.values()) stop();
+  speakingMonitors.clear();
+  speakingKeys.clear();
+  for (const streamId of Array.from(relayedAudioEls.keys())) removeRelayedAudio(streamId);
+  streamInfoMap.clear();
+  renderSpeakingIndicator();
 }
 
 function cleanupAll() {

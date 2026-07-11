@@ -17,6 +17,7 @@ const roomLinkInput = document.getElementById('room-link-input');
 const copyButton = document.getElementById('copy-button');
 const viewerCountEl = document.getElementById('viewer-count');
 const micIndicatorEl = document.getElementById('mic-indicator');
+const speakingIndicatorEl = document.getElementById('speaking-indicator');
 const statusMessageEl = document.getElementById('status-message');
 
 // --- Состояние ---
@@ -28,6 +29,18 @@ let iceServersConfig = [FALLBACK_ICE_SERVERS[0]];
 const peers = new Map();
 // peerId -> <audio> с входящим микрофоном этого зрителя (см. handleIncomingTrack).
 const micAudioEls = new Map();
+// peerId -> имя зрителя (из peer-joined), нужно подписывать источник ретранслируемого аудио.
+const viewerNames = new Map();
+// peerId (источник) -> { track, stream, name } — аудиотрек зрителя, который
+// сейчас ретранслируется всем остальным зрителям (аудио-хаб, см. п.9 плана).
+const relayedAudio = new Map();
+// peerId (источник) -> Map(peerId цели -> RTCRtpSender), чтобы можно было
+// снять трек у конкретной цели через removeTrack при уходе источника/цели.
+const relaySenders = new Map();
+// peerId -> функция stop() для монитора уровня звука (см. common.js: SpeakingDetection).
+const speakingMonitors = new Map();
+// peerId'ы зрителей, которые прямо сейчас говорят (по мнению детектора уровня).
+const speakingPeers = new Set();
 let chat = null;
 
 function showStatus(text, isError = false) {
@@ -114,8 +127,9 @@ function registerSignalingHandlers() {
     chat = ChatPanel.create({ signaling, peerId, variant: 'broadcaster' });
   });
 
-  signaling.on('peer-joined', ({ peerId }) => {
-    console.log('Новый зритель подключился:', peerId);
+  signaling.on('peer-joined', ({ peerId, name }) => {
+    console.log('Новый зритель подключился:', peerId, name ? `(${name})` : '');
+    viewerNames.set(peerId, name || null);
     const peer = createPeerConnection(peerId);
     peers.set(peerId, peer);
     updateViewerCount();
@@ -124,6 +138,14 @@ function registerSignalingHandlers() {
     // зрителю уйдёт сам, явный createOffer больше не нужен.
     for (const track of localStream.getTracks()) {
       peer.pc.addTrack(track, localStream);
+    }
+
+    // Аудио-хаб: новому зрителю сразу добавляем все уже живые чужие
+    // аудиотреки — вместе с добавлением локальных треков выше это уйдёт
+    // одним offer'ом (negotiationneeded коалесцирует синхронные изменения).
+    for (const [sourcePeerId, entry] of relayedAudio) {
+      if (sourcePeerId === peerId) continue;
+      addRelayedTrackToTarget(sourcePeerId, entry, peerId, peer);
     }
   });
 
@@ -215,12 +237,113 @@ function handleIncomingTrack(peerId, event) {
     }
   }
 
+  // Аудио-хаб: ретранслируем трек этого зрителя всем ОСТАЛЬНЫМ зрителям
+  // (см. п.9 плана — медиа через сервер не идёт, хаб только в браузере
+  // вещающего). Самому источнику трек не возвращается — см. relayAudioTrack.
+  relayAudioTrack(peerId, track, stream);
+
+  // Индикатор «кто говорит»: честный анализ уровня звука входящего трека
+  // (в отличие от счётчика «микрофонов» ниже — тот считает живые треки).
+  const stopMonitor = SpeakingDetection.monitorTrack(track, (speaking) => setSpeakingPeer(peerId, speaking));
+  speakingMonitors.set(peerId, stopMonitor);
+
   track.onended = () => {
     removeMicAudio(peerId);
+    unrelayAudioTrack(peerId);
+    stopSpeakingMonitor(peerId);
     updateViewerCount();
   };
 
   updateViewerCount();
+}
+
+// Добавить уже принятый трек `entry` (от `sourcePeerId`) в PeerConnection
+// зрителя `targetPeerId` и запомнить sender, чтобы потом можно было снять
+// трек через removeTrack. Используется и при появлении нового чужого трека
+// (всем существующим целям), и при подключении нового зрителя (все уже
+// живые чужие треки, см. registerSignalingHandlers -> peer-joined).
+function addRelayedTrackToTarget(sourcePeerId, entry, targetPeerId, targetPeer) {
+  const sender = targetPeer.pc.addTrack(entry.track, entry.stream);
+  let senders = relaySenders.get(sourcePeerId);
+  if (!senders) {
+    senders = new Map();
+    relaySenders.set(sourcePeerId, senders);
+  }
+  senders.set(targetPeerId, sender);
+  sendStreamInfo(targetPeerId, entry.stream.id, sourcePeerId, entry.name);
+}
+
+function relayAudioTrack(sourcePeerId, track, stream) {
+  const name = viewerNames.get(sourcePeerId) || null;
+  const entry = { track, stream, name };
+  relayedAudio.set(sourcePeerId, entry);
+  for (const [targetPeerId, targetPeer] of peers) {
+    if (targetPeerId === sourcePeerId) continue; // эхо самому источнику не возвращаем
+    addRelayedTrackToTarget(sourcePeerId, entry, targetPeerId, targetPeer);
+  }
+}
+
+// Убрать ретранслируемый трек источника `sourcePeerId` у всех целей, кому он
+// был добавлен (переговоры об удалении уйдут сами через onnegotiationneeded).
+function unrelayAudioTrack(sourcePeerId) {
+  const senders = relaySenders.get(sourcePeerId);
+  if (senders) {
+    for (const [targetPeerId, sender] of senders) {
+      const targetPeer = peers.get(targetPeerId);
+      if (targetPeer) {
+        try {
+          targetPeer.pc.removeTrack(sender);
+        } catch (err) {
+          console.warn(`Не удалось убрать ретранслированный трек у ${targetPeerId}:`, err);
+        }
+      }
+    }
+  }
+  relaySenders.delete(sourcePeerId);
+  relayedAudio.delete(sourcePeerId);
+}
+
+// Сообщить зрителю `targetPeerId` соответствие ретранслируемого стрима его
+// источнику: `streamId` совпадает с id MediaStream, который был передан в
+// addTrack — на стороне зрителя тот же id придёт в event.streams[0].id
+// (сохраняется в SDP как msid), это и есть ключ для сопоставления.
+function sendStreamInfo(targetPeerId, streamId, sourcePeerId, name) {
+  signaling.send('stream-info', {
+    targetPeerId,
+    info: { [streamId]: { peerId: sourcePeerId, name: name || null } },
+  });
+}
+
+function setSpeakingPeer(peerId, speaking) {
+  if (speaking) speakingPeers.add(peerId);
+  else speakingPeers.delete(peerId);
+  renderSpeakingIndicator();
+}
+
+function stopSpeakingMonitor(peerId) {
+  const stop = speakingMonitors.get(peerId);
+  if (stop) {
+    stop();
+    speakingMonitors.delete(peerId);
+  }
+  speakingPeers.delete(peerId);
+  renderSpeakingIndicator();
+}
+
+function speakerLabel(peerId) {
+  const name = viewerNames.get(peerId);
+  return name || `Гость-${peerId.slice(-4)}`;
+}
+
+function renderSpeakingIndicator() {
+  if (speakingPeers.size === 0) {
+    speakingIndicatorEl.textContent = '';
+    speakingIndicatorEl.classList.add('hidden');
+    return;
+  }
+  const names = Array.from(speakingPeers, speakerLabel);
+  speakingIndicatorEl.textContent = `Говорят: ${names.join(', ')}`;
+  speakingIndicatorEl.classList.remove('hidden');
 }
 
 function removeMicAudio(peerId) {
@@ -239,6 +362,15 @@ function removePeer(peerId) {
     peers.delete(peerId);
   }
   removeMicAudio(peerId);
+  // Если этот зритель сам был источником ретрансляции — убрать его трек у остальных.
+  unrelayAudioTrack(peerId);
+  // Если он был целью чужих ретрансляций — просто забываем про sender
+  // (его PeerConnection уже закрыт строчкой выше, removeTrack не нужен).
+  for (const senders of relaySenders.values()) {
+    senders.delete(peerId);
+  }
+  stopSpeakingMonitor(peerId);
+  viewerNames.delete(peerId);
 }
 
 function updateViewerCount() {
@@ -302,6 +434,8 @@ function resetUi() {
   viewerCountEl.textContent = '0';
   micIndicatorEl.textContent = '';
   micIndicatorEl.classList.add('hidden');
+  speakingIndicatorEl.textContent = '';
+  speakingIndicatorEl.classList.add('hidden');
   copyButton.textContent = 'Скопировать';
   copyButton.classList.remove('copied');
 }

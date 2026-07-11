@@ -183,7 +183,8 @@ async function runTests() {
     'первый зритель получил пустую chat-history сразу после joined');
 
   const pj = await b.next();
-  ok(pj.type === 'peer-joined' && pj.peerId === joined.peerId, 'broadcaster получил peer-joined');
+  ok(pj.type === 'peer-joined' && pj.peerId === joined.peerId && pj.name === null,
+    'broadcaster получил peer-joined (зритель без имени -> name null)');
 
   b.send({ type: 'offer', targetPeerId: joined.peerId, sdp: { type: 'offer', sdp: 'v=0 fake' } });
   const off = await v1.next();
@@ -236,7 +237,9 @@ async function runTests() {
   vRate.send({ type: 'join-room', roomId: created.roomId, role: 'viewer', name: 'Аня' });
   const joined2 = await vRate.next();
   ok(joined2.type === 'joined' && joined2.viewerCount === 2, 'второй зритель вошёл (viewerCount=2)');
-  await b.next(); // peer-joined броадкастеру
+  const pj2 = await b.next(); // peer-joined броадкастеру
+  ok(pj2.type === 'peer-joined' && pj2.peerId === joined2.peerId && pj2.name === 'Аня',
+    'broadcaster получил peer-joined с именем зрителя (Аня)');
 
   const hist2 = await vRate.next();
   ok(hist2.type === 'chat-history' && Array.isArray(hist2.messages) && hist2.messages.length === 2,
@@ -316,6 +319,62 @@ async function runTests() {
     const results = await sendChatAndDrain(b, 'чат жив после room-full', [b, ...allViewers]);
     ok(results.every((m) => isChatMsg(m) && m.text === 'чат жив после room-full'),
       'чат продолжает доставляться всем участникам после отказа 6-му зрителю');
+  }
+
+  // --- 6c. Релей stream-info (аудио-хаб): обе стороны с fromPeerId, тихий
+  // игнор неизвестного peerId и чужой комнаты, соединение и чат живы дальше ---
+  console.log('6c. stream-info: релей и игнор');
+  {
+    // Зритель -> вещающий.
+    v1.send({
+      type: 'stream-info',
+      targetPeerId: created.peerId,
+      info: { s1: { peerId: joined.peerId, name: null } },
+    });
+    const toB = await b.next();
+    ok(
+      toB.type === 'stream-info' && toB.fromPeerId === joined.peerId
+      && toB.info.s1 && toB.info.s1.peerId === joined.peerId && toB.info.s1.name === null,
+      'stream-info от зрителя доходит до вещающего с fromPeerId',
+    );
+
+    // Вещающий -> зритель (обычный случай: рассылка карты streamId -> {peerId, name}).
+    b.send({
+      type: 'stream-info',
+      targetPeerId: joined.peerId,
+      info: { s2: { peerId: 'kто-то-другой', name: 'Вася' } },
+    });
+    const toV1 = await v1.next();
+    ok(
+      toV1.type === 'stream-info' && toV1.fromPeerId === created.peerId
+      && toV1.info.s2 && toV1.info.s2.name === 'Вася',
+      'stream-info от вещающего доходит до зрителя с fromPeerId',
+    );
+
+    // Неизвестный peerId в своей же комнате — тихий игнор.
+    b.send({ type: 'stream-info', targetPeerId: 'ghost-peer-id', info: { s3: {} } });
+
+    // Чужая комната: создаём независимую вторую комнату, тут же закрываем её
+    // (peerId точно не существует нигде), и пробуем достучаться до её
+    // broadcaster'а из первой комнаты — relay() ищет цель только среди
+    // участников комнаты ОТПРАВИТЕЛЯ, так что это тоже тихий игнор.
+    const b2 = await connect();
+    b2.send({ type: 'create-room' });
+    const created2 = await b2.next();
+    b2.ws.close();
+    await b2.closed;
+    b.send({ type: 'stream-info', targetPeerId: created2.peerId, info: { s4: {} } });
+
+    // Оба игнора не должны были сломать сокет или чат: следующим сообщением
+    // ВСЕМ участникам комнаты (иначе непрочитанный маячок зависнет в очереди
+    // vRate/extras и собьёт следующие проверки peer-left/broadcaster-left)
+    // должен дойти маячок, а не утечка одного из stream-info.
+    const allRecipients = [b, v1, vRate, ...extras];
+    const results = await sendChatAndDrain(b, 'маячок-после-stream-info', allRecipients);
+    ok(
+      results.every((m) => isChatMsg(m) && m.text === 'маячок-после-stream-info'),
+      'после игнорируемых stream-info сокет и чат продолжают работать штатно',
+    );
   }
 
   // --- 7. Уход зрителя -> peer-left ---

@@ -229,7 +229,10 @@ async fn handle_message(
                 // Broadcaster инициирует оффер по этому событию. Одновременные
                 // входы зрителей безопасны: мьютекс сериализует вставки, а
                 // офферы независимы по peerId (edge-кейс №9).
-                send_to(&room.broadcaster_tx, ServerMessage::PeerJoined { peer_id: peer_id.clone() });
+                send_to(
+                    &room.broadcaster_tx,
+                    ServerMessage::PeerJoined { peer_id: peer_id.clone(), name: name.clone() },
+                );
                 send_to(
                     tx,
                     ServerMessage::Joined {
@@ -269,6 +272,12 @@ async fn handle_message(
             relay(me, rooms, tx, &target_peer_id, |from| ServerMessage::IceCandidate {
                 from_peer_id: from,
                 candidate,
+            });
+        }
+        ClientMessage::StreamInfo { target_peer_id, info } => {
+            relay(me, rooms, tx, &target_peer_id, |from| ServerMessage::StreamInfo {
+                from_peer_id: from,
+                info,
             });
         }
 

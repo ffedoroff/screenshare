@@ -21,6 +21,9 @@
     <!-- Микрофон зрителя: появляется только после успешного подключения к трансляции. -->
     <button id="mic-button" class="mic-button hidden" type="button" aria-pressed="false">🎤 Микрофон</button>
     <div id="mic-message" class="mic-message hidden"></div>
+
+    <!-- Индикатор «кто говорит»: чужие ретранслированные микрофоны + вещающий. -->
+    <div id="speaking-indicator" class="speaking-indicator speaking-indicator--viewer hidden"></div>
   </div>
 
   <script src="/static/common.js"></script>
