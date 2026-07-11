@@ -2,6 +2,10 @@
 //!
 //! Сервер НЕ разбирает содержимое `sdp` / `candidate` — это опаковые
 //! JSON-значения, которые лишь маршрутизируются между пирами.
+//!
+//! Протокол v2: симметричная комната — все участники равны (никакого
+//! broadcaster/viewer), соединяются mesh, шаринг экрана — временное
+//! состояние комнаты (максимум один шарящий одновременно).
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -10,32 +14,32 @@ use serde_json::Value;
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case", rename_all_fields = "camelCase")]
 pub enum ClientMessage {
-    /// Broadcaster создаёт комнату. `name` — опционально, как его показывать
-    /// зрителям в чате (не путать с peerId).
-    CreateRoom {
-        #[serde(default)]
-        name: Option<String>,
-    },
-    /// Viewer входит в существующую комнату. `name` — опционально, имя зрителя в чате.
+    /// Вход участника в уже существующую комнату (комната заводится заранее
+    /// через `POST /api/rooms`). `name` — опционально, как показывать этого
+    /// участника остальным в чате (не путать с peerId).
     JoinRoom {
         room_id: String,
-        role: String,
         #[serde(default)]
         name: Option<String>,
     },
-    /// SDP-оффер от broadcaster конкретному зрителю.
+    /// SDP-оффер любому другому пиру своей комнаты.
     Offer { target_peer_id: String, sdp: Value },
-    /// SDP-ответ от зрителя broadcaster'у.
+    /// SDP-ответ любому другому пиру своей комнаты.
     Answer { target_peer_id: String, sdp: Value },
     /// ICE-кандидат (trickle) любому пиру своей комнаты.
     IceCandidate { target_peer_id: String, candidate: Value },
-    /// Информация об аудиопотоке (аудио-хаб) — опаковый JSON, сервер не
-    /// разбирает содержимое `info`, только релеит как offer/answer/ICE.
-    /// Используется broadcaster'ом, чтобы сообщить зрителю соответствие
-    /// `streamId -> { peerId, name }` для ретранслируемых чужих аудиотреков.
+    /// Опаковый JSON, сервер не разбирает содержимое `info`, только релеит
+    /// как offer/answer/ICE — используется фронтом для служебной информации
+    /// между пирами (например, сопоставление аудиотреков с именами).
     StreamInfo { target_peer_id: String, info: Value },
     /// Текстовое сообщение в чат комнаты — от любого участника.
     Chat { text: String },
+    /// Заявка на шаринг экрана. Удовлетворяется, только если экран сейчас
+    /// свободен (комната одновременно поддерживает не более одного шарящего).
+    ShareStart,
+    /// Освобождение экрана — принимается только от текущего владельца,
+    /// от кого-то другого тихо игнорируется.
+    ShareStop,
     /// Явный выход (эквивалентен закрытию сокета).
     Leave,
 }
@@ -44,35 +48,40 @@ pub enum ClientMessage {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case", rename_all_fields = "camelCase")]
 pub enum ServerMessage {
-    /// Ответ broadcaster'у на `create-room`.
-    RoomCreated { room_id: String, peer_id: String },
-    /// Ответ зрителю на успешный `join-room`.
+    /// Ответ участнику на успешный `join-room`. `peers` — ДРУГИЕ уже
+    /// подключённые участники комнаты, `screen_owner` — кто сейчас шарит
+    /// экран (если шарит хоть кто-то).
     Joined {
         peer_id: String,
-        broadcaster_id: String,
-        viewer_count: usize,
+        peers: Vec<PeerInfo>,
+        screen_owner: Option<String>,
     },
-    /// Broadcaster'у: подключился новый зритель — пора слать оффер.
-    /// `name` — имя зрителя из `join-room` (то же, что уходит в чат), нужно
-    /// broadcaster'у, чтобы подписывать источник ретранслируемого аудио.
+    /// Остальным участникам комнаты: подключился новый участник.
     PeerJoined { peer_id: String, name: Option<String> },
-    /// Broadcaster'у: зритель ушёл.
+    /// Остальным участникам комнаты: участник ушёл.
     PeerLeft { peer_id: String },
-    /// Зрителю: оффер от broadcaster'а.
+    /// Целевому пиру: оффер от другого пира.
     Offer { from_peer_id: String, sdp: Value },
-    /// Broadcaster'у: ответ зрителя.
+    /// Целевому пиру: ответ от другого пира.
     Answer { from_peer_id: String, sdp: Value },
     /// Целевому пиру: ICE-кандидат от другого пира.
     IceCandidate { from_peer_id: String, candidate: Value },
     /// Целевому пиру: информация об аудиопотоке от другого пира (релей
     /// `stream-info`, см. `ClientMessage::StreamInfo`).
     StreamInfo { from_peer_id: String, info: Value },
-    /// Зрителю: в комнате уже максимум зрителей.
+    /// Всем участникам комнаты (включая инициатора — единый путь рендера):
+    /// шаринг экрана начался.
+    ShareStarted { peer_id: String },
+    /// Только инициатору `share-start`: экран уже занят кем-то другим.
+    ShareRejected { busy_peer_id: String },
+    /// Всем участникам комнаты: шаринг экрана закончился (явный `share-stop`
+    /// владельца или его дисконнект).
+    ShareStopped { peer_id: String },
+    /// Участнику: в комнате уже максимум участников.
     RoomFull,
-    /// Зрителю: комнаты нет (не создана или уже закрыта).
+    /// Участнику: комнаты нет (не создана, ещё не создана или уже удалена
+    /// реапером после истечения TTL пустой комнаты).
     RoomNotFound,
-    /// Всем зрителям комнаты: вещающий ушёл, трансляция завершена.
-    BroadcasterLeft,
     /// Всем участникам комнаты (включая отправителя — единый путь рендера):
     /// новое сообщение чата.
     Chat {
@@ -81,11 +90,19 @@ pub enum ServerMessage {
         text: String,
         ts: i64,
     },
-    /// Зрителю сразу после `joined`: последние сообщения чата комнаты
+    /// Участнику сразу после `joined`: последние сообщения чата комнаты
     /// в хронологическом порядке.
     ChatHistory { messages: Vec<ChatHistoryEntry> },
     /// Отправителю: некорректный запрос.
     Error { message: String },
+}
+
+/// Один другой участник комнаты в списке `Joined::peers`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerInfo {
+    pub peer_id: String,
+    pub name: Option<String>,
 }
 
 /// Одно сообщение в списке `ChatHistory::messages`.

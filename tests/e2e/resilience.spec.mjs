@@ -1,38 +1,52 @@
 #!/usr/bin/env node
-// tests/e2e/resilience.spec.mjs — браузерный e2e устойчивости к обрывам
-// (п.10 плана). Тот же самодостаточный стиль, что и basic.spec.mjs: свой
-// мини-раннер, свой сервер (порт 3333, отдельная временная SQLite),
-// реальный Chrome через playwright-core, синтетические медиастабы по
-// умолчанию (см. helpers.mjs — те же причины: зависший реальный
-// getDisplayMedia/getUserMedia на этой машине травит последующие
-// медиа-операции страницы).
+// tests/e2e/resilience.spec.mjs — браузерный e2e устойчивости к обрывам,
+// переписан под протокол v2 (симметричная комната-встреча, mesh между всеми,
+// шаринг экрана — замок на одного участника, комната живёт, пока не
+// опустеет + EMPTY_ROOM_TTL_SECONDS для пустой). Тот же самодостаточный
+// стиль, что и basic.spec.mjs/старый resilience.spec.mjs: свой мини-раннер,
+// свой сервер (порт 3333, отдельная временная SQLite), реальный Chrome через
+// playwright-core, синтетические медиастабы по умолчанию (см. helpers.mjs).
 //
-// Порядок сценариев в коде — а, б, в, г, е, д (буквы — как в плане), НЕ
-// а..е по порядку: сценарий (д) необратимо завершает трансляцию (вещающий
-// закрывает вкладку, комната удаляется), поэтому всё, что ещё нуждается в
-// живом чате/комнате (сценарий (е) — rate-limit чата), должно отработать до
-// него. Все сценарии переиспользуют одну и ту же комнату/вещающего —
-// состояние (кто в комнате, сколько зрителей) читается из реального DOM
-// перед каждым шагом, а не предполагается по номеру шага.
+// Сервер этого файла запускается с EMPTY_ROOM_TTL_SECONDS=5 (не 3 — см.
+// сценарий (е): пяти секунд достаточно, чтобы детерминированно проверить и
+// «успели зайти вовремя», и «опоздали», без гонки с реапером, который тикает
+// раз в секунду, см. src/state.rs::REAPER_INTERVAL).
 //
-// Тайминги обрывов — с запасом (серверная чистка при обрыве TCP может занять
-// секунды: сценарии ниже рвут TCP явно, socket.recv() видит ошибку/EOF сразу;
-// у сервера есть ещё и ping/pong-хартбит — см. src/ws.rs, PING_INTERVAL/
-// MAX_MISSED_PONGS — но он на секунды-десятки секунд медленнее явного обрыва,
-// поэтому тесты его не дожидаются), но нигде нет слепого sleep — везде
-// поллинг условия с дедлайном (waitForFunction с options третьим аргументом
-// и polling: 100, либо helpers.waitUntil).
+// Порядок сценариев в коде — а, б, в, г, д, е, ж, как в плане (в отличие от
+// старого файла порядок дополнительно не переставлялся: ни один из сценариев
+// а..д не уничтожает комнату безвозвратно — комната живёт, пока в ней
+// остаётся хотя бы один участник, поэтому они естественно текут друг в
+// друга через общую комнату Вася/Петя/Оля. Только сценарий (е) закономерно
+// опустошает и хоронит эту комнату по TTL, поэтому сценарий (ж) — уже в
+// заведомо новой комнате).
+//
+// Тайминги — поллинг с дедлайном (waitForFunction/waitUntil, всегда третьим
+// аргументом { polling: 100, timeout }), без слепых sleep — за одним
+// намеренным исключением в сценарии (е): TTL пустой комнаты — это свойство
+// реального времени на сервере, а не наблюдаемое состояние DOM, поэтому
+// «подождать меньше TTL» и «подождать больше TTL» невозможно выразить через
+// поллинг условия — там и только там используется helpers.sleep с
+// пояснением на месте.
+//
+// Обрыв сети (сценарий г) — тот же приём, что и в старом файле: чистый
+// `context.setOffline(true)` не рвёт уже открытый WebSocket предсказуемо
+// быстро (проверено эмпирически при написании старого теста — см. историю),
+// поэтому тестовый арнесс сам принудительно закрывает сигналинг-сокет через
+// обёртку window.__e2eSockets (см. подготовку контекста Игоря).
 
 import { chromium } from 'playwright-core';
 import assert from 'node:assert/strict';
 import {
   REAL_MIC_TIMEOUT_MS,
+  REAL_CAM_TIMEOUT_MS,
+  REAL_CAPTURE_TIMEOUT_MS,
   CAPTURE_FLAGS,
   createRunner,
   buildServer,
   createServerController,
   installCaptureStub,
   installMicStub,
+  installCamStub,
   installSavedName,
   waitForOverlayHidden,
   assertVideoPlaying,
@@ -40,58 +54,75 @@ import {
   sendChatMessage,
   messageTextsInclude,
   getChatDom,
-  installViewerCountHistory,
-  viewerCountHistoryLength,
-  viewerCountHistorySince,
   waitUntil,
+  sleep,
 } from './helpers.mjs';
 
 const PORT = 3333;
+const EMPTY_ROOM_TTL_SECONDS = 5;
 const { step, skip, printSummary, bumpFailedForUnexpectedError, counts } = createRunner();
-const server = createServerController(PORT);
+const server = createServerController(PORT, { EMPTY_ROOM_TTL_SECONDS: String(EMPTY_ROOM_TTL_SECONDS) });
 
-const micStubArg = {
-  tryReal: process.env.E2E_TRY_REAL_MIC === '1',
-  timeoutMs: REAL_MIC_TIMEOUT_MS,
-};
+const micStubArg = { tryReal: process.env.E2E_TRY_REAL_MIC === '1', timeoutMs: REAL_MIC_TIMEOUT_MS };
+const camStubArg = { tryReal: process.env.E2E_TRY_REAL_CAM === '1', timeoutMs: REAL_CAM_TIMEOUT_MS };
+const captureStubArg = { tryReal: process.env.E2E_TRY_REAL_CAPTURE === '1', timeoutMs: REAL_CAPTURE_TIMEOUT_MS };
 
-async function viewerCountText(broadcasterPage) {
-  return broadcasterPage.evaluate(() => document.getElementById('viewer-count')?.textContent ?? null);
+// Мик + камера (в этом порядке — см. комментарий у installCamStub в
+// helpers.mjs про делегирование запросов без video).
+async function installMicAndCamStubs(context) {
+  await context.addInitScript(installMicStub(), micStubArg);
+  await context.addInitScript(installCamStub(), camStubArg);
 }
 
-async function waitViewerCount(broadcasterPage, expected, timeoutMs = 8000) {
-  await broadcasterPage.waitForFunction(
-    (exp) => document.getElementById('viewer-count')?.textContent === exp,
-    String(expected),
-    { polling: 100, timeout: timeoutMs }
-  );
+async function installCaptureOnly(context) {
+  await context.addInitScript(installCaptureStub(), captureStubArg);
 }
 
-async function waitMicCount(broadcasterPage, expected, timeoutMs = 8000) {
-  if (expected === 0) {
-    await broadcasterPage.waitForFunction(
-      () => document.getElementById('mic-indicator')?.classList.contains('hidden'),
-      undefined,
-      { polling: 100, timeout: timeoutMs }
-    );
-  } else {
-    await broadcasterPage.waitForFunction(
-      (n) => {
-        const el = document.getElementById('mic-indicator');
-        return !!el && !el.classList.contains('hidden') && el.textContent.includes(String(n));
-      },
-      expected,
-      { polling: 100, timeout: timeoutMs }
-    );
-  }
+// --- Хелперы для DOM протокола v2 (тайлы, счётчик участников, оверлей) ---
+
+function tileSelector(name) {
+  return `.tile[data-name="${name}"]`;
 }
 
-async function waitSpeakingHidden(page, timeoutMs = 6000) {
+async function waitForTileCount(page, expected, timeoutMs = 8000) {
   await page.waitForFunction(
-    () => document.getElementById('speaking-indicator')?.classList.contains('hidden'),
-    undefined,
+    (n) => document.querySelectorAll('.tile').length === n,
+    expected,
     { polling: 100, timeout: timeoutMs }
   );
+}
+
+async function waitForNoTile(page, name, timeoutMs = 8000) {
+  await page.waitForFunction(
+    (sel) => !document.querySelector(sel),
+    tileSelector(name),
+    { polling: 100, timeout: timeoutMs }
+  );
+}
+
+async function waitForClassOnSelector(page, selector, className, present, timeoutMs = 8000) {
+  await page.waitForFunction(
+    ({ sel, cls, want }) => {
+      const el = document.querySelector(sel);
+      return !!el && el.classList.contains(cls) === want;
+    },
+    { sel: selector, cls: className, want: present },
+    { polling: 100, timeout: timeoutMs }
+  );
+}
+
+async function waitParticipantCount(page, total, timeoutMs = 8000) {
+  await page.waitForFunction(
+    (text) => document.getElementById('participant-count')?.textContent === text,
+    `Участников: ${total} / 6`,
+    { polling: 100, timeout: timeoutMs }
+  );
+}
+
+async function participantCount(page) {
+  const text = await page.evaluate(() => document.getElementById('participant-count')?.textContent ?? '');
+  const match = text.match(/Участников:\s*(\d+)/);
+  return match ? Number(match[1]) : NaN;
 }
 
 async function waitOverlayTitle(page, expectedTitle, timeoutMs = 15_000) {
@@ -100,6 +131,30 @@ async function waitOverlayTitle(page, expectedTitle, timeoutMs = 15_000) {
     expectedTitle,
     { polling: 100, timeout: timeoutMs }
   );
+}
+
+async function waitScreenButtonOn(page, on, timeoutMs = 8000) {
+  await page.waitForFunction(
+    (want) => document.getElementById('screen-button')?.classList.contains('control-button--on') === want,
+    on,
+    { polling: 100, timeout: timeoutMs }
+  );
+}
+
+async function waitScreenStageHidden(page, hidden, timeoutMs = 8000) {
+  await page.waitForFunction(
+    (want) => document.getElementById('screen-stage')?.classList.contains('hidden') === want,
+    hidden,
+    { polling: 100, timeout: timeoutMs }
+  );
+}
+
+async function createRoomViaApi(baseUrl) {
+  const res = await fetch(`${baseUrl}/api/rooms`, { method: 'POST' });
+  assert.ok(res.ok, `POST /api/rooms ответил статусом ${res.status}`);
+  const data = await res.json();
+  assert.ok(data && typeof data.roomId === 'string' && data.roomId, `в ответе нет roomId: ${JSON.stringify(data)}`);
+  return data.roomId;
 }
 
 async function main() {
@@ -118,46 +173,168 @@ async function main() {
       args: CAPTURE_FLAGS,
     });
 
-    // --- Общая подготовка: вещающий + два зрителя (Вася, Петя) ---
-    const broadcasterContext = await browser.newContext();
-    allContexts.push(broadcasterContext);
-    await broadcasterContext.addInitScript(installCaptureStub(), {
-      tryReal: process.env.E2E_TRY_REAL_CAPTURE === '1',
-      timeoutMs: 10_000,
-    });
-    const broadcasterPage = await broadcasterContext.newPage();
-
+    // ============================================================
+    // Подготовка: комната через POST /api/rooms, Вася/Петя/Оля заходят
+    // напрямую по ссылке (не через лендинг — это уже покрыто basic.spec.mjs).
+    // ============================================================
     let roomId = null;
-    const setupOk = await step('подготовка: вещающий открывает страницу и начинает трансляцию', async () => {
-      await broadcasterPage.goto(server.baseUrl);
-      await broadcasterPage.click('#start-button');
-      await broadcasterPage.waitForSelector('#live-section:not(.hidden)', { timeout: 18_000 });
-      const link = await broadcasterPage.inputValue('#room-link-input');
-      const match = link.match(/\/room\/([^/]+)$/);
-      assert.ok(match, `не удалось извлечь roomId из ссылки: ${link}`);
-      roomId = match[1];
-      await installViewerCountHistory(broadcasterPage);
+    const setupRoomOk = await step('подготовка: создаём комнату через POST /api/rooms', async () => {
+      roomId = await createRoomViaApi(server.baseUrl);
     });
-
-    if (!setupOk || !roomId) {
-      console.log('FAIL - критическая ошибка: не удалось создать комнату, дальнейшие сценарии невозможны');
+    if (!setupRoomOk || !roomId) {
+      console.log('FAIL - критическая ошибка: комната не создана, дальнейшие сценарии невозможны');
       return;
     }
     const roomUrl = `${server.baseUrl}/room/${roomId}`;
 
-    let viewer1Context = await browser.newContext(); // Вася
-    let viewer2Context = await browser.newContext(); // Петя
-    allContexts.push(viewer1Context, viewer2Context);
-    await viewer1Context.addInitScript(installMicStub(), micStubArg);
-    await viewer2Context.addInitScript(installMicStub(), micStubArg);
-    await installSavedName(viewer1Context, 'Вася');
-    await installSavedName(viewer2Context, 'Петя');
-    // Учёт WebSocket-инстансов страницы Пети — нужен сценарию (в), чтобы
-    // детерминированно оборвать сигналинг после setOffline(true) (см.
-    // большой комментарий у сценария (в): сам setOffline рвёт уже открытый
-    // WS только через ~46+ секунд, если вообще рвёт). Wrapper прозрачный —
-    // static/common.js работает с ним как с обычным WebSocket.
-    await viewer2Context.addInitScript(() => {
+    const vasyaContext = await browser.newContext();
+    const petyaContext = await browser.newContext();
+    const olyaContext = await browser.newContext();
+    allContexts.push(vasyaContext, petyaContext, olyaContext);
+    await installMicAndCamStubs(vasyaContext);
+    await installCaptureOnly(petyaContext); // Петя шарит экран в сценарии (б)
+    await installCaptureOnly(olyaContext); // Оля шарит экран в сценариях (б)/(в)
+    await installSavedName(vasyaContext, 'Вася');
+    await installSavedName(petyaContext, 'Петя');
+    await installSavedName(olyaContext, 'Оля');
+    let vasyaPage = await vasyaContext.newPage();
+    let petyaPage = await petyaContext.newPage();
+    let olyaPage = await olyaContext.newPage();
+
+    const bothJoinedOk = await step('подготовка: Вася, Петя и Оля заходят в комнату — у всех по 3 тайла', async () => {
+      await vasyaPage.goto(roomUrl);
+      await petyaPage.goto(roomUrl);
+      await olyaPage.goto(roomUrl);
+      await waitForOverlayHidden(vasyaPage);
+      await waitForOverlayHidden(petyaPage);
+      await waitForOverlayHidden(olyaPage);
+      for (const page of [vasyaPage, petyaPage, olyaPage]) {
+        await waitForTileCount(page, 3);
+      }
+    });
+
+    if (!bothJoinedOk) {
+      console.log('FAIL - критическая ошибка: участники не собрались, дальнейшие сценарии невозможны');
+      return;
+    }
+
+    // ============================================================
+    // (а) Вася включает камеру и микрофон, затем закрывает вкладку
+    // ============================================================
+    const vasyaTileSel = tileSelector('Вася');
+
+    const scenarioACamOk = await step('(а) Вася включает камеру — у Пети и Оли живое видео в его тайле', async () => {
+      await vasyaPage.click('#camera-button');
+      for (const page of [petyaPage, olyaPage]) {
+        await assertVideoPlaying(page, { selector: `${vasyaTileSel} video` });
+      }
+    });
+
+    const scenarioAMicOk = await step('(а) Вася включает микрофон — у Пети и Оли «Говорят» на его тайле', async () => {
+      await vasyaPage.click('#mic-button');
+      for (const page of [petyaPage, olyaPage]) {
+        await waitForClassOnSelector(page, vasyaTileSel, 'tile--speaking', true, 8000);
+      }
+    });
+
+    if (scenarioACamOk || scenarioAMicOk) {
+      await step('(а) Вася закрывает вкладку — у Пети и Оли тайл исчезает, счётчик участников падает, «Говорят» гаснет', async () => {
+        await vasyaPage.close();
+        for (const page of [petyaPage, olyaPage]) {
+          await waitForNoTile(page, 'Вася');
+          await waitForTileCount(page, 2);
+          await waitParticipantCount(page, 2);
+          await page.waitForFunction(
+            () => document.querySelectorAll('.tile--speaking').length === 0,
+            undefined,
+            { polling: 100, timeout: 8000 }
+          );
+        }
+      });
+
+      await step('(а) чат между Петей и Олей продолжает работать после ухода Васи', async () => {
+        await openChatPanel(petyaPage);
+        await openChatPanel(olyaPage);
+        const text = `Петя после ухода Васи — ${Date.now()}`;
+        await sendChatMessage(petyaPage, text);
+        assert.ok(await messageTextsInclude(petyaPage, text), 'сообщение не появилось у самой Пети');
+        assert.ok(await messageTextsInclude(olyaPage, text), 'сообщение не дошло до Оли');
+      });
+    } else {
+      skip('(а) закрытие вкладки Васи', 'не удалось включить камеру/микрофон');
+      skip('(а) чат Петя <-> Оля', 'сценарий (а) не выполнен');
+    }
+
+    // ============================================================
+    // (б) Петя шарит экран, потом закрывает вкладку (дисконнект владельца
+    // замка) — Оля видит освобождение и захватывает шаринг сама
+    // ============================================================
+    const scenarioBShareOk = await step('(б) Петя шарит экран — у Оли главная зона живая', async () => {
+      await petyaPage.click('#screen-button');
+      await waitScreenButtonOn(petyaPage, true);
+      await assertVideoPlaying(olyaPage, { selector: '#screen-video' });
+    });
+
+    if (scenarioBShareOk) {
+      await step('(б) Петя закрывает вкладку — у Оли экран освобождён (главная зона очищена, кнопка снова активна), комната жива', async () => {
+        await petyaPage.close();
+        await waitParticipantCount(olyaPage, 1);
+        await waitScreenStageHidden(olyaPage, true);
+        const disabled = await olyaPage.evaluate(() => document.getElementById('screen-button')?.disabled);
+        assert.equal(disabled, false, 'кнопка «Экран» у Оли должна быть снова активна');
+      });
+
+      await step('(б) Оля захватывает шаринг — share-started, её превью в главной зоне', async () => {
+        await olyaPage.click('#screen-button');
+        await waitScreenButtonOn(olyaPage, true);
+        await waitScreenStageHidden(olyaPage, false);
+      });
+    } else {
+      skip('(б) закрытие вкладки Пети / освобождение экрана', 'шаринг Пети не заработал');
+      skip('(б) Оля захватывает шаринг', 'шаринг Пети не заработал');
+    }
+
+    // ============================================================
+    // (в) Оля перезагружает страницу посреди своего же шаринга
+    // ============================================================
+    if (scenarioBShareOk) {
+      await step('(в) Оля перезагружает страницу — снова в комнате, старый шаринг освобождён сервером, история чата пришла заново', async () => {
+        await olyaPage.reload();
+        await waitForOverlayHidden(olyaPage);
+
+        // История чата: сообщение из сценария (а) должно прийти заново.
+        await openChatPanel(olyaPage);
+        const texts = await (await getChatDom(olyaPage)).messages.allTextContents();
+        assert.ok(texts.length >= 1, 'после переподключения история чата у Оли пуста');
+
+        // Старый шаринг реально освобождён сервером (дисконнект = share-stopped),
+        // а не просто «выглядит» освобождённым из-за свежей загрузки страницы:
+        // если бы сервер всё ещё считал Олю владельцем экрана (баг), новая
+        // заявка на шаринг получила бы share-rejected и кнопка не перешла бы
+        // в состояние «включено».
+        await olyaPage.click('#screen-button');
+        await waitScreenButtonOn(olyaPage, true, 8000);
+        await waitScreenStageHidden(olyaPage, false);
+
+        // Прибираем за собой перед следующими сценариями.
+        await olyaPage.click('#screen-button');
+        await waitScreenButtonOn(olyaPage, false, 8000);
+        await waitScreenStageHidden(olyaPage, true);
+      });
+    } else {
+      skip('(в) reload Оли посреди шаринга', 'сценарий (б) не выполнен, шаринга у Оли нет');
+    }
+
+    // ============================================================
+    // (г) Обрыв сети у нового участника (Игорь)
+    // ============================================================
+    const igorContext = await browser.newContext();
+    allContexts.push(igorContext);
+    // Учёт WebSocket-инстансов страницы Игоря — нужен, чтобы детерминированно
+    // оборвать сигналинг после setOffline(true) (см. комментарий в шапке
+    // файла и в старом resilience.spec.mjs: сам setOffline рвёт уже
+    // открытый WS только через 46+ секунд, если вообще рвёт).
+    await igorContext.addInitScript(() => {
       window.__e2eSockets = [];
       const RealWebSocket = window.WebSocket;
       window.WebSocket = class extends RealWebSocket {
@@ -167,203 +344,49 @@ async function main() {
         }
       };
     });
-    let viewer1Page = await viewer1Context.newPage();
-    let viewer2Page = await viewer2Context.newPage();
+    await installSavedName(igorContext, 'Игорь');
+    const igorPage = await igorContext.newPage();
 
-    const bothJoinedOk = await step('подготовка: Вася и Петя подключаются к комнате', async () => {
-      await viewer1Page.goto(roomUrl);
-      await viewer2Page.goto(roomUrl);
-      await waitForOverlayHidden(viewer1Page);
-      await waitForOverlayHidden(viewer2Page);
-      await waitViewerCount(broadcasterPage, 2);
+    const igorJoinedOk = await step('(г, подготовка) новый участник Игорь подключается к комнате', async () => {
+      await igorPage.goto(roomUrl);
+      await waitForOverlayHidden(igorPage);
+      await waitForTileCount(olyaPage, 2);
+      await waitParticipantCount(olyaPage, 2);
     });
 
-    if (!bothJoinedOk) {
-      console.log('FAIL - критическая ошибка: зрители не подключились, дальнейшие сценарии невозможны');
-      return;
-    }
-
-    // ============================================================
-    // (а) Вася включает микрофон и говорит, потом закрывает вкладку
-    // ============================================================
-    const scenarioAOk = await step('(а) Вася включает микрофон — у вещающего «микрофонов: 1» и «Говорят: Вася»', async () => {
-      await viewer1Page.click('#mic-button');
-      await waitMicCount(broadcasterPage, 1);
-      await broadcasterPage.waitForFunction(
-        () => (document.getElementById('speaking-indicator')?.textContent || '').includes('Вася'),
-        undefined,
-        { polling: 100, timeout: 6000 }
-      );
-      // У Пети должен появиться ретранслированный трек Васи + тот же индикатор.
-      await viewer2Page.waitForFunction(
-        () => document.querySelectorAll('audio[data-stream-id]').length > 0,
-        undefined,
-        { polling: 100, timeout: 6000 }
-      );
-      await viewer2Page.waitForFunction(
-        () => (document.getElementById('speaking-indicator')?.textContent || '').includes('Вася'),
-        undefined,
-        { polling: 100, timeout: 6000 }
-      );
-    });
-
-    if (scenarioAOk) {
-      await step('(а) Вася закрывает вкладку -> у вещающего счётчик зрителей 2 -> 1, «микрофонов» и «Говорят» гаснут', async () => {
-        await viewer1Page.close();
-        await waitViewerCount(broadcasterPage, 1);
-        await waitMicCount(broadcasterPage, 0);
-        await waitSpeakingHidden(broadcasterPage);
+    if (igorJoinedOk) {
+      await step('(г) обрыв сети у Игоря (setOffline + принудительный разрыв WS) — у Оли его тайл исчезает', async () => {
+        await igorContext.setOffline(true);
+        await igorPage.evaluate(() => {
+          for (const ws of window.__e2eSockets || []) {
+            try { ws.close(); } catch { /* уже закрыт */ }
+          }
+        });
+        await waitForNoTile(olyaPage, 'Игорь', 15_000);
+        await waitParticipantCount(olyaPage, 1, 15_000);
       });
-
-      await step('(а) у Пети индикатор «Говорят» гаснет, ретранслированный <audio> Васи физически удалён из DOM', async () => {
-        // Индикатор — честный RMS-анализ звука: после ухода Васи трек Пети
-        // перестаёт нести данные, детектор видит тишину и гасит индикатор.
-        await waitSpeakingHidden(viewer2Page, 15_000);
-
-        // Раньше здесь был известный баг: когда вещающий убирает ретранслированный
-        // трек через pc.removeTrack (broadcaster.js: unrelayAudioTrack), у Пети
-        // соответствующий remote-трек получает событие 'mute' (track.muted = true,
-        // readyState остаётся 'live'), а 'ended' не приходит вовсе — а
-        // static/viewer.js чистил скрытый <audio data-stream-id> только по
-        // track.onended, поэтому элемент и монитор уровня звука утекали.
-        // Исправлено: viewer.js теперь слушает 'removetrack' на самой
-        // MediaStream (надёжный сигнал в этом сценарии) и чистит <audio>, как
-        // только у стрима не осталось аудиодорожек — 'ended' остаётся страховкой,
-        // 'mute' сам по себе чистку не триггерит (бывает транзиентным). Поэтому
-        // теперь требуем строгий инвариант: элемента в DOM быть не должно.
-        await viewer2Page.waitForFunction(
-          () => document.querySelectorAll('audio[data-stream-id]').length === 0,
-          undefined,
-          { polling: 100, timeout: 15_000 }
-        );
-      });
-
-      await step('(а) чат продолжает работать между Петей и вещающим после ухода Васи', async () => {
-        await openChatPanel(viewer2Page);
-        await openChatPanel(broadcasterPage);
-        const text = `Петя после ухода Васи — ${Date.now()}`;
-        await sendChatMessage(viewer2Page, text);
-        assert.ok(await messageTextsInclude(viewer2Page, text), 'сообщение не появилось у самой Пети');
-        assert.ok(await messageTextsInclude(broadcasterPage, text), 'сообщение не дошло до вещающего');
-      });
+      await igorContext.setOffline(false);
     } else {
-      skip('(а) закрытие вкладки Васи', 'не удалось включить микрофон/убедиться в ретрансляции');
-      skip('(а) чат Петя <-> вещающий', 'сценарий (а) не выполнен');
+      skip('(г) обрыв сети у Игоря', 'Игорь не подключился к комнате');
     }
 
     // ============================================================
-    // (б) Петя перезагружает страницу
+    // (д) Переполнение комнаты: добиваем до 6 участников, 7-й видит
+    // «Комната заполнена»
     // ============================================================
-    const historyMarker = await viewerCountHistoryLength(broadcasterPage);
-
-    const scenarioBOk = await step('(б) Петя перезагружает страницу и снова подключается', async () => {
-      await viewer2Page.reload();
-      await waitForOverlayHidden(viewer2Page);
-      await assertVideoPlaying(viewer2Page);
-      await waitViewerCount(broadcasterPage, 1, 10_000);
-    });
-
-    if (scenarioBOk) {
-      await step('(б) счётчик у вещающего проходил через кратковременный 0 между уходом старой сессии и приходом новой', async () => {
-        const history = await viewerCountHistorySince(broadcasterPage, historyMarker);
-        assert.ok(
-          history.includes('0'),
-          `ожидали увидеть промежуточное значение "0" в истории счётчика, получено: ${JSON.stringify(history)}`
-        );
-        assert.equal(history[history.length - 1], '1', `итоговое значение счётчика должно быть "1", получено: ${JSON.stringify(history)}`);
-      });
-
-      await step('(б) история чата приходит заново Пете — видно сообщение из сценария (а)', async () => {
-        await openChatPanel(viewer2Page);
-        const texts = await (await getChatDom(viewer2Page)).messages.allTextContents();
-        assert.ok(texts.length >= 1, 'после переподключения история чата пуста');
-      });
-    } else {
-      skip('(б) кратковременный 0 в счётчике', 'перезагрузка/переподключение Пети не удались');
-      skip('(б) история чата после переподключения', 'перезагрузка/переподключение Пети не удались');
-    }
-
-    // ============================================================
-    // (в) Обрыв сети у зрителя (Петя)
-    //
-    // ВАЖНО (эмпирика этой среды, установлено диагностикой при написании
-    // теста — см. финальный отчёт агента):
-    // `browserContext.setOffline(true)` НЕ обрывает уже установленное
-    // WebSocket-соединение — ни сразу, ни «в течение ~10с». Проверено двумя
-    // изолированными экспериментами:
-    //   1) голый WebSocket: readyState оставался OPEN 20+ секунд после
-    //      setOffline, без событий close/error;
-    //   2) против нашего сервера: Chrome в одном прогоне сам послал
-    //      close-фрейм (код 1001 "Going Away") через ~46 секунд, в другом —
-    //      не послал и за 70 секунд. Существующий TCP-сокет при offline
-    //      продолжает работать (close-фрейм в первом прогоне дошёл до
-    //      сервера) — offline-эмуляция Chrome блокирует НОВЫЕ соединения,
-    //      а к уже открытым применяет какой-то свой ленивый таймер.
-    // Ждать этот недетерминированный таймер (46-70+с) — медленно и флейково,
-    // поэтому обрыв доводим до конца сами: после setOffline(true) тестовый
-    // арнесс принудительно закрывает сигналинг-сокет Пети (учтён wrapper'ом
-    // window.__e2eSockets, см. подготовку контекста). Для приложения это
-    // неотличимо от «браузер признал сеть мёртвой и порвал WS»: у Пети
-    // срабатывает штатный signaling.onClose (оверлей «Соединение потеряно»),
-    // а сервер обрабатывает Close/Err/None одной и той же веткой (src/ws.rs:
-    // `Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break`) — то есть
-    // серверная чистка по обрыву проверяется по-настоящему.
-    let offlineWasSet = false;
-    const scenarioCOk = await step('(в) обрыв сети у Пети (setOffline + принудительный разрыв WS) -> у вещающего счётчик падает до 0', async () => {
-      await viewer2Context.setOffline(true);
-      offlineWasSet = true;
-      // Довершаем обрыв, не дожидаясь ленивого таймера Chrome (см. выше).
-      await viewer2Page.evaluate(() => {
-        for (const ws of window.__e2eSockets || []) {
-          try { ws.close(); } catch { /* уже закрыт */ }
-        }
-      });
-      await waitViewerCount(broadcasterPage, 0, 15_000);
-    });
-
-    if (scenarioCOk) {
-      await step('(в) у Пети показывается оверлей «Соединение потеряно»', async () => {
-        await waitOverlayTitle(viewer2Page, 'Соединение потеряно', 10_000);
-      });
-    } else {
-      skip('(в) оверлей «Соединение потеряно» у Пети', 'обрыв сети не привёл к уходу зрителя со стороны сервера в отведённое время');
-    }
-
-    // Восстанавливаем сеть ВСЕГДА (даже если сама проверка выше упала) —
-    // иначе все последующие сценарии для Пети посыплются каскадом (именно
-    // так и произошло при отладке этого теста).
-    if (offlineWasSet) {
-      await viewer2Context.setOffline(false);
-    }
-
-    const scenarioCReconnectOk = await step('(в) после восстановления сети и перезагрузки Петя снова в комнате', async () => {
-      await viewer2Page.reload();
-      await waitForOverlayHidden(viewer2Page);
-      await waitViewerCount(broadcasterPage, 1, 10_000);
-    });
-    if (!scenarioCReconnectOk) {
-      console.log('# переподключение Пети после offline не удалось — последующие сценарии, зависящие от Пети, тоже могут быть затронуты');
-    }
-
-    // ============================================================
-    // (г) Переполнение комнаты
-    // ============================================================
-    // Лёгкие страницы-заполнители (без микрофона и стабов — им нужен только
-    // вход в комнату). fillerPages нужны и сценарию (д) — они должны увидеть
-    // «Трансляция завершена». 6-й зритель — отдельно: он в комнату не попал
-    // и навсегда остаётся с «Комната заполнена» (terminalState в viewer.js).
+    const fillerContexts = [];
     const fillerPages = [];
     let roomFullOk = false;
-    await step('(г) добиваем комнату до 5 зрителей, 6-й получает «Комната заполнена»', async () => {
-      const currentCountText = await viewerCountText(broadcasterPage);
-      const currentCount = Number(currentCountText);
-      assert.ok(Number.isFinite(currentCount), `не удалось прочитать текущий счётчик зрителей: ${currentCountText}`);
-      const toAdd = 5 - currentCount;
-      assert.ok(toAdd >= 0, `в комнате уже больше 5 зрителей (${currentCount}) — тест сценария не применим`);
+    await step('(д) добиваем комнату до 6 участников лёгкими вкладками, 7-й получает «Комната заполнена»', async () => {
+      const current = await participantCount(olyaPage);
+      assert.ok(Number.isFinite(current), `не удалось прочитать participant-count у Оли: ${current}`);
+      const toAdd = 6 - current;
+      assert.ok(toAdd >= 0, `в комнате уже больше 6 участников (${current}) — сценарий неприменим`);
 
       for (let i = 0; i < toAdd; i++) {
         const ctx = await browser.newContext();
         allContexts.push(ctx);
+        fillerContexts.push(ctx);
         const page = await ctx.newPage();
         fillerPages.push(page);
         await page.goto(roomUrl);
@@ -371,91 +394,123 @@ async function main() {
       for (const page of fillerPages) {
         await waitForOverlayHidden(page);
       }
-      await waitViewerCount(broadcasterPage, 5, 15_000);
+      await waitParticipantCount(olyaPage, 6, 15_000);
 
-      // 6-й — комната уже полна.
-      const sixthContext = await browser.newContext();
-      allContexts.push(sixthContext);
-      const sixthPage = await sixthContext.newPage();
-      await sixthPage.goto(roomUrl);
-      await waitOverlayTitle(sixthPage, 'Комната заполнена', 10_000);
+      const seventhContext = await browser.newContext();
+      const seventhPage = await seventhContext.newPage();
+      await seventhPage.goto(roomUrl);
+      await waitOverlayTitle(seventhPage, 'Комната заполнена', 10_000);
       roomFullOk = true;
+      await seventhContext.close(); // в комнату не попал, дальше не нужен
     });
 
     if (!roomFullOk) {
-      skip('(г) переполнение комнаты', 'не удалось довести комнату до 5 зрителей');
+      skip('(д) переполнение комнаты', 'не удалось довести комнату до 6 участников');
     }
 
     // ============================================================
-    // (е) Rate-limit чата глазами Пети (до того, как вещающий завершит
-    // трансляцию сценарием (д) — см. комментарий в шапке файла про порядок)
+    // (е) Опустевшая комната: все выходят («Покинуть» / закрытие) — вход в
+    // течение TTL успешен, вход после TTL — «Комната не найдена».
     // ============================================================
-    const rateLimitOk = await step('(е) Петя быстро шлёт 11 сообщений — 11-е отклоняется с ненавязчивой ошибкой в панели', async () => {
-      await openChatPanel(viewer2Page);
-      await openChatPanel(broadcasterPage);
-      const prefix = `RL-${Date.now()}-`;
-      for (let i = 1; i <= 11; i++) {
-        await sendChatMessage(viewer2Page, `${prefix}${i}`);
-      }
-
-      // Ненавязчивая ошибка рендерится в .chat-error-banner (см. chat.js:
-      // showError/handleError) только отправителю 11-го сообщения — Пете.
-      const chat = await getChatDom(viewer2Page);
-      await chat.errorBanner.waitFor({ state: 'visible', timeout: 5000 });
-      const errorText = await chat.errorBanner.textContent();
-      assert.ok(errorText && errorText.trim().length > 0, 'баннер ошибки чата пуст');
-
-      // Первые 10 должны дойти до вещающего, 11-е — нет. Ждём, пока число
-      // пришедших сообщений с этим префиксом стабилизируется на 10.
-      await waitUntil(
-        async () => {
-          const broadcasterChat = await getChatDom(broadcasterPage);
-          const texts = await broadcasterChat.messages.allTextContents();
-          return texts.filter((t) => t.startsWith(prefix)).length === 10;
-        },
-        { timeoutMs: 8000, message: 'у вещающего не набралось ровно 10 сообщений с rate-limit префиксом' }
-      );
-
-      const broadcasterChat = await getChatDom(broadcasterPage);
-      const finalTexts = await broadcasterChat.messages.allTextContents();
-      const matched = finalTexts.filter((t) => t.startsWith(prefix));
-      assert.equal(matched.length, 10, `у вещающего должно быть ровно 10 сообщений, получено ${matched.length}: ${JSON.stringify(matched)}`);
-      assert.ok(!matched.includes(`${prefix}11`), '11-е сообщение не должно было дойти до вещающего');
-    });
-
-    if (!rateLimitOk) {
-      console.log('# rate-limit чата не подтверждён — см. FAIL выше');
-    }
-
-    // ============================================================
-    // (д) Вещающий закрывает вкладку, пока у зрителя открыт чат и включён микрофон
-    // ============================================================
-    const micOnForScenarioD = await step('(д, подготовка) Петя снова включает микрофон перед завершением трансляции', async () => {
-      await viewer2Page.click('#mic-button');
-      await waitMicCount(broadcasterPage, 1, 8000);
-    });
-    if (!micOnForScenarioD) {
-      skip('(д) состояние микрофона Пети перед завершением', 'не удалось включить микрофон повторно');
-    }
-
-    await step('(д) вещающий закрывает вкладку -> у зрителей оверлей «Трансляция завершена», чат заблокирован', async () => {
-      await broadcasterPage.close();
-
-      await waitOverlayTitle(viewer2Page, 'Трансляция завершена', 8000);
-      const petyaChat = await getChatDom(viewer2Page);
-      const petyaInputDisabled = await petyaChat.textInput.evaluate((el) => el.disabled);
-      assert.equal(petyaInputDisabled, true, 'чат-инпут у Пети должен быть заблокирован (disabled)');
-      const petyaSendDisabled = await petyaChat.sendButton.evaluate((el) => el.disabled);
-      assert.equal(petyaSendDisabled, true, 'кнопка отправки чата у Пети должна быть заблокирована (disabled)');
-
-      // «Заполняющие» зрители из сценария (г) тоже должны увидеть завершение
-      // (6-й зритель — не среди них: он в комнату не попал и остаётся со
-      // своим оверлеем «Комната заполнена»).
+    await step('(е) все выходят из комнаты — Оля жмёт «Покинуть», остальные закрывают вкладки', async () => {
+      await olyaPage.click('#leave-button');
       for (const page of fillerPages) {
-        if (page.isClosed()) continue;
-        await waitOverlayTitle(page, 'Трансляция завершена', 8000);
+        if (!page.isClosed()) await page.close();
+      }
+      for (const ctx of fillerContexts) {
+        try { await ctx.close(); } catch { /* уже закрыт */ }
       }
     });
+
+    // Намеренный sleep (см. комментарий в шапке файла): TTL — свойство
+    // реального времени сервера, а не наблюдаемое состояние DOM, поэтому
+    // «меньше TTL» здесь можно проверить только реальной паузой короче него.
+    await sleep(1000);
+
+    const test1Context = await browser.newContext();
+    allContexts.push(test1Context);
+    const test1Page = await test1Context.newPage();
+    const withinTtlOk = await step('(е) вход в опустевшую комнату в течение TTL (1с < 5с) — успешен', async () => {
+      await test1Page.goto(roomUrl);
+      await waitForOverlayHidden(test1Page);
+    });
+
+    if (withinTtlOk) {
+      // Освобождаем комнату снова — от этого момента отсчитываем TTL заново
+      // для проверки истечения.
+      await test1Page.close();
+
+      // Намеренный sleep дольше EMPTY_ROOM_TTL_SECONDS(5с) + период
+      // реапера(1с, см. src/state.rs::REAPER_INTERVAL) + запас.
+      await sleep((EMPTY_ROOM_TTL_SECONDS + 1) * 1000 + 1500);
+
+      const test2Context = await browser.newContext();
+      allContexts.push(test2Context);
+      const test2Page = await test2Context.newPage();
+      await step('(е) вход в ту же комнату после истечения TTL — «Комната не найдена»', async () => {
+        await test2Page.goto(roomUrl);
+        await waitOverlayTitle(test2Page, 'Комната не найдена', 10_000);
+      });
+    } else {
+      skip('(е) вход после истечения TTL', 'вход в течение TTL не удался, дальнейшая проверка не имеет смысла');
+    }
+
+    // ============================================================
+    // (ж) Rate-limit чата глазами пользователя — уже в заведомо новой
+    // комнате (предыдущая похоронена сценарием (е)).
+    // ============================================================
+    let ninaPage = null;
+    let tolyaPage = null;
+    const rateLimitPrepOk = await step('(ж, подготовка) новая комната — Нина и Толя заходят', async () => {
+      const newRoomId = await createRoomViaApi(server.baseUrl);
+      const newRoomUrl = `${server.baseUrl}/room/${newRoomId}`;
+
+      const ninaContext = await browser.newContext();
+      const tolyaContext = await browser.newContext();
+      allContexts.push(ninaContext, tolyaContext);
+      await installSavedName(ninaContext, 'Нина');
+      await installSavedName(tolyaContext, 'Толя');
+      ninaPage = await ninaContext.newPage();
+      tolyaPage = await tolyaContext.newPage();
+
+      await ninaPage.goto(newRoomUrl);
+      await tolyaPage.goto(newRoomUrl);
+      await waitForOverlayHidden(ninaPage);
+      await waitForOverlayHidden(tolyaPage);
+    });
+
+    if (rateLimitPrepOk) {
+      await step('(ж) Нина быстро шлёт 11 сообщений — 11-е отклоняется с ошибкой в панели, первые 10 доставлены Толе', async () => {
+        await openChatPanel(ninaPage);
+        await openChatPanel(tolyaPage);
+        const prefix = `RL-${Date.now()}-`;
+        for (let i = 1; i <= 11; i++) {
+          await sendChatMessage(ninaPage, `${prefix}${i}`);
+        }
+
+        const ninaChat = await getChatDom(ninaPage);
+        await ninaChat.errorBanner.waitFor({ state: 'visible', timeout: 5000 });
+        const errorText = await ninaChat.errorBanner.textContent();
+        assert.ok(errorText && errorText.trim().length > 0, 'баннер ошибки чата пуст');
+
+        await waitUntil(
+          async () => {
+            const tolyaChat = await getChatDom(tolyaPage);
+            const texts = await tolyaChat.messages.allTextContents();
+            return texts.filter((t) => t.startsWith(prefix)).length === 10;
+          },
+          { timeoutMs: 8000, message: 'у Толи не набралось ровно 10 сообщений с rate-limit префиксом' }
+        );
+
+        const tolyaChat = await getChatDom(tolyaPage);
+        const finalTexts = await tolyaChat.messages.allTextContents();
+        const matched = finalTexts.filter((t) => t.startsWith(prefix));
+        assert.equal(matched.length, 10, `у Толи должно быть ровно 10 сообщений, получено ${matched.length}: ${JSON.stringify(matched)}`);
+        assert.ok(!matched.includes(`${prefix}11`), '11-е сообщение не должно было дойти до Толи');
+      });
+    } else {
+      skip('(ж) rate-limit чата', 'Нина/Толя не подключились к новой комнате');
+    }
 
     for (const ctx of allContexts) {
       try { await ctx.close(); } catch { /* уже закрыт */ }

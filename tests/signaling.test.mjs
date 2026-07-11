@@ -1,7 +1,9 @@
-// Интеграционный тест сигналинга + чата: гоняет полный жизненный цикл комнаты
-// против САМОСТОЯТЕЛЬНО поднятого сервера (собирает cargo build, запускает
-// ./target/debug/screenshare на порту 3311 с временной SQLite-БД и гарантированно
-// прибирает за собой). Чистый Node >= 22, глобальный WebSocket/fetch, без npm.
+// Интеграционный тест сигналинга + чата (протокол v2 — симметричная комната:
+// все участники равны, mesh, шаринг экрана — временное состояние комнаты).
+// Гоняет полный жизненный цикл комнаты против САМОСТОЯТЕЛЬНО поднятого
+// сервера (собирает cargo build, запускает ./target/debug/screenshare на
+// порту 3311 с временной SQLite-БД и гарантированно прибирает за собой).
+// Чистый Node >= 22, глобальный WebSocket/fetch, без npm.
 //
 // Запуск: node tests/signaling.test.mjs
 
@@ -17,6 +19,9 @@ const PROJECT_DIR = path.resolve(HERE, '..');
 const PORT = 3311;
 const URL = `ws://localhost:${PORT}/ws`;
 const CONFIG_URL = `http://localhost:${PORT}/config`;
+const ROOMS_URL = `http://localhost:${PORT}/api/rooms`;
+// TTL пустой комнаты для этого прогона — короткий, чтобы тест не ждал 120с.
+const EMPTY_ROOM_TTL_SECONDS = 2;
 
 let passed = 0, failed = 0;
 
@@ -67,6 +72,7 @@ function startServer() {
       ...process.env,
       PORT: String(PORT),
       DATABASE_URL: `sqlite://${dbPath}?mode=rwc`,
+      EMPTY_ROOM_TTL_SECONDS: String(EMPTY_ROOM_TTL_SECONDS),
       RUST_LOG: 'error',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -100,6 +106,24 @@ async function waitForReady(timeoutMs = 15000) {
   throw new Error(`сервер не поднялся за ${timeoutMs}мс: ${lastErr}`);
 }
 
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// --- HTTP: создание комнаты ------------------------------------------------
+
+async function createRoom(body) {
+  const opts = { method: 'POST' };
+  if (body !== undefined) {
+    opts.headers = { 'Content-Type': 'application/json' };
+    opts.body = JSON.stringify(body);
+  }
+  const res = await fetch(ROOMS_URL, opts);
+  let json = null;
+  try { json = await res.json(); } catch { /* не JSON — ниже проверим статус */ }
+  return { status: res.status, roomId: json && json.roomId };
+}
+
 // --- WS-клиент для теста --------------------------------------------------
 
 function connect() {
@@ -127,6 +151,17 @@ function connect() {
   });
 }
 
+// Подключиться и войти в комнату одним шагом; возвращает { peer, joined }
+// (без ожидания chat-history — вызывающий код сам решает, ждать её или нет).
+async function join(roomId, name) {
+  const peer = await connect();
+  const msg = { type: 'join-room', roomId };
+  if (name !== undefined) msg.name = name;
+  peer.send(msg);
+  const joined = await peer.next();
+  return { peer, joined };
+}
+
 // Отправить chat с одного пира и дождаться его широковещательной копии
 // у каждого из recipients (порядок результата соответствует порядку recipients).
 function sendChatAndDrain(sender, text, recipients) {
@@ -142,261 +177,291 @@ function isChatMsg(m) {
 // --- Сам прогон тестов -----------------------------------------------------
 
 async function runTests() {
-  // --- 1. Комната не найдена ---
+  // --- 1. Комната не найдена (никогда не создавалась) ---
   console.log('1. join несуществующей комнаты');
   {
     const v = await connect();
-    v.send({ type: 'join-room', roomId: 'nope1234', role: 'viewer' });
+    v.send({ type: 'join-room', roomId: 'nope1234' });
     const m = await v.next();
     ok(m.type === 'room-not-found', 'получен room-not-found');
     await v.closed;
     ok(true, 'сервер закрыл сокет');
   }
 
-  // --- 1b. create-room с опциональным name (проверяем оба варианта вызова) ---
-  console.log('1b. create-room: старый вызов без name и новый с name');
+  // --- 2. POST /api/rooms создаёт пустую комнату ---
+  console.log('2. POST /api/rooms');
+  let roomId;
   {
-    const bNamed = await connect();
-    bNamed.send({ type: 'create-room', name: 'Вещающий Вова' });
-    const createdNamed = await bNamed.next();
-    ok(createdNamed.type === 'room-created' && createdNamed.roomId && createdNamed.peerId,
-      'create-room с name тоже создаёт комнату');
-    bNamed.ws.close();
-    await bNamed.closed;
+    const { status, roomId: id } = await createRoom();
+    ok(status === 201, `201 Created (status=${status})`);
+    ok(/^[23456789a-z]{8}$/.test(id), `roomId короткий и человекочитаемый (${id})`);
+    roomId = id;
+
+    // Тело опционально и игнорируется — не должно ломать создание.
+    const withBody = await createRoom({ name: 'Моя комната' });
+    ok(withBody.status === 201 && /^[23456789a-z]{8}$/.test(withBody.roomId),
+      'опциональное тело {name} игнорируется, комната всё равно создаётся');
   }
 
-  // --- 2. Создание комнаты (старый вызов БЕЗ name), вход зрителя, offer/answer/ICE ---
-  console.log('2. полный цикл сигналинга');
-  const b = await connect();
-  b.send({ type: 'create-room' }); // старый вызов без name — должен работать как раньше
-  const created = await b.next();
-  ok(created.type === 'room-created' && created.roomId && created.peerId, `room-created (roomId=${created.roomId})`);
-  ok(/^[23456789a-z]{8}$/.test(created.roomId), 'roomId короткий и человекочитаемый');
+  // --- 3. Первый участник входит в свежесозданную комнату ---
+  console.log('3. первый участник входит: peers=[], screenOwner=null');
+  const { peer: p1, joined: j1 } = await join(roomId);
+  ok(j1.type === 'joined' && Array.isArray(j1.peers) && j1.peers.length === 0 && j1.screenOwner === null,
+    'joined: peers=[], screenOwner=null для первого участника');
+  const p1Id = j1.peerId;
 
-  const v1 = await connect();
-  v1.send({ type: 'join-room', roomId: created.roomId, role: 'viewer' }); // тоже без name
-  const joined = await v1.next();
-  ok(joined.type === 'joined' && joined.broadcasterId === created.peerId && joined.viewerCount === 1, 'joined с broadcasterId и viewerCount=1');
+  const p1History0 = await p1.next();
+  ok(p1History0.type === 'chat-history' && Array.isArray(p1History0.messages) && p1History0.messages.length === 0,
+    'первый участник получил пустую chat-history сразу после joined');
 
-  const v1History0 = await v1.next();
-  ok(v1History0.type === 'chat-history' && Array.isArray(v1History0.messages) && v1History0.messages.length === 0,
-    'первый зритель получил пустую chat-history сразу после joined');
+  // --- 4. Второй участник (с именем) входит: видит первого в peers ---
+  console.log('4. второй участник: peers содержит первого, peer-joined приходит первому');
+  const { peer: p2, joined: j2 } = await join(roomId, 'Аня');
+  const p2Id = j2.peerId;
+  ok(j2.type === 'joined' && j2.peers.length === 1 && j2.peers[0].peerId === p1Id && j2.peers[0].name === null,
+    'joined: peers=[{peerId: первый, name: null}] для второго участника');
+  ok(j2.screenOwner === null, 'screenOwner всё ещё null');
+  await p2.next(); // chat-history (пустая)
 
-  const pj = await b.next();
-  ok(pj.type === 'peer-joined' && pj.peerId === joined.peerId && pj.name === null,
-    'broadcaster получил peer-joined (зритель без имени -> name null)');
+  const pj1 = await p1.next();
+  ok(pj1.type === 'peer-joined' && pj1.peerId === p2Id && pj1.name === 'Аня',
+    'первый участник получил peer-joined с именем второго (Аня)');
 
-  b.send({ type: 'offer', targetPeerId: joined.peerId, sdp: { type: 'offer', sdp: 'v=0 fake' } });
-  const off = await v1.next();
-  ok(off.type === 'offer' && off.fromPeerId === created.peerId && off.sdp.sdp === 'v=0 fake', 'viewer получил offer с fromPeerId');
+  // --- 5. Третий участник видит ОБОИХ предыдущих в peers ---
+  console.log('5. третий участник видит всех предыдущих; оба получают peer-joined');
+  const { peer: p3, joined: j3 } = await join(roomId, 'Боб');
+  const p3Id = j3.peerId;
+  ok(j3.peers.length === 2, 'у третьего участника peers содержит двух предыдущих');
+  ok(j3.peers.some((p) => p.peerId === p1Id && p.name === null), 'peers содержит первого (имя null)');
+  ok(j3.peers.some((p) => p.peerId === p2Id && p.name === 'Аня'), 'peers содержит второго (имя Аня)');
+  await p3.next(); // chat-history
 
-  v1.send({ type: 'answer', targetPeerId: created.peerId, sdp: { type: 'answer', sdp: 'v=0 fake2' } });
-  const ans = await b.next();
-  ok(ans.type === 'answer' && ans.fromPeerId === joined.peerId, 'broadcaster получил answer');
+  const [pj2a, pj2b] = await Promise.all([p1.next(), p2.next()]);
+  ok(pj2a.type === 'peer-joined' && pj2a.peerId === p3Id && pj2a.name === 'Боб', 'первый получил peer-joined (Боб)');
+  ok(pj2b.type === 'peer-joined' && pj2b.peerId === p3Id && pj2b.name === 'Боб', 'второй получил peer-joined (Боб)');
 
-  b.send({ type: 'ice-candidate', targetPeerId: joined.peerId, candidate: { candidate: 'candidate:1', sdpMid: '0' } });
-  const ice = await v1.next();
-  ok(ice.type === 'ice-candidate' && ice.fromPeerId === created.peerId && ice.candidate.sdpMid === '0', 'ICE дошёл до viewer');
+  // --- 6. Релей offer/answer/ice/stream-info между ДВУМЯ НЕ-первыми участниками ---
+  console.log('6. релей между вторым и третьим участником (не первым)');
+  p2.send({ type: 'offer', targetPeerId: p3Id, sdp: { type: 'offer', sdp: 'v=0 fake' } });
+  const off = await p3.next();
+  ok(off.type === 'offer' && off.fromPeerId === p2Id && off.sdp.sdp === 'v=0 fake', 'offer p2->p3 с fromPeerId');
+
+  p3.send({ type: 'answer', targetPeerId: p2Id, sdp: { type: 'answer', sdp: 'v=0 fake2' } });
+  const ans = await p2.next();
+  ok(ans.type === 'answer' && ans.fromPeerId === p3Id, 'answer p3->p2');
+
+  p2.send({ type: 'ice-candidate', targetPeerId: p3Id, candidate: { candidate: 'candidate:1', sdpMid: '0' } });
+  const ice = await p3.next();
+  ok(ice.type === 'ice-candidate' && ice.fromPeerId === p2Id && ice.candidate.sdpMid === '0', 'ice-candidate p2->p3');
+
+  p3.send({
+    type: 'stream-info',
+    targetPeerId: p2Id,
+    info: { s1: { peerId: p3Id, name: 'Боб' } },
+  });
+  const si = await p2.next();
+  ok(si.type === 'stream-info' && si.fromPeerId === p3Id && si.info.s1.name === 'Боб', 'stream-info p3->p2');
 
   // Релей на несуществующий peerId — тихо игнорируется, соединение живо.
-  b.send({ type: 'ice-candidate', targetPeerId: 'ghost', candidate: {} });
-
-  // --- 3. Чат: базовая доставка всем участникам, включая отправителя ---
-  console.log('3. чат: базовая доставка');
+  p2.send({ type: 'ice-candidate', targetPeerId: 'ghost', candidate: {} });
   {
-    const [selfMsg, bMsg] = await sendChatAndDrain(v1, 'Привет из зрителя', [v1, b]);
-    ok(isChatMsg(selfMsg) && selfMsg.fromPeerId === joined.peerId && selfMsg.name === null && selfMsg.text === 'Привет из зрителя',
-      'chat от зрителя приходит самому отправителю (fromPeerId, name, ts)');
-    ok(isChatMsg(bMsg) && bMsg.fromPeerId === joined.peerId && bMsg.text === 'Привет из зрителя',
-      'chat от зрителя приходит вещающему');
-  }
-  {
-    const [vMsg, selfMsg] = await sendChatAndDrain(b, 'Привет от вещающего', [v1, b]);
-    ok(isChatMsg(vMsg) && vMsg.fromPeerId === created.peerId && vMsg.text === 'Привет от вещающего',
-      'chat от вещающего приходит зрителю');
-    ok(isChatMsg(selfMsg) && selfMsg.fromPeerId === created.peerId,
-      'chat от вещающего приходит и самому вещающему (единый путь рендера)');
+    const results = await sendChatAndDrain(p2, 'маячок-после-ghost-релея', [p1, p2, p3]);
+    ok(results.every((m) => isChatMsg(m) && m.text === 'маячок-после-ghost-релея'),
+      'релей на неизвестный peerId не ломает сокет/чат');
   }
 
-  // --- 3b. Невалидный чат: пустой текст и слишком длинный ---
-  console.log('3b. чат: валидация текста');
+  // --- 7. Чат: базовая доставка всем участникам, включая отправителя ---
+  console.log('7. чат: базовая доставка и история');
   {
-    v1.send({ type: 'chat', text: '' });
-    const m = await v1.next();
+    const [selfMsg, p1Msg, p3Msg] = await sendChatAndDrain(p2, 'Привет от Ани', [p2, p1, p3]);
+    ok(isChatMsg(selfMsg) && selfMsg.fromPeerId === p2Id && selfMsg.name === 'Аня' && selfMsg.text === 'Привет от Ани',
+      'chat приходит самому отправителю (fromPeerId, name, ts)');
+    ok(isChatMsg(p1Msg) && p1Msg.fromPeerId === p2Id, 'chat приходит первому участнику');
+    ok(isChatMsg(p3Msg) && p3Msg.fromPeerId === p2Id, 'chat приходит третьему участнику');
+  }
+  {
+    const [p2Msg, selfMsg, p3Msg] = await sendChatAndDrain(p1, 'Привет от первого', [p2, p1, p3]);
+    ok(isChatMsg(p2Msg) && p2Msg.fromPeerId === p1Id && p2Msg.name === null, 'chat от первого доходит второму');
+    ok(isChatMsg(selfMsg) && selfMsg.fromPeerId === p1Id, 'chat доходит самому себе (единый путь рендера)');
+    ok(isChatMsg(p3Msg) && p3Msg.fromPeerId === p1Id, 'chat от первого доходит третьему');
+  }
+
+  // --- 7b. Невалидный чат: пустой текст и слишком длинный ---
+  console.log('7b. чат: валидация текста');
+  {
+    p1.send({ type: 'chat', text: '' });
+    const m = await p1.next();
     ok(m.type === 'error', `пустой text -> error (${m.message})`);
   }
   {
-    v1.send({ type: 'chat', text: 'a'.repeat(2001) });
-    const m = await v1.next();
+    p1.send({ type: 'chat', text: 'a'.repeat(2001) });
+    const m = await p1.next();
     ok(m.type === 'error', `текст 2001 символ -> error (${m.message})`);
   }
 
-  // --- 4. Второй зритель (с именем): накопленная chat-history + имя в чате ---
-  console.log('4. второй зритель: chat-history + имя из join-room');
-  const vRate = await connect();
-  vRate.send({ type: 'join-room', roomId: created.roomId, role: 'viewer', name: 'Аня' });
-  const joined2 = await vRate.next();
-  ok(joined2.type === 'joined' && joined2.viewerCount === 2, 'второй зритель вошёл (viewerCount=2)');
-  const pj2 = await b.next(); // peer-joined броадкастеру
-  ok(pj2.type === 'peer-joined' && pj2.peerId === joined2.peerId && pj2.name === 'Аня',
-    'broadcaster получил peer-joined с именем зрителя (Аня)');
+  // --- 8. Новый участник получает накопленную историю в хронологическом порядке ---
+  console.log('8. четвёртый участник: chat-history с 2 сообщениями');
+  const { peer: p4, joined: j4 } = await join(roomId, 'Вова');
+  const p4Id = j4.peerId;
+  ok(j4.peers.length === 3, 'у четвёртого участника peers содержит трёх предыдущих');
+  await Promise.all([p1.next(), p2.next(), p3.next()]); // peer-joined всем троим
 
-  const hist2 = await vRate.next();
-  ok(hist2.type === 'chat-history' && Array.isArray(hist2.messages) && hist2.messages.length === 2,
-    'второй зритель получил накопленную chat-history (2 сообщения)');
+  const hist4 = await p4.next();
+  // 3 сообщения: маячок из релей-теста (п.6) + два из п.7.
+  ok(hist4.type === 'chat-history' && hist4.messages.length === 3, 'четвёртый участник получил накопленную историю (3 сообщения)');
   ok(
-    hist2.messages[0].fromPeerId === joined.peerId && hist2.messages[0].text === 'Привет из зрителя'
-    && hist2.messages[1].fromPeerId === created.peerId && hist2.messages[1].text === 'Привет от вещающего',
-    'chat-history в хронологическом порядке (сначала сообщение зрителя, потом вещающего)',
+    hist4.messages[0].text === 'маячок-после-ghost-релея'
+    && hist4.messages[1].fromPeerId === p2Id && hist4.messages[1].text === 'Привет от Ани'
+    && hist4.messages[2].fromPeerId === p1Id && hist4.messages[2].text === 'Привет от первого',
+    'chat-history в хронологическом порядке',
   );
 
   {
-    const [selfMsg, v1Msg, bMsg] = await sendChatAndDrain(vRate, 'Привет, я Аня', [vRate, v1, b]);
-    ok(selfMsg.name === 'Аня' && v1Msg.name === 'Аня' && bMsg.name === 'Аня',
+    const [selfMsg, p1Msg, p2Msg, p3Msg] = await sendChatAndDrain(p4, 'Привет, я Вова', [p4, p1, p2, p3]);
+    ok(selfMsg.name === 'Вова' && p1Msg.name === 'Вова' && p2Msg.name === 'Вова' && p3Msg.name === 'Вова',
       'name из join-room попадает в поле name чата');
   }
 
-  // --- 4b. Rate-limit: не более 10 сообщений за окно, 11-е -> error, не доставляется другим ---
-  console.log('4b. чат: rate-limit');
+  // --- 8b. Rate-limit: не более 10 сообщений за окно, 11-е -> error, не доставляется другим ---
+  console.log('8b. чат: rate-limit');
   {
-    // vRate уже отправил одно валидное сообщение выше — досылаем ещё 9, итого 10 в окне.
+    // p4 уже отправил одно валидное сообщение выше — досылаем ещё 9, итого 10 в окне.
     for (let i = 0; i < 9; i++) {
-      await sendChatAndDrain(vRate, `сообщение ${i}`, [vRate, v1, b]);
+      await sendChatAndDrain(p4, `сообщение ${i}`, [p4, p1, p2, p3]);
     }
     // 11-е сообщение в окне -> error самому отправителю.
-    vRate.send({ type: 'chat', text: 'одиннадцатое' });
-    const errMsg = await vRate.next();
+    p4.send({ type: 'chat', text: 'одиннадцатое' });
+    const errMsg = await p4.next();
     ok(errMsg.type === 'error', `11-е сообщение за окно -> error (${errMsg.message})`);
 
     // Доказываем, что 11-е сообщение НЕ было разослано другим: следующим
-    // сообщением у v1, b и самого vRate должен прийти заведомо другой "маячок"
-    // (а не просочившееся 11-е). Обязательно дренируем ВСЕХ участников комнаты,
-    // включая vRate — иначе в его очереди останется непрочитанное сообщение.
-    const [v1Next, bNext, vRateNext] = await sendChatAndDrain(v1, 'маячок-после-rate-limit', [v1, b, vRate]);
-    ok(v1Next.text === 'маячок-после-rate-limit' && bNext.text === 'маячок-после-rate-limit'
-      && vRateNext.text === 'маячок-после-rate-limit',
+    // сообщением должен прийти заведомо другой "маячок", а не просочившееся 11-е.
+    const [p1Next, p2Next, p3Next, p4Next] = await sendChatAndDrain(p1, 'маячок-после-rate-limit', [p1, p2, p3, p4]);
+    ok(p1Next.text === 'маячок-после-rate-limit' && p2Next.text === 'маячок-после-rate-limit'
+      && p3Next.text === 'маячок-после-rate-limit' && p4Next.text === 'маячок-после-rate-limit',
       'сообщение, срезанное rate-limit, не доставлено другим участникам');
   }
 
-  // --- 5. Лимит 5 зрителей: ещё 3 входят (заполняя комнату), 6-й получает room-full ---
-  console.log('5. лимит 5 зрителей');
-  const extras = [];
-  let viewerCount = 2; // v1 + vRate уже внутри
-  for (let i = 0; i < 3; i++) {
-    const v = await connect();
-    v.send({ type: 'join-room', roomId: created.roomId, role: 'viewer' });
-    const j = await v.next();
-    viewerCount += 1;
-    ok(j.type === 'joined' && j.viewerCount === viewerCount, `зритель №${viewerCount} вошёл (viewerCount=${j.viewerCount})`);
-    await b.next(); // peer-joined броадкастеру
-    const h = await v.next();
-    ok(h.type === 'chat-history', `зритель №${viewerCount} получил chat-history`);
-    extras.push(v);
-  }
+  // --- 9. Шаринг экрана: захват, отказ занятому, освобождение, перезахват ---
+  console.log('9. шаринг экрана');
   {
-    const v6 = await connect();
-    v6.send({ type: 'join-room', roomId: created.roomId, role: 'viewer' });
-    const m = await v6.next();
-    ok(m.type === 'room-full', '6-й зритель получил room-full');
-    await v6.closed;
-    ok(true, 'сокет 6-го закрыт сервером');
+    p1.send({ type: 'share-start' });
+    const [s1, s2, s3, s4] = await Promise.all([p1.next(), p2.next(), p3.next(), p4.next()]);
+    ok([s1, s2, s3, s4].every((m) => m.type === 'share-started' && m.peerId === p1Id),
+      'share-started приходит ВСЕМ, включая инициатора');
+
+    // Второй участник пытается захватить занятый экран — отказ только ему.
+    p2.send({ type: 'share-start' });
+    const rej = await p2.next();
+    ok(rej.type === 'share-rejected' && rej.busyPeerId === p1Id, 'share-rejected с busyPeerId занявшего экран участника');
+
+    // Доказываем, что share-rejected НЕ разослан остальным: следующим сообщением
+    // всем (включая самого p2 — chat всегда приходит и отправителю) должен
+    // прийти маячок, а не второй share-started/share-rejected.
+    {
+      const [b1, b2, b3, b4] = await sendChatAndDrain(p2, 'маячок-после-share-rejected', [p1, p2, p3, p4]);
+      ok([b1, b2, b3, b4].every((m) => isChatMsg(m) && m.text === 'маячок-после-share-rejected'),
+        'share-rejected доставлен только инициатору, остальные его не получили');
+    }
+
+    // share-stop НЕ от владельца — тихо игнорируется, экран остаётся за p1.
+    p3.send({ type: 'share-stop' });
+    p2.send({ type: 'share-start' }); // если бы share-stop сработал, тут был бы share-started
+    const stillBusy = await p2.next();
+    ok(stillBusy.type === 'share-rejected' && stillBusy.busyPeerId === p1Id,
+      'share-stop не от владельца проигнорирован — экран остаётся за прежним владельцем');
+
+    // Владелец освобождает экран — share-stopped всем.
+    p1.send({ type: 'share-stop' });
+    const [st1, st2, st3, st4] = await Promise.all([p1.next(), p2.next(), p3.next(), p4.next()]);
+    ok([st1, st2, st3, st4].every((m) => m.type === 'share-stopped' && m.peerId === p1Id),
+      'share-stopped приходит всем после share-stop владельца');
+
+    // После освобождения другой участник может захватить экран.
+    p2.send({ type: 'share-start' });
+    const [c1, c2, c3, c4] = await Promise.all([p1.next(), p2.next(), p3.next(), p4.next()]);
+    ok([c1, c2, c3, c4].every((m) => m.type === 'share-started' && m.peerId === p2Id),
+      'после освобождения другой участник успешно захватывает экран');
+
+    // Новый участник в комнату с активным шарингом получает screenOwner в joined.
+    const { peer: p5, joined: j5 } = await join(roomId, 'Галя');
+    ok(j5.screenOwner === p2Id, 'новый участник получает screenOwner активного шаринга в joined');
+    await Promise.all([p1.next(), p2.next(), p3.next(), p4.next()]); // peer-joined всем
+    await p5.next(); // chat-history
+
+    // Освобождаем перед следующим блоком (дисконнект-тест).
+    p2.send({ type: 'share-stop' });
+    await Promise.all([p1.next(), p2.next(), p3.next(), p4.next(), p5.next()]);
+
+    // --- 9b. Дисконнект владельца экрана: share-stopped всем + peer-left ---
+    console.log('9b. дисконнект владельца экрана');
+    p3.send({ type: 'share-start' });
+    await Promise.all([p1.next(), p2.next(), p3.next(), p4.next(), p5.next()]); // share-started всем
+
+    p3.ws.close();
+    const [dsc1, dsc2, dsc4, dsc5] = await Promise.all([p1.next(), p2.next(), p4.next(), p5.next()]);
+    ok([dsc1, dsc2, dsc4, dsc5].every((m) => m.type === 'share-stopped' && m.peerId === p3Id),
+      'дисконнект владельца шлёт share-stopped всем оставшимся');
+    const [pl1, pl2, pl4, pl5] = await Promise.all([p1.next(), p2.next(), p4.next(), p5.next()]);
+    ok([pl1, pl2, pl4, pl5].every((m) => m.type === 'peer-left' && m.peerId === p3Id),
+      'дисконнект владельца затем шлёт peer-left всем оставшимся');
+
+    // Обычный уход (не владелец) — просто peer-left, без share-stopped.
+    console.log('9c. уход обычного участника');
+    p5.ws.close();
+    const [pl1b, pl2b, pl4b] = await Promise.all([p1.next(), p2.next(), p4.next()]);
+    ok([pl1b, pl2b, pl4b].every((m) => m.type === 'peer-left' && m.peerId === j5.peerId),
+      'уход обычного участника шлёт peer-left оставшимся (без share-stopped)');
+
+    p1.ws.close();
+    p2.ws.close();
+    p4.ws.close();
   }
 
-  // --- 6. Чужая роль: второй "broadcaster" не может занять комнату ---
-  console.log('6. чужая роль');
+  // --- 10. Лимит 6 участников: 6 входят, 7-й получает room-full ---
+  console.log('10. лимит 6 участников');
   {
-    const impostor = await connect();
-    impostor.send({ type: 'join-room', roomId: created.roomId, role: 'broadcaster' });
-    const m = await impostor.next();
-    ok(m.type === 'error', `отказ второму вещающему (${m.message})`);
-    impostor.ws.close();
+    const { roomId: fullRoomId } = await createRoom();
+    const members = [];
+    for (let i = 0; i < 6; i++) {
+      const { peer, joined: j } = await join(fullRoomId, `участник${i}`);
+      ok(j.type === 'joined', `участник №${i + 1} вошёл`);
+      await peer.next(); // chat-history
+      // peer-joined всем предыдущим участникам этой же комнаты.
+      await Promise.all(members.map((m) => m.peer.next()));
+      members.push({ peer, joined: j });
+    }
+    const seventh = await connect();
+    seventh.send({ type: 'join-room', roomId: fullRoomId });
+    const m = await seventh.next();
+    ok(m.type === 'room-full', '7-й участник получил room-full');
+    await seventh.closed;
+    ok(true, 'сокет 7-го закрыт сервером');
+
+    for (const { peer } of members) peer.ws.close();
   }
 
-  // --- 6b. После переполнения комнаты чат остальных продолжает работать ---
-  console.log('6b. чат после room-full');
+  // --- 11. Комната живёт после ухода ВСЕХ участников < TTL, удаляется > TTL ---
+  console.log('11. TTL пустой комнаты');
   {
-    const allViewers = [v1, vRate, ...extras];
-    const results = await sendChatAndDrain(b, 'чат жив после room-full', [b, ...allViewers]);
-    ok(results.every((m) => isChatMsg(m) && m.text === 'чат жив после room-full'),
-      'чат продолжает доставляться всем участникам после отказа 6-му зрителю');
-  }
+    const { roomId: ttlRoomId } = await createRoom();
+    const { peer } = await join(ttlRoomId);
+    await peer.next(); // chat-history
+    peer.ws.close();
+    await peer.closed;
 
-  // --- 6c. Релей stream-info (аудио-хаб): обе стороны с fromPeerId, тихий
-  // игнор неизвестного peerId и чужой комнаты, соединение и чат живы дальше ---
-  console.log('6c. stream-info: релей и игнор');
-  {
-    // Зритель -> вещающий.
-    v1.send({
-      type: 'stream-info',
-      targetPeerId: created.peerId,
-      info: { s1: { peerId: joined.peerId, name: null } },
-    });
-    const toB = await b.next();
-    ok(
-      toB.type === 'stream-info' && toB.fromPeerId === joined.peerId
-      && toB.info.s1 && toB.info.s1.peerId === joined.peerId && toB.info.s1.name === null,
-      'stream-info от зрителя доходит до вещающего с fromPeerId',
-    );
+    await sleep(500); // меньше TTL (2с)
+    const { peer: reJoinPeer, joined: reJoined } = await join(ttlRoomId);
+    ok(reJoined.type === 'joined', 'вход в опустевшую, но ещё живую комнату (< TTL) успешен');
+    await reJoinPeer.next(); // chat-history
+    reJoinPeer.ws.close();
+    await reJoinPeer.closed;
 
-    // Вещающий -> зритель (обычный случай: рассылка карты streamId -> {peerId, name}).
-    b.send({
-      type: 'stream-info',
-      targetPeerId: joined.peerId,
-      info: { s2: { peerId: 'kто-то-другой', name: 'Вася' } },
-    });
-    const toV1 = await v1.next();
-    ok(
-      toV1.type === 'stream-info' && toV1.fromPeerId === created.peerId
-      && toV1.info.s2 && toV1.info.s2.name === 'Вася',
-      'stream-info от вещающего доходит до зрителя с fromPeerId',
-    );
-
-    // Неизвестный peerId в своей же комнате — тихий игнор.
-    b.send({ type: 'stream-info', targetPeerId: 'ghost-peer-id', info: { s3: {} } });
-
-    // Чужая комната: создаём независимую вторую комнату, тут же закрываем её
-    // (peerId точно не существует нигде), и пробуем достучаться до её
-    // broadcaster'а из первой комнаты — relay() ищет цель только среди
-    // участников комнаты ОТПРАВИТЕЛЯ, так что это тоже тихий игнор.
-    const b2 = await connect();
-    b2.send({ type: 'create-room' });
-    const created2 = await b2.next();
-    b2.ws.close();
-    await b2.closed;
-    b.send({ type: 'stream-info', targetPeerId: created2.peerId, info: { s4: {} } });
-
-    // Оба игнора не должны были сломать сокет или чат: следующим сообщением
-    // ВСЕМ участникам комнаты (иначе непрочитанный маячок зависнет в очереди
-    // vRate/extras и собьёт следующие проверки peer-left/broadcaster-left)
-    // должен дойти маячок, а не утечка одного из stream-info.
-    const allRecipients = [b, v1, vRate, ...extras];
-    const results = await sendChatAndDrain(b, 'маячок-после-stream-info', allRecipients);
-    ok(
-      results.every((m) => isChatMsg(m) && m.text === 'маячок-после-stream-info'),
-      'после игнорируемых stream-info сокет и чат продолжают работать штатно',
-    );
-  }
-
-  // --- 7. Уход зрителя -> peer-left ---
-  console.log('7. уход зрителя');
-  v1.ws.close();
-  const pl = await b.next();
-  ok(pl.type === 'peer-left' && pl.peerId === joined.peerId, 'broadcaster получил peer-left');
-
-  // --- 8. Уход вещающего -> broadcaster-left всем, комната удалена ---
-  console.log('8. уход вещающего');
-  b.ws.close();
-  const remainingViewers = [vRate, ...extras];
-  for (const [idx, v] of remainingViewers.entries()) {
-    const m = await v.next();
-    ok(m.type === 'broadcaster-left', `оставшийся зритель №${idx + 1} получил broadcaster-left`);
-    v.ws.close();
-  }
-  {
+    await sleep(3000); // больше TTL (2с) + запас на тик реапера
     const late = await connect();
-    late.send({ type: 'join-room', roomId: created.roomId, role: 'viewer' });
+    late.send({ type: 'join-room', roomId: ttlRoomId });
     const m = await late.next();
-    ok(m.type === 'room-not-found', 'комната удалена после ухода вещающего');
+    ok(m.type === 'room-not-found', 'комната удалена реапером после истечения TTL пустоты');
   }
 }
 

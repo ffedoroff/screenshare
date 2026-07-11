@@ -3,47 +3,30 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Шеринг экрана — вещание</title>
+  <title>Созвон — создать комнату</title>
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
-  <div class="page">
-    <div class="header">
-      <h1>Шеринг экрана</h1>
-      <p>Начните трансляцию и поделитесь ссылкой с зрителями</p>
-    </div>
+  <div class="landing-page">
+    <div class="landing-card">
+      <h1>Созвон с шарингом экрана</h1>
+      <p>Без регистрации: создайте комнату и поделитесь ссылкой с остальными.</p>
 
-    <div class="card">
-      <!-- Исходное состояние -->
-      <button id="start-button" class="start-button">Начать трансляцию</button>
+      <input
+        id="name-input"
+        class="name-input"
+        type="text"
+        placeholder="Ваше имя (необязательно)"
+        maxlength="40"
+        autocomplete="off"
+      />
 
-      <!-- Состояние активной трансляции (изначально скрыто) -->
-      <div id="live-section" class="live-section hidden">
-        <div class="preview">
-          <video id="preview-video" autoplay muted playsinline></video>
-        </div>
+      <button id="create-room-button" class="start-button">Создать комнату</button>
 
-        <div class="room-link-row">
-          <input id="room-link-input" class="room-link-input" type="text" readonly />
-          <button id="copy-button" class="copy-button">Скопировать</button>
-        </div>
-
-        <div class="viewer-count">
-          Зрителей: <strong id="viewer-count">0</strong> / 5<span id="mic-indicator" class="mic-indicator hidden"></span>
-        </div>
-
-        <div id="speaking-indicator" class="speaking-indicator hidden"></div>
-
-        <button id="stop-button" class="stop-button">Остановить трансляцию</button>
-      </div>
-
-      <div id="status-message" class="status-message"></div>
+      <div id="landing-message" class="status-message"></div>
     </div>
   </div>
 
-  <script src="/static/common.js"></script>
-  <script src="/static/chat.js"></script>
-  <script src="/static/rtc.js"></script>
-  <script src="/static/broadcaster.js"></script>
+  <script src="/static/landing.js"></script>
 </body>
 </html>

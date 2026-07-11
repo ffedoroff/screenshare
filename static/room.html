@@ -3,32 +3,59 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Шеринг экрана — просмотр</title>
+  <title>Комната — созвон</title>
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
-  <div class="viewer-page">
-    <video id="remote-video" class="viewer-video" autoplay playsinline></video>
-
-    <!-- Оверлей текущего состояния (подключение / ожидание / ошибка и т.п.) -->
+  <div class="room-page">
+    <!-- Оверлей текущего состояния: подключение / комната не найдена / заполнена / обрыв связи. -->
     <div id="overlay" class="overlay">
       <div id="overlay-spinner" class="spinner"></div>
       <h2 id="overlay-title">Подключение…</h2>
       <p id="overlay-text"></p>
-      <button id="play-button" class="play-button hidden">Нажмите, чтобы начать просмотр</button>
+      <button id="overlay-action-button" class="retry-button hidden">Создать новую</button>
     </div>
 
-    <!-- Микрофон зрителя: появляется только после успешного подключения к трансляции. -->
-    <button id="mic-button" class="mic-button hidden" type="button" aria-pressed="false">🎤 Микрофон</button>
-    <div id="mic-message" class="mic-message hidden"></div>
+    <div class="room-top-bar">
+      <span id="participant-count" class="participant-count">Участников: 1 / 6</span>
+    </div>
 
-    <!-- Индикатор «кто говорит»: чужие ретранслированные микрофоны + вещающий. -->
-    <div id="speaking-indicator" class="speaking-indicator speaking-indicator--viewer hidden"></div>
+    <div class="room-stage">
+      <!-- Главная зона: экран крупно, когда кто-то шарит. -->
+      <div id="screen-stage" class="screen-stage hidden">
+        <video id="screen-video" class="screen-video" autoplay playsinline></video>
+        <div id="screen-caption" class="screen-caption"></div>
+      </div>
+
+      <!-- Сетка тайлов участников (свой тайл — первым). -->
+      <div id="tiles-grid" class="tiles-grid"></div>
+    </div>
+
+    <!-- Ненавязчивые сообщения (отказ доступа к устройству, экран занят и т.п.). -->
+    <div id="room-message" class="room-message hidden"></div>
+
+    <div class="control-panel">
+      <button id="mic-button" class="control-button" type="button" aria-pressed="false">
+        <span class="control-button-icon">🎤</span><span class="control-button-label">Микрофон</span>
+      </button>
+      <button id="camera-button" class="control-button" type="button" aria-pressed="false">
+        <span class="control-button-icon">📷</span><span class="control-button-label">Камера</span>
+      </button>
+      <button id="screen-button" class="control-button" type="button" aria-pressed="false">
+        <span class="control-button-icon">🖥️</span><span class="control-button-label">Экран</span>
+      </button>
+      <button id="copy-link-button" class="control-button" type="button">
+        <span class="control-button-icon">🔗</span><span class="control-button-label">Скопировать ссылку</span>
+      </button>
+      <button id="leave-button" class="control-button control-button--danger" type="button">
+        <span class="control-button-icon">🚪</span><span class="control-button-label">Покинуть</span>
+      </button>
+    </div>
   </div>
 
   <script src="/static/common.js"></script>
   <script src="/static/chat.js"></script>
   <script src="/static/rtc.js"></script>
-  <script src="/static/viewer.js"></script>
+  <script src="/static/room.js"></script>
 </body>
 </html>

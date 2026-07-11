@@ -3,17 +3,14 @@
 // https://developer.chrome.com/blog/perfect-negotiation/
 // https://developer.mozilla.org/en-US/docs/Web/API/WebRTC_API/Perfect_negotiation
 //
-// Роли (важно, зафиксировано намеренно):
-//   - broadcaster — ВСЕГДА impolite (polite: false). Он единственный, кто
-//     добавляет треки и на практике инициирует первый оффер, поэтому в
-//     коллизиях офферов побеждает его версия.
-//   - viewer — ВСЕГДА polite (polite: true). Viewer может добавить свой
-//     микрофон (см. static/viewer.js: pc.addTrack при первом включении
-//     кнопки «Микрофон») — это триггерит его собственный onnegotiationneeded
-//     и он инициирует offer сам. Сервер релеит offer/answer/ice-candidate в
-//     обе стороны без ограничений (см. src/ws.rs relay()), поэтому viewer
-//     технически может прислать offer одновременно с broadcaster'ом — и как
-//     polite-пир он должен уступать broadcaster'у при коллизии, а не наоборот.
+// Протокол v2: симметричная комната, mesh — на каждого другого участника
+// заводится свой RtcPeer. Роли broadcaster/viewer больше нет: polite/impolite
+// выводится детерминированно из сравнения peerId обеих сторон (см.
+// static/room.js: polite = мой peerId > peerId собеседника, лексикографически)
+// — обе стороны сравнивают одну и ту же пару id, поэтому ровно один получает
+// polite=true. Любая сторона может первой добавить трек (getUserMedia на
+// микрофон/камеру, getDisplayMedia на шаринг экрана) и тем самым
+// инициировать offer — коллизии разрешает perfect negotiation ниже.
 //
 // Флаги:
 //   - makingOffer — true между началом onnegotiationneeded и отправкой offer;

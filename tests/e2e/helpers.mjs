@@ -26,6 +26,10 @@ export const REAL_CAPTURE_TIMEOUT_MS = 10_000;
 // на синтетический источник (см. installMicStub).
 export const REAL_MIC_TIMEOUT_MS = 5_000;
 
+// Сколько ждём реальный getUserMedia(video) (камера), прежде чем откатиться
+// на синтетический источник (см. installCamStub).
+export const REAL_CAM_TIMEOUT_MS = 5_000;
+
 export const CAPTURE_FLAGS = [
   '--auto-select-desktop-capture-source=Entire screen',
   '--use-fake-ui-for-media-stream',
@@ -95,7 +99,12 @@ export async function buildServer() {
 // Инкапсулирует свой process/tmp-dir — можно поднимать несколько независимых
 // серверов в одном файле (не требуется сейчас, но не создаёт скрытого
 // глобального состояния).
-export function createServerController(port) {
+//
+// `extraEnv` — дополнительные переменные окружения сервера (например,
+// EMPTY_ROOM_TTL_SECONDS для resilience.spec.mjs, сценарий с TTL пустой
+// комнаты) — необязательный второй параметр, не ломает существующие вызовы
+// с одним аргументом (basic.spec.mjs).
+export function createServerController(port, extraEnv = {}) {
   const baseUrl = `http://localhost:${port}`;
   let serverProcess = null;
   let dbTmpDir = null;
@@ -109,6 +118,7 @@ export function createServerController(port) {
         ...process.env,
         PORT: String(port),
         DATABASE_URL: `sqlite://${dbPath}?mode=rwc`,
+        ...extraEnv,
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -277,6 +287,68 @@ export function installMicStub() {
   };
 }
 
+// --- Синтетический источник видео для камеры участника (протокол v2: room.js) ---
+//
+// room.js вызывает getUserMedia({ video: {...} }) для камеры и отдельно
+// getUserMedia({ audio: true }) для микрофона — оба через один и тот же
+// navigator.mediaDevices.getUserMedia. Чтобы стабы камеры и микрофона могли
+// сосуществовать на одной странице, этот стаб проверяет constraints сам:
+// запрос без constraints.video прозрачно делегируется в ту функцию
+// getUserMedia, что была установлена ДО него (обычно installMicStub) — важен
+// порядок установки в addInitScript: сначала installMicStub, потом
+// installCamStub (иначе делегирование пойдёт не туда). Запрос с
+// constraints.video обрабатывается этим стабом: как и installCaptureStub,
+// сперва (по флагу) пробует реальный getUserMedia с таймаутом, иначе сразу
+// синтетический canvas.captureStream() — той же логике, что и у камеры.
+export function installCamStub() {
+  return ({ tryReal, timeoutMs }) => {
+    const previousGetUserMedia = navigator.mediaDevices.getUserMedia
+      ? navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices)
+      : null;
+
+    navigator.mediaDevices.getUserMedia = async (constraints) => {
+      const wantsVideo = !!(constraints && constraints.video);
+      if (!wantsVideo) {
+        if (previousGetUserMedia) return previousGetUserMedia(constraints);
+        throw new Error('getUserMedia недоступен (нет ни реального, ни предыдущего стаба)');
+      }
+
+      if (tryReal && previousGetUserMedia) {
+        const withTimeout = (p, ms) =>
+          Promise.race([
+            p,
+            new Promise((_, reject) => setTimeout(() => reject(new Error('e2e-real-cam-timeout')), ms)),
+          ]);
+        try {
+          const stream = await withTimeout(previousGetUserMedia(constraints), timeoutMs);
+          window.__e2eCamSource = 'real';
+          return stream;
+        } catch (err) {
+          console.warn('[e2e] реальный getUserMedia(video) не сработал за отведённое время, откат на синтетический источник:', err);
+        }
+      }
+
+      window.__e2eCamSource = 'synthetic';
+      const canvas = document.createElement('canvas');
+      canvas.width = 320;
+      canvas.height = 240;
+      const ctx = canvas.getContext('2d');
+      let hue = 120;
+      const draw = () => {
+        hue = (hue + 2) % 360;
+        ctx.fillStyle = `hsl(${hue}, 70%, 45%)`;
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '18px sans-serif';
+        ctx.fillText(String(Date.now()), 10, 30);
+        window.__e2eCamFrame = requestAnimationFrame(draw);
+      };
+      draw();
+      return canvas.captureStream(30);
+    };
+  };
+}
+
 // Задать имя участника в localStorage (chat.js: NAME_STORAGE_KEY =
 // 'screenshare-name') ДО загрузки скриптов страницы — addInitScript
 // выполняется при каждой навигации (в т.ч. при page.reload()).
@@ -312,32 +384,38 @@ export async function waitForOverlayHidden(page, timeoutMs = 20_000) {
 
 // Проверка, что видео реально идёт: videoWidth/readyState сразу, и
 // currentTime растёт спустя waitMs. Используется и в basic.spec.mjs (сразу
-// после подключения), и в resilience.spec.mjs (после reload).
-export async function assertVideoPlaying(page, { waitMs = 2000, warmupTimeoutMs = 5000 } = {}) {
+// после подключения — и там, и в room.js-версии теста, для разных <video> —
+// см. `selector`), и в resilience.spec.mjs (после reload, старый viewer.js
+// с единственным #remote-video — поэтому `selector` по умолчанию именно им
+// и остаётся, ради обратной совместимости).
+export async function assertVideoPlaying(
+  page,
+  { selector = '#remote-video', waitMs = 2000, warmupTimeoutMs = 5000 } = {}
+) {
   // videoWidth может на пару кадров отставать от момента, когда overlay уже
-  // скрылся (ontrack -> hideOverlay() синхронно, но декодирование первого
-  // кадра — нет) — особенно заметно сразу после reload(), когда вся страница
-  // (и WebRTC-стек) поднимается с нуля. Поэтому сначала дожидаемся первого
+  // скрылся/трек подключён (синхронно, но декодирование первого кадра — нет)
+  // — особенно заметно сразу после reload(), когда вся страница (и
+  // WebRTC-стек) поднимается с нуля. Поэтому сначала дожидаемся первого
   // кадра поллингом, а не считаем videoWidth>0 сразу гарантированным.
   await page.waitForFunction(
-    () => (document.getElementById('remote-video')?.videoWidth || 0) > 0,
-    undefined,
+    (sel) => (document.querySelector(sel)?.videoWidth || 0) > 0,
+    selector,
     { polling: 100, timeout: warmupTimeoutMs }
   );
 
-  const before = await page.evaluate(() => {
-    const v = document.getElementById('remote-video');
+  const before = await page.evaluate((sel) => {
+    const v = document.querySelector(sel);
     return { videoWidth: v.videoWidth, readyState: v.readyState, currentTime: v.currentTime };
-  });
+  }, selector);
   assert.ok(before.videoWidth > 0, `videoWidth должен быть > 0, получено ${before.videoWidth}`);
   assert.ok(before.readyState >= 2, `readyState должен быть >= 2, получено ${before.readyState}`);
 
   await new Promise((r) => setTimeout(r, waitMs));
 
-  const after = await page.evaluate(() => {
-    const v = document.getElementById('remote-video');
+  const after = await page.evaluate((sel) => {
+    const v = document.querySelector(sel);
     return { currentTime: v.currentTime };
-  });
+  }, selector);
   assert.ok(
     after.currentTime > before.currentTime,
     `currentTime должен вырасти за ${waitMs}мс: было ${before.currentTime}, стало ${after.currentTime}`

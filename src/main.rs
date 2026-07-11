@@ -14,16 +14,17 @@ mod ws;
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
-use axum::extract::Path;
+use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse, Json, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use serde_json::json;
-use tracing::info;
+use tracing::{info, warn};
 
-use crate::state::AppState;
+use crate::state::{AppState, Room};
 
 /// Каталог со статикой фронтенда. Настраивается через env `STATIC_DIR` (в
 /// контейнере — например `/app/static`), а для `cargo run` без переменной
@@ -49,13 +50,30 @@ async fn main() {
     info!(url = %database_url, "подключение к БД истории чата");
     let db = db::init_pool(&database_url).await;
 
-    let state = AppState { rooms, db };
+    // Сколько пустая комната (никого не подключилось / все вышли) живёт до
+    // удаления реапером. Дефолт 120с — время создателю перейти по ссылке;
+    // в тестах выставляется значительно короче.
+    let empty_room_ttl_secs: u64 = std::env::var("EMPTY_ROOM_TTL_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120);
+    let empty_room_ttl = Duration::from_secs(empty_room_ttl_secs);
+    tokio::spawn(state::reap_empty_rooms(rooms.clone(), empty_room_ttl));
+
+    // Единственный писатель истории чата в БД — сериализует вставки (см.
+    // `db::run_chat_writer`), чтобы `join-room` мог достоверно дождаться
+    // всех более ранних сообщений перед чтением истории (`flush_and_fetch_history`).
+    let (chat_tx, chat_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(db::run_chat_writer(db.clone(), chat_rx));
+
+    let state = AppState { rooms, db, chat_tx };
 
     let app = Router::new()
-        // Страница вещающего.
+        // Страница входа/лендинга.
         .route("/", get(|| page("index.html")))
-        // Страница зрителя: roomId фронтенд читает из URL сам.
+        // Страница комнаты: roomId фронтенд читает из URL сам.
         .route("/room/{room_id}", get(|_: Path<String>| page("room.html")))
+        .route("/api/rooms", post(create_room))
         .route("/config", get(ice_config))
         .route("/healthz", get(healthz))
         .route("/version.json", get(version_json))
@@ -97,6 +115,55 @@ async fn shutdown_signal() {
         _ = sigterm => info!("получен SIGTERM, завершаемся"),
         _ = sigint => info!("получен SIGINT, завершаемся"),
     }
+}
+
+/// `POST /api/rooms`: создать новую ПУСТУЮ комнату (протокол v2 — комната
+/// заводится отдельно от входа в неё, чтобы создатель успел скопировать и
+/// открыть ссылку). Тело запроса опционально и сейчас не используется
+/// (задел на будущее — например, название комнаты), поэтому сознательно не
+/// парсится вовсе.
+///
+/// Комната без единого участника живёт `EMPTY_ROOM_TTL_SECONDS` — если за
+/// это время никто не подключится, реапер (`state::reap_empty_rooms`) её
+/// удалит.
+async fn create_room(State(state): State<AppState>) -> Response {
+    let room_id = state::generate_room_id();
+
+    // Сессия чата заводится в БД ДО захвата мьютекса комнат: вставка в
+    // HashMap синхронна и не должна ждать диск.
+    let session_id = match db::create_session(&state.db, &room_id, state::now_ms()).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!("не удалось создать сессию комнаты в БД: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error, try again").into_response();
+        }
+    };
+
+    let mut rooms_guard = state.rooms.lock().unwrap();
+    // Коллизия 8-символьного id астрономически маловероятна (32^8 вариантов).
+    // В отличие от циклической перегенерации под мьютексом, здесь id уже ушёл
+    // в БД вместе с сессией, поэтому в теоретическом проигрышном случае просто
+    // отказываем: клиент повторит запрос.
+    if rooms_guard.contains_key(&room_id) {
+        drop(rooms_guard);
+        warn!(room = %room_id, "коллизия roomId при создании — отказ");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "try again").into_response();
+    }
+    rooms_guard.insert(
+        room_id.clone(),
+        Room {
+            participants: HashMap::new(),
+            screen_owner: None,
+            session_id,
+            // Сразу помечена «пустой»: если никто не подключится за TTL,
+            // реапер её удалит.
+            emptied_at: Some(Instant::now()),
+        },
+    );
+    drop(rooms_guard);
+    info!(room = %room_id, "комната создана (пустая)");
+
+    (StatusCode::CREATED, Json(json!({ "roomId": room_id }))).into_response()
 }
 
 /// Проба готовности/живости для k8s: если процесс отвечает на HTTP — он жив.

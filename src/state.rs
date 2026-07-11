@@ -1,36 +1,64 @@
-//! Состояние комнат, целиком в памяти процесса (БД по спецификации нет).
+//! Состояние комнат, целиком в памяти процесса (БД используется только для
+//! истории чата, см. `db.rs`).
 //!
 //! Выбор синхронизации: `std::sync::Mutex` поверх `HashMap`, а не tokio-мьютекс
 //! и не акторная схема. Обоснование: все критические секции короткие и не
-//! содержат `.await` (отправка в `UnboundedSender` синхронна и не блокирует),
-//! поэтому обычный мьютекс проще и быстрее асинхронного, а contention при
-//! нашем масштабе (единицы комнат по ≤6 пиров) пренебрежим.
+//! содержат `.await` (отправка в `UnboundedSender` синхронна и не блокирует,
+//! а удаление устаревших комнат в реапере — тоже чисто синхронная операция
+//! над `HashMap`), поэтому обычный мьютекс проще и быстрее асинхронного, а
+//! contention при нашем масштабе (единицы комнат по ≤6 участников) пренебрежим.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use sqlx::SqlitePool;
 use tokio::sync::mpsc;
+use tracing::info;
 use uuid::Uuid;
 
+use crate::db::ChatWriteTx;
 use crate::protocol::ServerMessage;
 
-/// Максимум зрителей в комнате одновременно.
-pub const MAX_VIEWERS: usize = 5;
+/// Максимум участников в комнате одновременно (протокол v2: симметричная
+/// комната, роли broadcaster/viewer больше не существует).
+pub const MAX_PARTICIPANTS: usize = 6;
+
+/// Как часто реапер проверяет комнаты на протухание. Сознательно чаще, чем
+/// «раз в 5 секунд» могло бы показаться достаточным: TTL пустой комнаты в
+/// тестах — 2 секунды, и с более редким тиком удаление легко перехлёстывает
+/// за отведённое тестам время ожидания. Накладные расходы пренебрежимы —
+/// комнат единицы, сама проверка — линейный проход по `HashMap` под коротким
+/// локом без единого `.await`.
+pub const REAPER_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Канал для отправки сообщений конкретному WebSocket-соединению.
 /// Писатель сокета читает из парного `UnboundedReceiver`.
 pub type PeerTx = mpsc::UnboundedSender<ServerMessage>;
 
-/// Комната: один вещающий + до `MAX_VIEWERS` зрителей.
+/// Один участник комнаты: канал для рассылки ему сообщений + имя для чата.
+pub struct Participant {
+    pub tx: PeerTx,
+    pub name: Option<String>,
+}
+
+/// Комната: до `MAX_PARTICIPANTS` равноправных участников, соединяющихся
+/// mesh (сервер сам медиа не трогает — только сигналинг). Максимум один из
+/// участников может в моменте шарить экран (`screen_owner`).
 pub struct Room {
-    pub broadcaster_id: String,
-    pub broadcaster_tx: PeerTx,
-    pub viewers: HashMap<String, PeerTx>,
+    pub participants: HashMap<String, Participant>,
+    /// peerId участника, который сейчас шарит экран (если шарит хоть кто-то).
+    pub screen_owner: Option<String>,
     /// id строки в `room_sessions` — по нему ищется история чата. Заводится
-    /// заново при каждом `create-room`, даже если `roomId` уже встречался
+    /// один раз при `POST /api/rooms`, даже если `roomId` уже встречался
     /// раньше, чтобы не подмешивать чужую историю при переиспользовании id.
     pub session_id: i64,
+    /// Когда комната опустела (последний участник вышел), либо когда она
+    /// была создана пустой через `POST /api/rooms`. `None`, пока в комнате
+    /// есть хоть один участник. Реапер удаляет комнату, если она пуста
+    /// дольше `EMPTY_ROOM_TTL` с этого момента; новый `join-room` в живую
+    /// (но помеченную) комнату снимает отметку.
+    pub emptied_at: Option<Instant>,
 }
 
 /// Общее состояние всех комнат.
@@ -42,6 +70,10 @@ pub type SharedRooms = Arc<Mutex<HashMap<String, Room>>>;
 pub struct AppState {
     pub rooms: SharedRooms,
     pub db: SqlitePool,
+    /// Канал к единственному фоновому писателю истории чата (см.
+    /// `db::run_chat_writer`) — сериализует запись сообщений в БД, чтобы
+    /// порядок и полнота истории не зависели от гонки конкурентных вставок.
+    pub chat_tx: ChatWriteTx,
 }
 
 /// Отправить сообщение пиру; ошибка (пир уже отвалился) сознательно
@@ -74,4 +106,24 @@ pub fn generate_room_id() -> String {
         .take(8)
         .map(|b| ALPHABET[(*b as usize) % ALPHABET.len()] as char)
         .collect()
+}
+
+/// Фоновая задача: раз в `REAPER_INTERVAL` удаляет комнаты, которые пусты
+/// (без единого участника) дольше `ttl`. Инвариант конкурентности: весь
+/// проход по комнатам — синхронный (`HashMap::retain`), лок держится только
+/// на время самого прохода, без `.await` внутри критической секции.
+pub async fn reap_empty_rooms(rooms: SharedRooms, ttl: Duration) {
+    let mut interval = tokio::time::interval(REAPER_INTERVAL);
+    loop {
+        interval.tick().await;
+        let mut rooms_guard = rooms.lock().unwrap();
+        rooms_guard.retain(|room_id, room| {
+            let expired = room.participants.is_empty()
+                && room.emptied_at.is_some_and(|t| t.elapsed() >= ttl);
+            if expired {
+                info!(room = %room_id, "комната пуста дольше TTL — удалена реапером");
+            }
+            !expired
+        });
+    }
 }
