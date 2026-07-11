@@ -1,11 +1,13 @@
 //! Точка входа: HTTP-сервер на axum.
 //!
 //! Backend делает ровно две вещи (по спецификации):
-//!   1. Signaling-релей поверх WebSocket (`/ws`) — см. `ws.rs`.
+//!   1. Signaling-релей поверх WebSocket (`/ws`) — см. `ws.rs`. Сюда же
+//!      подмешан текстовый чат комнаты с историей в SQLite (`db.rs`).
 //!   2. Раздача статики фронтенда (`/`, `/room/{id}`, `/static/...`).
 //! Плюс крошечный `/config` с ICE-серверами из переменных окружения.
-//! Медиа через сервер не проходит.
+//! Медиа через сервер по-прежнему не проходит.
 
+mod db;
 mod protocol;
 mod state;
 mod ws;
@@ -21,7 +23,7 @@ use axum::Router;
 use serde_json::json;
 use tracing::info;
 
-use crate::state::SharedRooms;
+use crate::state::AppState;
 
 /// Статика лежит рядом с Cargo.toml; путь фиксируется на этапе компиляции,
 /// поэтому `cargo run` работает из любой текущей директории.
@@ -36,7 +38,14 @@ async fn main() {
         )
         .init();
 
-    let rooms: SharedRooms = Arc::new(Mutex::new(HashMap::new()));
+    let rooms = Arc::new(Mutex::new(HashMap::new()));
+
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "sqlite://screenshare.db?mode=rwc".to_string());
+    info!(url = %database_url, "подключение к БД истории чата");
+    let db = db::init_pool(&database_url).await;
+
+    let state = AppState { rooms, db };
 
     let app = Router::new()
         // Страница вещающего.
@@ -46,7 +55,7 @@ async fn main() {
         .route("/config", get(ice_config))
         .route("/ws", get(ws::ws_handler))
         .route("/static/{*path}", get(static_file))
-        .with_state(rooms);
+        .with_state(state);
 
     let port: u16 = std::env::var("PORT")
         .ok()

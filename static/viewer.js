@@ -22,6 +22,7 @@ let pc = null;
 let broadcasterId = null;
 let remoteDescSet = false;
 let candidateQueue = [];
+let chat = null;
 // Как только показан «финальный» оверлей (ошибка/завершение), больше не
 // перетираем его сообщениями о попутных обрывах соединения.
 let terminalState = false;
@@ -54,6 +55,9 @@ async function init() {
         title: 'Соединение потеряно',
         text: 'Связь с сервером сигналинга прервалась. Обновите страницу.',
       });
+      if (chat) {
+        chat.disableInput('Соединение потеряно.');
+      }
       cleanupPeer();
     }
   };
@@ -70,15 +74,21 @@ async function init() {
   }
 
   registerSignalingHandlers(iceServers);
-  signaling.send('join-room', { roomId, role: 'viewer' });
+  const savedName = ChatPanel.getSavedName();
+  signaling.send('join-room', {
+    roomId,
+    role: 'viewer',
+    ...(savedName ? { name: savedName } : {}),
+  });
 }
 
 function registerSignalingHandlers(iceServers) {
-  signaling.on('joined', ({ broadcasterId: bId }) => {
+  signaling.on('joined', ({ broadcasterId: bId, peerId }) => {
     broadcasterId = bId;
     showOverlay({ title: 'Ожидание вещающего…', spinner: true, text: 'Трансляция вот-вот начнётся.' });
     pc = createPeerConnection(iceServers);
     console.log('Успешно присоединились к комнате, broadcasterId:', bId);
+    chat = ChatPanel.create({ signaling, peerId, variant: 'viewer' });
   });
 
   signaling.on('room-not-found', () => {
@@ -133,6 +143,9 @@ function registerSignalingHandlers(iceServers) {
   signaling.on('broadcaster-left', () => {
     terminalState = true;
     showOverlay({ title: 'Трансляция завершена', text: 'Вещающий закончил трансляцию.' });
+    if (chat) {
+      chat.disableInput('Вещающий закончил трансляцию.');
+    }
     cleanupAll();
   });
 

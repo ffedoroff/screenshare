@@ -23,6 +23,7 @@ let signaling = null;
 let iceServersConfig = [FALLBACK_ICE_SERVERS[0]];
 // peerId -> { pc, remoteSet, candidateQueue }
 const peers = new Map();
+let chat = null;
 
 function showStatus(text, isError = false) {
   statusMessageEl.textContent = text;
@@ -90,7 +91,8 @@ async function startBroadcast() {
   }
 
   registerSignalingHandlers();
-  signaling.send('create-room');
+  const savedName = ChatPanel.getSavedName();
+  signaling.send('create-room', savedName ? { name: savedName } : {});
 }
 
 function registerSignalingHandlers() {
@@ -104,6 +106,7 @@ function registerSignalingHandlers() {
     updateViewerCount();
     clearStatus();
     console.log('Комната создана:', roomId, 'peerId:', peerId);
+    chat = ChatPanel.create({ signaling, peerId, variant: 'broadcaster' });
   });
 
   signaling.on('peer-joined', async ({ peerId }) => {
@@ -224,6 +227,10 @@ function stopBroadcast(options = {}) {
 
   for (const peerId of Array.from(peers.keys())) {
     removePeer(peerId);
+  }
+
+  if (chat) {
+    chat.disableInput('Трансляция завершена.');
   }
 
   stopLocalStreamOnly();

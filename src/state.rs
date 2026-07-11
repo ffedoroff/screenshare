@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use sqlx::SqlitePool;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -26,10 +27,22 @@ pub struct Room {
     pub broadcaster_id: String,
     pub broadcaster_tx: PeerTx,
     pub viewers: HashMap<String, PeerTx>,
+    /// id строки в `room_sessions` — по нему ищется история чата. Заводится
+    /// заново при каждом `create-room`, даже если `roomId` уже встречался
+    /// раньше, чтобы не подмешивать чужую историю при переиспользовании id.
+    pub session_id: i64,
 }
 
 /// Общее состояние всех комнат.
 pub type SharedRooms = Arc<Mutex<HashMap<String, Room>>>;
+
+/// Состояние приложения, разделяемое между всеми обработчиками axum:
+/// комнаты в памяти + пул соединений SQLite для истории чата.
+#[derive(Clone)]
+pub struct AppState {
+    pub rooms: SharedRooms,
+    pub db: SqlitePool,
+}
 
 /// Отправить сообщение пиру; ошибка (пир уже отвалился) сознательно
 /// игнорируется — чистку сделает его собственный обработчик сокета.
@@ -40,6 +53,14 @@ pub fn send_to(tx: &PeerTx, msg: ServerMessage) {
 /// Внутренний идентификатор пира — обычный UUID.
 pub fn generate_peer_id() -> String {
     Uuid::new_v4().to_string()
+}
+
+/// Текущее время в unix-миллисекундах (для `ts` в сообщениях чата).
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Короткий человекочитаемый roomId для URL: 8 символов из алфавита
