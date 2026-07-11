@@ -16,6 +16,7 @@ const previewVideo = document.getElementById('preview-video');
 const roomLinkInput = document.getElementById('room-link-input');
 const copyButton = document.getElementById('copy-button');
 const viewerCountEl = document.getElementById('viewer-count');
+const micIndicatorEl = document.getElementById('mic-indicator');
 const statusMessageEl = document.getElementById('status-message');
 
 // --- Состояние ---
@@ -25,6 +26,8 @@ let signaling = null;
 let iceServersConfig = [FALLBACK_ICE_SERVERS[0]];
 // peerId -> RtcPeer
 const peers = new Map();
+// peerId -> <audio> с входящим микрофоном этого зрителя (см. handleIncomingTrack).
+const micAudioEls = new Map();
 let chat = null;
 
 function showStatus(text, isError = false) {
@@ -133,6 +136,18 @@ function registerSignalingHandlers() {
     await peer.handleDescription(sdp);
   });
 
+  // Оффер от зрителя — раньше зрители офферов не слали, теперь появление
+  // микрофона у зрителя триггерит его onnegotiationneeded (см. viewer.js:
+  // pc.addTrack при первом включении микрофона).
+  signaling.on('offer', async ({ fromPeerId, sdp }) => {
+    const peer = peers.get(fromPeerId);
+    if (!peer) {
+      console.warn('offer от неизвестного пира:', fromPeerId);
+      return;
+    }
+    await peer.handleDescription(sdp);
+  });
+
   signaling.on('ice-candidate', async ({ fromPeerId, candidate }) => {
     const peer = peers.get(fromPeerId);
     if (!peer) return;
@@ -158,6 +173,7 @@ function createPeerConnection(peerId) {
     polite: false,
     signaling,
     targetPeerId: peerId,
+    onTrack: (event) => handleIncomingTrack(peerId, event),
     onStateChange: (connectionState) => {
       if (connectionState === 'failed') {
         removePeer(peerId);
@@ -167,16 +183,75 @@ function createPeerConnection(peerId) {
   });
 }
 
+// Микрофон зрителя приходит как входящий аудиотрек на его RtcPeer. На peerId
+// заводим один скрытый <audio autoplay> и проигрываем в него.
+//
+// Индикатор «микрофонов: M» — это НЕ «кто сейчас говорит»: честно определить
+// активность звука без анализа аудиоданных нельзя. У зрителя track.enabled =
+// false (выключение микрофона кнопкой) не останавливает трек — на приёмнике
+// он остаётся live, просто отдаёт тишину. Поэтому M здесь — количество живых
+// входящих аудиотреков (уменьшается только когда трек реально ended, т.е.
+// зритель отключился или его peer-connection закрылся).
+function handleIncomingTrack(peerId, event) {
+  const track = event.track;
+  if (track.kind !== 'audio') return;
+
+  let audioEl = micAudioEls.get(peerId);
+  if (!audioEl) {
+    audioEl = document.createElement('audio');
+    audioEl.autoplay = true;
+    audioEl.dataset.peerId = peerId;
+    audioEl.style.display = 'none';
+    document.body.appendChild(audioEl);
+    micAudioEls.set(peerId, audioEl);
+  }
+
+  const stream = event.streams[0] || new MediaStream([track]);
+  if (audioEl.srcObject !== stream) {
+    audioEl.srcObject = stream;
+    const playPromise = audioEl.play();
+    if (playPromise) {
+      playPromise.catch((err) => console.warn(`Не удалось запустить аудио зрителя ${peerId}:`, err));
+    }
+  }
+
+  track.onended = () => {
+    removeMicAudio(peerId);
+    updateViewerCount();
+  };
+
+  updateViewerCount();
+}
+
+function removeMicAudio(peerId) {
+  const audioEl = micAudioEls.get(peerId);
+  if (audioEl) {
+    audioEl.srcObject = null;
+    audioEl.remove();
+    micAudioEls.delete(peerId);
+  }
+}
+
 function removePeer(peerId) {
   const peer = peers.get(peerId);
   if (peer) {
     peer.close();
     peers.delete(peerId);
   }
+  removeMicAudio(peerId);
 }
 
 function updateViewerCount() {
   viewerCountEl.textContent = String(peers.size);
+
+  const micCount = micAudioEls.size;
+  if (micCount > 0) {
+    micIndicatorEl.textContent = ` · микрофонов: ${micCount}`;
+    micIndicatorEl.classList.remove('hidden');
+  } else {
+    micIndicatorEl.textContent = '';
+    micIndicatorEl.classList.add('hidden');
+  }
 }
 
 // --- Остановка трансляции ---
@@ -225,6 +300,8 @@ function resetUi() {
   liveSection.classList.add('hidden');
   roomLinkInput.value = '';
   viewerCountEl.textContent = '0';
+  micIndicatorEl.textContent = '';
+  micIndicatorEl.classList.add('hidden');
   copyButton.textContent = 'Скопировать';
   copyButton.classList.remove('copied');
 }

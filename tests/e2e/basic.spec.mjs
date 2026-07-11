@@ -66,6 +66,10 @@ const BINARY_PATH = path.join(REPO_ROOT, 'target/debug/screenshare');
 // откатиться на синтетический источник (см. комментарий выше).
 const REAL_CAPTURE_TIMEOUT_MS = 10_000;
 
+// Сколько ждём реальный getUserMedia(audio) у зрителя, прежде чем откатиться
+// на синтетический источник (см. комментарий у installMicStub).
+const REAL_MIC_TIMEOUT_MS = 5_000;
+
 const CAPTURE_FLAGS = [
   '--auto-select-desktop-capture-source=Entire screen',
   '--use-fake-ui-for-media-stream',
@@ -213,6 +217,60 @@ function installCaptureStub() {
   };
 }
 
+// --- Синтетический источник аудио для микрофона зрителя ---
+//
+// Ожидалось, что --use-fake-device-for-media-stream + --use-fake-ui-for-media-stream
+// (уже переданы в browser.launch, см. CAPTURE_FLAGS) достаточно, чтобы
+// navigator.mediaDevices.getUserMedia({ audio: true }) резолвился фейковым
+// микрофоном без диалога — так документирует Chromium и так ведут себя флаги
+// для getDisplayMedia выше. На практике на этой машине getUserMedia(audio)
+// зависает навсегда даже при явно выданном разрешении (permissions.query
+// возвращает 'granted', проверено через ctx.grantPermissions) и в headed, и в
+// headless режиме — то есть проблема не в системном TCC (в отличие от
+// getDisplayMedia/Screen Recording выше, для микрофона Chrome в TCC.db разрешён),
+// а, по всей видимости, в недоступности реального аудио-HAL для процесса
+// автоматизации в этой среде. Поэтому здесь применяется тот же приём, что и для
+// getDisplayMedia: реальный getUserMedia пробуется первым с таймаутом, а если
+// не успел — тестовый арнесс подменяет его на синтетический аудиотрек
+// (осциллятор Web Audio API -> MediaStreamAudioDestinationNode), который не
+// трогает никакое реальное аудио-железо и создаёт полноценный live-трек.
+// static/viewer.js при этом не меняется — он как обычно вызывает
+// getUserMedia({ audio: true }) и просто получает то, что вернёт браузер.
+function installMicStub() {
+  return (timeoutMs) => {
+    const realGetUserMedia = navigator.mediaDevices.getUserMedia
+      ? navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices)
+      : null;
+
+    navigator.mediaDevices.getUserMedia = async (constraints) => {
+      if (realGetUserMedia) {
+        const withTimeout = (p, ms) =>
+          Promise.race([
+            p,
+            new Promise((_, reject) => setTimeout(() => reject(new Error('e2e-real-mic-timeout')), ms)),
+          ]);
+        try {
+          const stream = await withTimeout(realGetUserMedia(constraints), timeoutMs);
+          window.__e2eMicSource = 'real';
+          return stream;
+        } catch (err) {
+          console.warn('[e2e] реальный getUserMedia(audio) не сработал за отведённое время, откат на синтетический источник:', err);
+        }
+      }
+
+      window.__e2eMicSource = 'synthetic';
+      const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+      const audioCtx = new AudioContextCtor();
+      const oscillator = audioCtx.createOscillator();
+      oscillator.frequency.value = 440;
+      const destination = audioCtx.createMediaStreamDestination();
+      oscillator.connect(destination);
+      oscillator.start();
+      return destination.stream;
+    };
+  };
+}
+
 // --- Вспомогательные функции для страниц ---
 
 // Дожидается реального просмотра потока у зрителя. Хром блокирует autoplay
@@ -342,6 +400,8 @@ async function main() {
     // --- Два зрителя ---
     const viewer1Context = await browser.newContext();
     const viewer2Context = await browser.newContext();
+    await viewer1Context.addInitScript(installMicStub(), REAL_MIC_TIMEOUT_MS);
+    await viewer2Context.addInitScript(installMicStub(), REAL_MIC_TIMEOUT_MS);
     const viewer1Page = await viewer1Context.newPage();
     const viewer2Page = await viewer2Context.newPage();
 
@@ -443,6 +503,78 @@ async function main() {
       skip('чат: сообщение от зрителя №1', 'зрители не подключились');
       skip('чат: ответ вещающего', 'зрители не подключились');
       skip('чат: бейдж непрочитанных', 'зрители не подключились');
+    }
+
+    // --- Микрофон зрителя ---
+    // Контексты зрителей запущены с --use-fake-device-for-media-stream и
+    // --use-fake-ui-for-media-stream (CAPTURE_FLAGS в browser.launch — это
+    // process-wide флаги Chrome, действуют на все контексты этого браузера) —
+    // по документации Chromium этого достаточно, чтобы getUserMedia({ audio: true })
+    // резолвился фейковым микрофоном без диалога. installMicStub() пробует
+    // это первым и только если не сработало (как оказалось, стабильно не
+    // срабатывает на этой машине, см. комментарий у installMicStub) — подменяет
+    // источник на синтетический аудиотрек тестового арнесса. В любом случае
+    // WebRTC-ренегоциация и обновление UI у вещающего проверяются по-настоящему.
+    if (viewersJoinedOk) {
+      await step('зритель №1 включает микрофон — у вещающего появляется «микрофонов: 1» и <audio>-элемент', async () => {
+        await viewer1Page.click('#mic-button');
+
+        await broadcasterPage.waitForFunction(
+          () => {
+            const el = document.getElementById('mic-indicator');
+            return !!el && !el.classList.contains('hidden') && el.textContent.includes('1');
+          },
+          { timeout: 8000 }
+        );
+
+        const micSource = await viewer1Page.evaluate(() => window.__e2eMicSource || 'unknown');
+        if (micSource === 'real') {
+          console.log('# источник микрофона у зрителя №1: РЕАЛЬНЫЙ getUserMedia (флаги сработали)');
+        } else {
+          console.log(
+            `# источник микрофона у зрителя №1: синтетический (Web Audio API) — ` +
+            `реальный getUserMedia(audio) не отработал за ${REAL_MIC_TIMEOUT_MS}мс, см. комментарий у installMicStub`
+          );
+          skip(
+            'микрофон: настоящий захват через getUserMedia',
+            'на этой машине getUserMedia(audio) зависает даже при выданном разрешении (permissions.query -> granted); ' +
+            'используется синтетический аудиотрек на уровне тестового арнесса, проверки WebRTC-ренегоциации и UI ниже всё равно выполняются'
+          );
+        }
+
+        const audioCount = await broadcasterPage.evaluate(
+          () => document.querySelectorAll('audio[data-peer-id]').length
+        );
+        assert.equal(audioCount, 1, `ожидался один <audio>-элемент микрофона у вещающего, получено ${audioCount}`);
+
+        const micButtonOn = await viewer1Page.evaluate(
+          () => document.getElementById('mic-button').classList.contains('mic-button--on')
+        );
+        assert.equal(micButtonOn, true, 'кнопка микрофона у зрителя №1 должна быть в состоянии «включено»');
+      });
+
+      await step('зритель №1 выключает микрофон повторным кликом — кнопка меняет состояние, индикатор у вещающего не падает', async () => {
+        await viewer1Page.click('#mic-button');
+
+        const micButtonOn = await viewer1Page.evaluate(
+          () => document.getElementById('mic-button').classList.contains('mic-button--on')
+        );
+        assert.equal(micButtonOn, false, 'после повторного клика кнопка должна выйти из состояния «включено»');
+
+        // track.enabled = false не завершает трек — на приёмнике он остаётся
+        // live, поэтому счётчик «микрофонов» у вещающего честно не меняется
+        // (см. комментарий в static/broadcaster.js: handleIncomingTrack).
+        const micIndicatorText = await broadcasterPage.evaluate(
+          () => document.getElementById('mic-indicator').textContent
+        );
+        assert.ok(
+          micIndicatorText.includes('1'),
+          `индикатор микрофонов должен остаться «...1», получено «${micIndicatorText}»`
+        );
+      });
+    } else {
+      skip('микрофон зрителя: включение', 'зрители не подключились');
+      skip('микрофон зрителя: выключение', 'зрители не подключились');
     }
 
     // --- Завершение трансляции ---

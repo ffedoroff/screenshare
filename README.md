@@ -1,6 +1,6 @@
 # screenshare
 
-Браузерный шеринг экрана «один вещает — несколько смотрят», без регистрации и записи. Плюс текстовый чат комнаты с историей.
+Браузерный шеринг экрана «один вещает — несколько смотрят», без регистрации и записи. Плюс текстовый чат комнаты с историей и микрофон зрителя (по кнопке, чтобы вещающий мог услышать зрителя в ответ).
 
 ## Архитектура
 
@@ -13,6 +13,7 @@
 - Состояние комнат (кто в какой комнате, каналы для рассылки) — в памяти процесса (`HashMap`). История чата — в SQLite (`sqlx`, без compile-time query-макросов).
 - Лимит: **максимум 5 зрителей** на комнату одновременно; 6-й получает отказ `room-full`. Один broadcaster на комнату.
 - Чат: до 2000 символов на сообщение, до 10 сообщений за 10 секунд с одного соединения; хранятся последние 50 сообщений на сессию комнаты.
+- Микрофон зрителя: кнопка «Микрофон» у зрителя (выключен по умолчанию), при первом включении зритель добавляет аудиотрек в свой `RTCPeerConnection` — ренегоциация идёт через тот же perfect-negotiation-паттерн (viewer как polite-пир сам инициирует offer). Вещающий проигрывает входящий звук через скрытый `<audio>` и показывает счётчик «микрофонов: N» (это количество живых входящих аудиотреков, а не индикатор «кто сейчас говорит»).
 - STUN — публичный `stun:stun.l.google.com:19302`. TURN — опциональный, отдельный сервер (например `turn-rs`), настраивается через переменные окружения.
 
 ## Запуск
@@ -145,8 +146,8 @@ tests/
 |---|---|---|
 | `create-room` | `name?` (имя вещающего для чата) | broadcaster |
 | `join-room` | `roomId`, `role: "viewer"`, `name?` (имя зрителя для чата) | viewer |
-| `offer` | `targetPeerId`, `sdp` | broadcaster |
-| `answer` | `targetPeerId`, `sdp` | viewer |
+| `offer` | `targetPeerId`, `sdp` | оба (broadcaster — первый offer; viewer — ренегоциация при включении микрофона) |
+| `answer` | `targetPeerId`, `sdp` | оба (viewer — ответ на первый offer; broadcaster — ответ на offer от viewer'а с микрофоном) |
 | `ice-candidate` | `targetPeerId`, `candidate` | оба |
 | `chat` | `text` (≤2000 символов после trim) | оба |
 | `leave` | — | оба (или закрытие сокета) |
@@ -159,8 +160,8 @@ tests/
 | `joined` | `peerId`, `broadcasterId`, `viewerCount` | viewer |
 | `peer-joined` | `peerId` | broadcaster |
 | `peer-left` | `peerId` | broadcaster |
-| `offer` | `fromPeerId`, `sdp` | viewer |
-| `answer` | `fromPeerId`, `sdp` | broadcaster |
+| `offer` | `fromPeerId`, `sdp` | оба (viewer получает первый offer; broadcaster — offer от viewer'а с микрофоном) |
+| `answer` | `fromPeerId`, `sdp` | оба (broadcaster получает первый answer; viewer — answer на свой offer с микрофоном) |
 | `ice-candidate` | `fromPeerId`, `candidate` | целевой пир |
 | `chat` | `fromPeerId`, `name`, `text`, `ts` (unix millis) | все участники комнаты, включая отправителя |
 | `chat-history` | `messages: [{fromPeerId, name, text, ts}, ...]` | зрителю сразу после `joined` (последние 50, хронологически) |
