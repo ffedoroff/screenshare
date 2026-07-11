@@ -1,8 +1,10 @@
 // broadcaster.js — логика страницы вещающего.
 //
 // Состояния: idle (исходное) -> live (трансляция идёт) -> обратно в idle при остановке.
-// Инициатор WebRTC-оффера — всегда broadcaster: по каждому peer-joined создаётся
-// новый RTCPeerConnection, треки добавляются, createOffer уходит конкретному зрителю.
+// WebRTC-соединения строятся через rtc.js (perfect negotiation, см. static/rtc.js):
+// по каждому peer-joined создаётся обёртка RtcPeer (роль broadcaster — impolite),
+// треки добавляются сразу — это триггерит onnegotiationneeded и первый offer
+// уходит конкретному зрителю сам, без явного createOffer.
 
 'use strict';
 
@@ -21,7 +23,7 @@ let state = 'idle'; // 'idle' | 'live'
 let localStream = null;
 let signaling = null;
 let iceServersConfig = [FALLBACK_ICE_SERVERS[0]];
-// peerId -> { pc, remoteSet, candidateQueue }
+// peerId -> RtcPeer
 const peers = new Map();
 let chat = null;
 
@@ -109,49 +111,32 @@ function registerSignalingHandlers() {
     chat = ChatPanel.create({ signaling, peerId, variant: 'broadcaster' });
   });
 
-  signaling.on('peer-joined', async ({ peerId }) => {
+  signaling.on('peer-joined', ({ peerId }) => {
     console.log('Новый зритель подключился:', peerId);
-    const peerState = createPeerConnection(peerId);
-    peers.set(peerId, peerState);
+    const peer = createPeerConnection(peerId);
+    peers.set(peerId, peer);
     updateViewerCount();
 
-    try {
-      const offer = await peerState.pc.createOffer();
-      await peerState.pc.setLocalDescription(offer);
-      signaling.send('offer', { targetPeerId: peerId, sdp: peerState.pc.localDescription });
-    } catch (err) {
-      console.error('Не удалось создать/отправить offer для', peerId, err);
+    // Добавление треков триггерит onnegotiationneeded внутри RtcPeer — offer
+    // зрителю уйдёт сам, явный createOffer больше не нужен.
+    for (const track of localStream.getTracks()) {
+      peer.pc.addTrack(track, localStream);
     }
   });
 
   signaling.on('answer', async ({ fromPeerId, sdp }) => {
-    const peerState = peers.get(fromPeerId);
-    if (!peerState) {
+    const peer = peers.get(fromPeerId);
+    if (!peer) {
       console.warn('answer от неизвестного пира:', fromPeerId);
       return;
     }
-    try {
-      await peerState.pc.setRemoteDescription(sdp);
-      peerState.remoteSet = true;
-      flushCandidateQueue(peerState);
-    } catch (err) {
-      console.error('Ошибка setRemoteDescription (answer) для', fromPeerId, err);
-    }
+    await peer.handleDescription(sdp);
   });
 
   signaling.on('ice-candidate', async ({ fromPeerId, candidate }) => {
-    const peerState = peers.get(fromPeerId);
-    if (!peerState) return;
-    if (peerState.remoteSet) {
-      try {
-        await peerState.pc.addIceCandidate(candidate);
-      } catch (err) {
-        console.error('Ошибка addIceCandidate для', fromPeerId, err);
-      }
-    } else {
-      // remoteDescription ещё не установлен — копим кандидатов в очередь.
-      peerState.candidateQueue.push(candidate);
-    }
+    const peer = peers.get(fromPeerId);
+    if (!peer) return;
+    await peer.handleCandidate(candidate);
   });
 
   signaling.on('peer-left', ({ peerId }) => {
@@ -166,50 +151,26 @@ function registerSignalingHandlers() {
 }
 
 function createPeerConnection(peerId) {
-  const pc = new RTCPeerConnection({ iceServers: iceServersConfig });
-
-  for (const track of localStream.getTracks()) {
-    pc.addTrack(track, localStream);
-  }
-
-  pc.onicecandidate = (event) => {
-    if (event.candidate) {
-      signaling.send('ice-candidate', {
-        targetPeerId: peerId,
-        candidate: event.candidate.toJSON(),
-      });
-    }
-  };
-
-  pc.onconnectionstatechange = () => {
-    console.log(`[peer ${peerId}] connectionState -> ${pc.connectionState}`);
-    if (pc.connectionState === 'failed') {
-      removePeer(peerId);
-      updateViewerCount();
-    }
-  };
-
-  pc.oniceconnectionstatechange = () => {
-    console.log(`[peer ${peerId}] iceConnectionState -> ${pc.iceConnectionState}`);
-  };
-
-  return { pc, remoteSet: false, candidateQueue: [] };
-}
-
-function flushCandidateQueue(peerState) {
-  const queue = peerState.candidateQueue;
-  peerState.candidateQueue = [];
-  for (const candidate of queue) {
-    peerState.pc.addIceCandidate(candidate).catch((err) => {
-      console.error('Ошибка addIceCandidate (из очереди):', err);
-    });
-  }
+  // Broadcaster — impolite: единственный источник треков, в коллизиях
+  // офферов его версия побеждает (см. static/rtc.js).
+  return new RtcPeer({
+    iceServers: iceServersConfig,
+    polite: false,
+    signaling,
+    targetPeerId: peerId,
+    onStateChange: (connectionState) => {
+      if (connectionState === 'failed') {
+        removePeer(peerId);
+        updateViewerCount();
+      }
+    },
+  });
 }
 
 function removePeer(peerId) {
-  const peerState = peers.get(peerId);
-  if (peerState) {
-    peerState.pc.close();
+  const peer = peers.get(peerId);
+  if (peer) {
+    peer.close();
     peers.delete(peerId);
   }
 }

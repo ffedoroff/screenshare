@@ -2,6 +2,10 @@
 //
 // roomId берём из URL (последний сегмент pathname). Дальше: join-room -> ждём
 // offer от broadcaster'а -> отвечаем answer -> обмен ICE -> показываем поток.
+// WebRTC-соединение строится через rtc.js (perfect negotiation, см. static/rtc.js):
+// viewer — polite-пир. Он сейчас не добавляет треков и не шлёт offer сам
+// (onnegotiationneeded у него не сработает), но обёртка одинакова для обеих
+// сторон — это подготовка к будущей ренегоциации (например, микрофон зрителя).
 
 'use strict';
 
@@ -18,10 +22,8 @@ const roomId = location.pathname.split('/').filter(Boolean).pop();
 
 // --- Состояние ---
 let signaling = null;
-let pc = null;
+let peer = null; // RtcPeer
 let broadcasterId = null;
-let remoteDescSet = false;
-let candidateQueue = [];
 let chat = null;
 // Как только показан «финальный» оверлей (ошибка/завершение), больше не
 // перетираем его сообщениями о попутных обрывах соединения.
@@ -86,7 +88,7 @@ function registerSignalingHandlers(iceServers) {
   signaling.on('joined', ({ broadcasterId: bId, peerId }) => {
     broadcasterId = bId;
     showOverlay({ title: 'Ожидание вещающего…', spinner: true, text: 'Трансляция вот-вот начнётся.' });
-    pc = createPeerConnection(iceServers);
+    peer = createPeerConnection(iceServers, bId);
     console.log('Успешно присоединились к комнате, broadcasterId:', bId);
     chat = ChatPanel.create({ signaling, peerId, variant: 'viewer' });
   });
@@ -110,34 +112,16 @@ function registerSignalingHandlers(iceServers) {
   });
 
   signaling.on('offer', async ({ fromPeerId, sdp }) => {
-    if (!pc) {
+    if (!peer) {
       console.warn('offer получен раньше, чем создан RTCPeerConnection — игнорируем');
       return;
     }
-    try {
-      await pc.setRemoteDescription(sdp);
-      remoteDescSet = true;
-      flushCandidateQueue();
-
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      signaling.send('answer', { targetPeerId: fromPeerId, sdp: pc.localDescription });
-    } catch (err) {
-      console.error('Ошибка обработки offer:', err);
-    }
+    await peer.handleDescription(sdp);
   });
 
   signaling.on('ice-candidate', async ({ candidate }) => {
-    if (!pc) return;
-    if (remoteDescSet) {
-      try {
-        await pc.addIceCandidate(candidate);
-      } catch (err) {
-        console.error('Ошибка addIceCandidate:', err);
-      }
-    } else {
-      candidateQueue.push(candidate);
-    }
+    if (!peer) return;
+    await peer.handleCandidate(candidate);
   });
 
   signaling.on('broadcaster-left', () => {
@@ -154,51 +138,30 @@ function registerSignalingHandlers(iceServers) {
   });
 }
 
-function createPeerConnection(iceServers) {
-  const p = new RTCPeerConnection({ iceServers });
-
-  p.onicecandidate = (event) => {
-    if (event.candidate && broadcasterId) {
-      signaling.send('ice-candidate', {
-        targetPeerId: broadcasterId,
-        candidate: event.candidate.toJSON(),
-      });
-    }
-  };
-
-  p.ontrack = (event) => {
-    hideOverlay();
-    if (remoteVideo.srcObject !== event.streams[0]) {
-      remoteVideo.srcObject = event.streams[0];
-    }
-    attemptPlay();
-  };
-
-  p.onconnectionstatechange = () => {
-    console.log('connectionState ->', p.connectionState);
-    if (p.connectionState === 'failed' && !terminalState) {
-      showOverlay({
-        title: 'Соединение потеряно',
-        text: 'Не удалось установить соединение с вещающим.',
-      });
-    }
-  };
-
-  p.oniceconnectionstatechange = () => {
-    console.log('iceConnectionState ->', p.iceConnectionState);
-  };
-
-  return p;
-}
-
-function flushCandidateQueue() {
-  const queue = candidateQueue;
-  candidateQueue = [];
-  for (const candidate of queue) {
-    pc.addIceCandidate(candidate).catch((err) => {
-      console.error('Ошибка addIceCandidate (из очереди):', err);
-    });
-  }
+function createPeerConnection(iceServers, broadcasterPeerId) {
+  // Viewer — polite: сейчас треков не добавляет и offer не шлёт (см. rtc.js),
+  // но при коллизии офферов в будущем должен уступать broadcaster'у.
+  return new RtcPeer({
+    iceServers,
+    polite: true,
+    signaling,
+    targetPeerId: broadcasterPeerId,
+    onTrack: (event) => {
+      hideOverlay();
+      if (remoteVideo.srcObject !== event.streams[0]) {
+        remoteVideo.srcObject = event.streams[0];
+      }
+      attemptPlay();
+    },
+    onStateChange: (connectionState) => {
+      if (connectionState === 'failed' && !terminalState) {
+        showOverlay({
+          title: 'Соединение потеряно',
+          text: 'Не удалось установить соединение с вещающим.',
+        });
+      }
+    },
+  });
 }
 
 // Политика автовоспроизведения: если браузер отклонил play() без явного
@@ -225,9 +188,9 @@ playButton.addEventListener('click', () => {
 });
 
 function cleanupPeer() {
-  if (pc) {
-    pc.close();
-    pc = null;
+  if (peer) {
+    peer.close();
+    peer = null;
   }
 }
 
