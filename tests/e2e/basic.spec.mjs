@@ -10,6 +10,11 @@
 // Chrome, прогнать реальный WebRTC-поток видео и чат поверх реального
 // сигналинга, закрыть вещающего и проверить, что зрители увидели завершение.
 //
+// Переиспользуемая инфраструктура (мини-раннер, сервер, стабы медиа,
+// чат-хелперы) вынесена в helpers.mjs — см. там подробные комментарии про
+// почему стабы именно такие и почему waitForFunction всегда с options
+// третьим аргументом. Второй e2e-файл — resilience.spec.mjs (обрывы связи).
+//
 // Про диалог getDisplayMedia на macOS (важно, см. финальный отчёт агента):
 // реальный захват экрана в headless/автоматизированном Chrome на macOS
 // упирается не столько во флаги Chrome, сколько в системное разрешение
@@ -36,9 +41,10 @@
 //     navigator.mediaDevices.getDisplayMedia на синтетический источник
 //     (canvas.captureStream) — реальный захват даже не пробуется: его зависший
 //     запрос ещё и тормозит последующие медиа-операции страницы (см. комментарий
-//     у installCaptureStub). Попытка реального захвата — E2E_TRY_REAL_CAPTURE=1
-//     (аналогично для микрофона зрителя — E2E_TRY_REAL_MIC=1);
-//     реальный код broadcaster.js/viewer.js/chat.js при этом не трогается.
+//     у installCaptureStub в helpers.mjs). Попытка реального захвата —
+//     E2E_TRY_REAL_CAPTURE=1 (аналогично для микрофона зрителя —
+//     E2E_TRY_REAL_MIC=1); реальный код broadcaster.js/viewer.js/chat.js при
+//     этом не трогается.
 //   - в выводе явно помечается, какой источник видео использовался; если
 //     использовался синтетический — проверка «это НАСТОЯЩИЙ захват экрана»
 //     помечается как skip, но проверки того, что видео реально идёт
@@ -47,314 +53,32 @@
 //     WebRTC-транспорt (SDP/ICE/media), а не происхождение пикселей.
 
 import { chromium } from 'playwright-core';
-import { spawn, execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, existsSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
+import {
+  REAL_CAPTURE_TIMEOUT_MS,
+  REAL_MIC_TIMEOUT_MS,
+  CAPTURE_FLAGS,
+  createRunner,
+  buildServer,
+  createServerController,
+  installCaptureStub,
+  installMicStub,
+  installSavedName,
+  waitForOverlayHidden,
+  assertVideoPlaying,
+  openChatPanel,
+  sendChatMessage,
+  messageTextsInclude,
+  unreadBadgeCount,
+} from './helpers.mjs';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const REPO_ROOT = path.resolve(__dirname, '../..');
 const PORT = 3322;
-const BASE_URL = `http://localhost:${PORT}`;
-const BINARY_PATH = path.join(REPO_ROOT, 'target/debug/screenshare');
-
-// Сколько ждём реальный getDisplayMedia в broadcaster-контексте, прежде чем
-// откатиться на синтетический источник (см. комментарий выше).
-const REAL_CAPTURE_TIMEOUT_MS = 10_000;
-
-// Сколько ждём реальный getUserMedia(audio) у зрителя, прежде чем откатиться
-// на синтетический источник (см. комментарий у installMicStub).
-const REAL_MIC_TIMEOUT_MS = 5_000;
-
-const CAPTURE_FLAGS = [
-  '--auto-select-desktop-capture-source=Entire screen',
-  '--use-fake-ui-for-media-stream',
-  '--use-fake-device-for-media-stream',
-];
-
-// --- Мини-раннер: ok/FAIL построчно, без внешнего test-runner'а ---
-
-let passedCount = 0;
-let failedCount = 0;
-let skippedCount = 0;
-
-async function step(name, fn) {
-  try {
-    await fn();
-    console.log(`ok - ${name}`);
-    passedCount++;
-    return true;
-  } catch (err) {
-    console.log(`FAIL - ${name}: ${err && err.message ? err.message : err}`);
-    failedCount++;
-    return false;
-  }
-}
-
-function skip(name, reason) {
-  console.log(`skip - ${name}: ${reason}`);
-  skippedCount++;
-}
-
-// --- Сервер: сборка, запуск, ожидание готовности, гарантированное убийство ---
-
-let serverProcess = null;
-let dbTmpDir = null;
-
-async function buildServer() {
-  console.log('# cargo build...');
-  execFileSync('cargo', ['build'], { cwd: REPO_ROOT, stdio: 'inherit' });
-  if (!existsSync(BINARY_PATH)) {
-    throw new Error(`бинарь не найден после сборки: ${BINARY_PATH}`);
-  }
-}
-
-async function startServer() {
-  dbTmpDir = mkdtempSync(path.join(tmpdir(), 'screenshare-e2e-'));
-  const dbPath = path.join(dbTmpDir, 'test.db');
-  serverProcess = spawn(BINARY_PATH, [], {
-    cwd: REPO_ROOT,
-    env: {
-      ...process.env,
-      PORT: String(PORT),
-      DATABASE_URL: `sqlite://${dbPath}?mode=rwc`,
-    },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-
-  let serverLog = '';
-  serverProcess.stdout.on('data', (d) => { serverLog += d.toString(); });
-  serverProcess.stderr.on('data', (d) => { serverLog += d.toString(); });
-  serverProcess.on('exit', (code, signal) => {
-    if (code !== null && code !== 0) {
-      console.log(`# сервер неожиданно завершился (code=${code}, signal=${signal})`);
-      console.log(serverLog);
-    }
-  });
-
-  const deadline = Date.now() + 10_000;
-  while (Date.now() < deadline) {
-    try {
-      const res = await fetch(`${BASE_URL}/`);
-      if (res.ok) return;
-    } catch {
-      // сервер ещё не поднялся — подождём и попробуем снова
-    }
-    await new Promise((r) => setTimeout(r, 150));
-  }
-  throw new Error(`сервер не ответил на ${BASE_URL}/ за 10с. Лог:\n${serverLog}`);
-}
-
-async function stopServer() {
-  if (!serverProcess) return;
-  await new Promise((resolve) => {
-    let resolved = false;
-    const done = () => { if (!resolved) { resolved = true; resolve(); } };
-    serverProcess.once('exit', done);
-    serverProcess.kill('SIGTERM');
-    setTimeout(() => {
-      if (!resolved) {
-        serverProcess.kill('SIGKILL');
-        done();
-      }
-    }, 3000);
-  });
-  serverProcess = null;
-  if (dbTmpDir) {
-    rmSync(dbTmpDir, { recursive: true, force: true });
-    dbTmpDir = null;
-  }
-}
-
-// --- Синтетический источник видео для случая, когда реальный getDisplayMedia
-//     недоступен (см. комментарий в шапке файла). Ставится ДО загрузки любых
-//     скриптов страницы через addInitScript — static/broadcaster.js не трогаем. ---
-
-// ВАЖНО (выяснено диагностикой флейка mic-ренегоциации): попытка реального
-// getDisplayMedia, чей промис на этой машине никогда не резолвится, не просто
-// стоит 10 секунд на старте — зависший desktop-capture-запрос остаётся жить в
-// медиастеке Chrome и потом задерживает обработку последующих медиа-операций
-// той же страницы (ответ вещающего на mic-offer зрителя приходил ровно через
-// REAL_CAPTURE_TIMEOUT_MS после offer'а). Поэтому по умолчанию идём сразу в
-// синтетику; попытка реального захвата — только по E2E_TRY_REAL_CAPTURE=1.
-function installCaptureStub() {
-  return ({ tryReal, timeoutMs }) => {
-    const realGetDisplayMedia = navigator.mediaDevices.getDisplayMedia
-      ? navigator.mediaDevices.getDisplayMedia.bind(navigator.mediaDevices)
-      : null;
-
-    navigator.mediaDevices.getDisplayMedia = async (constraints) => {
-      if (tryReal && realGetDisplayMedia) {
-        const withTimeout = (p, ms) =>
-          Promise.race([
-            p,
-            new Promise((_, reject) => setTimeout(() => reject(new Error('e2e-real-capture-timeout')), ms)),
-          ]);
-        try {
-          const stream = await withTimeout(realGetDisplayMedia(constraints), timeoutMs);
-          window.__e2eCaptureSource = 'real';
-          return stream;
-        } catch (err) {
-          console.warn('[e2e] реальный getDisplayMedia не сработал за отведённое время, откат на синтетический источник:', err);
-        }
-      }
-
-      window.__e2eCaptureSource = 'synthetic';
-      const canvas = document.createElement('canvas');
-      canvas.width = 320;
-      canvas.height = 240;
-      const ctx = canvas.getContext('2d');
-      let hue = 0;
-      const draw = () => {
-        hue = (hue + 3) % 360;
-        ctx.fillStyle = `hsl(${hue}, 70%, 50%)`;
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        ctx.fillStyle = '#ffffff';
-        ctx.font = '20px sans-serif';
-        ctx.fillText(String(Date.now()), 10, 30);
-        window.__e2eSyntheticFrame = requestAnimationFrame(draw);
-      };
-      draw();
-      return canvas.captureStream(30);
-    };
-  };
-}
-
-// --- Синтетический источник аудио для микрофона зрителя ---
-//
-// Ожидалось, что --use-fake-device-for-media-stream + --use-fake-ui-for-media-stream
-// (уже переданы в browser.launch, см. CAPTURE_FLAGS) достаточно, чтобы
-// navigator.mediaDevices.getUserMedia({ audio: true }) резолвился фейковым
-// микрофоном без диалога — так документирует Chromium и так ведут себя флаги
-// для getDisplayMedia выше. На практике на этой машине getUserMedia(audio)
-// зависает навсегда даже при явно выданном разрешении (permissions.query
-// возвращает 'granted', проверено через ctx.grantPermissions) и в headed, и в
-// headless режиме — то есть проблема не в системном TCC (в отличие от
-// getDisplayMedia/Screen Recording выше, для микрофона Chrome в TCC.db разрешён),
-// а, по всей видимости, в недоступности реального аудио-HAL для процесса
-// автоматизации в этой среде. Тестовый арнесс подменяет getUserMedia на
-// синтетический аудиотрек (осциллятор Web Audio API ->
-// MediaStreamAudioDestinationNode) — он не трогает реальное аудио-железо и
-// создаёт полноценный live-трек. static/viewer.js при этом не меняется — он
-// как обычно вызывает getUserMedia({ audio: true }) и просто получает то,
-// что вернёт браузер.
-//
-// ВАЖНО (выяснено диагностикой флейка): вариант «сначала пробуем реальный
-// getUserMedia с таймаутом через Promise.race + setTimeout» ненадёжен —
-// страница зрителя к моменту клика по микрофону может быть фоновой, а Chrome
-// троттлит таймеры фоновых страниц, поэтому 5-секундный фолбэк срабатывал
-// через десятки секунд и тест мигал. Реальный getUserMedia на этой машине
-// всё равно стабильно зависает, так что по умолчанию идём сразу в синтетику;
-// попытку реального захвата можно включить env-переменной E2E_TRY_REAL_MIC=1
-// (полезно на машинах, где fake-device флаги работают как задумано).
-function installMicStub() {
-  return ({ tryReal, timeoutMs }) => {
-    const realGetUserMedia = navigator.mediaDevices.getUserMedia
-      ? navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices)
-      : null;
-
-    navigator.mediaDevices.getUserMedia = async (constraints) => {
-      if (tryReal && realGetUserMedia) {
-        const withTimeout = (p, ms) =>
-          Promise.race([
-            p,
-            new Promise((_, reject) => setTimeout(() => reject(new Error('e2e-real-mic-timeout')), ms)),
-          ]);
-        try {
-          const stream = await withTimeout(realGetUserMedia(constraints), timeoutMs);
-          window.__e2eMicSource = 'real';
-          return stream;
-        } catch (err) {
-          console.warn('[e2e] реальный getUserMedia(audio) не сработал за отведённое время, откат на синтетический источник:', err);
-        }
-      }
-
-      window.__e2eMicSource = 'synthetic';
-      const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
-      const audioCtx = new AudioContextCtor();
-      const oscillator = audioCtx.createOscillator();
-      oscillator.frequency.value = 440;
-      const destination = audioCtx.createMediaStreamDestination();
-      oscillator.connect(destination);
-      oscillator.start();
-      return destination.stream;
-    };
-  };
-}
-
-// --- Вспомогательные функции для страниц ---
-
-// Дожидается реального просмотра потока у зрителя. Хром блокирует autoplay
-// незамьюченного <video> без пользовательского взаимодействия со страницей —
-// в этом случае viewer.js сам показывает кнопку «Нажмите, чтобы начать
-// просмотр» (см. static/viewer.js: attemptPlay()). Это штатное поведение
-// приложения, а не баг — поэтому тест эмулирует реального пользователя и
-// кликает по кнопке, если она появилась, вместо того чтобы обходить это стороной.
-// Важно: НЕ page.waitForSelector('#overlay.hidden') — по умолчанию он ждёт
-// видимость совпавшего элемента, а элемент с классом .hidden как раз
-// display:none (см. static/style.css), поэтому такой селектор никогда бы не
-// срезолвился. Проверяем classList напрямую через waitForFunction.
-async function waitForOverlayHidden(page, timeoutMs = 20_000) {
-  const isOverlayHidden = () => document.getElementById('overlay').classList.contains('hidden');
-  const outcome = await Promise.race([
-    page.waitForFunction(isOverlayHidden, undefined, { polling: 100, timeout: timeoutMs }).then(() => 'hidden'),
-    page.waitForSelector('#play-button:not(.hidden)', { timeout: timeoutMs }).then(() => 'play-button'),
-  ]);
-  if (outcome === 'play-button') {
-    await page.click('#play-button');
-    await page.waitForFunction(isOverlayHidden, undefined, { polling: 100, timeout: 5000 });
-  }
-}
-
-async function getChatDom(page) {
-  return {
-    toggleButton: page.locator('.chat-toggle-button'),
-    unreadBadge: page.locator('.chat-unread-badge'),
-    panel: page.locator('.chat-panel'),
-    messages: page.locator('.chat-message-text'),
-    textInput: page.locator('.chat-text-input'),
-    sendButton: page.locator('.chat-send-button'),
-  };
-}
-
-async function openChatPanel(page) {
-  const chat = await getChatDom(page);
-  await chat.toggleButton.click();
-  await chat.panel.waitFor({ state: 'visible' });
-}
-
-async function sendChatMessage(page, text) {
-  const chat = await getChatDom(page);
-  await chat.textInput.fill(text);
-  await chat.sendButton.click();
-}
-
-async function messageTextsInclude(page, text, timeoutMs = 5000) {
-  const chat = await getChatDom(page);
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const texts = await chat.messages.allTextContents();
-    if (texts.includes(text)) return true;
-    await new Promise((r) => setTimeout(r, 100));
-  }
-  return false;
-}
-
-async function unreadBadgeCount(page) {
-  const chat = await getChatDom(page);
-  const hidden = await chat.unreadBadge.evaluate((el) => el.classList.contains('hidden'));
-  if (hidden) return 0;
-  const text = await chat.unreadBadge.textContent();
-  return Number(text);
-}
-
-// --- Основной сценарий ---
+const { step, skip, printSummary, bumpFailedForUnexpectedError, counts } = createRunner();
+const server = createServerController(PORT);
 
 async function main() {
   await buildServer();
-  await startServer();
+  await server.start();
 
   let browser = null;
   try {
@@ -376,7 +100,7 @@ async function main() {
     let captureSource = 'unknown';
 
     const setupOk = await step('вещающий: открыть страницу и начать трансляцию', async () => {
-      await broadcasterPage.goto(BASE_URL);
+      await broadcasterPage.goto(server.baseUrl);
       await broadcasterPage.click('#start-button');
       await broadcasterPage.waitForSelector('#live-section:not(.hidden)', {
         timeout: REAL_CAPTURE_TIMEOUT_MS + 8_000,
@@ -425,20 +149,14 @@ async function main() {
     // Имена зрителей — заранее в localStorage (chat.js: NAME_STORAGE_KEY =
     // 'screenshare-name'), чтобы broadcaster узнал их из join-room и подписал
     // ими источники ретранслируемого аудио (см. индикатор «кто говорит» ниже).
-    // addInitScript выполняется до любого скрипта страницы при каждой
-    // навигации — значение уже будет в localStorage к моменту init() в viewer.js.
-    await viewer1Context.addInitScript((name) => {
-      localStorage.setItem('screenshare-name', name);
-    }, 'Вася');
-    await viewer2Context.addInitScript((name) => {
-      localStorage.setItem('screenshare-name', name);
-    }, 'Петя');
+    await installSavedName(viewer1Context, 'Вася');
+    await installSavedName(viewer2Context, 'Петя');
     const viewer1Page = await viewer1Context.newPage();
     const viewer2Page = await viewer2Context.newPage();
 
     const viewersJoinedOk = await step('оба зрителя: открыть комнату и дождаться исчезновения оверлея', async () => {
-      await viewer1Page.goto(`${BASE_URL}/room/${roomId}`);
-      await viewer2Page.goto(`${BASE_URL}/room/${roomId}`);
+      await viewer1Page.goto(`${server.baseUrl}/room/${roomId}`);
+      await viewer2Page.goto(`${server.baseUrl}/room/${roomId}`);
       await waitForOverlayHidden(viewer1Page);
       await waitForOverlayHidden(viewer2Page);
     });
@@ -446,23 +164,7 @@ async function main() {
     if (viewersJoinedOk) {
       for (const [label, page] of [['зритель №1', viewer1Page], ['зритель №2', viewer2Page]]) {
         await step(`видео реально идёт у ${label} (videoWidth/readyState/currentTime)`, async () => {
-          const before = await page.evaluate(() => {
-            const v = document.getElementById('remote-video');
-            return { videoWidth: v.videoWidth, readyState: v.readyState, currentTime: v.currentTime };
-          });
-          assert.ok(before.videoWidth > 0, `videoWidth должен быть > 0, получено ${before.videoWidth}`);
-          assert.ok(before.readyState >= 2, `readyState должен быть >= 2, получено ${before.readyState}`);
-
-          await new Promise((r) => setTimeout(r, 2000));
-
-          const after = await page.evaluate(() => {
-            const v = document.getElementById('remote-video');
-            return { currentTime: v.currentTime };
-          });
-          assert.ok(
-            after.currentTime > before.currentTime,
-            `currentTime должен вырасти за 2с: было ${before.currentTime}, стало ${after.currentTime}`
-          );
+          await assertVideoPlaying(page);
         });
       }
     } else {
@@ -528,7 +230,7 @@ async function main() {
         await openChatPanel(viewer2Page);
         const unread = await unreadBadgeCount(viewer2Page);
         assert.equal(unread, 0, 'бейдж должен сброситься после открытия панели');
-        const texts = await (await getChatDom(viewer2Page)).messages.allTextContents();
+        const texts = await viewer2Page.locator('.chat-message-text').allTextContents();
         assert.ok(texts.length >= 2, `ожидалось минимум 2 сообщения в истории, получено ${texts.length}`);
       });
     } else {
@@ -544,9 +246,9 @@ async function main() {
     // по документации Chromium этого достаточно, чтобы getUserMedia({ audio: true })
     // резолвился фейковым микрофоном без диалога. installMicStub() пробует
     // это первым и только если не сработало (как оказалось, стабильно не
-    // срабатывает на этой машине, см. комментарий у installMicStub) — подменяет
-    // источник на синтетический аудиотрек тестового арнесса. В любом случае
-    // WebRTC-ренегоциация и обновление UI у вещающего проверяются по-настоящему.
+    // срабатывает на этой машине, см. комментарий у installMicStub в helpers.mjs) —
+    // подменяет источник на синтетический аудиотрек тестового арнесса. В любом
+    // случае WebRTC-ренегоциация и обновление UI у вещающего проверяются по-настоящему.
     if (viewersJoinedOk) {
       await step('зритель №1 включает микрофон — у вещающего появляется «микрофонов: 1» и <audio>-элемент', async () => {
         await viewer1Page.click('#mic-button');
@@ -674,20 +376,19 @@ async function main() {
     if (!broadcasterPage.isClosed()) await broadcasterContext.close();
   } finally {
     if (browser) await browser.close();
-    await stopServer();
+    await server.stop();
   }
 }
 
 main()
   .then(() => {
-    console.log('');
-    console.log(`# итого: ok=${passedCount} FAIL=${failedCount} skip=${skippedCount}`);
-    process.exit(failedCount > 0 ? 1 : 0);
+    printSummary();
+    process.exit(counts.failedCount > 0 ? 1 : 0);
   })
   .catch(async (err) => {
     console.log(`FAIL - неожиданная ошибка теста: ${err && err.stack ? err.stack : err}`);
-    try { await stopServer(); } catch { /* уже остановлен или не запускался */ }
-    console.log('');
-    console.log(`# итого: ok=${passedCount} FAIL=${failedCount + 1} skip=${skippedCount}`);
+    try { await server.stop(); } catch { /* уже остановлен или не запускался */ }
+    bumpFailedForUnexpectedError();
+    printSummary();
     process.exit(1);
   });
