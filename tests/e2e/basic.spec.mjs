@@ -32,15 +32,13 @@
 //      + --use-fake-device-for-media-stream
 //
 // Поэтому тест ведёт себя так:
-//   - broadcaster-контекст запускается с комбинацией №5 (наиболее вероятная
-//     из документации Chromium) и реальный getDisplayMedia пробуется первым,
-//     с таймаутом REAL_CAPTURE_TIMEOUT_MS;
-//   - если за это время реального потока нет — тестовый арнесс (не
-//     static/broadcaster.js!) подменяет navigator.mediaDevices.getDisplayMedia
-//     на синтетический источник (canvas.captureStream), чтобы не блокировать
-//     остальную часть сценария (комната всё равно должна быть создана: без
-//     неё нельзя проверить чат/счётчик зрителей/завершение трансляции).
-//     Реальный код broadcaster.js/viewer.js/chat.js при этом не трогается.
+//   - по умолчанию тестовый арнесс (не static/broadcaster.js!) сразу подменяет
+//     navigator.mediaDevices.getDisplayMedia на синтетический источник
+//     (canvas.captureStream) — реальный захват даже не пробуется: его зависший
+//     запрос ещё и тормозит последующие медиа-операции страницы (см. комментарий
+//     у installCaptureStub). Попытка реального захвата — E2E_TRY_REAL_CAPTURE=1
+//     (аналогично для микрофона зрителя — E2E_TRY_REAL_MIC=1);
+//     реальный код broadcaster.js/viewer.js/chat.js при этом не трогается.
 //   - в выводе явно помечается, какой источник видео использовался; если
 //     использовался синтетический — проверка «это НАСТОЯЩИЙ захват экрана»
 //     помечается как skip, но проверки того, что видео реально идёт
@@ -174,14 +172,21 @@ async function stopServer() {
 //     недоступен (см. комментарий в шапке файла). Ставится ДО загрузки любых
 //     скриптов страницы через addInitScript — static/broadcaster.js не трогаем. ---
 
+// ВАЖНО (выяснено диагностикой флейка mic-ренегоциации): попытка реального
+// getDisplayMedia, чей промис на этой машине никогда не резолвится, не просто
+// стоит 10 секунд на старте — зависший desktop-capture-запрос остаётся жить в
+// медиастеке Chrome и потом задерживает обработку последующих медиа-операций
+// той же страницы (ответ вещающего на mic-offer зрителя приходил ровно через
+// REAL_CAPTURE_TIMEOUT_MS после offer'а). Поэтому по умолчанию идём сразу в
+// синтетику; попытка реального захвата — только по E2E_TRY_REAL_CAPTURE=1.
 function installCaptureStub() {
-  return (timeoutMs) => {
+  return ({ tryReal, timeoutMs }) => {
     const realGetDisplayMedia = navigator.mediaDevices.getDisplayMedia
       ? navigator.mediaDevices.getDisplayMedia.bind(navigator.mediaDevices)
       : null;
 
     navigator.mediaDevices.getDisplayMedia = async (constraints) => {
-      if (realGetDisplayMedia) {
+      if (tryReal && realGetDisplayMedia) {
         const withTimeout = (p, ms) =>
           Promise.race([
             p,
@@ -229,21 +234,29 @@ function installCaptureStub() {
 // headless режиме — то есть проблема не в системном TCC (в отличие от
 // getDisplayMedia/Screen Recording выше, для микрофона Chrome в TCC.db разрешён),
 // а, по всей видимости, в недоступности реального аудио-HAL для процесса
-// автоматизации в этой среде. Поэтому здесь применяется тот же приём, что и для
-// getDisplayMedia: реальный getUserMedia пробуется первым с таймаутом, а если
-// не успел — тестовый арнесс подменяет его на синтетический аудиотрек
-// (осциллятор Web Audio API -> MediaStreamAudioDestinationNode), который не
-// трогает никакое реальное аудио-железо и создаёт полноценный live-трек.
-// static/viewer.js при этом не меняется — он как обычно вызывает
-// getUserMedia({ audio: true }) и просто получает то, что вернёт браузер.
+// автоматизации в этой среде. Тестовый арнесс подменяет getUserMedia на
+// синтетический аудиотрек (осциллятор Web Audio API ->
+// MediaStreamAudioDestinationNode) — он не трогает реальное аудио-железо и
+// создаёт полноценный live-трек. static/viewer.js при этом не меняется — он
+// как обычно вызывает getUserMedia({ audio: true }) и просто получает то,
+// что вернёт браузер.
+//
+// ВАЖНО (выяснено диагностикой флейка): вариант «сначала пробуем реальный
+// getUserMedia с таймаутом через Promise.race + setTimeout» ненадёжен —
+// страница зрителя к моменту клика по микрофону может быть фоновой, а Chrome
+// троттлит таймеры фоновых страниц, поэтому 5-секундный фолбэк срабатывал
+// через десятки секунд и тест мигал. Реальный getUserMedia на этой машине
+// всё равно стабильно зависает, так что по умолчанию идём сразу в синтетику;
+// попытку реального захвата можно включить env-переменной E2E_TRY_REAL_MIC=1
+// (полезно на машинах, где fake-device флаги работают как задумано).
 function installMicStub() {
-  return (timeoutMs) => {
+  return ({ tryReal, timeoutMs }) => {
     const realGetUserMedia = navigator.mediaDevices.getUserMedia
       ? navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices)
       : null;
 
     navigator.mediaDevices.getUserMedia = async (constraints) => {
-      if (realGetUserMedia) {
+      if (tryReal && realGetUserMedia) {
         const withTimeout = (p, ms) =>
           Promise.race([
             p,
@@ -286,12 +299,12 @@ function installMicStub() {
 async function waitForOverlayHidden(page, timeoutMs = 20_000) {
   const isOverlayHidden = () => document.getElementById('overlay').classList.contains('hidden');
   const outcome = await Promise.race([
-    page.waitForFunction(isOverlayHidden, { timeout: timeoutMs }).then(() => 'hidden'),
+    page.waitForFunction(isOverlayHidden, undefined, { polling: 100, timeout: timeoutMs }).then(() => 'hidden'),
     page.waitForSelector('#play-button:not(.hidden)', { timeout: timeoutMs }).then(() => 'play-button'),
   ]);
   if (outcome === 'play-button') {
     await page.click('#play-button');
-    await page.waitForFunction(isOverlayHidden, { timeout: 5000 });
+    await page.waitForFunction(isOverlayHidden, undefined, { polling: 100, timeout: 5000 });
   }
 }
 
@@ -353,7 +366,10 @@ async function main() {
 
     // --- Вещающий ---
     const broadcasterContext = await browser.newContext();
-    await broadcasterContext.addInitScript(installCaptureStub(), REAL_CAPTURE_TIMEOUT_MS);
+    await broadcasterContext.addInitScript(installCaptureStub(), {
+      tryReal: process.env.E2E_TRY_REAL_CAPTURE === '1',
+      timeoutMs: REAL_CAPTURE_TIMEOUT_MS,
+    });
     const broadcasterPage = await broadcasterContext.newPage();
 
     let roomId = null;
@@ -400,8 +416,12 @@ async function main() {
     // --- Два зрителя ---
     const viewer1Context = await browser.newContext();
     const viewer2Context = await browser.newContext();
-    await viewer1Context.addInitScript(installMicStub(), REAL_MIC_TIMEOUT_MS);
-    await viewer2Context.addInitScript(installMicStub(), REAL_MIC_TIMEOUT_MS);
+    const micStubArg = {
+      tryReal: process.env.E2E_TRY_REAL_MIC === '1',
+      timeoutMs: REAL_MIC_TIMEOUT_MS,
+    };
+    await viewer1Context.addInitScript(installMicStub(), micStubArg);
+    await viewer2Context.addInitScript(installMicStub(), micStubArg);
     const viewer1Page = await viewer1Context.newPage();
     const viewer2Page = await viewer2Context.newPage();
 
@@ -444,7 +464,8 @@ async function main() {
       await step('счётчик зрителей у вещающего показывает 2', async () => {
         await broadcasterPage.waitForFunction(
           () => document.getElementById('viewer-count')?.textContent === '2',
-          { timeout: 5000 }
+          undefined,
+          { polling: 100, timeout: 5000 }
         );
       });
     } else {
@@ -524,7 +545,8 @@ async function main() {
             const el = document.getElementById('mic-indicator');
             return !!el && !el.classList.contains('hidden') && el.textContent.includes('1');
           },
-          { timeout: 8000 }
+          undefined,
+          { polling: 100, timeout: 8000 }
         );
 
         const micSource = await viewer1Page.evaluate(() => window.__e2eMicSource || 'unknown');
@@ -584,7 +606,8 @@ async function main() {
         for (const [label, page] of [['зритель №1', viewer1Page], ['зритель №2', viewer2Page]]) {
           await page.waitForFunction(
             () => document.getElementById('overlay-title')?.textContent === 'Трансляция завершена',
-            { timeout: 5000 }
+            undefined,
+            { polling: 100, timeout: 5000 }
           );
         }
       });
