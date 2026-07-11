@@ -1,0 +1,322 @@
+/* Общие стили: тёмная тема по умолчанию, адаптивная вёрстка, без UI-библиотек. */
+
+:root {
+  --bg: #101215;
+  --bg-elevated: #1a1d22;
+  --border: #2a2e35;
+  --text: #e8eaed;
+  --text-muted: #9aa0a8;
+  --accent: #4f8cff;
+  --accent-hover: #6ea0ff;
+  --danger: #e5484d;
+  --danger-hover: #ff5d61;
+  --success: #33b56c;
+  --radius: 12px;
+  --shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+}
+
+/* ---------- Broadcaster ---------- */
+
+.page {
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 24px 16px 48px;
+}
+
+.header {
+  width: 100%;
+  max-width: 720px;
+  text-align: center;
+  margin-bottom: 24px;
+}
+
+.header h1 {
+  font-size: 1.5rem;
+  margin: 0 0 4px;
+}
+
+.header p {
+  color: var(--text-muted);
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.card {
+  width: 100%;
+  max-width: 720px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  align-items: center;
+}
+
+.start-button,
+.stop-button,
+.copy-button,
+.retry-button {
+  border: none;
+  border-radius: var(--radius);
+  cursor: pointer;
+  font-size: 1rem;
+  font-weight: 600;
+  font-family: inherit;
+  transition: background-color 0.15s ease, transform 0.1s ease;
+}
+
+.start-button {
+  background: var(--accent);
+  color: #fff;
+  padding: 18px 36px;
+  font-size: 1.15rem;
+}
+
+.start-button:hover {
+  background: var(--accent-hover);
+}
+
+.start-button:active {
+  transform: scale(0.98);
+}
+
+.start-button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.stop-button {
+  background: var(--danger);
+  color: #fff;
+  padding: 12px 28px;
+}
+
+.stop-button:hover {
+  background: var(--danger-hover);
+}
+
+.retry-button {
+  background: var(--bg-elevated);
+  color: var(--text);
+  border: 1px solid var(--border);
+  padding: 10px 20px;
+}
+
+.retry-button:hover {
+  border-color: var(--accent);
+}
+
+.live-section {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  align-items: center;
+}
+
+.preview {
+  width: 100%;
+  max-width: 640px;
+  aspect-ratio: 16 / 9;
+  background: #000;
+  border-radius: var(--radius);
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+
+.preview video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+
+.room-link-row {
+  width: 100%;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.room-link-input {
+  flex: 1;
+  min-width: 0;
+  padding: 12px 14px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.95rem;
+}
+
+.copy-button {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  padding: 12px 18px;
+  white-space: nowrap;
+}
+
+.copy-button:hover {
+  border-color: var(--accent);
+}
+
+.copy-button.copied {
+  background: var(--success);
+  border-color: var(--success);
+  color: #fff;
+}
+
+.viewer-count {
+  font-size: 1rem;
+  color: var(--text-muted);
+}
+
+.viewer-count strong {
+  color: var(--text);
+}
+
+.status-message {
+  min-height: 1.4em;
+  font-size: 0.95rem;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.status-message.error {
+  color: var(--danger);
+}
+
+.hidden {
+  display: none !important;
+}
+
+/* ---------- Viewer ---------- */
+
+.viewer-page {
+  position: fixed;
+  inset: 0;
+  background: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.viewer-video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #000;
+}
+
+.overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding: 24px;
+  text-align: center;
+  background: rgba(10, 11, 13, 0.82);
+  backdrop-filter: blur(2px);
+}
+
+.overlay h2 {
+  margin: 0;
+  font-size: 1.3rem;
+  font-weight: 600;
+}
+
+.overlay p {
+  margin: 0;
+  color: var(--text-muted);
+  max-width: 420px;
+}
+
+.spinner {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  border: 3px solid var(--border);
+  border-top-color: var(--accent);
+  animation: spin 0.9s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.play-button {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius);
+  padding: 16px 32px;
+  font-size: 1.05rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.play-button:hover {
+  background: var(--accent-hover);
+}
+
+@media (max-width: 480px) {
+  .card {
+    padding: 16px;
+  }
+
+  .room-link-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .start-button {
+    padding: 16px 24px;
+    width: 100%;
+  }
+}
+
+/* Светлая тема, если пользователь явно предпочитает её на уровне ОС. */
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f4f5f7;
+    --bg-elevated: #ffffff;
+    --border: #dde1e6;
+    --text: #1a1d22;
+    --text-muted: #565c66;
+    --shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
+  }
+
+  .room-link-input {
+    color: var(--text);
+  }
+}

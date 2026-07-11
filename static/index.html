@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Шеринг экрана — вещание</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="page">
+    <div class="header">
+      <h1>Шеринг экрана</h1>
+      <p>Начните трансляцию и поделитесь ссылкой с зрителями</p>
+    </div>
+
+    <div class="card">
+      <!-- Исходное состояние -->
+      <button id="start-button" class="start-button">Начать трансляцию</button>
+
+      <!-- Состояние активной трансляции (изначально скрыто) -->
+      <div id="live-section" class="live-section hidden">
+        <div class="preview">
+          <video id="preview-video" autoplay muted playsinline></video>
+        </div>
+
+        <div class="room-link-row">
+          <input id="room-link-input" class="room-link-input" type="text" readonly />
+          <button id="copy-button" class="copy-button">Скопировать</button>
+        </div>
+
+        <div class="viewer-count">
+          Зрителей: <strong id="viewer-count">0</strong> / 5
+        </div>
+
+        <button id="stop-button" class="stop-button">Остановить трансляцию</button>
+      </div>
+
+      <div id="status-message" class="status-message"></div>
+    </div>
+  </div>
+
+  <script src="/static/common.js"></script>
+  <script src="/static/broadcaster.js"></script>
+</body>
+</html>

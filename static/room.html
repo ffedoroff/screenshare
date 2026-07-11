@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Шеринг экрана — просмотр</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="viewer-page">
+    <video id="remote-video" class="viewer-video" autoplay playsinline></video>
+
+    <!-- Оверлей текущего состояния (подключение / ожидание / ошибка и т.п.) -->
+    <div id="overlay" class="overlay">
+      <div id="overlay-spinner" class="spinner"></div>
+      <h2 id="overlay-title">Подключение…</h2>
+      <p id="overlay-text"></p>
+      <button id="play-button" class="play-button hidden">Нажмите, чтобы начать просмотр</button>
+    </div>
+  </div>
+
+  <script src="/static/common.js"></script>
+  <script src="/static/viewer.js"></script>
+</body>
+</html>
