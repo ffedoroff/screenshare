@@ -33,6 +33,7 @@ cargo run
 |---|---|---|
 | `PORT` | нет (по умолчанию `3000`) | порт HTTP/WebSocket-сервера |
 | `DATABASE_URL` | нет (по умолчанию `sqlite://screenshare.db?mode=rwc`) | путь к SQLite-БД истории чата; миграции применяются автоматически при старте |
+| `STATIC_DIR` | нет (по умолчанию каталог `static/` рядом с `Cargo.toml`) | откуда раздавать статику фронтенда; в контейнере — например `/app/static` |
 | `TURN_URL` | нет | адрес TURN-сервера (например `turn:example.com:3478`) |
 | `TURN_USERNAME` | нет | логин для TURN |
 | `TURN_PASSWORD` | нет | пароль для TURN |
@@ -136,6 +137,17 @@ TURN_USERNAME=user
 TURN_PASSWORD=pass
 ```
 
+## Деплой
+
+Прод крутится в KubeSolo (single-node k8s) на `chat.fedorov.it`, наружу
+опубликован через Cloudflare Tunnel. Автодеплой — push в `main`
+(`.github/workflows/deploy-prod.yml`), манифесты и подробности —
+[`deploy/README.md`](deploy/README.md).
+
+Ограничение: в проде **одна реплика** (комнаты живут в памяти процесса, а
+SQLite — с одним писателем), деплой = `Recreate`, а не rolling update — при
+выкатке новой версии активные трансляции на несколько секунд обрываются.
+
 ## Структура репозитория
 
 ```
@@ -157,6 +169,12 @@ static/
 tests/
   signaling.test.mjs   — протокольный тест сигналинга/чата без браузера (см. «Тестирование»)
   e2e/                 — браузерный e2e на playwright-core + системный Chrome (см. «Тестирование»)
+Dockerfile           — образ для деплоя (distroless/cc), см. «Деплой»
+deploy/
+  manifests/           — k8s-манифесты KubeSolo (namespace/pvc/deployment/service/ingress/rbac)
+  README.md            — порядок применения и устройство CI-деплоя
+.github/workflows/
+  deploy-prod.yml      — автодеплой prod при push в main
 ```
 
 ## Протокол сигналинга (WebSocket, JSON)

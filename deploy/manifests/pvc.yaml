@@ -1,0 +1,9 @@
+# PVC для SQLite-файла истории чата (единственный писатель, см. deployment.yaml).
+# storageClassName local-path — дефолтный provisioner KubeSolo (из коробки).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: chat-data, namespace: chat-prod }
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources: { requests: { storage: 1Gi } }

@@ -1,0 +1,17 @@
+# Публикация наружу через cloudflare-tunnel-ingress-controller (уже развёрнут
+# на кластере, обслуживает и другие проекты — см. simple-deploy/cloudflare/tunnel.md
+# «Вариант 2»). Контроллер сам заводит туннель и DNS-запись по этому Ingress —
+# отдельно в дашборде Cloudflare ничего создавать не нужно.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: chat, namespace: chat-prod }
+spec:
+  ingressClassName: cloudflare-tunnel
+  rules:
+  - host: chat.fedorov.it
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service: { name: chat, port: { number: 80 } }

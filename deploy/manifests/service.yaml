@@ -1,0 +1,7 @@
+# ClusterIP-сервис перед подом приложения.
+apiVersion: v1
+kind: Service
+metadata: { name: chat, namespace: chat-prod }
+spec:
+  selector: { app: chat }
+  ports: [ { port: 80, targetPort: 8080 } ]

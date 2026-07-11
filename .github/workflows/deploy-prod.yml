@@ -1,0 +1,54 @@
+# Автодеплой prod при пуше в main. Доставка образа — без реестра, напрямую
+# на сервер по SSH (deployer в forced command импортирует образ в containerd
+# и катит `kubectl set image`). Подробности — deploy/README.md и
+# simple-deploy/kube/backend-deploy.md.
+#
+# Стандарты (simple-deploy/standards/delivery/*):
+#   - иммутабельный тег образа prod-<short-sha>, деплоится ровно github.sha;
+#   - деплой гейтится зелёными тестами (job test);
+#   - в образ впекаются APP_VERSION/GIT_COMMIT/BUILD_DATE (отдаются в /version.json);
+#   - откат = перезапуск run'а предыдущего коммита (gh run rerun <id>).
+#
+# Секреты репозитория: DEPLOY_SSH_KEY, DEPLOY_HOST, DEPLOY_PORT, DEPLOY_KNOWN_HOSTS
+name: deploy-prod
+on: { push: { branches: [main] } }
+concurrency: { group: deploy-prod, cancel-in-progress: false }
+permissions: { contents: read }
+jobs:
+  # Красные тесты не пускают деплой: протокол сигналинга гоняется целиком
+  # (тест сам собирает и поднимает сервер). Браузерный e2e в CI не гоняем.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - uses: Swatinem/rust-cache@v2
+      - name: Тесты протокола сигналинга (43 проверки, включает cargo build)
+        run: node tests/signaling.test.mjs
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build (linux/amd64, тег prod-<sha>)
+        run: |
+          TAG="prod-$(git rev-parse --short HEAD)"; echo "TAG=$TAG" >> "$GITHUB_ENV"
+          docker buildx build --provenance=false --sbom=false --platform linux/amd64 \
+            --build-arg APP_VERSION="$TAG" \
+            --build-arg GIT_COMMIT="$(git rev-parse HEAD)" \
+            --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --cache-from type=gha --cache-to type=gha,mode=max \
+            --load -t "chat:$TAG" .
+      - name: Deliver + deploy
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          PORT: ${{ secrets.DEPLOY_PORT }}
+          KNOWN: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m600 /dev/stdin key <<<"$KEY"
+          mkdir -p ~/.ssh && printf '%s\n' "$KNOWN" >> ~/.ssh/known_hosts
+          docker save "chat:$TAG" | gzip | ssh -i key -p "$PORT" "deployer@$HOST" "prod $TAG"
