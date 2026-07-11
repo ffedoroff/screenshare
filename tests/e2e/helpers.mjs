@@ -243,7 +243,22 @@ export function installMicStub() {
         try {
           const stream = await withTimeout(realGetUserMedia(constraints), timeoutMs);
           window.__e2eMicSource = 'real';
-          return stream;
+          // Нормализация громкости: фейковое аудиоустройство Chrome
+          // (--use-fake-device-for-media-stream) выдаёт очень тихий тон —
+          // RMS ~0.010–0.019, аккурат на границе продуктового порога
+          // детектора «кто говорит» (0.02), из-за чего проверка индикатора
+          // флейкала. Прогоняем трек через GainNode ×6: тестируется тот же
+          // реальный путь getUserMedia (разрешения, устройство), но громкость
+          // становится детерминированно «речевой». Порог продукта под тест
+          // не подгоняем принципиально.
+          const boostCtx = new (window.AudioContext || window.webkitAudioContext)();
+          const boostSrc = boostCtx.createMediaStreamSource(stream);
+          const gain = boostCtx.createGain();
+          gain.gain.value = 6;
+          const boostDst = boostCtx.createMediaStreamDestination();
+          boostSrc.connect(gain);
+          gain.connect(boostDst);
+          return boostDst.stream;
         } catch (err) {
           console.warn('[e2e] реальный getUserMedia(audio) не сработал за отведённое время, откат на синтетический источник:', err);
         }
