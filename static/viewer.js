@@ -254,6 +254,17 @@ playButton.addEventListener('click', () => {
 // отдельная MediaStream). В обоих случаях подключаем детектор уровня звука; для
 // чужого микрофона дополнительно заводим скрытый <audio autoplay>, чтобы его
 // вообще было слышно (звук вещающего и так слышен через <video>).
+//
+// Чистка скрытого <audio> и монитора уровня — по совокупности сигналов, не
+// только по track.onended. Когда вещающий убирает ретранслированный трек
+// через pc.removeTrack (broadcaster.js: unrelayAudioTrack), Chrome на этой
+// стороне НЕ шлёт 'ended' у трека — только 'mute' (track.muted = true,
+// readyState остаётся 'live', проверено эмпирически, см. resilience.spec.mjs).
+// 'removetrack' на самом MediaStream, наоборот, срабатывает надёжно в этом
+// случае — это и есть основной сигнал. mute сам по себе НЕ повод удалять:
+// он бывает и транзиентным (кратковременная потеря пакетов), поэтому только
+// логируется. ended остаётся как страховка на случай, если браузер всё же
+// его пришлёт (другой браузер/другой сценарий обрыва).
 function handleAudioTrack(stream, track) {
   const streamId = stream ? stream.id : track.id;
   const isBroadcasterTrack = !!(stream && stream.getVideoTracks().length > 0);
@@ -277,6 +288,17 @@ function handleAudioTrack(stream, track) {
         playPromise.catch((err) => console.warn('Не удалось запустить ретранслированное аудио:', err));
       }
     }
+
+    // Основной сигнал ухода трека в этом сценарии: MediaStream лишился всех
+    // аудиодорожек (removeTrack на стороне вещающего доходит сюда именно так).
+    if (stream) {
+      stream.onremovetrack = () => {
+        if (stream.getAudioTracks().length === 0) {
+          removeRelayedAudio(streamId);
+          stopSpeakingMonitor(key);
+        }
+      };
+    }
   }
 
   if (!speakingMonitors.has(key)) {
@@ -284,9 +306,16 @@ function handleAudioTrack(stream, track) {
     speakingMonitors.set(key, stop);
   }
 
+  // Страховка: если браузер всё же пришлёт 'ended' (например, другой обрыв,
+  // не через removeTrack) — чистим и по нему, тем же путём.
   track.onended = () => {
     if (!isBroadcasterTrack) removeRelayedAudio(streamId);
     stopSpeakingMonitor(key);
+  };
+
+  // mute транзиентный — не удаляем сразу, только для диагностики.
+  track.onmute = () => {
+    console.debug(`[audio ${key}] трек замьючен (mute) — не удаляем сразу, ждём removetrack/ended`);
   };
 }
 

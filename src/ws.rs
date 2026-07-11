@@ -3,6 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
+use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::Response;
@@ -26,6 +27,21 @@ const CHAT_RATE_WINDOW: Duration = Duration::from_secs(10);
 const CHAT_TEXT_MAX_CHARS: usize = 2000;
 /// Максимальная длина отображаемого имени в символах.
 const CHAT_NAME_MAX_CHARS: usize = 32;
+
+/// Серверный ping/pong-хартбит: как часто сами пингуем клиента.
+///
+/// Зачем: TCP-соединение может оборваться тихо, без FIN/RST (у клиента сдох
+/// Wi-Fi, ноутбук ушёл в сон, между нами и клиентом лежит NAT/балансировщик,
+/// молча уронивший состояние) — `socket.recv()` в этом случае не вернёт ни
+/// ошибку, ни `None` ещё очень долго: обрыв обнаружится только по TCP-таймауту
+/// операционной системы, а это минуты. Активный ping/pong ловит такой обрыв
+/// за секунды-десятки секунд вместо минут — дальше чистку доводит уже
+/// существующая `cleanup_peer` (комната освобождается, остальные пиры узнают).
+const PING_INTERVAL: Duration = Duration::from_secs(20);
+/// Если подряд отправлено `MAX_MISSED_PONGS` ping'ов и на них не пришло НИ
+/// ОДНОГО pong'а (и вообще ничего от клиента за это время) — считаем
+/// соединение мёртвым и рвём его сами.
+const MAX_MISSED_PONGS: u32 = 2;
 
 /// Кем это соединение зарегистрировано в комнате.
 #[derive(Debug, Clone)]
@@ -62,8 +78,32 @@ async fn handle_socket(mut socket: WebSocket, rooms: SharedRooms, db: SqlitePool
     // (скользящее окно для rate-limit).
     let mut chat_times: VecDeque<Instant> = VecDeque::new();
 
+    // Хартбит: тикает каждые PING_INTERVAL, шлёт Message::Ping. axum сам
+    // отвечает Pong'ом на ВХОДЯЩИЕ Ping (нам ничего для этого делать не нужно),
+    // а вот входящие Pong (ответ на НАШ ping) прилетают в socket.recv() ниже
+    // как Message::Pong — их и считаем. missed_pongs растёт на каждый
+    // отправленный ping и сбрасывается в 0 любым входящим сообщением от
+    // клиента (в том числе pong) — значит клиент жив, кто бы что ни отвечал.
+    let mut ping_interval = tokio::time::interval(PING_INTERVAL);
+    ping_interval.tick().await; // первый тик — мгновенно, не в счёт
+    let mut missed_pongs: u32 = 0;
+
     loop {
         tokio::select! {
+            // Хартбит: раз в PING_INTERVAL. Если два ping'а подряд ушли без
+            // единого ответа (пуст ни pong, ни вообще что-либо от клиента) —
+            // соединение считаем мёртвым и рвём сами, не дожидаясь TCP-таймаута.
+            _ = ping_interval.tick() => {
+                if missed_pongs >= MAX_MISSED_PONGS {
+                    debug!("клиент не отвечает на ping ({missed_pongs} подряд без ответа) — считаем соединение мёртвым");
+                    break;
+                }
+                if socket.send(Message::Ping(Bytes::new())).await.is_err() {
+                    break; // сокет уже мёртв — чистка ниже
+                }
+                missed_pongs += 1;
+            }
+
             // Исходящие сообщения этому пиру.
             out = rx.recv() => {
                 // None невозможен, пока жив наш собственный `tx`, но
@@ -91,6 +131,13 @@ async fn handle_socket(mut socket: WebSocket, rooms: SharedRooms, db: SqlitePool
 
             // Входящие сообщения от клиента.
             inbound = socket.recv() => {
+                // Любое входящее сообщение — знак, что клиент жив: сбрасываем
+                // счётчик пропущенных pong'ов. Касается и Message::Pong (ответ
+                // на наш ping, axum отдаёт его сюда как обычный кадр), и всего
+                // остального (Text/Binary/входящий Ping клиента и т.д.).
+                if matches!(inbound, Some(Ok(_))) {
+                    missed_pongs = 0;
+                }
                 match inbound {
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<ClientMessage>(&text) {
@@ -117,7 +164,10 @@ async fn handle_socket(mut socket: WebSocket, rooms: SharedRooms, db: SqlitePool
                     }
                     // Закрытие или обрыв сокета (edge-кейс №8).
                     Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
-                    // Ping/pong axum обрабатывает сам; бинарные кадры игнорируем.
+                    // Входящий Ping от клиента — axum отвечает Pong'ом сам, нам
+                    // ничего делать не нужно. Message::Pong (ответ на НАШ
+                    // хартбит-ping) уже учтён сбросом missed_pongs выше — здесь
+                    // как и бинарные кадры дальше просто игнорируется.
                     Some(Ok(_)) => {}
                 }
             }

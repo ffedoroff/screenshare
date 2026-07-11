@@ -16,10 +16,12 @@
 // перед каждым шагом, а не предполагается по номеру шага.
 //
 // Тайминги обрывов — с запасом (серверная чистка при обрыве TCP может занять
-// секунды, см. src/ws.rs: у соединения нет ping/pong-хартбита, обрыв
-// обнаруживается только когда socket.recv() вернёт ошибку/EOF), но нигде нет
-// слепого sleep — везде поллинг условия с дедлайном (waitForFunction с
-// options третьим аргументом и polling: 100, либо helpers.waitUntil).
+// секунды: сценарии ниже рвут TCP явно, socket.recv() видит ошибку/EOF сразу;
+// у сервера есть ещё и ping/pong-хартбит — см. src/ws.rs, PING_INTERVAL/
+// MAX_MISSED_PONGS — но он на секунды-десятки секунд медленнее явного обрыва,
+// поэтому тесты его не дожидаются), но нигде нет слепого sleep — везде
+// поллинг условия с дедлайном (waitForFunction с options третьим аргументом
+// и polling: 100, либо helpers.waitUntil).
 
 import { chromium } from 'playwright-core';
 import assert from 'node:assert/strict';
@@ -213,43 +215,28 @@ async function main() {
         await waitSpeakingHidden(broadcasterPage);
       });
 
-      await step('(а) у Пети индикатор «Говорят» гаснет, ретранслированный трек Васи убран или заглушен', async () => {
+      await step('(а) у Пети индикатор «Говорят» гаснет, ретранслированный <audio> Васи физически удалён из DOM', async () => {
         // Индикатор — честный RMS-анализ звука: после ухода Васи трек Пети
         // перестаёт нести данные, детектор видит тишину и гасит индикатор.
         await waitSpeakingHidden(viewer2Page, 15_000);
 
-        // НАЙДЕННЫЙ БАГ ПРИЛОЖЕНИЯ (диагностировано изолированным
-        // экспериментом, см. финальный отчёт): когда вещающий убирает
-        // ретранслированный трек через pc.removeTrack (broadcaster.js:
-        // unrelayAudioTrack), у Пети соответствующий remote-трек получает
-        // событие 'mute' (track.muted = true, readyState остаётся 'live'),
-        // а 'ended' НЕ приходит вовсе (проверено 20+ секунд ожидания).
-        // static/viewer.js же чистит скрытый <audio data-stream-id> только
-        // по track.onended (handleAudioTrack), поэтому элемент и монитор
-        // уровня звука утекают — по одному на каждого ушедшего «говорившего»
-        // зрителя. Правильное место чистки — 'removetrack' на MediaStream
-        // и/или 'mute' на треке. По ТЗ src/static не чиним — здесь
-        // проверяется достижимый инвариант «элемента нет ИЛИ его трек
-        // ended/muted», а строгая проверка удаления элемента — skip ниже.
+        // Раньше здесь был известный баг: когда вещающий убирает ретранслированный
+        // трек через pc.removeTrack (broadcaster.js: unrelayAudioTrack), у Пети
+        // соответствующий remote-трек получает событие 'mute' (track.muted = true,
+        // readyState остаётся 'live'), а 'ended' не приходит вовсе — а
+        // static/viewer.js чистил скрытый <audio data-stream-id> только по
+        // track.onended, поэтому элемент и монитор уровня звука утекали.
+        // Исправлено: viewer.js теперь слушает 'removetrack' на самой
+        // MediaStream (надёжный сигнал в этом сценарии) и чистит <audio>, как
+        // только у стрима не осталось аудиодорожек — 'ended' остаётся страховкой,
+        // 'mute' сам по себе чистку не триггерит (бывает транзиентным). Поэтому
+        // теперь требуем строгий инвариант: элемента в DOM быть не должно.
         await viewer2Page.waitForFunction(
-          () => {
-            const els = Array.from(document.querySelectorAll('audio[data-stream-id]'));
-            if (els.length === 0) return true;
-            return els.every((el) => {
-              const track = el.srcObject && el.srcObject.getAudioTracks()[0];
-              return !track || track.readyState === 'ended' || track.muted;
-            });
-          },
+          () => document.querySelectorAll('audio[data-stream-id]').length === 0,
           undefined,
           { polling: 100, timeout: 15_000 }
         );
       });
-      skip(
-        '(а) скрытый <audio> чужого трека физически удаляется из DOM у Пети',
-        'известный баг приложения: viewer.js удаляет ретранслированный <audio> только по track.onended, ' +
-        'а при pc.removeTrack на стороне вещающего Chrome шлёт получателю mute, а не ended — элемент утекает ' +
-        '(подробности в комментарии шага выше и в финальном отчёте)'
-      );
 
       await step('(а) чат продолжает работать между Петей и вещающим после ухода Васи', async () => {
         await openChatPanel(viewer2Page);
