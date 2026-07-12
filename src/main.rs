@@ -34,7 +34,9 @@ use qrcode::render::svg;
 use qrcode::QrCode;
 use serde_json::json;
 use tracing::{info, warn};
+use uuid::Uuid;
 
+use crate::protocol::RoomSettings;
 use crate::state::{AppState, Room};
 
 /// Каталог со статикой фронтенда. Настраивается через env `STATIC_DIR` (в
@@ -128,8 +130,15 @@ async fn shutdown_signal() {
 /// Комната без единого участника живёт `EMPTY_ROOM_TTL_SECONDS` — если за
 /// это время никто не подключится, реапер (`state::reap_empty_rooms`) её
 /// удалит.
+///
+/// Возвращает вместе с `roomId` одноразовый `leaderToken` (см. README.md,
+/// «Права и лидер»): создатель предъявляет его в своём `join-room`, чтобы
+/// стать лидером комнаты — токен сгорает при первом же успешном предъявлении
+/// (совпавшем с хранимым). Если никто не предъявит токен, лидером станет
+/// первый вошедший как обычно.
 async fn create_room(State(state): State<AppState>) -> Response {
     let room_id = state::generate_room_id();
+    let leader_token = Uuid::new_v4().to_string();
 
     let mut rooms_guard = state.rooms.lock().unwrap();
     // Коллизия 8-символьного id астрономически маловероятна (32^8 вариантов);
@@ -148,12 +157,20 @@ async fn create_room(State(state): State<AppState>) -> Response {
             // Сразу помечена «пустой»: если никто не подключится за TTL,
             // реапер её удалит.
             emptied_at: Some(Instant::now()),
+            leader_id: None,
+            leader_token: Some(leader_token.clone()),
+            settings: RoomSettings::default(),
+            pending: HashMap::new(),
         },
     );
     drop(rooms_guard);
     info!(room = %room_id, "комната создана (пустая)");
 
-    (StatusCode::CREATED, Json(json!({ "roomId": room_id }))).into_response()
+    (
+        StatusCode::CREATED,
+        Json(json!({ "roomId": room_id, "leaderToken": leader_token })),
+    )
+        .into_response()
 }
 
 /// `PUT /api/rooms/{room_id}`: идемпотентное восстановление комнаты после
@@ -202,6 +219,12 @@ async fn restore_room(
             participants: HashMap::new(),
             screen_owner: None,
             emptied_at: Some(Instant::now()),
+            // Восстановленная комната токен лидера не выдаёт — лидером
+            // станет первый вошедший (см. README.md, «Права и лидер»).
+            leader_id: None,
+            leader_token: None,
+            settings: RoomSettings::default(),
+            pending: HashMap::new(),
         },
     );
     drop(rooms_guard);

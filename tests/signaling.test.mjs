@@ -128,7 +128,7 @@ async function createRoom(body, roomsUrl = ROOMS_URL) {
   const res = await fetch(roomsUrl, opts);
   let json = null;
   try { json = await res.json(); } catch { /* не JSON — ниже проверим статус */ }
-  return { status: res.status, roomId: json && json.roomId };
+  return { status: res.status, roomId: json && json.roomId, leaderToken: json && json.leaderToken };
 }
 
 // PUT /api/rooms/<roomId> — идемпотентное восстановление (см. src/main.rs::restore_room).
@@ -177,15 +177,34 @@ function connect(wsUrl = URL) {
 
 // Подключиться и войти в комнату одним шагом; возвращает { peer, joined }.
 // `peerId` (опционально) — см. src/protocol.rs::ClientMessage::JoinRoom и
-// раздел 5b ниже.
-async function join(roomId, name, wsUrl = URL, peerId = undefined) {
+// раздел 5b ниже. `leaderToken` (опционально) — см. раздел 15 (система прав).
+async function join(roomId, name, wsUrl = URL, peerId = undefined, leaderToken = undefined) {
   const peer = await connect(wsUrl);
   const msg = { type: 'join-room', roomId };
   if (name !== undefined) msg.name = name;
   if (peerId !== undefined) msg.peerId = peerId;
+  if (leaderToken !== undefined) msg.leaderToken = leaderToken;
   peer.send(msg);
   const joined = await peer.next();
   return { peer, joined };
+}
+
+// Сменить настройки комнаты (только лидер) — см. раздел 17.
+function updateSettings(sender, settings) {
+  sender.send({ type: 'update-settings', settings });
+}
+
+// Настройки по умолчанию (см. src/protocol.rs::RoomSettings::default),
+// удобно как база для точечного переопределения в тестах.
+function defaultSettings(overrides = {}) {
+  return {
+    lobbyEnabled: false,
+    guestChat: true,
+    guestAudio: true,
+    guestVideo: true,
+    guestScreen: true,
+    ...overrides,
+  };
 }
 
 function isChatMsg(m) {
@@ -234,10 +253,12 @@ async function runTests() {
   // --- 2. POST /api/rooms создаёт пустую комнату ---
   console.log('2. POST /api/rooms');
   let roomId;
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
   {
-    const { status, roomId: id } = await createRoom();
+    const { status, roomId: id, leaderToken } = await createRoom();
     ok(status === 201, `201 Created (status=${status})`);
     ok(/^[23456789a-z]{8}$/.test(id), `roomId короткий и человекочитаемый (${id})`);
+    ok(typeof leaderToken === 'string' && UUID_RE.test(leaderToken), `leaderToken выдан и похож на uuid (${leaderToken})`);
     roomId = id;
 
     // Тело опционально и игнорируется — не должно ломать создание.
@@ -277,6 +298,13 @@ async function runTests() {
   ok(j1.type === 'joined' && Array.isArray(j1.peers) && j1.peers.length === 0 && j1.screenOwner === null,
     'joined: peers=[], screenOwner=null для первого участника');
   const p1Id = j1.peerId;
+  // Токен не предъявлен, но лидера в комнате ещё не было -> первый вошедший
+  // становится лидером сам (см. раздел 15 про leaderToken).
+  ok(j1.leaderId === p1Id, 'первый участник без токена становится лидером сам собой');
+  ok(j1.settings && j1.settings.lobbyEnabled === false && j1.settings.guestChat === true
+    && j1.settings.guestAudio === true && j1.settings.guestVideo === true && j1.settings.guestScreen === true,
+    'joined.settings — дефолты (всё разрешено, лобби выключено)');
+  ok(Array.isArray(j1.pending) && j1.pending.length === 0, 'joined.pending — пустой список (заявок в лобби ещё нет)');
 
   // --- 4. Второй участник (с именем) входит: видит первого в peers ---
   console.log('4. второй участник: peers содержит первого, peer-joined приходит первому');
@@ -285,6 +313,8 @@ async function runTests() {
   ok(j2.type === 'joined' && j2.peers.length === 1 && j2.peers[0].peerId === p1Id && j2.peers[0].name === null,
     'joined: peers=[{peerId: первый, name: null}] для второго участника');
   ok(j2.screenOwner === null, 'screenOwner всё ещё null');
+  ok(j2.leaderId === p1Id, 'второй участник (гость) видит лидером первого');
+  ok(Array.isArray(j2.pending) && j2.pending.length === 0, 'joined.pending пуст для не-лидера, даже если бы там что-то было');
 
   const pj1 = await p1.next();
   ok(pj1.type === 'peer-joined' && pj1.peerId === p2Id && pj1.name === 'Аня',
@@ -598,6 +628,199 @@ async function runTests() {
     const dbFiles = fs.readdirSync(PROJECT_DIR).filter((f) => f.endsWith('.db') || f.includes('.db-'));
     ok(dbFiles.length === 0,
       `нет файлов БД в ${PROJECT_DIR} (найдено: ${dbFiles.join(', ') || 'ничего'})`);
+  }
+
+  // === Система прав (лидер/гости), протокол v4 ===========================
+
+  // --- 15. leaderToken: предъявление делает лидером, токен одноразовый ---
+  console.log('15. leaderToken');
+  {
+    const { roomId: lrId, leaderToken } = await createRoom();
+
+    // Вход с валидным токеном -> сразу лидер (leaderId == свой peerId).
+    const { peer: leader, joined: leaderJoined } = await join(lrId, 'Лидер', URL, undefined, leaderToken);
+    ok(leaderJoined.leaderId === leaderJoined.peerId, 'вход с leaderToken делает вошедшего лидером (leaderId == свой peerId)');
+
+    // Токен одноразовый: второй вход с ТЕМ ЖЕ токеном -> просто гость (лидер уже есть).
+    const { peer: impostor, joined: impostorJoined } = await join(lrId, 'Самозванец', URL, undefined, leaderToken);
+    ok(impostorJoined.leaderId === leaderJoined.peerId && impostorJoined.leaderId !== impostorJoined.peerId,
+      'повторное предъявление уже сожжённого токена не делает лидером — виден прежний лидер');
+    await leader.next(); // peer-joined самозванца лидеру
+
+    leader.ws.close();
+    impostor.ws.close();
+    await Promise.all([leader.closed, impostor.closed]);
+  }
+
+  // --- 16/17/19/20: смена лидера, update-settings, guest_screen/guest_chat enforcement ---
+  console.log('16. смена лидера при уходе');
+  {
+    const { roomId: rId, leaderToken } = await createRoom();
+    const { peer: a, joined: ja } = await join(rId, 'A', URL, undefined, leaderToken); // лидер
+    const { peer: b, joined: jb } = await join(rId, 'B'); // гость, вошёл вторым
+    await a.next(); // peer-joined B у A
+    const { peer: c, joined: jc } = await join(rId, 'C'); // гость, вошёл третьим
+    await Promise.all([a.next(), b.next()]); // peer-joined C у A и B
+
+    ok(ja.leaderId === ja.peerId && jb.leaderId === ja.peerId && jc.leaderId === ja.peerId,
+      'все трое видят A лидером до его ухода');
+
+    a.ws.close();
+    const [lcB, lcC] = await Promise.all([b.next(), c.next()]);
+    ok(lcB.type === 'leader-changed' && lcC.type === 'leader-changed'
+      && lcB.leaderId === jb.peerId && lcC.leaderId === jb.peerId,
+      'уход лидера -> leader-changed всем оставшимся, новый лидер — самый старый из оставшихся (B, вошёл раньше C)');
+    const [plB, plC] = await Promise.all([b.next(), c.next()]);
+    ok(plB.type === 'peer-left' && plC.type === 'peer-left'
+      && plB.peerId === ja.peerId && plC.peerId === ja.peerId,
+      'вслед за leader-changed приходит peer-left ушедшего лидера');
+
+    // --- 17. update-settings: только лидер (теперь B) может менять настройки ---
+    console.log('17. update-settings: только лидер, всем settings-changed');
+
+    // Гость (C) пытается сменить настройки -> error, ничего не разослано.
+    updateSettings(c, defaultSettings({ guestChat: false }));
+    const errMsg = await c.next();
+    ok(errMsg.type === 'error', `гость не может менять настройки комнаты (${errMsg.message})`);
+
+    // Лидер (B) меняет настройки -> settings-changed приходит и ему, и C.
+    updateSettings(b, defaultSettings({ guestScreen: false }));
+    const [scB, scC] = await Promise.all([b.next(), c.next()]);
+    ok(scB.type === 'settings-changed' && scC.type === 'settings-changed'
+      && scB.settings.guestScreen === false && scC.settings.guestScreen === false,
+      'update-settings лидера рассылает settings-changed всем участникам');
+
+    // --- 19. guest_screen=false: share-start гостя отклонён, лидеру можно ---
+    console.log('19. guest_screen=false enforcement');
+
+    // C (гость) пытается шарить экран -> forbidden, без busyPeerId.
+    c.send({ type: 'share-start' });
+    const rejC = await c.next();
+    ok(rejC.type === 'share-rejected' && rejC.reason === 'forbidden' && rejC.busyPeerId === undefined,
+      'гостю с guestScreen=false отказано с reason=forbidden, без busyPeerId');
+
+    // B (лидер) может шарить экран независимо от guestScreen.
+    b.send({ type: 'share-start' });
+    const [ssB, ssC] = await Promise.all([b.next(), c.next()]);
+    ok(ssB.type === 'share-started' && ssC.type === 'share-started' && ssB.peerId === jb.peerId,
+      'лидеру можно шарить экран даже при guestScreen=false');
+    b.send({ type: 'share-stop' });
+    await Promise.all([b.next(), c.next()]); // share-stopped
+
+    // Возвращаем guestScreen, чтобы гость мог сам захватить экран.
+    updateSettings(b, defaultSettings({ guestScreen: true }));
+    await Promise.all([b.next(), c.next()]); // settings-changed
+
+    c.send({ type: 'share-start' });
+    const [ss2B, ss2C] = await Promise.all([b.next(), c.next()]);
+    ok(ss2B.type === 'share-started' && ss2C.type === 'share-started' && ss2B.peerId === jc.peerId,
+      'guestScreen=true -> гость успешно захватывает экран');
+
+    // Лидер отбирает guestScreen, ПОКА гость шарит -> сервер сам шлёт share-stopped всем.
+    updateSettings(b, defaultSettings({ guestScreen: false }));
+    const [sc2B, sc2C] = await Promise.all([b.next(), c.next()]); // settings-changed
+    ok(sc2B.type === 'settings-changed' && sc2C.type === 'settings-changed', 'settings-changed при отзыве guestScreen во время шаринга гостя');
+    const [stB, stC] = await Promise.all([b.next(), c.next()]); // сервер сам останавливает шаринг
+    ok(stB.type === 'share-stopped' && stC.type === 'share-stopped' && stB.peerId === jc.peerId,
+      'отзыв guestScreen у шарящего гостя -> сервер сам шлёт share-stopped всем участникам');
+
+    // --- 20. guest_chat=false: chat гостя error, лидера проходит ---
+    console.log('20. guest_chat=false enforcement');
+    updateSettings(b, defaultSettings({ guestScreen: false, guestChat: false }));
+    await Promise.all([b.next(), c.next()]); // settings-changed
+
+    sendChat(c, jb.peerId, { kind: 'text', text: 'запрещённое сообщение' });
+    const chatErr = await c.next();
+    ok(chatErr.type === 'error', `гостю с guestChat=false запрещён fallback-чат (${chatErr.message})`);
+
+    sendChat(b, jc.peerId, { kind: 'text', text: 'лидеру можно' });
+    const chatOk = await c.next();
+    ok(isChatMsg(chatOk) && chatOk.fromPeerId === jb.peerId && chatOk.envelope.text === 'лидеру можно',
+      'лидеру fallback-чат разрешён независимо от guestChat');
+
+    b.ws.close();
+    c.ws.close();
+    await Promise.all([b.closed, c.closed]);
+  }
+
+  // --- 18. Лобби (wait room): waiting/join-request/approve/reject/cancel/наследование ---
+  console.log('18. лобби (wait room)');
+  {
+    const { roomId: lId, leaderToken } = await createRoom();
+    const { peer: leader, joined: leaderJoined } = await join(lId, 'Лидер', URL, undefined, leaderToken);
+    ok(leaderJoined.leaderId === leaderJoined.peerId, 'лидер лобби-комнаты — сам вошедший с токеном');
+
+    // Включаем лобби.
+    updateSettings(leader, defaultSettings({ lobbyEnabled: true }));
+    const scSelf = await leader.next(); // settings-changed (единственный участник пока — сам лидер)
+    ok(scSelf.type === 'settings-changed' && scSelf.settings.lobbyEnabled === true, 'лобби включено');
+
+    // Новый гость -> waiting, лидер получает join-request.
+    const guest1 = await connect();
+    guest1.send({ type: 'join-room', roomId: lId, name: 'Ждущий1' });
+    const waitMsg = await guest1.next();
+    ok(waitMsg.type === 'waiting', 'новый гость при lobbyEnabled=true получает waiting вместо joined');
+    const jr1 = await leader.next();
+    ok(jr1.type === 'join-request' && jr1.name === 'Ждущий1' && typeof jr1.peerId === 'string',
+      'лидер получает join-request с именем ожидающего');
+    const guest1Id = jr1.peerId;
+
+    // Approve -> ожидающему joined, остальным (пока только лидеру) peer-joined.
+    leader.send({ type: 'approve', peerId: guest1Id });
+    const joinedMsg = await guest1.next();
+    ok(joinedMsg.type === 'joined' && joinedMsg.peerId === guest1Id && joinedMsg.leaderId === leaderJoined.peerId,
+      'approve -> ожидающему приходит полноценный joined');
+    ok(Array.isArray(joinedMsg.pending) && joinedMsg.pending.length === 0,
+      'joined.pending пуст — approved гость не лидер');
+    const pjMsg = await leader.next();
+    ok(pjMsg.type === 'peer-joined' && pjMsg.peerId === guest1Id, 'остальным (лидеру) приходит peer-joined после approve');
+
+    // Reject: второй ожидающий отклоняется, сокет закрывается сервером.
+    const guest2 = await connect();
+    guest2.send({ type: 'join-room', roomId: lId, name: 'Ждущий2' });
+    await guest2.next(); // waiting
+    const jr2 = await leader.next();
+    ok(jr2.type === 'join-request' && jr2.name === 'Ждущий2', 'вторая заявка приходит лидеру');
+    leader.send({ type: 'reject', peerId: jr2.peerId });
+    const rejMsg = await guest2.next();
+    ok(rejMsg.type === 'join-rejected', 'reject -> ожидающему join-rejected');
+    await guest2.closed;
+    ok(true, 'сервер закрыл сокет отклонённого сервером ожидающего');
+
+    // Cancel: третий ожидающий отваливается сам, не дождавшись решения.
+    const guest3 = await connect();
+    guest3.send({ type: 'join-room', roomId: lId, name: 'Ждущий3' });
+    await guest3.next(); // waiting
+    const jr3 = await leader.next();
+    ok(jr3.type === 'join-request' && jr3.name === 'Ждущий3', 'третья заявка приходит лидеру');
+    guest3.ws.close();
+    const cancelMsg = await leader.next();
+    ok(cancelMsg.type === 'join-request-cancelled' && cancelMsg.peerId === jr3.peerId,
+      'отвал ожидающего, не дождавшегося решения -> лидеру join-request-cancelled');
+
+    // Смена лидера при непустом pending: четвёртый ожидающий заявляется, затем лидер уходит.
+    const guest4 = await connect();
+    guest4.send({ type: 'join-room', roomId: lId, name: 'Ждущий4' });
+    await guest4.next(); // waiting
+    const jr4 = await leader.next();
+    ok(jr4.type === 'join-request' && jr4.name === 'Ждущий4', 'четвёртая заявка приходит прежнему лидеру');
+
+    // Комната сейчас: участники — leader (лидер) и guest1 (approved); ожидает — guest4.
+    leader.ws.close();
+    const lcMsg = await guest1.next();
+    ok(lcMsg.type === 'leader-changed' && lcMsg.leaderId === guest1Id,
+      'уход лидера при непустом pending -> leader-changed новому (единственному оставшемуся) участнику');
+    const jrAgain = await guest1.next();
+    ok(jrAgain.type === 'join-request' && jrAgain.peerId === jr4.peerId && jrAgain.name === 'Ждущий4',
+      'непустой pending пересылается новому лидеру заново (join-request)');
+
+    // Комната опустевает целиком -> все ещё живые ожидающие получают join-rejected.
+    guest1.ws.close();
+    const rejAll = await guest4.next();
+    ok(rejAll.type === 'join-rejected', 'комната опустела при живых pending -> ожидающим join-rejected');
+    await guest4.closed;
+
+    await Promise.all([leader.closed, guest1.closed]);
   }
 }
 

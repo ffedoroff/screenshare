@@ -14,9 +14,48 @@
 //! DataChannel-шина до конкретного пира ещё не открыта; `envelope` для
 //! сервера опаковый JSON (как `sdp`/`candidate`/`info`), не разбирается и
 //! нигде не хранится.
+//!
+//! Протокол v4 (система прав): комната теперь имеет лидера (`leaderId`) и
+//! `settings` (права гостей), опционально wait room (`lobby_enabled`) —
+//! подробности модели см. README.md, раздел «Права и лидер».
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// Настройки комнаты: права гостей + переключатель wait room. Меняет только
+/// лидер (`update-settings`), рассылаются всем участникам (`settings-changed`)
+/// и новому участнику в `joined`. По умолчанию разрешено всё, кроме комнаты
+/// ожидания (`lobby_enabled=false` — входить может кто угодно без одобрения).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomSettings {
+    #[serde(default)]
+    pub lobby_enabled: bool,
+    #[serde(default = "default_true")]
+    pub guest_chat: bool,
+    #[serde(default = "default_true")]
+    pub guest_audio: bool,
+    #[serde(default = "default_true")]
+    pub guest_video: bool,
+    #[serde(default = "default_true")]
+    pub guest_screen: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for RoomSettings {
+    fn default() -> Self {
+        Self {
+            lobby_enabled: false,
+            guest_chat: true,
+            guest_audio: true,
+            guest_video: true,
+            guest_screen: true,
+        }
+    }
+}
 
 /// Сообщения клиент → сервер.
 #[derive(Debug, Deserialize)]
@@ -41,6 +80,13 @@ pub enum ClientMessage {
         name: Option<String>,
         #[serde(default)]
         peer_id: Option<String>,
+        /// Одноразовый токен лидера, выданный `POST /api/rooms` (см.
+        /// `AppState`/`main.rs::create_room`). Совпал с хранимым в комнате —
+        /// вошедший становится лидером и токен сгорает. `PUT
+        /// /api/rooms/{id}` токен не выдаёт вовсе — восстановленная комната
+        /// отдаёт лидерство первому вошедшему (см. README.md).
+        #[serde(default)]
+        leader_token: Option<String>,
     },
     /// SDP-оффер любому другому пиру своей комнаты.
     Offer { target_peer_id: String, sdp: Value },
@@ -67,6 +113,15 @@ pub enum ClientMessage {
     /// Освобождение экрана — принимается только от текущего владельца,
     /// от кого-то другого тихо игнорируется.
     ShareStop,
+    /// Сменить настройки комнаты (права гостей + lobby). Только лидер —
+    /// от кого-то другого `error`. Применяется целиком (не патч), рассылается
+    /// всем участникам как `settings-changed`.
+    UpdateSettings { settings: RoomSettings },
+    /// Впустить ожидающего в комнату (лобби). Только лидер.
+    Approve { peer_id: String },
+    /// Отклонить ожидающего — ему `join-rejected` и сервер закрывает его
+    /// сокет. Только лидер.
+    Reject { peer_id: String },
     /// Явный выход (эквивалентен закрытию сокета).
     Leave,
 }
@@ -82,6 +137,14 @@ pub enum ServerMessage {
         peer_id: String,
         peers: Vec<PeerInfo>,
         screen_owner: Option<String>,
+        /// peerId текущего лидера комнаты (см. README.md, «Права и лидер»).
+        leader_id: String,
+        /// Текущие настройки комнаты (права гостей + lobby).
+        settings: RoomSettings,
+        /// Ожидающие одобрения в лобби — заполнено ТОЛЬКО для самого лидера
+        /// (чтобы он мог сразу увидеть, кого одобрить/отклонить); всем
+        /// остальным приходит пустой список.
+        pending: Vec<PendingInfo>,
     },
     /// Остальным участникам комнаты: подключился новый участник.
     PeerJoined { peer_id: String, name: Option<String> },
@@ -99,8 +162,16 @@ pub enum ServerMessage {
     /// Всем участникам комнаты (включая инициатора — единый путь рендера):
     /// шаринг экрана начался.
     ShareStarted { peer_id: String },
-    /// Только инициатору `share-start`: экран уже занят кем-то другим.
-    ShareRejected { busy_peer_id: String },
+    /// Только инициатору `share-start`: заявка отклонена. `busy_peer_id`
+    /// присутствует, если экран занят кем-то другим; отсутствует (`None`),
+    /// если отказ по правам (`reason: "forbidden"` — гостю запрещён
+    /// `guest_screen` в настройках комнаты).
+    ShareRejected {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        busy_peer_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     /// Всем участникам комнаты: шаринг экрана закончился (явный `share-stop`
     /// владельца или его дисконнект).
     ShareStopped { peer_id: String },
@@ -116,12 +187,37 @@ pub enum ServerMessage {
     Chat { from_peer_id: String, envelope: Value },
     /// Отправителю: некорректный запрос.
     Error { message: String },
+    /// Ожидающему в лобби (см. `RoomSettings::lobby_enabled`): заявка на вход
+    /// принята сервером, ждём решения лидера (`approve`/`reject`).
+    Waiting {},
+    /// Лидеру: новая заявка на вход в комнату с включённым лобби.
+    JoinRequest { peer_id: String, name: Option<String> },
+    /// Лидеру: ожидающий отвалился (закрыл вкладку/сокет), не дождавшись
+    /// решения — заявка снята сама собой.
+    JoinRequestCancelled { peer_id: String },
+    /// Ожидающему: лидер отклонил заявку — сервер закрывает сокет сразу
+    /// вслед за этим сообщением.
+    JoinRejected {},
+    /// Всем участникам комнаты: лидер сменил настройки комнаты.
+    SettingsChanged { settings: RoomSettings },
+    /// Всем участникам комнаты: сменился лидер (прежний вышел, сервер
+    /// детерминированно назначил участника с самым ранним `joined_at`).
+    LeaderChanged { leader_id: String },
 }
 
 /// Один другой участник комнаты в списке `Joined::peers`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PeerInfo {
+    pub peer_id: String,
+    pub name: Option<String>,
+}
+
+/// Один ожидающий одобрения в лобби — в списке `Joined::pending` (только для
+/// лидера) и в поле `JoinRequest`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingInfo {
     pub peer_id: String,
     pub name: Option<String>,
 }

@@ -19,11 +19,16 @@ use tokio::sync::mpsc;
 use tracing::info;
 use uuid::Uuid;
 
-use crate::protocol::ServerMessage;
+use crate::protocol::{RoomSettings, ServerMessage};
 
 /// Максимум участников в комнате одновременно (протокол v2: симметричная
 /// комната, роли broadcaster/viewer больше не существует).
 pub const MAX_PARTICIPANTS: usize = 6;
+
+/// Максимум ожидающих одобрения в лобби одновременно (см.
+/// `RoomSettings::lobby_enabled`) — не участники комнаты, отдельный, более
+/// щедрый лимит, чтобы не запирать людей в толчее перед началом созвона.
+pub const MAX_PENDING: usize = 10;
 
 /// Как часто реапер проверяет комнаты на протухание. Сознательно чаще, чем
 /// «раз в 5 секунд» могло бы показаться достаточным: TTL пустой комнаты в
@@ -37,15 +42,36 @@ pub const REAPER_INTERVAL: Duration = Duration::from_secs(1);
 /// Писатель сокета читает из парного `UnboundedReceiver`.
 pub type PeerTx = mpsc::UnboundedSender<ServerMessage>;
 
-/// Один участник комнаты: канал для рассылки ему сообщений + имя для чата.
+/// Один участник комнаты: канал для рассылки ему сообщений + имя для чата +
+/// момент входа (для детерминированного выбора нового лидера — см.
+/// `Room::leader_id` — при уходе прежнего лидера им становится участник с
+/// самым ранним `joined_at`).
 pub struct Participant {
     pub tx: PeerTx,
     pub name: Option<String>,
+    pub joined_at: Instant,
+}
+
+/// Один ожидающий одобрения в лобби (см. `RoomSettings::lobby_enabled`) — НЕ
+/// участник комнаты (не считается в `MAX_PARTICIPANTS`, живёт в отдельной
+/// карте `Room::pending` с отдельным лимитом `MAX_PENDING`).
+pub struct PendingParticipant {
+    pub tx: PeerTx,
+    pub name: Option<String>,
+    pub joined_at: Instant,
 }
 
 /// Комната: до `MAX_PARTICIPANTS` равноправных участников, соединяющихся
 /// mesh (сервер сам медиа не трогает — только сигналинг). Максимум один из
 /// участников может в моменте шарить экран (`screen_owner`).
+///
+/// Права и лидер (см. README.md, «Права и лидер»): ровно один участник —
+/// лидер (`leader_id`); при его уходе сервер сам детерминированно назначает
+/// нового (участника с самым ранним `joined_at`) — кворум не нужен,
+/// членство и порядок входа целиком серверные. `leader_token` — одноразовый
+/// токен из `POST /api/rooms`, предъявивший его первым при `join-room`
+/// становится лидером и сжигает токен; `PUT /api/rooms/{id}` токен не
+/// выдаёт вовсе (первый вошедший в восстановленную комнату — лидер).
 pub struct Room {
     pub participants: HashMap<String, Participant>,
     /// peerId участника, который сейчас шарит экран (если шарит хоть кто-то).
@@ -56,6 +82,18 @@ pub struct Room {
     /// дольше `EMPTY_ROOM_TTL` с этого момента; новый `join-room` в живую
     /// (но помеченную) комнату снимает отметку.
     pub emptied_at: Option<Instant>,
+    /// peerId текущего лидера. `None` только пока в комнате нет ни одного
+    /// участника (свежесозданная/восстановленная/только что опустевшая
+    /// комната) — как только кто-то входит, лидер назначается.
+    pub leader_id: Option<String>,
+    /// Одноразовый токен лидера. `Some` до первого предъявления валидным
+    /// `join-room.leaderToken` (сжигается сразу), либо `None` изначально
+    /// (комната восстановлена через `PUT`, без токена).
+    pub leader_token: Option<String>,
+    /// Настройки комнаты (права гостей + lobby), меняет только лидер.
+    pub settings: RoomSettings,
+    /// Ожидающие одобрения лидера (лобби) по peerId. НЕ участники комнаты.
+    pub pending: HashMap<String, PendingParticipant>,
 }
 
 /// Общее состояние всех комнат.

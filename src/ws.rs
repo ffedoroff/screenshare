@@ -12,9 +12,10 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::protocol::{ClientMessage, PeerInfo, ServerMessage};
+use crate::protocol::{ClientMessage, PeerInfo, PendingInfo, RoomSettings, ServerMessage};
 use crate::state::{
-    generate_peer_id, send_to, AppState, Participant, PeerTx, SharedRooms, MAX_PARTICIPANTS,
+    generate_peer_id, send_to, AppState, PendingParticipant, Participant, PeerTx, Room,
+    SharedRooms, MAX_PARTICIPANTS, MAX_PENDING,
 };
 
 /// Лимит на fallback-релей чата (см. `ClientMessage::Chat`): не более
@@ -113,8 +114,14 @@ async fn handle_socket(mut socket: WebSocket, rooms: SharedRooms) {
                 // None невозможен, пока жив наш собственный `tx`, но
                 // обрабатываем аккуратно.
                 let Some(msg) = out else { break };
-                // После отказа сервер сам закрывает сокет (edge-кейс №3/№4).
-                let reject = matches!(msg, ServerMessage::RoomFull | ServerMessage::RoomNotFound);
+                // После отказа сервер сам закрывает сокет (edge-кейс №3/№4;
+                // JoinRejected — отказ лидера ожидающему в лобби).
+                let reject = matches!(
+                    msg,
+                    ServerMessage::RoomFull
+                        | ServerMessage::RoomNotFound
+                        | ServerMessage::JoinRejected {}
+                );
                 let text = match serde_json::to_string(&msg) {
                     Ok(t) => t,
                     Err(e) => { warn!("сериализация ServerMessage: {e}"); continue }
@@ -195,7 +202,7 @@ fn handle_message(
     chat_times: &mut VecDeque<Instant>,
 ) -> Flow {
     match msg {
-        ClientMessage::JoinRoom { room_id, name, peer_id } => {
+        ClientMessage::JoinRoom { room_id, name, peer_id, leader_token } => {
             if me.is_some() {
                 send_to(tx, err("already in a room"));
                 return Flow::Continue;
@@ -207,52 +214,65 @@ fn handle_message(
                 send_to(tx, ServerMessage::RoomNotFound); // комната не создана или уже удалена реапером
                 return Flow::Continue; // сокет закроет писатель
             };
+
+            // Клиентский peerId (переподключение после обрыва сигналинга, см.
+            // ClientMessage::JoinRoom) — принимаем, только если валидный UUID
+            // и ещё свободен в этой комнате (ни среди участников, ни среди
+            // ожидающих в лобби); иначе как раньше генерируем новый.
+            let peer_id = peer_id
+                .filter(|id| Uuid::parse_str(id).is_ok())
+                .filter(|id| !room.participants.contains_key(id) && !room.pending.contains_key(id))
+                .unwrap_or_else(generate_peer_id);
+
+            // Лидерство: предъявленный токен, совпавший с хранимым, сжигается
+            // и делает вошедшего лидером; иначе — если в комнате прямо сейчас
+            // нет лидера (свежесозданная/восстановленная/только что опустевшая
+            // комната) — лидером становится первый вошедший.
+            let mut becomes_leader = false;
+            if let Some(token) = &leader_token {
+                if room.leader_token.as_deref() == Some(token.as_str()) {
+                    becomes_leader = true;
+                    room.leader_token = None; // одноразовый — сжигаем
+                }
+            }
+            if !becomes_leader && room.leader_id.is_none() {
+                becomes_leader = true;
+            }
+
+            // Лобби (wait room) применяется только к НЕ-лидеру: лидер всегда
+            // входит напрямую, минуя ожидание.
+            if !becomes_leader && room.settings.lobby_enabled {
+                if room.pending.len() >= MAX_PENDING {
+                    send_to(tx, err("waiting room is full, try again later"));
+                    drop(rooms_guard);
+                    return Flow::Stop;
+                }
+                room.pending.insert(
+                    peer_id.clone(),
+                    PendingParticipant { tx: tx.clone(), name: name.clone(), joined_at: Instant::now() },
+                );
+                info!(room = %room_id, peer = %peer_id, "участник ждёт одобрения в лобби");
+                send_to(tx, ServerMessage::Waiting {});
+                if let Some(leader_id) = room.leader_id.clone() {
+                    if let Some(leader) = room.participants.get(&leader_id) {
+                        send_to(&leader.tx, ServerMessage::JoinRequest {
+                            peer_id: peer_id.clone(),
+                            name: name.clone(),
+                        });
+                    }
+                }
+                drop(rooms_guard);
+                *me = Some(PeerCtx { room_id: room_id.clone(), peer_id });
+                return Flow::Continue;
+            }
+
             if room.participants.len() >= MAX_PARTICIPANTS {
                 send_to(tx, ServerMessage::RoomFull);
                 return Flow::Continue;
             }
 
-            // Клиентский peerId (переподключение после обрыва сигналинга, см.
-            // ClientMessage::JoinRoom) — принимаем, только если валидный UUID
-            // и ещё свободен в этой комнате; иначе как раньше генерируем новый.
-            let peer_id = peer_id
-                .filter(|id| Uuid::parse_str(id).is_ok())
-                .filter(|id| !room.participants.contains_key(id))
-                .unwrap_or_else(generate_peer_id);
+            admit_participant(room, &room_id, peer_id.clone(), name.clone(), tx.clone(), becomes_leader);
 
-            // Другие уже подключённые участники — до вставки нового.
-            let peers: Vec<PeerInfo> = room
-                .participants
-                .iter()
-                .map(|(id, p)| PeerInfo { peer_id: id.clone(), name: p.name.clone() })
-                .collect();
-            let screen_owner = room.screen_owner.clone();
-
-            room.participants.insert(
-                peer_id.clone(),
-                Participant { tx: tx.clone(), name: name.clone() },
-            );
-            // Вход в опустевшую-но-живую комнату снимает отметку TTL.
-            room.emptied_at = None;
-
-            let count = room.participants.len();
-            info!(room = %room_id, peer = %peer_id, count, "участник подключился");
-
-            // Уведомляем остальных о новом участнике; сам новый участник
-            // узнаёт о них через список `peers` в своём `joined`.
-            for (id, p) in room.participants.iter() {
-                if id != &peer_id {
-                    send_to(&p.tx, ServerMessage::PeerJoined {
-                        peer_id: peer_id.clone(),
-                        name: name.clone(),
-                    });
-                }
-            }
-            send_to(tx, ServerMessage::Joined { peer_id: peer_id.clone(), peers, screen_owner });
-
-            // Истории чата сервер новичку больше не шлёт: чат целиком на
-            // mesh RTCDataChannel, историю новичок запрашивает сам у
-            // соседей по шине (см. `static/chat.js`) — сервер её не хранит.
             drop(rooms_guard);
             *me = Some(PeerCtx { room_id: room_id.clone(), peer_id });
         }
@@ -295,14 +315,209 @@ fn handle_message(
             handle_share_stop(me, rooms);
         }
 
+        ClientMessage::UpdateSettings { settings } => {
+            handle_update_settings(settings, me, tx, rooms);
+        }
+        ClientMessage::Approve { peer_id } => {
+            handle_approve(peer_id, me, tx, rooms);
+        }
+        ClientMessage::Reject { peer_id } => {
+            handle_reject(peer_id, me, tx, rooms);
+        }
+
         ClientMessage::Leave => return Flow::Stop,
     }
     Flow::Continue
 }
 
+/// Общая часть приёма участника в комнату напрямую (минуя лобби): либо
+/// потому что он стал лидером, либо потому что лобби выключено (или его для
+/// данного входа не применили). Вставляет участника, назначает лидера (если
+/// стал им), уведомляет остальных `peer-joined` и шлёт самому вошедшему
+/// `joined` — с текущими pending-заявками ТОЛЬКО если он лидер, иначе с
+/// пустым списком.
+fn admit_participant(
+    room: &mut Room,
+    room_id: &str,
+    peer_id: String,
+    name: Option<String>,
+    tx: PeerTx,
+    becomes_leader: bool,
+) {
+    // Другие уже подключённые участники — до вставки нового.
+    let peers: Vec<PeerInfo> = room
+        .participants
+        .iter()
+        .map(|(id, p)| PeerInfo { peer_id: id.clone(), name: p.name.clone() })
+        .collect();
+    let screen_owner = room.screen_owner.clone();
+
+    room.participants.insert(
+        peer_id.clone(),
+        Participant { tx: tx.clone(), name: name.clone(), joined_at: Instant::now() },
+    );
+    // Вход в опустевшую-но-живую комнату снимает отметку TTL.
+    room.emptied_at = None;
+
+    if becomes_leader {
+        room.leader_id = Some(peer_id.clone());
+    }
+    let leader_id = room.leader_id.clone().unwrap_or_else(|| peer_id.clone());
+
+    let count = room.participants.len();
+    info!(room = %room_id, peer = %peer_id, count, "участник подключился");
+
+    // Уведомляем остальных о новом участнике; сам новый участник узнаёт о
+    // них через список `peers` в своём `joined`.
+    for (id, p) in room.participants.iter() {
+        if id != &peer_id {
+            send_to(&p.tx, ServerMessage::PeerJoined {
+                peer_id: peer_id.clone(),
+                name: name.clone(),
+            });
+        }
+    }
+
+    // Ожидающие в лобби видны ТОЛЬКО самому лидеру — остальным пустой список.
+    // Порядок — по времени подачи заявки (`joined_at`), старейшая первой.
+    let pending = if becomes_leader {
+        pending_sorted_by_arrival(room)
+    } else {
+        Vec::new()
+    };
+
+    send_to(&tx, ServerMessage::Joined {
+        peer_id,
+        peers,
+        screen_owner,
+        leader_id,
+        settings: room.settings.clone(),
+        pending,
+    });
+
+    // Истории чата сервер новичку больше не шлёт: чат целиком на mesh
+    // RTCDataChannel, историю новичок запрашивает сам у соседей по шине (см.
+    // `static/chat.js`) — сервер её не хранит.
+}
+
+/// Текущие заявки лобби, отсортированные по времени подачи (`joined_at`,
+/// старейшая первой) — используется и для `Joined::pending` лидера, и при
+/// переносе заявок новому лидеру после смены (см. `cleanup_peer`).
+fn pending_sorted_by_arrival(room: &Room) -> Vec<PendingInfo> {
+    let mut items: Vec<_> = room.pending.iter().collect();
+    items.sort_by_key(|(_, p)| p.joined_at);
+    items
+        .into_iter()
+        .map(|(id, p)| PendingInfo { peer_id: id.clone(), name: p.name.clone() })
+        .collect()
+}
+
+/// `update-settings`: применяет новые настройки целиком (не патч) — только от
+/// лидера, иначе `error`. Рассылает `settings-changed` всем участникам. Если
+/// `guest_screen` только что отобрали, а текущий владелец экрана — не лидер,
+/// сервер сам останавливает его шаринг (`share-stopped` всем).
+fn handle_update_settings(
+    settings: RoomSettings,
+    me: &Option<PeerCtx>,
+    tx: &PeerTx,
+    rooms: &SharedRooms,
+) {
+    let Some(ctx) = me else {
+        send_to(tx, err("not in a room"));
+        return;
+    };
+    let mut rooms_guard = rooms.lock().unwrap();
+    let Some(room) = rooms_guard.get_mut(&ctx.room_id) else {
+        return;
+    };
+    if room.leader_id.as_deref() != Some(ctx.peer_id.as_str()) {
+        send_to(tx, err("only the room leader can change settings"));
+        return;
+    }
+
+    let guest_screen_was_allowed = room.settings.guest_screen;
+    room.settings = settings.clone();
+
+    let changed_msg = ServerMessage::SettingsChanged { settings };
+    for p in room.participants.values() {
+        send_to(&p.tx, changed_msg.clone());
+    }
+
+    // Отобрали право шаринга у гостей, пока гость (не лидер) шарит — сервер
+    // сам останавливает его.
+    if guest_screen_was_allowed && !room.settings.guest_screen {
+        if let Some(owner) = room.screen_owner.clone() {
+            if room.leader_id.as_deref() != Some(owner.as_str()) {
+                room.screen_owner = None;
+                let stop_msg = ServerMessage::ShareStopped { peer_id: owner };
+                for p in room.participants.values() {
+                    send_to(&p.tx, stop_msg.clone());
+                }
+            }
+        }
+    }
+}
+
+/// `approve {peerId}`: только лидер, только по действующей заявке в
+/// `room.pending`. Переносит ожидающего в участники (тем же `tx`/`name`),
+/// шлёт ему полноценный `joined` и остальным `peer-joined`. Если комната
+/// успела заполниться, пока заявка ждала — отклоняем её отдельно (не даём
+/// превысить `MAX_PARTICIPANTS`).
+fn handle_approve(target: String, me: &Option<PeerCtx>, tx: &PeerTx, rooms: &SharedRooms) {
+    let Some(ctx) = me else {
+        send_to(tx, err("not in a room"));
+        return;
+    };
+    let mut rooms_guard = rooms.lock().unwrap();
+    let Some(room) = rooms_guard.get_mut(&ctx.room_id) else {
+        return;
+    };
+    if room.leader_id.as_deref() != Some(ctx.peer_id.as_str()) {
+        send_to(tx, err("only the room leader can approve"));
+        return;
+    }
+    let Some(pending) = room.pending.remove(&target) else {
+        send_to(tx, err("no such pending join request"));
+        return;
+    };
+    if room.participants.len() >= MAX_PARTICIPANTS {
+        send_to(&pending.tx, ServerMessage::RoomFull);
+        send_to(tx, err("room is full, cannot approve"));
+        return;
+    }
+
+    let room_id = ctx.room_id.clone();
+    admit_participant(room, &room_id, target, pending.name, pending.tx, false);
+}
+
+/// `reject {peerId}`: только лидер, только по действующей заявке. Ожидающему
+/// уходит `join-rejected`, писатель его соединения сам закрывает сокет сразу
+/// вслед за этим сообщением (см. `reject` в `handle_socket`).
+fn handle_reject(target: String, me: &Option<PeerCtx>, tx: &PeerTx, rooms: &SharedRooms) {
+    let Some(ctx) = me else {
+        send_to(tx, err("not in a room"));
+        return;
+    };
+    let mut rooms_guard = rooms.lock().unwrap();
+    let Some(room) = rooms_guard.get_mut(&ctx.room_id) else {
+        return;
+    };
+    if room.leader_id.as_deref() != Some(ctx.peer_id.as_str()) {
+        send_to(tx, err("only the room leader can reject"));
+        return;
+    }
+    let Some(pending) = room.pending.remove(&target) else {
+        send_to(tx, err("no such pending join request"));
+        return;
+    };
+    send_to(&pending.tx, ServerMessage::JoinRejected {});
+}
+
 /// Заявка на шаринг экрана: удовлетворяется, только если экран сейчас
 /// свободен. Если уже занят — отказ (`share-rejected`) только инициатору,
 /// без рассылки остальным. Повторная заявка текущего владельца — не-op.
+/// Не-лидеру при `guest_screen=false` — отказ с `reason: "forbidden"`
+/// (без `busyPeerId`), независимо от того, свободен экран или нет.
 fn handle_share_start(me: &Option<PeerCtx>, tx: &PeerTx, rooms: &SharedRooms) {
     let Some(ctx) = me else {
         send_to(tx, err("not in a room"));
@@ -312,6 +527,15 @@ fn handle_share_start(me: &Option<PeerCtx>, tx: &PeerTx, rooms: &SharedRooms) {
     let Some(room) = rooms_guard.get_mut(&ctx.room_id) else {
         return;
     };
+    if !room.participants.contains_key(&ctx.peer_id) {
+        send_to(tx, err("not in a room"));
+        return;
+    }
+    let is_leader = room.leader_id.as_deref() == Some(ctx.peer_id.as_str());
+    if !is_leader && !room.settings.guest_screen {
+        send_to(tx, ServerMessage::ShareRejected { busy_peer_id: None, reason: Some("forbidden".to_string()) });
+        return;
+    }
     match &room.screen_owner {
         None => {
             room.screen_owner = Some(ctx.peer_id.clone());
@@ -324,7 +548,7 @@ fn handle_share_start(me: &Option<PeerCtx>, tx: &PeerTx, rooms: &SharedRooms) {
             // Уже владеет экраном — заявка избыточна, ничего не меняем.
         }
         Some(owner) => {
-            send_to(tx, ServerMessage::ShareRejected { busy_peer_id: owner.clone() });
+            send_to(tx, ServerMessage::ShareRejected { busy_peer_id: Some(owner.clone()), reason: None });
         }
     }
 }
@@ -361,9 +585,23 @@ fn handle_chat(
     rooms: &SharedRooms,
     chat_times: &mut VecDeque<Instant>,
 ) {
-    if me.is_none() {
+    let Some(ctx) = me else {
         send_to(tx, err("not in a room"));
         return;
+    };
+
+    // Право на чат: лидеру всегда можно, гостю — только если не отобрано
+    // настройками комнаты (`guest_chat`).
+    {
+        let rooms_guard = rooms.lock().unwrap();
+        if let Some(room) = rooms_guard.get(&ctx.room_id) {
+            let is_leader = room.leader_id.as_deref() == Some(ctx.peer_id.as_str());
+            if !is_leader && !room.settings.guest_chat {
+                drop(rooms_guard);
+                send_to(tx, err("чат запрещён лидером"));
+                return;
+            }
+        }
     }
 
     if !check_rate_limit(chat_times) {
@@ -431,42 +669,105 @@ where
         debug!(room = %ctx.room_id, "релей в уже удалённую комнату — игнорируем");
         return;
     };
+    // Ожидающий одобрения в лобби (см. `Room::pending`) — ещё не участник,
+    // ему релей недоступен (ни как отправителю, ни как получателю — вторых
+    // тут проверять не нужно, он не окажется в `room.participants`).
+    if !room.participants.contains_key(&ctx.peer_id) {
+        send_to(tx, err("not in a room"));
+        return;
+    }
     match room.participants.get(target) {
         Some(p) => send_to(&p.tx, build(ctx.peer_id.clone())),
         None => debug!(target = %target, "релей на неизвестный peerId — игнорируем"),
     }
 }
 
-/// Убрать пира из комнаты и уведомить остальных: если он шарил экран —
-/// сначала `share-stopped` всем оставшимся, затем (если кто-то остался)
+/// Убрать пира из комнаты и уведомить остальных. Пир мог быть либо полным
+/// участником, либо ожидающим одобрения в лобби (`Room::pending`) — это
+/// взаимоисключающие карты, обрабатываем по очереди.
+///
+/// Для участника: если он шарил экран — сначала `share-stopped` всем
+/// оставшимся; если он был лидером — сервер детерминированно назначает
+/// нового (участника с самым ранним `joined_at`) и рассылает
+/// `leader-changed`, а накопленные заявки лобби пересылает новому лидеру
+/// заново (`join-request` за каждую); затем (если кто-то остался)
 /// `peer-left`. Если комната опустела — не удаляем её сразу, а помечаем
-/// момент опустошения: реапер удалит её позже, если никто не подключится
-/// до истечения TTL (см. `state::reap_empty_rooms`).
+/// момент опустошения: реапер удалит её позже, если никто не подключится до
+/// истечения TTL (см. `state::reap_empty_rooms`); все ещё живые заявки
+/// лобби в этот момент отклоняются (`join-rejected` + закрытие сокета) —
+/// одобрять их больше некому.
+///
+/// Для ожидающего в лобби: просто убираем из `pending` и, если лидер ещё
+/// есть, уведомляем его `join-request-cancelled`.
 fn cleanup_peer(ctx: &PeerCtx, rooms: &SharedRooms) {
     let mut rooms_guard = rooms.lock().unwrap();
     let Some(room) = rooms_guard.get_mut(&ctx.room_id) else { return };
-    if room.participants.remove(&ctx.peer_id).is_none() {
-        return; // уже не в комнате
+
+    if room.participants.remove(&ctx.peer_id).is_some() {
+        if room.screen_owner.as_deref() == Some(ctx.peer_id.as_str()) {
+            room.screen_owner = None;
+            let msg = ServerMessage::ShareStopped { peer_id: ctx.peer_id.clone() };
+            for p in room.participants.values() {
+                send_to(&p.tx, msg.clone());
+            }
+        }
+
+        let was_leader = room.leader_id.as_deref() == Some(ctx.peer_id.as_str());
+        if was_leader {
+            let new_leader = room
+                .participants
+                .iter()
+                .min_by_key(|(_, p)| p.joined_at)
+                .map(|(id, _)| id.clone());
+            room.leader_id = new_leader.clone();
+            if let Some(new_leader_id) = new_leader {
+                info!(room = %ctx.room_id, leader = %new_leader_id, "лидер ушёл — назначен новый");
+                let msg = ServerMessage::LeaderChanged { leader_id: new_leader_id.clone() };
+                for p in room.participants.values() {
+                    send_to(&p.tx, msg.clone());
+                }
+                // Заявки лобби наследуются новым лидером — пересылаем их ему
+                // заново (в порядке подачи), он их ещё не видел.
+                if !room.pending.is_empty() {
+                    let pending = pending_sorted_by_arrival(room);
+                    if let Some(new_leader) = room.participants.get(&new_leader_id) {
+                        for p in pending {
+                            send_to(&new_leader.tx, ServerMessage::JoinRequest {
+                                peer_id: p.peer_id,
+                                name: p.name,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        if room.participants.is_empty() {
+            room.emptied_at = Some(Instant::now());
+            // Некому больше одобрять — отклоняем всех, кто ещё ждал.
+            for (_, pend) in room.pending.drain() {
+                send_to(&pend.tx, ServerMessage::JoinRejected {});
+            }
+            info!(room = %ctx.room_id, "комната опустела, ожидает TTL перед удалением");
+        } else {
+            info!(room = %ctx.room_id, peer = %ctx.peer_id, "участник отключился");
+            let msg = ServerMessage::PeerLeft { peer_id: ctx.peer_id.clone() };
+            for p in room.participants.values() {
+                send_to(&p.tx, msg.clone());
+            }
+        }
+        return;
     }
 
-    if room.screen_owner.as_deref() == Some(ctx.peer_id.as_str()) {
-        room.screen_owner = None;
-        let msg = ServerMessage::ShareStopped { peer_id: ctx.peer_id.clone() };
-        for p in room.participants.values() {
-            send_to(&p.tx, msg.clone());
+    if room.pending.remove(&ctx.peer_id).is_some() {
+        info!(room = %ctx.room_id, peer = %ctx.peer_id, "ожидающий отвалился, заявка снята");
+        if let Some(leader_id) = room.leader_id.clone() {
+            if let Some(leader) = room.participants.get(&leader_id) {
+                send_to(&leader.tx, ServerMessage::JoinRequestCancelled { peer_id: ctx.peer_id.clone() });
+            }
         }
     }
-
-    if room.participants.is_empty() {
-        room.emptied_at = Some(Instant::now());
-        info!(room = %ctx.room_id, "комната опустела, ожидает TTL перед удалением");
-    } else {
-        info!(room = %ctx.room_id, peer = %ctx.peer_id, "участник отключился");
-        let msg = ServerMessage::PeerLeft { peer_id: ctx.peer_id.clone() };
-        for p in room.participants.values() {
-            send_to(&p.tx, msg.clone());
-        }
-    }
+    // Иначе пир уже не в комнате ни в каком виде — нечего делать.
 }
 
 fn err(message: &str) -> ServerMessage {
