@@ -47,7 +47,7 @@ import {
   installCaptureStub,
   installMicStub,
   installCamStub,
-  installSavedName,
+  joinRoom,
   installPcRegistry,
   waitForMeshSettled,
   waitForOverlayHidden,
@@ -84,6 +84,18 @@ async function installCaptureOnly(context) {
 
 function tileSelector(name) {
   return `.tile[data-name="${name}"]`;
+}
+
+/** Корона видна (не .hidden) на тайле `selector .tile-crown` (см. README.md «Права и лидер»). */
+async function waitCrownVisible(page, selector, visible, timeoutMs = 8000) {
+  await page.waitForFunction(
+    ({ sel, want }) => {
+      const crown = document.querySelector(`${sel} .tile-crown`);
+      return !!crown && crown.classList.contains('hidden') !== want;
+    },
+    { sel: selector, want: visible },
+    { polling: 100, timeout: timeoutMs }
+  );
 }
 
 async function waitForTileCount(page, expected, timeoutMs = 8000) {
@@ -199,17 +211,17 @@ async function main() {
     await installPcRegistry(vasyaContext);
     await installPcRegistry(petyaContext);
     await installPcRegistry(olyaContext);
-    await installSavedName(vasyaContext, 'Вася');
-    await installSavedName(petyaContext, 'Петя');
-    await installSavedName(olyaContext, 'Оля');
     let vasyaPage = await vasyaContext.newPage();
     let petyaPage = await petyaContext.newPage();
     let olyaPage = await olyaContext.newPage();
 
-    const bothJoinedOk = await step('подготовка: Вася, Петя и Оля заходят в комнату — у всех по 3 тайла', async () => {
+    const bothJoinedOk = await step('подготовка: Вася, Петя и Оля заходят в комнату (модалка входа) — у всех по 3 тайла', async () => {
       await vasyaPage.goto(roomUrl);
       await petyaPage.goto(roomUrl);
       await olyaPage.goto(roomUrl);
+      await joinRoom(vasyaPage, 'Вася');
+      await joinRoom(petyaPage, 'Петя');
+      await joinRoom(olyaPage, 'Оля');
       await waitForOverlayHidden(vasyaPage);
       await waitForOverlayHidden(petyaPage);
       await waitForOverlayHidden(olyaPage);
@@ -305,7 +317,11 @@ async function main() {
     // ============================================================
     if (scenarioBShareOk) {
       await step('(в) Оля перезагружает страницу — снова в комнате, старый шаринг освобождён сервером, история чата пуста (Ф1: сервер её не хранит, а к этому моменту Оля в комнате одна — спросить не у кого)', async () => {
+        // page.reload() — это полная перезагрузка (новый JS-контекст, не
+        // авто-reconnect внутри вкладки) — модалка входа показывается заново
+        // (анонимность, см. static/room.js), имя вводим снова.
         await olyaPage.reload();
+        await joinRoom(olyaPage, 'Оля');
         await waitForOverlayHidden(olyaPage);
 
         // Ф1: истории на сервере больше нет вообще (см. README.md/src/ws.rs) —
@@ -357,11 +373,11 @@ async function main() {
         }
       };
     });
-    await installSavedName(igorContext, 'Игорь');
     const igorPage = await igorContext.newPage();
 
     const igorJoinedOk = await step('(г, подготовка) новый участник Игорь подключается к комнате', async () => {
       await igorPage.goto(roomUrl);
+      await joinRoom(igorPage, 'Игорь');
       await waitForOverlayHidden(igorPage);
       await waitForTileCount(olyaPage, 2);
       await waitParticipantCount(olyaPage, 2);
@@ -411,6 +427,7 @@ async function main() {
         const page = await ctx.newPage();
         fillerPages.push(page);
         await page.goto(roomUrl);
+        await joinRoom(page);
       }
       for (const page of fillerPages) {
         await waitForOverlayHidden(page);
@@ -420,6 +437,7 @@ async function main() {
       const seventhContext = await browser.newContext();
       const seventhPage = await seventhContext.newPage();
       await seventhPage.goto(roomUrl);
+      await joinRoom(seventhPage);
       await waitOverlayTitle(seventhPage, 'Комната заполнена', 10_000);
       roomFullOk = true;
       await seventhContext.close(); // в комнату не попал, дальше не нужен
@@ -453,6 +471,7 @@ async function main() {
     const test1Page = await test1Context.newPage();
     const withinTtlOk = await step('(е) вход в опустевшую комнату в течение TTL (1с < 5с) — успешен', async () => {
       await test1Page.goto(roomUrl);
+      await joinRoom(test1Page);
       await waitForOverlayHidden(test1Page);
     });
 
@@ -470,6 +489,7 @@ async function main() {
       const test2Page = await test2Context.newPage();
       await step('(е) вход в ту же комнату после истечения TTL — «Комната не найдена»', async () => {
         await test2Page.goto(roomUrl);
+        await joinRoom(test2Page);
         await waitOverlayTitle(test2Page, 'Комната не найдена', 10_000);
       });
     } else {
@@ -489,13 +509,13 @@ async function main() {
       const ninaContext = await browser.newContext();
       const tolyaContext = await browser.newContext();
       allContexts.push(ninaContext, tolyaContext);
-      await installSavedName(ninaContext, 'Нина');
-      await installSavedName(tolyaContext, 'Толя');
       ninaPage = await ninaContext.newPage();
       tolyaPage = await tolyaContext.newPage();
 
       await ninaPage.goto(newRoomUrl);
       await tolyaPage.goto(newRoomUrl);
+      await joinRoom(ninaPage, 'Нина');
+      await joinRoom(tolyaPage, 'Толя');
       await waitForOverlayHidden(ninaPage);
       await waitForOverlayHidden(tolyaPage);
     });
@@ -570,9 +590,6 @@ async function main() {
         await installPcRegistry(vasya2Context);
         await installPcRegistry(petya2Context);
         await installPcRegistry(olya2Context);
-        await installSavedName(vasya2Context, 'Вася');
-        await installSavedName(petya2Context, 'Петя');
-        await installSavedName(olya2Context, 'Оля');
         vasya2Page = await vasya2Context.newPage();
         petya2Page = await petya2Context.newPage();
         olya2Page = await olya2Context.newPage();
@@ -580,6 +597,9 @@ async function main() {
         await vasya2Page.goto(restartRoomUrl);
         await petya2Page.goto(restartRoomUrl);
         await olya2Page.goto(restartRoomUrl);
+        await joinRoom(vasya2Page, 'Вася');
+        await joinRoom(petya2Page, 'Петя');
+        await joinRoom(olya2Page, 'Оля');
         await waitForOverlayHidden(vasya2Page);
         await waitForOverlayHidden(petya2Page);
         await waitForOverlayHidden(olya2Page);
@@ -605,6 +625,11 @@ async function main() {
         await sendChatMessage(petya2Page, msg2);
         assert.ok(await messageTextsInclude(vasya2Page, msg2), 'сообщение 2 не дошло до Васи');
         assert.ok(await messageTextsInclude(olya2Page, msg2), 'сообщение 2 не дошло до Оли');
+
+        // Комната создана через createRoomViaApi (без leaderToken) — лидером
+        // становится первый вошедший (см. README.md «Права и лидер»), здесь
+        // это Вася (join-room отправлен первым, до Пети/Оли).
+        await waitCrownVisible(petya2Page, tileSelector('Вася'), true);
       }
     );
 
@@ -654,6 +679,53 @@ async function main() {
           await waitParticipantCount(page, 3, 15_000);
         }
       });
+
+      // Лидерство при рестарте сервера (см. README.md «Права и лидер»):
+      // сервер теряет ВСЮ память (включая leader_id) при рестарте — комната
+      // восстанавливается пустой через PUT /api/rooms/{id} и лидером
+      // становится первый, кто успешно ре-джойнится (см.
+      // src/main.rs::restore_room и src/ws.rs::JoinRoom). Кто из троих
+      // ре-джойнится первым — гонка бэкоффов реконнекта (см.
+      // static/room.js), НЕ гарантированно снова Вася. Здесь фиксируем
+      // фактический исход и главное свойство: без дедлока и ровно один
+      // лидер, на котором сходятся ВСЕ участники.
+      await step(
+        '(з.д) лидерство после рестарта сервера: ровно один лидер, сходятся все участники — фиксируем фактическое поведение',
+        async () => {
+          const leaderIds = await Promise.all(
+            [vasya2Page, petya2Page, olya2Page].map((page) => page.evaluate(() => leaderId))
+          );
+          assert.ok(
+            leaderIds.every((id) => id === leaderIds[0]),
+            `все участники должны видеть ОДНОГО И ТОГО ЖЕ лидера (без дедлока/расхождения), получено: ${JSON.stringify(leaderIds)}`
+          );
+          assert.ok(leaderIds[0], 'leaderId не должен быть пустым после реконнекта');
+
+          const nameByPeerId = {};
+          for (const [label, page] of [['Вася', vasya2Page], ['Петя', petya2Page], ['Оля', olya2Page]]) {
+            const myId = await page.evaluate(() => myPeerId);
+            nameByPeerId[myId] = label;
+          }
+          console.log(
+            `# фактическое поведение (лидерство при рестарте сервера): лидером остался(лась) ${
+              nameByPeerId[leaderIds[0]] || leaderIds[0]
+            }`
+          );
+
+          // Ровно один участник должен видеть корону на СВОЁМ тайле — не ноль
+          // (лидер потерян) и не больше одного (несколько «лидеров» разом).
+          const ownCrownFlags = await Promise.all(
+            [vasya2Page, petya2Page, olya2Page].map((page) =>
+              page.evaluate(() => !document.querySelector('.tile--own .tile-crown')?.classList.contains('hidden'))
+            )
+          );
+          assert.equal(
+            ownCrownFlags.filter(Boolean).length,
+            1,
+            `ровно один участник должен видеть корону на своём тайле, получено: ${JSON.stringify(ownCrownFlags)}`
+          );
+        }
+      );
 
       let screenRestoredActually = false;
       await step('(з.в) шаринг экрана Пети после реконнекта — фиксируем фактическое поведение', async () => {

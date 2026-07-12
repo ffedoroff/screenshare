@@ -341,13 +341,21 @@ export function installCamStub() {
   };
 }
 
-// Задать имя участника в localStorage (chat.js: NAME_STORAGE_KEY =
-// 'screenshare-name') ДО загрузки скриптов страницы — addInitScript
-// выполняется при каждой навигации (в т.ч. при page.reload()).
-export function installSavedName(context, name) {
-  return context.addInitScript((n) => {
-    localStorage.setItem('screenshare-name', n);
-  }, name);
+// --- Модалка входа (анонимность — см. static/room.js) ---
+//
+// Никакого localStorage больше нет: имя вводится в модалке «Присоединиться»
+// при КАЖДОМ заходе в комнату (первый вход и любой page.reload() — реконнект
+// после обрыва сигналинга БЕЗ перезагрузки страницы модалку повторно не
+// показывает, см. static/room.js). Эта функция — единая точка входа для
+// ВСЕХ сценариев теста: дождаться модалки, (опционально) ввести имя, кликнуть
+// «Войти». Создатель комнаты тоже проходит через неё — лендинг больше не
+// спрашивает имя, только создаёт комнату и редиректит на /r/<id>#lt=<token>.
+export async function joinRoom(page, name) {
+  await page.waitForSelector('#join-modal:not(.hidden)', { timeout: 10_000 });
+  if (name) {
+    await page.fill('#join-name-input', name);
+  }
+  await page.click('#join-modal-button');
 }
 
 // --- Реестр RTCPeerConnection для ожидания реального "соединения устаканились" ---
@@ -427,7 +435,12 @@ export async function waitForMeshSettled(pages, { tileCount, connectionsPerPage,
         `[waitForMeshSettled] попытка ${attempt}/${attempts} не устаканилась (${err.message}) — перезаходим в комнату и пробуем снова`
       );
       for (const page of pages) {
+        // page.reload() — полная перезагрузка (не авто-reconnect внутри
+        // вкладки) — модалка входа появляется заново (анонимность, см.
+        // static/room.js), имя заново не важно для этой страховки — просто
+        // жмём «Войти» пустым именем, чтобы снова оказаться в комнате.
         await page.reload();
+        await joinRoom(page);
         await waitForOverlayHidden(page);
       }
     }

@@ -39,7 +39,7 @@ import {
   installCaptureStub,
   installMicStub,
   installCamStub,
-  installSavedName,
+  joinRoom,
   installPcRegistry,
   waitForMeshSettled,
   waitForOverlayHidden,
@@ -82,6 +82,26 @@ async function waitForTileCount(page, expected, timeoutMs = 8000) {
 
 async function tileSelector(name) {
   return `.tile[data-name="${name}"]`;
+}
+
+async function waitOverlayTitle(page, expectedTitle, timeoutMs = 10_000) {
+  await page.waitForFunction(
+    (title) => document.getElementById('overlay-title')?.textContent === title,
+    expectedTitle,
+    { polling: 100, timeout: timeoutMs }
+  );
+}
+
+/** Корона видна (не .hidden) на тайле `selector .tile-crown`. */
+async function waitCrownVisible(page, selector, visible, timeoutMs = 8000) {
+  await page.waitForFunction(
+    ({ sel, want }) => {
+      const crown = document.querySelector(`${sel} .tile-crown`);
+      return !!crown && crown.classList.contains('hidden') !== want;
+    },
+    { sel: selector, want: visible },
+    { polling: 100, timeout: timeoutMs }
+  );
 }
 
 async function waitForClassOnSelector(page, selector, className, present, timeoutMs = 8000) {
@@ -152,15 +172,27 @@ async function main() {
     const vasyaPage = await vasyaContext.newPage();
 
     let roomId = null;
-    const roomCreatedOk = await step('Вася: главная страница, вводит имя, создаёт комнату', async () => {
+    const roomCreatedOk = await step('Вася: главная страница -> создаёт комнату -> вводит имя в модалке входа комнаты -> становится лидером (корона)', async () => {
       await vasyaPage.goto(server.baseUrl);
-      await vasyaPage.fill('#name-input', 'Вася');
       await vasyaPage.click('#create-room-button');
-      await vasyaPage.waitForURL(/\/r\/[^/]+$/, { timeout: 10_000 });
-      const match = vasyaPage.url().match(/\/r\/([^/]+)$/);
+      await vasyaPage.waitForURL(/\/r\/[^/]+/, { timeout: 10_000 });
+      // Лендинг больше не спрашивает имя (анонимность — см. static/landing.js) —
+      // роль извлекается из /r/<id>#lt=<token>. Фрагмент не матчим "$": он
+      // может быть уже вычищен к этому моменту через history.replaceState
+      // (см. static/room.js), а может ещё нет — регэксп безразличен к обоим случаям.
+      const match = vasyaPage.url().match(/\/r\/([^/#]+)/);
       assert.ok(match, `не удалось извлечь roomId из URL: ${vasyaPage.url()}`);
       roomId = match[1];
+      await joinRoom(vasyaPage, 'Вася');
       await waitForOverlayHidden(vasyaPage);
+
+      // Создатель предъявил leaderToken из фрагмента ссылки — стал лидером:
+      // корона на своём тайле.
+      await vasyaPage.waitForFunction(
+        () => !document.querySelector('.tile--own .tile-crown')?.classList.contains('hidden'),
+        undefined,
+        { polling: 100, timeout: 5000 }
+      );
     });
 
     if (!roomCreatedOk || !roomId) {
@@ -181,20 +213,36 @@ async function main() {
     await installChatWsSpy(olyaContext);
     await installPcRegistry(petyaContext);
     await installPcRegistry(olyaContext);
-    await installSavedName(petyaContext, 'Петя');
-    await installSavedName(olyaContext, 'Оля');
     const petyaPage = await petyaContext.newPage();
     const olyaPage = await olyaContext.newPage();
 
-    const everyoneJoinedOk = await step('Петя и Оля открывают ссылку комнаты, у всех троих по 3 тайла', async () => {
+    const everyoneJoinedOk = await step('Петя и Оля открывают ссылку комнаты (модалка входа), у всех троих по 3 тайла, корона только у Васи', async () => {
       await petyaPage.goto(roomUrl);
       await olyaPage.goto(roomUrl);
+      await joinRoom(petyaPage, 'Петя');
+      await joinRoom(olyaPage, 'Оля');
       await waitForOverlayHidden(petyaPage);
       await waitForOverlayHidden(olyaPage);
 
       // waitForMeshSettled ждёт и тайлы, и что у всех троих обе mesh-связи
       // (шина + сигналинг) реально дошли до connected — см. helpers.mjs.
       await waitForMeshSettled([vasyaPage, petyaPage, olyaPage], { tileCount: 3, connectionsPerPage: 2 });
+
+      // (а) Вася — лидер (корона на его тайле у остальных), у Пети/Оли короны нет.
+      const vasyaTileSel = await tileSelector('Вася');
+      for (const page of [petyaPage, olyaPage]) {
+        await page.waitForFunction(
+          (sel) => !document.querySelector(`${sel} .tile-crown`)?.classList.contains('hidden'),
+          vasyaTileSel,
+          { polling: 100, timeout: 5000 }
+        );
+      }
+      for (const [label, page] of [['Петя', petyaPage], ['Оля', olyaPage]]) {
+        const ownCrownHidden = await page.evaluate(
+          () => document.querySelector('.tile--own .tile-crown')?.classList.contains('hidden')
+        );
+        assert.equal(ownCrownHidden, true, `у ${label} на своём тайле не должно быть короны`);
+      }
     });
 
     if (!everyoneJoinedOk) {
@@ -422,14 +470,14 @@ async function main() {
 
         const igorContext = await browser.newContext();
         const nastyaContext = await browser.newContext();
-        await installSavedName(igorContext, 'Игорь');
-        await installSavedName(nastyaContext, 'Настя');
         const igorPage = await igorContext.newPage();
         const nastyaPage = await nastyaContext.newPage();
 
         try {
           await igorPage.goto(histRoomUrl);
           await nastyaPage.goto(histRoomUrl);
+          await joinRoom(igorPage, 'Игорь');
+          await joinRoom(nastyaPage, 'Настя');
           await waitForOverlayHidden(igorPage);
           await waitForOverlayHidden(nastyaPage);
           await waitForTileCount(igorPage, 2);
@@ -451,10 +499,10 @@ async function main() {
           // тоже целиком по DataChannel, без обращения к серверу.
           const tretyContext = await browser.newContext();
           await installChatWsSpy(tretyContext);
-          await installSavedName(tretyContext, 'Третий');
           const tretyPage = await tretyContext.newPage();
           try {
             await tretyPage.goto(histRoomUrl);
+            await joinRoom(tretyPage, 'Третий');
             await waitForOverlayHidden(tretyPage);
             await waitForTileCount(tretyPage, 3);
 
@@ -502,9 +550,6 @@ async function main() {
         const aContext = await browser.newContext();
         const bContext = await browser.newContext();
         const cContext = await browser.newContext();
-        await installSavedName(aContext, 'Аня');
-        await installSavedName(bContext, 'Боря');
-        await installSavedName(cContext, 'Витя');
         const aPage = await aContext.newPage();
         const bPage = await bContext.newPage();
         const cPage = await cContext.newPage();
@@ -513,6 +558,9 @@ async function main() {
           await aPage.goto(fmtRoomUrl);
           await bPage.goto(fmtRoomUrl);
           await cPage.goto(fmtRoomUrl);
+          await joinRoom(aPage, 'Аня');
+          await joinRoom(bPage, 'Боря');
+          await joinRoom(cPage, 'Витя');
           await waitForOverlayHidden(aPage);
           await waitForOverlayHidden(bPage);
           await waitForOverlayHidden(cPage);
@@ -636,10 +684,10 @@ async function main() {
 
           // --- (г) опоздавший (Гриша) видит и сообщение, и реакцию из истории ---
           const dContext = await browser.newContext();
-          await installSavedName(dContext, 'Гриша');
           const dPage = await dContext.newPage();
           try {
             await dPage.goto(fmtRoomUrl);
+            await joinRoom(dPage, 'Гриша');
             await waitForOverlayHidden(dPage);
             await waitForTileCount(dPage, 4);
             await openChatPanel(dPage);
@@ -690,14 +738,14 @@ async function main() {
 
         const iContext = await browser.newContext();
         const pContext = await browser.newContext();
-        await installSavedName(iContext, 'Инна');
-        await installSavedName(pContext, 'Паша');
         const iPage = await iContext.newPage();
         const pPage = await pContext.newPage();
 
         try {
           await iPage.goto(editRoomUrl);
           await pPage.goto(editRoomUrl);
+          await joinRoom(iPage, 'Инна');
+          await joinRoom(pPage, 'Паша');
           await waitForOverlayHidden(iPage);
           await waitForOverlayHidden(pPage);
           await waitForTileCount(iPage, 2);
@@ -787,10 +835,10 @@ async function main() {
           // --- (в) опоздавший (Слава) видит из реплея истории: отредактированный
           //     текст М1 (не оригинал) и тумбстоун вместо удалённого М2 ---
           const sContext = await browser.newContext();
-          await installSavedName(sContext, 'Слава');
           const sPage = await sContext.newPage();
           try {
             await sPage.goto(editRoomUrl);
+            await joinRoom(sPage, 'Слава');
             await waitForOverlayHidden(sPage);
             await waitForTileCount(sPage, 3);
             await openChatPanel(sPage);
@@ -888,14 +936,14 @@ async function main() {
         const fContext = await browser.newContext();
         await installPcRegistry(eContext);
         await installPcRegistry(fContext);
-        await installSavedName(eContext, 'Женя');
-        await installSavedName(fContext, 'Захар');
         const ePage = await eContext.newPage();
         const fPage = await fContext.newPage();
 
         try {
           await ePage.goto(fileRoomUrl);
           await fPage.goto(fileRoomUrl);
+          await joinRoom(ePage, 'Женя');
+          await joinRoom(fPage, 'Захар');
           await waitForOverlayHidden(ePage);
           await waitForOverlayHidden(fPage);
           // Именно waitForMeshSettled (не просто waitForTileCount) — файловый
@@ -948,10 +996,10 @@ async function main() {
           //     скачать, пока отправитель (Женя) ещё в комнате ---
           const gContext = await browser.newContext();
           await installPcRegistry(gContext);
-          await installSavedName(gContext, 'Иван');
           const gPage = await gContext.newPage();
           try {
             await gPage.goto(fileRoomUrl);
+            await joinRoom(gPage, 'Иван');
             await waitForOverlayHidden(gPage);
             await waitForMeshSettled([ePage, fPage, gPage], { tileCount: 3, connectionsPerPage: 2 });
             await openChatPanel(gPage);
@@ -984,6 +1032,227 @@ async function main() {
       }
     );
 
+    // --- Права и лидер (см. README.md «Права и лидер») ---
+    //
+    // Отдельная комната: Лида — создатель (предъявляет leaderToken из
+    // фрагмента, становится лидером), Гоша — обычный гость по прямой ссылке
+    // (без токена, лобби пока выключено). Дальше по шагам: (б) лидер включает
+    // лобби, Тоня ждёт одобрения и получает его, Юра ждёт и получает отказ;
+    // (в) лидер выключает гостям чат — у Гоши инпут дизейблен, а ПОДДЕЛАННЫЙ
+    // конверт (инъекция через evaluate в bus._dispatch у Лиды, минуя реальный
+    // DataChannel — тот же приём, что и в негативном тесте edit выше) с
+    // ЧУЖИМ from не рендерится ни у кого; (г) лидер выключает гостям показ
+    // экрана — кнопка «Экран» у Гоши дизейблена; (д) лидер уходит — старейший
+    // гость (Гоша, joined_at раньше Тони) получает корону и тост.
+    await step(
+      'Права и лидер: корона создателя, лобби (одобрение/отказ), запрет чата гостям (+ игнор поддельного конверта), запрет показа экрана, смена лидера при уходе',
+      async () => {
+        const res = await fetch(`${server.baseUrl}/api/rooms`, { method: 'POST' });
+        assert.ok(res.ok, `POST /api/rooms ответил статусом ${res.status}`);
+        const { roomId: permRoomId, leaderToken: permLeaderToken } = await res.json();
+        const permRoomUrl = `${server.baseUrl}/r/${permRoomId}`;
+        const permLeaderUrl = `${permRoomUrl}#lt=${encodeURIComponent(permLeaderToken)}`;
+
+        const lidaContext = await browser.newContext();
+        const goshaContext = await browser.newContext();
+        const lidaPage = await lidaContext.newPage();
+        const goshaPage = await goshaContext.newPage();
+
+        try {
+          // --- подготовка: Лида (создатель, лидер) и Гоша (обычный гость) ---
+          await lidaPage.goto(permLeaderUrl);
+          await joinRoom(lidaPage, 'Лида');
+          await waitForOverlayHidden(lidaPage);
+
+          await goshaPage.goto(permRoomUrl);
+          await joinRoom(goshaPage, 'Гоша');
+          await waitForOverlayHidden(goshaPage);
+          // Простая проверка по тайлам, БЕЗ waitForMeshSettled: этот сценарий
+          // не проверяет видео/аудио, только UI прав/лидера/чата — тайлы и
+          // шина комнаты (bus.addPeer) уже на месте сразу по joined/peer-joined,
+          // не дожидаясь фактического connectionState==='connected' — так
+          // тест не зависит от загруженности машины ICE-негоциацией (этот
+          // сценарий идёт последним в файле, после уже накопленных тяжёлых
+          // WebRTC-сценариев выше).
+          await waitForTileCount(lidaPage, 2, 10_000);
+          await waitForTileCount(goshaPage, 2, 10_000);
+
+          const lidaTileSel = await tileSelector('Лида');
+          await waitCrownVisible(goshaPage, lidaTileSel, true);
+          const goshaOwnCrownHidden = await goshaPage.evaluate(
+            () => document.querySelector('.tile--own .tile-crown')?.classList.contains('hidden')
+          );
+          assert.equal(goshaOwnCrownHidden, true, 'у Гоши на своём тайле короны быть не должно');
+          await goshaPage.waitForFunction(
+            () => document.getElementById('settings-button')?.classList.contains('hidden'),
+            undefined,
+            { polling: 100, timeout: 3000 }
+          );
+
+          // --- (б) лидер включает лобби ---
+          await lidaPage.click('#settings-button');
+          await lidaPage.locator('#setting-lobby').check();
+          await waitUntil(async () => (await lidaPage.evaluate(() => roomSettings && roomSettings.lobbyEnabled === true)), {
+            timeoutMs: 5000,
+            message: 'lobbyEnabled не применился у Лиды после тумблера',
+          });
+          await lidaPage.click('#settings-panel-close');
+
+          // Тоня заходит по прямой ссылке — попадает в лобби, ждёт одобрения.
+          const tonyaContext = await browser.newContext();
+          const tonyaPage = await tonyaContext.newPage();
+          await tonyaPage.goto(permRoomUrl);
+          await joinRoom(tonyaPage, 'Тоня');
+          await waitOverlayTitle(tonyaPage, 'Ожидание одобрения…');
+
+          const tonyaRequestCard = lidaPage.locator('.join-request-card', { hasText: 'Тоня' });
+          await tonyaRequestCard.waitFor({ state: 'visible', timeout: 8000 });
+          const badgeText = await lidaPage.locator('#settings-badge').textContent();
+          assert.equal(badgeText, '1', `бейдж заявок лобби должен показывать 1, получено: ${badgeText}`);
+
+          await tonyaRequestCard.locator('.join-request-button--accept').click();
+          await waitForOverlayHidden(tonyaPage);
+          // Простая проверка по тайлам (не waitForMeshSettled с его
+          // reload-ретраем): reload здесь опасен — при lobbyEnabled=true он
+          // заново отправил бы Тоню в лобби, требуя повторного одобрения.
+          for (const page of [lidaPage, goshaPage, tonyaPage]) {
+            await waitForTileCount(page, 3, 10_000);
+          }
+
+          // Юра заходит — тоже в лобби, лидер его отклоняет.
+          const yuraContext = await browser.newContext();
+          const yuraPage = await yuraContext.newPage();
+          try {
+            await yuraPage.goto(permRoomUrl);
+            await joinRoom(yuraPage, 'Юра');
+            await waitOverlayTitle(yuraPage, 'Ожидание одобрения…');
+
+            const yuraRequestCard = lidaPage.locator('.join-request-card', { hasText: 'Юра' });
+            await yuraRequestCard.waitFor({ state: 'visible', timeout: 8000 });
+            await yuraRequestCard.locator('.join-request-button--reject').click();
+            await waitOverlayTitle(yuraPage, 'Вход отклонён');
+          } finally {
+            await yuraContext.close();
+          }
+
+          // --- (в) лидер запрещает гостям чат ---
+          await openChatPanel(lidaPage);
+          await openChatPanel(goshaPage);
+          await lidaPage.click('#settings-button');
+          await lidaPage.locator('#setting-guest-chat').uncheck();
+          await waitUntil(async () => (await goshaPage.evaluate(() => roomSettings && roomSettings.guestChat === false)), {
+            timeoutMs: 5000,
+            message: 'guestChat=false не применился у Гоши',
+          });
+          await lidaPage.click('#settings-panel-close');
+
+          const goshaChatState = await goshaPage.evaluate(() => ({
+            disabled: document.querySelector('.chat-text-input').disabled,
+            placeholder: document.querySelector('.chat-text-input').placeholder,
+          }));
+          assert.equal(goshaChatState.disabled, true, 'у Гоши инпут чата должен быть задизейблен при guestChat=false');
+          assert.equal(
+            goshaChatState.placeholder,
+            'Чат запрещён лидером',
+            `плейсхолдер должен объяснять запрет: ${goshaChatState.placeholder}`
+          );
+
+          // Поддельный конверт как будто от Гоши (guestChat=false, Гоша не
+          // лидер) — инъекция напрямую в bus._dispatch у Лиды, минуя реальный
+          // DataChannel (тот же приём, что и в негативном тесте edit выше) —
+          // получатель должен молча проигнорировать.
+          const goshaPeerId = await lidaPage.evaluate(() => document.querySelector('.tile[data-name="Гоша"]').dataset.peerId);
+          await lidaPage.evaluate(
+            (pid) => {
+              bus._dispatch(pid, {
+                v: 1,
+                id: 'forged-text-guestchat-forbidden',
+                lamport: 999999,
+                from: pid,
+                name: 'Гоша',
+                kind: 'text',
+                text: 'ЗАПРЕЩЁННЫЙ-ТЕКСТ-ГОСТЯ',
+                ts: Date.now(),
+              });
+            },
+            goshaPeerId
+          );
+          assert.ok(
+            !(await messageTextsInclude(lidaPage, 'ЗАПРЕЩЁННЫЙ-ТЕКСТ-ГОСТЯ', 300)),
+            'конверт от гостя при guestChat=false должен быть проигнорирован получателем (даже подделанный напрямую в шину)'
+          );
+
+          // Лидеру чат по-прежнему разрешён.
+          const leaderMsg = `Лида-может-писать-${Date.now()}`;
+          await sendChatMessage(lidaPage, leaderMsg);
+          assert.ok(await messageTextsInclude(goshaPage, leaderMsg), 'лидеру должно быть можно писать в чат при guestChat=false');
+
+          // --- (г) лидер запрещает гостям показ экрана ---
+          await lidaPage.click('#settings-button');
+          await lidaPage.locator('#setting-guest-screen').uncheck();
+          await waitUntil(async () => (await goshaPage.evaluate(() => roomSettings && roomSettings.guestScreen === false)), {
+            timeoutMs: 5000,
+            message: 'guestScreen=false не применился у Гоши',
+          });
+          await lidaPage.click('#settings-panel-close');
+
+          const goshaScreenState = await goshaPage.evaluate(() => ({
+            disabled: document.getElementById('screen-button')?.disabled,
+            title: document.getElementById('screen-button')?.title,
+          }));
+          assert.equal(goshaScreenState.disabled, true, 'кнопка «Экран» у Гоши должна быть задизейблена при guestScreen=false');
+          assert.equal(
+            goshaScreenState.title,
+            'Запрещено лидером',
+            `title кнопки «Экран» должен объяснять запрет: ${goshaScreenState.title}`
+          );
+
+          // --- (д) лидер уходит — старейший гость (Гоша) получает корону и тост ---
+          const goshaTileSel = await tileSelector('Гоша');
+          await lidaPage.click('#leave-button');
+
+          await goshaPage.waitForFunction(
+            () => document.getElementById('toast')?.textContent === 'Вы стали лидером' && !document.getElementById('toast')?.classList.contains('hidden'),
+            undefined,
+            { polling: 50, timeout: 8000 }
+          );
+          await waitCrownVisible(goshaPage, '.tile--own', true);
+          await goshaPage.waitForFunction(
+            () => !document.getElementById('settings-button')?.classList.contains('hidden'),
+            undefined,
+            { polling: 100, timeout: 5000 }
+          );
+
+          await tonyaPage.waitForFunction(
+            () => (document.getElementById('toast')?.textContent || '').includes('Гоша') && !document.getElementById('toast')?.classList.contains('hidden'),
+            undefined,
+            { polling: 50, timeout: 8000 }
+          );
+          await waitCrownVisible(tonyaPage, goshaTileSel, true);
+
+          await waitForTileCount(goshaPage, 2, 8000);
+          await waitForTileCount(tonyaPage, 2, 8000);
+
+          // --- (е) анонимность: ноль localStorage/cookie на всех вовлечённых страницах ---
+          for (const [label, page] of [['Гоша', goshaPage], ['Тоня', tonyaPage]]) {
+            const anon = await page.evaluate(() => ({ lsLength: localStorage.length, cookie: document.cookie }));
+            assert.equal(anon.lsLength, 0, `у ${label} localStorage.length должен быть 0, получено ${anon.lsLength}`);
+            assert.equal(anon.cookie, '', `у ${label} document.cookie должен быть пустым, получено "${anon.cookie}"`);
+          }
+          // Лида после «Покинуть» уходит на лендинг — тоже без следов.
+          await lidaPage.waitForURL(/\/$/, { timeout: 5000 });
+          const lidaAnon = await lidaPage.evaluate(() => ({ lsLength: localStorage.length, cookie: document.cookie }));
+          assert.equal(lidaAnon.lsLength, 0, `у Лиды (лендинг) localStorage.length должен быть 0, получено ${lidaAnon.lsLength}`);
+          assert.equal(lidaAnon.cookie, '', `у Лиды (лендинг) document.cookie должен быть пустым, получено "${lidaAnon.cookie}"`);
+
+          await tonyaContext.close();
+        } finally {
+          await lidaContext.close();
+          await goshaContext.close();
+        }
+      }
+    );
+
     // --- Мобильный смоук: узкий вьюпорт, новая (отдельная) комната ---
     // Экран не проверяем намеренно: на реальных мобильных браузерах
     // getDisplayMedia недоступен вовсе и кнопка «Экран» скрывается (см.
@@ -1010,6 +1279,26 @@ async function main() {
           const mobilePage = await mobileContext.newPage();
 
           await mobilePage.goto(`${server.baseUrl}/r/${mobileRoomId}`);
+
+          // Модалка входа — первое, что видит участник; должна помещаться в
+          // 390×844 без горизонтального скролла (mobile-first, см. README.md).
+          await mobilePage.waitForSelector('#join-modal:not(.hidden)', { timeout: 10_000 });
+          const joinModalBox = await mobilePage.locator('.join-modal-card').boundingBox();
+          assert.ok(joinModalBox, 'модалка входа должна быть видима на мобильном вьюпорте');
+          assert.ok(
+            joinModalBox.x >= -1 && joinModalBox.x + joinModalBox.width <= 390 + 1,
+            `модалка входа должна помещаться по ширине вьюпорта (390px): ${JSON.stringify(joinModalBox)}`
+          );
+          const modalOverflowInfo = await mobilePage.evaluate(() => ({
+            scrollWidth: document.documentElement.scrollWidth,
+            clientWidth: document.documentElement.clientWidth,
+          }));
+          assert.ok(
+            modalOverflowInfo.scrollWidth <= modalOverflowInfo.clientWidth + 1,
+            `модалка входа не должна вызывать горизонтальный скролл: ${JSON.stringify(modalOverflowInfo)}`
+          );
+
+          await joinRoom(mobilePage, 'Мобильный');
           await waitForOverlayHidden(mobilePage);
           await waitForTileCount(mobilePage, 1);
 

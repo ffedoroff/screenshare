@@ -4,17 +4,41 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>Комната — созвон</title>
-  <link rel="stylesheet" href="/static/style.css?v=3" />
+  <link rel="stylesheet" href="/static/style.css?v=4" />
 </head>
 <body class="page-room">
   <div class="room-page">
-    <!-- Оверлей текущего состояния: подключение / комната не найдена / заполнена / обрыв связи. -->
-    <div id="overlay" class="overlay">
+    <!-- Модалка входа: показывается ПЕРВОЙ, до любого подключения к
+         сигналингу — имя вводится заново при каждом заходе (анонимность, см.
+         README.md), join-room уходит только после клика «Войти» (заодно даёт
+         user-gesture для AudioContext, см. static/common.js). При авто-reconnect
+         модалка повторно не показывается — имя уже есть в памяти вкладки. -->
+    <div id="join-modal" class="join-modal">
+      <div class="join-modal-card">
+        <h2>Присоединиться к комнате</h2>
+        <input
+          id="join-name-input"
+          class="name-input"
+          type="text"
+          placeholder="Ваше имя (необязательно)"
+          maxlength="40"
+          autocomplete="off"
+        />
+        <button id="join-modal-button" class="start-button">Войти</button>
+      </div>
+    </div>
+
+    <!-- Оверлей текущего состояния: подключение / ожидание одобрения лобби /
+         вход отклонён / комната не найдена / заполнена / обрыв связи. -->
+    <div id="overlay" class="overlay hidden">
       <div id="overlay-spinner" class="spinner"></div>
       <h2 id="overlay-title">Подключение…</h2>
       <p id="overlay-text"></p>
       <button id="overlay-action-button" class="retry-button hidden">Создать новую</button>
     </div>
+
+    <!-- Ненавязчивый тост (смена лидера и т.п.) — см. static/room.js: showToast(). -->
+    <div id="toast" class="toast hidden"></div>
 
     <div class="room-top-bar">
       <span class="room-logo">Созвон</span>
@@ -60,7 +84,24 @@
     <!-- Ненавязчивые сообщения (отказ доступа к устройству, экран занят и т.п.). -->
     <div id="room-message" class="room-message hidden"></div>
 
+    <!-- Заявки лобби (только у лидера, только пока lobbyEnabled=true и есть
+         ожидающие) — карточки над пилюлей управления, см. static/room.js:
+         renderJoinRequests(). -->
+    <div id="join-requests" class="join-requests hidden"></div>
+
     <div class="control-panel">
+      <!-- Шестерёнка настроек комнаты — видна ТОЛЬКО лидеру (см.
+           static/room.js: updateSettingsButtonVisibility()). Бейдж — число
+           заявок в лобби, ждущих решения. -->
+      <button id="settings-button" class="control-button hidden" type="button" aria-pressed="false" aria-label="Настройки комнаты" title="Настройки комнаты">
+        <span class="control-button-icon" aria-hidden="true">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+          </svg>
+        </span>
+        <span id="settings-badge" class="chat-unread-badge hidden"></span>
+      </button>
       <button id="mic-button" class="control-button" type="button" aria-pressed="false" aria-label="Микрофон" title="Микрофон">
         <span class="control-button-icon" aria-hidden="true">
           <svg class="icon icon-on" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -150,12 +191,70 @@
         <button id="share-popup-copy-button" class="share-popup-copy-button" type="button">Скопировать</button>
       </div>
     </div>
+
+    <!-- Настройки комнаты (только лидер): попап на десктопе, bottom-sheet на
+         мобильном (см. media-запрос в style.css) — тумблер лобби + права
+         гостей. Изменение шлёт update-settings, см. static/room.js. -->
+    <div id="settings-panel" class="settings-panel hidden" role="dialog" aria-modal="true" aria-labelledby="settings-panel-title">
+      <div id="settings-panel-backdrop" class="settings-panel-backdrop"></div>
+      <div class="settings-panel-card">
+        <button id="settings-panel-close" class="share-popup-close" type="button" aria-label="Закрыть" title="Закрыть">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="5" y1="5" x2="19" y2="19"></line>
+            <line x1="19" y1="5" x2="5" y2="19"></line>
+          </svg>
+        </button>
+        <h2 id="settings-panel-title">Настройки комнаты</h2>
+
+        <label class="settings-row">
+          <span class="settings-row-label">Комната ожидания</span>
+          <span class="settings-toggle">
+            <input type="checkbox" id="setting-lobby" />
+            <span class="settings-toggle-track"><span class="settings-toggle-thumb"></span></span>
+          </span>
+        </label>
+
+        <div class="settings-section-label">Гостям разрешено:</div>
+
+        <label class="settings-row">
+          <span class="settings-row-label">Чат</span>
+          <span class="settings-toggle">
+            <input type="checkbox" id="setting-guest-chat" />
+            <span class="settings-toggle-track"><span class="settings-toggle-thumb"></span></span>
+          </span>
+        </label>
+
+        <label class="settings-row">
+          <span class="settings-row-label">Микрофон</span>
+          <span class="settings-toggle">
+            <input type="checkbox" id="setting-guest-audio" />
+            <span class="settings-toggle-track"><span class="settings-toggle-thumb"></span></span>
+          </span>
+        </label>
+
+        <label class="settings-row">
+          <span class="settings-row-label">Камера</span>
+          <span class="settings-toggle">
+            <input type="checkbox" id="setting-guest-video" />
+            <span class="settings-toggle-track"><span class="settings-toggle-thumb"></span></span>
+          </span>
+        </label>
+
+        <label class="settings-row">
+          <span class="settings-row-label">Показ экрана</span>
+          <span class="settings-toggle">
+            <input type="checkbox" id="setting-guest-screen" />
+            <span class="settings-toggle-track"><span class="settings-toggle-thumb"></span></span>
+          </span>
+        </label>
+      </div>
+    </div>
   </div>
 
-  <script src="/static/common.js?v=3"></script>
-  <script src="/static/bus.js?v=3"></script>
-  <script src="/static/rtc.js?v=3"></script>
-  <script src="/static/chat.js?v=3"></script>
-  <script src="/static/room.js?v=3"></script>
+  <script src="/static/common.js?v=4"></script>
+  <script src="/static/bus.js?v=4"></script>
+  <script src="/static/rtc.js?v=4"></script>
+  <script src="/static/chat.js?v=4"></script>
+  <script src="/static/room.js?v=4"></script>
 </body>
 </html>

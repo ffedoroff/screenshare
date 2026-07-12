@@ -1,37 +1,19 @@
-// landing.js — логика главной страницы: ввод имени + создание комнаты.
+// landing.js — логика главной страницы: создание комнаты.
 //
-// Имя хранится в localStorage под тем же ключом, что использует chat.js
-// (NAME_STORAGE_KEY = 'screenshare-name') — так что заданное здесь имя
-// подхватится room.js при входе в комнату и панелью чата.
+// Анонимность: никакого localStorage/sessionStorage/cookies нигде на этой
+// странице. Имя участника здесь больше не спрашивается вовсе — его спросит
+// модалка входа в самой комнате (см. static/room.js), при КАЖДОМ заходе
+// заново, а не один раз здесь. `POST /api/rooms` возвращает {roomId,
+// leaderToken} — leaderToken кладём во фрагмент ссылки (#lt=...), а не в путь
+// и не в query: фрагмент никогда не уходит на сервер ни при обычной
+// навигации браузера, ни в Referer — токен долетает только до room.js на
+// этой же странице (см. там же — читается и сразу вычищается из адресной
+// строки через history.replaceState, прежде чем показать что-либо ещё).
 
 'use strict';
 
-const NAME_STORAGE_KEY = 'screenshare-name';
-
-const nameInput = document.getElementById('name-input');
 const createButton = document.getElementById('create-room-button');
 const messageEl = document.getElementById('landing-message');
-
-function getSavedName() {
-  try {
-    const raw = localStorage.getItem(NAME_STORAGE_KEY);
-    return raw ? raw.trim() : '';
-  } catch (err) {
-    console.warn('Не удалось прочитать имя из localStorage:', err);
-    return '';
-  }
-}
-
-function saveName(name) {
-  try {
-    localStorage.setItem(NAME_STORAGE_KEY, name.trim());
-  } catch (err) {
-    console.warn('Не удалось сохранить имя в localStorage:', err);
-  }
-}
-
-nameInput.value = getSavedName();
-nameInput.addEventListener('input', () => saveName(nameInput.value));
 
 function showMessage(text, isError = true) {
   messageEl.textContent = text;
@@ -41,7 +23,6 @@ function showMessage(text, isError = true) {
 createButton.addEventListener('click', async () => {
   createButton.disabled = true;
   showMessage('');
-  saveName(nameInput.value);
 
   try {
     const res = await fetch('/api/rooms', { method: 'POST' });
@@ -50,7 +31,10 @@ createButton.addEventListener('click', async () => {
     if (!data || typeof data.roomId !== 'string' || !data.roomId) {
       throw new Error('в ответе нет roomId');
     }
-    location.href = `/r/${data.roomId}`;
+    if (typeof data.leaderToken !== 'string' || !data.leaderToken) {
+      throw new Error('в ответе нет leaderToken');
+    }
+    location.href = `/r/${data.roomId}#lt=${encodeURIComponent(data.leaderToken)}`;
   } catch (err) {
     console.error('Не удалось создать комнату:', err);
     showMessage('Не удалось создать комнату. Проверьте соединение и попробуйте снова.');

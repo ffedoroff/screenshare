@@ -129,11 +129,23 @@
 // пилюли управления (#chat-button в room.html), а не создаётся здесь: её
 // элемент передаётся в ChatPanel.create({ toggleButton }) вызывающей
 // стороной. Сама панель (.chat-panel) по-прежнему создаётся и живёт в body.
+//
+// Анонимность: поля ввода имени в шапке чата больше нет — имя фиксируется
+// один раз за сессию модалкой входа комнаты (см. static/room.js) и передаётся
+// сюда параметром `name` в ChatPanel.create()/attach(). Никакого
+// localStorage/sessionStorage здесь и во всём файле нет.
+//
+// Права гостей (см. README.md, «Права и лидер»): при `guestChat=false`
+// инпут дизейблится (см. room.js: ChatPanel.setChatForbidden) и получатели
+// игнорируют входящие 'text'/'file-offer' конверты от НЕ-лидеров (см.
+// dispatchEnvelope ниже) — и по шине, и по серверному fallback, единая точка
+// входа. Это кооперативная защита: модифицированный клиент получателя может
+// её игнорировать и отрендерить конверт всё равно (сервер P2P-трафик не
+// видит и проверить не может) — так и задумано, см. README.md.
 
 'use strict';
 
 const ChatPanel = (() => {
-  const NAME_STORAGE_KEY = 'screenshare-name';
   const NEAR_BOTTOM_THRESHOLD = 32; // px
   const HISTORY_CAP = 50;
   const HISTORY_REQUEST_TIMEOUT_MS = 3000;
@@ -202,26 +214,6 @@ const ChatPanel = (() => {
     if (m.startsWith('image/')) return FILE_ICON_IMAGE_SVG;
     if (m.startsWith('audio/')) return FILE_ICON_AUDIO_SVG;
     return FILE_ICON_GENERIC_SVG;
-  }
-
-  /** Прочитать сохранённое имя участника (или null, если не задано/пусто). */
-  function getSavedName() {
-    try {
-      const raw = localStorage.getItem(NAME_STORAGE_KEY);
-      const trimmed = raw ? raw.trim() : '';
-      return trimmed || null;
-    } catch (err) {
-      console.warn('Не удалось прочитать имя из localStorage:', err);
-      return null;
-    }
-  }
-
-  function saveName(name) {
-    try {
-      localStorage.setItem(NAME_STORAGE_KEY, name.trim());
-    } catch (err) {
-      console.warn('Не удалось сохранить имя в localStorage:', err);
-    }
   }
 
   function formatTime(ts) {
@@ -385,7 +377,6 @@ const ChatPanel = (() => {
     panel.innerHTML = `
       <div class="chat-header">
         <span class="chat-title">Чат</span>
-        <input type="text" class="chat-name-input" placeholder="Ваше имя" maxlength="40" />
         <button type="button" class="chat-collapse-button" aria-label="Свернуть чат" title="Свернуть чат">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <line x1="5" y1="5" x2="19" y2="19"></line>
@@ -439,7 +430,6 @@ const ChatPanel = (() => {
       toggleButton,
       panel,
       unreadBadge: toggleButton.querySelector('.chat-unread-badge'),
-      nameInput: panel.querySelector('.chat-name-input'),
       collapseButton: panel.querySelector('.chat-collapse-button'),
       messagesEl: panel.querySelector('.chat-messages'),
       errorBanner: panel.querySelector('.chat-error-banner'),
@@ -467,12 +457,23 @@ const ChatPanel = (() => {
    * @param {() => string[]} opts.getPeerIds — актуальный список peerId остальных участников (для рассылки).
    * @param {string[]} opts.initialPeerIds — peerId остальных участников на момент joined, в порядке из joined.peers (для запроса истории).
    */
-  function create({ signaling, bus, peerId, name, variant, toggleButton, getPeerIds, initialPeerIds }) {
+  function create({
+    signaling,
+    bus,
+    peerId,
+    name,
+    variant,
+    toggleButton,
+    getPeerIds,
+    initialPeerIds,
+    getLeaderId,
+    getGuestChatAllowed,
+  }) {
     if (!singleton) {
       const dom = buildDom(variant, toggleButton);
       singleton = createController(dom);
     }
-    singleton.attach({ signaling, bus, peerId, name, getPeerIds, initialPeerIds });
+    singleton.attach({ signaling, bus, peerId, name, getPeerIds, initialPeerIds, getLeaderId, getGuestChatAllowed });
     return singleton.publicApi;
   }
 
@@ -481,7 +482,6 @@ const ChatPanel = (() => {
       toggleButton,
       panel,
       unreadBadge,
-      nameInput,
       collapseButton,
       messagesEl,
       errorBanner,
@@ -502,8 +502,20 @@ const ChatPanel = (() => {
     let peerId = null;
     let myName = null;
     let getPeerIds = () => [];
+    // Права гостей (см. README.md, «Права и лидер»): getLeaderId/getGuestChatAllowed
+    // — колбэки room.js, читающие ЖИВЫЕ leaderId/roomSettings.guestChat на
+    // момент вызова (не снимок на момент attach) — используются в
+    // isIncomingEnvelopeAllowed ниже для игнорирования входящих text/file-offer
+    // конвертов от не-лидеров, когда guestChat=false (см. заголовок файла).
+    let getLeaderId = () => null;
+    let getGuestChatAllowed = () => true;
     let unreadCount = 0;
     let errorTimer = null;
+    // Отправку (СВОЙ инпут) дизейблит room.js через publicApi.setChatForbidden
+    // при guestChat=false — независимо от connectionLost (см. disableInput/
+    // enableInput ниже), оба состояния учитываются вместе в applyInputState.
+    let connectionLost = false;
+    let forbiddenByLeader = false;
 
     // --- Состояние протокола чата ---
     let lamportClock = 0;
@@ -540,11 +552,6 @@ const ChatPanel = (() => {
     // fileId -> { targetPeerId, expectedLabel, mime, name, size } — запрос на
     // скачивание, которого мы ждём (открытия входящего файлового DataChannel).
     let pendingFileRequests = new Map();
-
-    nameInput.value = getSavedName() || '';
-    nameInput.addEventListener('input', () => {
-      saveName(nameInput.value);
-    });
 
     function isNearBottom() {
       return (
@@ -1263,9 +1270,29 @@ const ChatPanel = (() => {
       }
     }
 
+    /**
+     * Права гостей на стороне ПОЛУЧАТЕЛЯ (см. README.md, «Права и лидер» и
+     * заголовок файла): при `guestChat=false` входящие 'text'/'file-offer' от
+     * кого угодно, кроме текущего лидера, молча игнорируются — и по шине, и
+     * по fallback-релею сервера (единая точка входа — dispatchEnvelope).
+     * Остальные kind (reaction/edit/delete/history-*) этим ограничением не
+     * затрагиваются: это лёгкие производные операции над уже показанными
+     * сообщениями, не самостоятельный текст.
+     *
+     * Кооперативная защита: модифицированный клиент получателя может этот
+     * фильтр не применять и отрендерить конверт всё равно — сервер P2P-байты
+     * не видит и запретить их доставку физически не может (см. README.md).
+     */
+    function isIncomingEnvelopeAllowed(fromPeerId, envelope) {
+      if (envelope.kind !== 'text' && envelope.kind !== 'file-offer') return true;
+      if (getGuestChatAllowed()) return true;
+      return fromPeerId === getLeaderId();
+    }
+
     // --- Приём: единая точка для сообщений с шины И с fallback-релея сервера ---
     function dispatchEnvelope(fromPeerId, envelope) {
       if (!envelope || typeof envelope !== 'object' || typeof envelope.kind !== 'string') return;
+      if (!isIncomingEnvelopeAllowed(fromPeerId, envelope)) return;
       switch (envelope.kind) {
         case 'text':
           handleIncomingText(envelope);
@@ -1862,21 +1889,52 @@ const ChatPanel = (() => {
       }
     });
 
-    function enableInput() {
+    /**
+     * Единая точка применения состояния инпута — учитывает ОБА независимых
+     * повода дизейблить отправку одновременно (обрыв соединения и запрет
+     * лидера, см. заголовок конструктора controller): connectionLost имеет
+     * приоритет над forbiddenByLeader просто по порядку проверки (оба и так
+     * дают одинаковый визуальный эффект — задизейбленный инпут с поясняющим
+     * placeholder).
+     */
+    function applyInputState() {
+      if (connectionLost) {
+        textInput.disabled = true;
+        sendButton.disabled = true;
+        attachButton.disabled = true;
+        textInput.placeholder = 'Соединение потеряно.';
+        return;
+      }
+      if (forbiddenByLeader) {
+        textInput.disabled = true;
+        sendButton.disabled = true;
+        attachButton.disabled = true;
+        textInput.placeholder = 'Чат запрещён лидером';
+        return;
+      }
       textInput.disabled = false;
       sendButton.disabled = false;
       attachButton.disabled = false;
       textInput.placeholder = 'Сообщение…';
     }
 
-    function disableInput(reason) {
-      textInput.disabled = true;
-      sendButton.disabled = true;
-      attachButton.disabled = true;
-      textInput.placeholder = reason || 'Чат недоступен';
+    function enableInput() {
+      connectionLost = false;
+      applyInputState();
     }
 
-    const publicApi = { disableInput, enableInput, handleIncomingFileChannel };
+    function disableInput(reason) {
+      connectionLost = true;
+      applyInputState();
+    }
+
+    /** room.js вызывает при applyGuestEnforcement()/settings-changed (см. README.md, «Права и лидер»). */
+    function setChatForbidden(forbidden) {
+      forbiddenByLeader = forbidden;
+      applyInputState();
+    }
+
+    const publicApi = { disableInput, enableInput, setChatForbidden, handleIncomingFileChannel };
 
     function handleServerError({ message }) {
       // Ошибки fallback-релея сервера (envelope > 8KB, серверный rate-limit
@@ -1884,18 +1942,31 @@ const ChatPanel = (() => {
       if (message) showError(message);
     }
 
-    function attach({ signaling: newSignaling, bus: newBus, peerId: newPeerId, name, getPeerIds: newGetPeerIds, initialPeerIds }) {
+    function attach({
+      signaling: newSignaling,
+      bus: newBus,
+      peerId: newPeerId,
+      name,
+      getPeerIds: newGetPeerIds,
+      initialPeerIds,
+      getLeaderId: newGetLeaderId,
+      getGuestChatAllowed: newGetGuestChatAllowed,
+    }) {
       signaling = newSignaling;
       bus = newBus;
       peerId = newPeerId;
       myName = name || null;
       getPeerIds = typeof newGetPeerIds === 'function' ? newGetPeerIds : () => [];
+      getLeaderId = typeof newGetLeaderId === 'function' ? newGetLeaderId : () => null;
+      getGuestChatAllowed = typeof newGetGuestChatAllowed === 'function' ? newGetGuestChatAllowed : () => true;
 
       clearMessages();
       unreadCount = 0;
       updateUnreadBadge();
       errorBanner.classList.add('hidden');
-      enableInput();
+      connectionLost = false;
+      forbiddenByLeader = false;
+      applyInputState();
       setCollapsed(true);
 
       bus.onMessage(dispatchEnvelope);
@@ -1912,5 +1983,5 @@ const ChatPanel = (() => {
     return { attach, publicApi };
   }
 
-  return { create, getSavedName };
+  return { create };
 })();

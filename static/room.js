@@ -12,7 +12,27 @@
 
 'use strict';
 
+// --- Анонимность: leaderToken из фрагмента ссылки (см. static/landing.js —
+// POST /api/rooms -> редирект на /r/<id>#lt=<token>) читается ДО ВСЕГО
+// остального и сразу вычищается из адресной строки через history.replaceState
+// — токен не должен светиться ни в адресной строке, ни в ссылке из
+// «Поделиться» (см. openSharePopup ниже, использует уже очищенный location.href).
+// Фрагмент никогда не уходит на сервер сам по себе (в отличие от query),
+// поэтому единственный способ его прочитать — этот же таб на этой же странице.
+const initialLeaderToken = (() => {
+  const match = location.hash.match(/(?:^|[&#])lt=([^&]+)/);
+  const token = match ? decodeURIComponent(match[1]) : null;
+  if (location.hash) {
+    history.replaceState(null, '', location.pathname + location.search);
+  }
+  return token;
+})();
+
 // --- DOM ---
+const joinModalEl = document.getElementById('join-modal');
+const joinNameInputEl = document.getElementById('join-name-input');
+const joinModalButtonEl = document.getElementById('join-modal-button');
+const toastEl = document.getElementById('toast');
 const overlayEl = document.getElementById('overlay');
 const overlaySpinnerEl = document.getElementById('overlay-spinner');
 const overlayTitleEl = document.getElementById('overlay-title');
@@ -41,6 +61,23 @@ const sharePopupCopyButtonEl = document.getElementById('share-popup-copy-button'
 const reconnectBannerEl = document.getElementById('reconnect-banner');
 const versionBannerEl = document.getElementById('version-banner');
 const versionBannerReloadButtonEl = document.getElementById('version-banner-reload-button');
+
+// --- DOM: права и лидер (см. README.md, «Права и лидер») ---
+const settingsButton = document.getElementById('settings-button');
+const settingsBadgeEl = document.getElementById('settings-badge');
+const joinRequestsEl = document.getElementById('join-requests');
+const settingsPanelEl = document.getElementById('settings-panel');
+const settingsPanelBackdropEl = document.getElementById('settings-panel-backdrop');
+const settingsPanelCloseEl = document.getElementById('settings-panel-close');
+const settingLobbyInput = document.getElementById('setting-lobby');
+const settingGuestChatInput = document.getElementById('setting-guest-chat');
+const settingGuestAudioInput = document.getElementById('setting-guest-audio');
+const settingGuestVideoInput = document.getElementById('setting-guest-video');
+const settingGuestScreenInput = document.getElementById('setting-guest-screen');
+
+// Статичная разметка (не зависит от пользовательских данных) — безопасна для innerHTML.
+const CROWN_ICON_SVG =
+  '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M3 19h18l-1.6-9.6-5.2 3.6L12 5l-2.2 8-5.2-3.6L3 19z"/></svg>';
 
 // roomId — последний сегмент пути, например /r/abc123 -> "abc123".
 const roomId = location.pathname.split('/').filter(Boolean).pop();
@@ -110,12 +147,26 @@ let screenOwnerGraceTimer = null;
 // version-skew баннера, см. README.md).
 let lastKnownVersion = null;
 
-// peerId -> { rtc: RtcPeer, name, tile: {root, videoEl, placeholderEl, labelEl} }
+// peerId -> { rtc: RtcPeer, name, tile: {root, videoEl, placeholderEl, labelEl, crownEl} }
 const peers = new Map();
 // peerId -> имя (включая себя не храним — своё имя в myName).
 const peerNames = new Map();
 // Свой тайл (создаётся сразу после joined).
 let ownTile = null;
+
+// --- Права и лидер (см. README.md, «Права и лидер») ---
+let leaderId = null;
+let isLeader = false;
+// RoomSettings с сервера (см. src/protocol.rs::RoomSettings) — null до первого joined.
+let roomSettings = null;
+// Заявки лобби, видимые ТОЛЬКО лидеру: [{ peerId, name }].
+let pendingRequests = [];
+let toastTimer = null;
+// peerId -> { mic: {stream, track} | null, camera: {stream, track, enabled} | null } —
+// храним ссылки на входящие треки гостей НЕЗАВИСИМО от того, разрешено ли их
+// сейчас рендерить, чтобы можно было ретроактивно показать/скрыть при смене
+// guestAudio/guestVideo на лету (см. refreshMediaRenderingForPeer).
+const peerMediaRefs = new Map();
 
 // Ф0: шина комнаты поверх mesh RTCDataChannel (см. bus.js/rtc.js) — общая
 // для чата (chat.js) и будущих фич, живёт на протяжении всей сессии в
@@ -157,11 +208,19 @@ let chat = null;
 
 // ---------- Оверлей ----------
 
-function showOverlay({ title, text = '', spinner = false, actionLabel = null }) {
+// `onAction` — необязательный колбэк для кнопки оверлея; по умолчанию (не
+// передан) кнопка ведёт на главную (см. overlayActionButtonEl ниже) — так
+// работали «Комната не найдена»/«Комната заполнена» и раньше. Лобби
+// («Ожидание одобрения…») переопределяет его на «Отменить» = leave + на
+// главную (см. registerSignalingHandlers: signaling.on('waiting', ...)).
+let overlayActionHandler = null;
+
+function showOverlay({ title, text = '', spinner = false, actionLabel = null, onAction = null }) {
   overlayEl.classList.remove('hidden');
   overlayTitleEl.textContent = title;
   overlayTextEl.textContent = text;
   overlaySpinnerEl.classList.toggle('hidden', !spinner);
+  overlayActionHandler = onAction;
   if (actionLabel) {
     overlayActionButtonEl.textContent = actionLabel;
     overlayActionButtonEl.classList.remove('hidden');
@@ -175,7 +234,11 @@ function hideOverlay() {
 }
 
 overlayActionButtonEl.addEventListener('click', () => {
-  location.href = '/';
+  if (overlayActionHandler) {
+    overlayActionHandler();
+  } else {
+    location.href = '/';
+  }
 });
 
 // ---------- Ненавязчивые сообщения ----------
@@ -188,6 +251,16 @@ function showRoomMessage(text) {
   roomMessageTimer = setTimeout(() => {
     roomMessageEl.classList.add('hidden');
   }, 4000);
+}
+
+/** Ненавязчивый тост (смена лидера и т.п., см. README.md «Права и лидер») — отдельно от showRoomMessage (та зарезервирована под предупреждения/ошибки). */
+function showToast(text, ms = 3000) {
+  toastEl.textContent = text;
+  toastEl.classList.remove('hidden');
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    toastEl.classList.add('hidden');
+  }, ms);
 }
 
 // ---------- Баннер переподключения сигналинга ----------
@@ -285,9 +358,17 @@ function createTile(peerId, name, isOwn) {
   label.className = 'tile-name';
   label.textContent = isOwn ? `Вы${trimmedName ? ` (${trimmedName})` : ''}` : (trimmedName || 'Гость');
 
+  // Корона лидера (см. README.md «Права и лидер») — скрыта по умолчанию,
+  // показывается/прячется через setLeaderIndicator() при смене leaderId.
+  const crown = document.createElement('span');
+  crown.className = 'tile-crown hidden';
+  crown.setAttribute('aria-hidden', 'true');
+  crown.innerHTML = CROWN_ICON_SVG; // статичная разметка, не пользовательские данные
+
   tile.appendChild(video);
   tile.appendChild(placeholder);
   tile.appendChild(label);
+  tile.appendChild(crown);
 
   if (isOwn) {
     tilesGridEl.prepend(tile);
@@ -295,7 +376,7 @@ function createTile(peerId, name, isOwn) {
     tilesGridEl.appendChild(tile);
   }
 
-  return { root: tile, videoEl: video, placeholderEl: placeholder, labelEl: label };
+  return { root: tile, videoEl: video, placeholderEl: placeholder, labelEl: label, crownEl: crown };
 }
 
 function updateParticipantCount() {
@@ -315,6 +396,42 @@ function updateSoloState() {
   inviteCtaEl.classList.toggle('hidden', !solo);
 }
 
+// ---------- Лидер: корона на тайле, подпись своего тайла, видимость шестерёнки ----------
+
+function isPeerLeader(peerId) {
+  return leaderId !== null && peerId === leaderId;
+}
+
+/** Обновить корону на тайлах (своём и всех текущих peers) под новый leaderId + подпись своего тайла. */
+function setLeaderIndicator(newLeaderId) {
+  leaderId = newLeaderId || null;
+  isLeader = myPeerId !== null && myPeerId === leaderId;
+  if (ownTile) ownTile.crownEl.classList.toggle('hidden', leaderId !== myPeerId);
+  for (const [peerId, entry] of peers) {
+    entry.tile.crownEl.classList.toggle('hidden', leaderId !== peerId);
+  }
+  updateOwnTileLabel();
+}
+
+/** «Вы (имя)» + « (лидер)», если лидер — сам. Пересчитывается при любой смене leaderId. */
+function updateOwnTileLabel() {
+  if (!ownTile) return;
+  const trimmedName = (myName || '').trim();
+  let text = `Вы${trimmedName ? ` (${trimmedName})` : ''}`;
+  if (isLeader) text += ' (лидер)';
+  ownTile.labelEl.textContent = text;
+}
+
+/** Шестерёнка настроек видна ТОЛЬКО лидеру; потеряв лидерство — закрываем панель настроек и список заявок (они больше не наши). */
+function updateSettingsButtonVisibility() {
+  settingsButton.classList.toggle('hidden', !isLeader);
+  if (!isLeader) {
+    closeSettingsPanel();
+    pendingRequests = [];
+    renderJoinRequests();
+  }
+}
+
 function setTileSpeaking(peerId, speaking) {
   const entry = peers.get(peerId);
   if (!entry) return;
@@ -331,6 +448,16 @@ function showTileVideo(peerId, show) {
 // ---------- Экран (главная зона) ----------
 
 function updateScreenButtonState() {
+  // Права гостей (см. README.md «Права и лидер»): guestScreen=false запрещает
+  // гостю (не лидеру) даже пробовать — кнопка задизейблена независимо от
+  // текущего состояния владения экраном. Лидера это ограничение не касается.
+  if (!isLeader && roomSettings && !roomSettings.guestScreen) {
+    screenButton.disabled = true;
+    screenButton.title = 'Запрещено лидером';
+    screenButton.classList.remove('control-button--on');
+    screenButton.setAttribute('aria-pressed', 'false');
+    return;
+  }
   if (currentScreenOwnerPeerId === null) {
     screenButton.disabled = false;
     screenButton.title = '';
@@ -376,6 +503,200 @@ function showRemoteScreenCaption(peerId) {
   showScreenStageContainer();
   screenCaptionEl.textContent = `Экран: ${peerNames.get(peerId) || 'Гость'}`;
 }
+
+// ---------- Права гостей: применение на своей стороне (отправитель) ----------
+//
+// Кооперативная защита (см. README.md «Права и лидер»): применяется на
+// СВОЕЙ стороне (кнопки мик/камера/экран, инпут чата) при получении
+// settings-changed/joined. Обходится модифицированным клиентом — сервер это
+// и не пытается предотвратить технически (медиа/чат — P2P), только не
+// показывает лишних возможностей честному клиенту. Симметричная защита на
+// стороне ПОЛУЧАТЕЛЯ — см. refreshMediaRenderingForPeer ниже и
+// ChatPanel.isIncomingEnvelopeAllowed в chat.js.
+function applyGuestEnforcement() {
+  if (!roomSettings) return;
+  const restrictAudio = !isLeader && !roomSettings.guestAudio;
+  const restrictVideo = !isLeader && !roomSettings.guestVideo;
+  const restrictChat = !isLeader && !roomSettings.guestChat;
+
+  micButton.disabled = restrictAudio;
+  micButton.title = restrictAudio ? 'Запрещено лидером' : '';
+  if (restrictAudio && micTrack && micTrack.enabled) {
+    micTrack.enabled = false;
+    setMicButtonOn(false);
+  }
+
+  cameraButton.disabled = restrictVideo;
+  cameraButton.title = restrictVideo ? 'Запрещено лидером' : '';
+  if (restrictVideo && camTrack && camTrack.enabled) {
+    camTrack.enabled = false;
+    setCameraButtonOn(false);
+    if (ownTile) {
+      ownTile.videoEl.classList.add('hidden');
+      ownTile.placeholderEl.classList.remove('hidden');
+    }
+    broadcastStreamEnabled(camStream, 'camera', false);
+  }
+
+  updateScreenButtonState(); // сам проверяет guestScreen/isLeader
+
+  if (chat) chat.setChatForbidden(restrictChat);
+}
+
+// ---------- Права гостей: применение на стороне ПОЛУЧАТЕЛЯ (рендер чужих треков) ----------
+//
+// guestAudio/guestVideo=false — получатели не рендерят соответствующий трек
+// ГОСТЕЙ (не лидера), независимо от того, отключил ли сам гость трек кнопкой
+// (см. applyGuestEnforcement выше — защита именно кооперативная: сервер
+// медиапотоки не видит и не может их запретить технически, см. README.md).
+
+function getOrCreateMediaRefs(peerId) {
+  let refs = peerMediaRefs.get(peerId);
+  if (!refs) {
+    refs = { mic: null, camera: null };
+    peerMediaRefs.set(peerId, refs);
+  }
+  return refs;
+}
+
+/** Пересчитать рендер входящих мик/камера треков одного пира под текущие roomSettings/leaderId. */
+function refreshMediaRenderingForPeer(peerId) {
+  const refs = peerMediaRefs.get(peerId);
+  if (!refs || !roomSettings) return;
+  const exempt = isPeerLeader(peerId); // лидера ограничения не касаются
+
+  if (refs.mic) {
+    if (exempt || roomSettings.guestAudio) {
+      attachMicAudio(peerId, refs.mic.stream, refs.mic.track);
+    } else {
+      cleanupMicAudio(peerId);
+    }
+  }
+
+  if (refs.camera) {
+    if (exempt || roomSettings.guestVideo) {
+      attachCameraVideo(peerId, refs.camera.stream, refs.camera.track, refs.camera.enabled);
+    } else {
+      showTileVideo(peerId, false);
+      const entry = peers.get(peerId);
+      if (entry) entry.tile.videoEl.srcObject = null;
+    }
+  }
+}
+
+function refreshMediaRenderingForAllPeers() {
+  for (const peerId of peers.keys()) refreshMediaRenderingForPeer(peerId);
+}
+
+// ---------- Лобби: заявки на вход (только у лидера) ----------
+
+function renderJoinRequests() {
+  joinRequestsEl.textContent = '';
+  if (pendingRequests.length === 0) {
+    joinRequestsEl.classList.add('hidden');
+  } else {
+    joinRequestsEl.classList.remove('hidden');
+    for (const req of pendingRequests) {
+      joinRequestsEl.appendChild(buildJoinRequestCardEl(req));
+    }
+  }
+  updateSettingsBadge();
+}
+
+function buildJoinRequestCardEl(req) {
+  const card = document.createElement('div');
+  card.className = 'join-request-card';
+  card.dataset.peerId = req.peerId;
+
+  const name = document.createElement('span');
+  name.className = 'join-request-name';
+  name.textContent = req.name || 'Гость';
+
+  const actions = document.createElement('div');
+  actions.className = 'join-request-actions';
+
+  const acceptButton = document.createElement('button');
+  acceptButton.type = 'button';
+  acceptButton.className = 'join-request-button join-request-button--accept';
+  acceptButton.textContent = 'Принять';
+  acceptButton.addEventListener('click', () => {
+    signaling.send('approve', { peerId: req.peerId });
+    removePendingRequest(req.peerId);
+  });
+
+  const rejectButton = document.createElement('button');
+  rejectButton.type = 'button';
+  rejectButton.className = 'join-request-button join-request-button--reject';
+  rejectButton.textContent = 'Отклонить';
+  rejectButton.addEventListener('click', () => {
+    signaling.send('reject', { peerId: req.peerId });
+    removePendingRequest(req.peerId);
+  });
+
+  actions.appendChild(acceptButton);
+  actions.appendChild(rejectButton);
+  card.appendChild(name);
+  card.appendChild(actions);
+  return card;
+}
+
+function updateSettingsBadge() {
+  settingsBadgeEl.textContent = String(pendingRequests.length);
+  settingsBadgeEl.classList.toggle('hidden', pendingRequests.length === 0);
+}
+
+function addPendingRequest(peerId, name) {
+  if (pendingRequests.some((r) => r.peerId === peerId)) return;
+  pendingRequests.push({ peerId, name: name || null });
+  renderJoinRequests();
+}
+
+function removePendingRequest(peerId) {
+  pendingRequests = pendingRequests.filter((r) => r.peerId !== peerId);
+  renderJoinRequests();
+}
+
+// ---------- Настройки комнаты (только лидер): попап/bottom-sheet ----------
+
+function syncSettingsPanelInputs() {
+  if (!roomSettings) return;
+  settingLobbyInput.checked = !!roomSettings.lobbyEnabled;
+  settingGuestChatInput.checked = !!roomSettings.guestChat;
+  settingGuestAudioInput.checked = !!roomSettings.guestAudio;
+  settingGuestVideoInput.checked = !!roomSettings.guestVideo;
+  settingGuestScreenInput.checked = !!roomSettings.guestScreen;
+}
+
+function openSettingsPanel() {
+  syncSettingsPanelInputs();
+  settingsPanelEl.classList.remove('hidden');
+}
+
+function closeSettingsPanel() {
+  settingsPanelEl.classList.add('hidden');
+}
+
+/** Шлёт update-settings ЦЕЛИКОМ (не патч, см. src/protocol.rs) — сервер рассылает settings-changed всем, включая нас (см. registerSignalingHandlers). */
+function sendSettingsUpdate(partial) {
+  if (!roomSettings) return;
+  const next = { ...roomSettings, ...partial };
+  signaling.send('update-settings', { settings: next });
+}
+
+function wireSettingToggle(inputEl, key) {
+  inputEl.addEventListener('change', () => {
+    sendSettingsUpdate({ [key]: inputEl.checked });
+  });
+}
+
+settingsButton.addEventListener('click', openSettingsPanel);
+settingsPanelCloseEl.addEventListener('click', closeSettingsPanel);
+settingsPanelBackdropEl.addEventListener('click', closeSettingsPanel);
+wireSettingToggle(settingLobbyInput, 'lobbyEnabled');
+wireSettingToggle(settingGuestChatInput, 'guestChat');
+wireSettingToggle(settingGuestAudioInput, 'guestAudio');
+wireSettingToggle(settingGuestVideoInput, 'guestVideo');
+wireSettingToggle(settingGuestScreenInput, 'guestScreen');
 
 // ---------- Локальные потоки: рассылка новым и уже существующим пирам ----------
 
@@ -464,10 +785,14 @@ function handleRemoteTrack(peerId, event) {
 function routeRemoteTrack(peerId, streamId, stream, track, meta) {
   if (!peers.has(peerId)) return; // пир уже ушёл, пока летела информация
   if (meta.kind === 'mic') {
-    attachMicAudio(peerId, stream, track);
+    // Ссылку храним всегда (см. заголовок раздела «Права гостей: применение
+    // на стороне получателя») — рендерим только если разрешено прямо сейчас.
+    getOrCreateMediaRefs(peerId).mic = { stream, track };
+    refreshMediaRenderingForPeer(peerId);
   } else if (meta.kind === 'camera') {
     cameraStreamOwner.set(streamId, peerId);
-    attachCameraVideo(peerId, stream, track, meta.enabled !== false);
+    getOrCreateMediaRefs(peerId).camera = { stream, track, enabled: meta.enabled !== false };
+    refreshMediaRenderingForPeer(peerId);
   } else if (meta.kind === 'screen') {
     attachScreenVideo(peerId, stream);
   }
@@ -572,7 +897,13 @@ function attachScreenVideo(peerId, stream) {
 function applyCameraEnabledUpdate(streamId, enabled) {
   const peerId = cameraStreamOwner.get(streamId);
   if (!peerId) return;
-  showTileVideo(peerId, enabled);
+  const refs = peerMediaRefs.get(peerId);
+  if (refs && refs.camera) refs.camera.enabled = enabled;
+  // Если рендер сейчас запрещён правами гостя (см. refreshMediaRenderingForPeer)
+  // — видео и так не подключено, трогать элемент не нужно (иначе показали бы
+  // пустой/протухший кадр).
+  const allowed = isPeerLeader(peerId) || (roomSettings && roomSettings.guestVideo);
+  if (allowed) showTileVideo(peerId, enabled);
 }
 
 // ---------- Пиры: создание/удаление ----------
@@ -598,6 +929,7 @@ function createRemotePeer(peerId, name, iceServers) {
   bus.addPeer(peerId, rtc);
 
   const tile = createTile(peerId, name, false);
+  tile.crownEl.classList.toggle('hidden', leaderId !== peerId); // leaderId уже мог быть известен (peer-joined/реконнект)
   peers.set(peerId, { rtc, name, tile });
 
   // Локальные активные треки — сразу в новый pc (коалесцируются в один offer).
@@ -616,6 +948,7 @@ function removeRemotePeer(peerId) {
   entry.tile.root.remove();
   peers.delete(peerId);
   peerNames.delete(peerId);
+  peerMediaRefs.delete(peerId);
   bus.removePeer(peerId);
   cleanupMicAudio(peerId);
   for (const [streamId, ownerPeerId] of cameraStreamOwner) {
@@ -680,7 +1013,49 @@ function cancelScreenOwnerGrace() {
 
 // ---------- Сигналинг ----------
 
+// ---------- Модалка входа: показывается ПЕРВОЙ, join-room уходит только после клика ----------
+
+function showJoinModal() {
+  joinModalEl.classList.remove('hidden');
+  joinNameInputEl.focus();
+}
+
+function hideJoinModal() {
+  joinModalEl.classList.add('hidden');
+}
+
+let joinSubmitInProgress = false;
+
+async function onJoinModalSubmit() {
+  if (joinSubmitInProgress) return;
+  joinSubmitInProgress = true;
+  // Клик — user-gesture, полезный заодно и для AudioContext (см.
+  // static/common.js: SpeakingDetection пытается резюмировать AudioContext
+  // по click/keydown).
+  const raw = joinNameInputEl.value.trim();
+  myName = raw || null;
+  hideJoinModal();
+  await connectAndJoin();
+}
+
+joinModalButtonEl.addEventListener('click', onJoinModalSubmit);
+joinNameInputEl.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    onJoinModalSubmit();
+  }
+});
+
 async function init() {
+  // Анонимность (см. README.md): имя спрашивается заново при КАЖДОМ заходе
+  // этой модалкой — никакого localStorage. join-room уходит только после
+  // клика «Войти» (см. onJoinModalSubmit). При авто-reconnect модалка не
+  // показывается повторно — имя уже в памяти вкладки (myName), см.
+  // attemptReconnectOnce/sendJoinAndWait ниже.
+  showJoinModal();
+}
+
+async function connectAndJoin() {
   showOverlay({ title: 'Подключение…', spinner: true });
 
   iceServersCache = await fetchIceServers();
@@ -718,12 +1093,15 @@ async function init() {
   }
 
   registerSignalingHandlers(iceServersCache);
-  myName = ChatPanel.getSavedName();
-  signaling.send('join-room', { roomId, ...(myName ? { name: myName } : {}) });
+  signaling.send('join-room', {
+    roomId,
+    ...(myName ? { name: myName } : {}),
+    ...(initialLeaderToken ? { leaderToken: initialLeaderToken } : {}),
+  });
 }
 
 function registerSignalingHandlers(iceServers) {
-  signaling.on('joined', ({ peerId, peers: otherPeers, screenOwner }) => {
+  signaling.on('joined', ({ peerId, peers: otherPeers, screenOwner, leaderId: joinedLeaderId, settings, pending }) => {
     // Реконнект ждёт именно этот ответ (см. sendJoinAndWait) — репортуем ему
     // исход в дополнение к обычной обработке ниже (при первом входе
     // pendingJoinResolve никогда не взведён).
@@ -746,6 +1124,14 @@ function registerSignalingHandlers(iceServers) {
       if (currentScreenOwnerPeerId && currentScreenOwnerPeerId !== myPeerId) {
         showRemoteScreenCaption(currentScreenOwnerPeerId);
       }
+
+      roomSettings = settings;
+      pendingRequests = (pending || []).map((p) => ({ peerId: p.peerId, name: p.name || null }));
+      setLeaderIndicator(joinedLeaderId);
+      updateSettingsButtonVisibility();
+      renderJoinRequests();
+      applyGuestEnforcement();
+
       updateScreenButtonState();
       updateParticipantCount();
 
@@ -758,6 +1144,8 @@ function registerSignalingHandlers(iceServers) {
         toggleButton: chatButton,
         getPeerIds: () => Array.from(peers.keys()),
         initialPeerIds: otherPeers.map((p) => p.peerId),
+        getLeaderId: () => leaderId,
+        getGuestChatAllowed: () => (roomSettings ? roomSettings.guestChat : true),
       });
       return;
     }
@@ -768,7 +1156,70 @@ function registerSignalingHandlers(iceServers) {
     // (см. src/ws.rs::JoinRoom { peer_id }), но подстрахуемся и на случай,
     // если он всё же сменился.
     myPeerId = peerId;
+    roomSettings = settings;
+    setLeaderIndicator(joinedLeaderId);
+    updateSettingsButtonVisibility();
+    // Лидерство при реконнекте может смениться (см. README.md «Права и
+    // лидер»: сервер мог уже удалить нас и назначить нового лидера) — pending
+    // видим заново, только если после реконнекта лидер снова мы.
+    pendingRequests = isLeader ? (pending || []).map((p) => ({ peerId: p.peerId, name: p.name || null })) : [];
+    renderJoinRequests();
+    applyGuestEnforcement();
     reconcileAfterReconnect(otherPeers, screenOwner);
+    refreshMediaRenderingForAllPeers();
+  });
+
+  signaling.on('waiting', () => {
+    // Лобби (см. README.md «Права и лидер»): вместо joined сначала приходит
+    // это — ждём решения лидера. «Отменить» = leave + на главную (тот же
+    // приём, что и у leaveButton ниже — intentionalDisconnect до leave).
+    showOverlay({
+      title: 'Ожидание одобрения…',
+      text: myName ? `Вы вошли как «${myName}»` : 'Ждём решения лидера комнаты.',
+      spinner: true,
+      actionLabel: 'Отменить',
+      onAction: () => {
+        intentionalDisconnect = true;
+        if (signaling) signaling.send('leave');
+        location.href = '/';
+      },
+    });
+  });
+
+  signaling.on('join-request', ({ peerId, name }) => {
+    addPendingRequest(peerId, name);
+  });
+
+  signaling.on('join-request-cancelled', ({ peerId }) => {
+    removePendingRequest(peerId);
+  });
+
+  signaling.on('join-rejected', () => {
+    terminalState = true;
+    showOverlay({
+      title: 'Вход отклонён',
+      text: 'Лидер комнаты отклонил вашу заявку на вход.',
+      actionLabel: 'На главную',
+    });
+  });
+
+  signaling.on('settings-changed', ({ settings }) => {
+    roomSettings = settings;
+    if (!settingsPanelEl.classList.contains('hidden')) syncSettingsPanelInputs();
+    applyGuestEnforcement();
+    refreshMediaRenderingForAllPeers();
+  });
+
+  signaling.on('leader-changed', ({ leaderId: newLeaderId }) => {
+    setLeaderIndicator(newLeaderId);
+    updateSettingsButtonVisibility();
+    applyGuestEnforcement();
+    refreshMediaRenderingForAllPeers();
+    if (newLeaderId === myPeerId) {
+      showToast('Вы стали лидером');
+    } else {
+      showToast(`Лидер теперь ${peerNames.get(newLeaderId) || 'Гость'}`);
+    }
   });
 
   signaling.on('room-not-found', () => {
@@ -878,7 +1329,7 @@ function registerSignalingHandlers(iceServers) {
     updateScreenButtonState();
   });
 
-  signaling.on('share-rejected', ({ busyPeerId }) => {
+  signaling.on('share-rejected', ({ busyPeerId, reason }) => {
     cancelScreenOwnerGrace();
     if (screenStream && currentScreenOwnerPeerId === myPeerId) {
       // Мы шарили экран до обрыва сигналинга и после реконнекта попытались
@@ -888,9 +1339,17 @@ function registerSignalingHandlers(iceServers) {
       // ломать её не нужно).
       forceStopLocalScreenCapture();
     }
-    currentScreenOwnerPeerId = busyPeerId;
-    updateScreenButtonState();
-    showRoomMessage(`Экран показывает ${peerNames.get(busyPeerId) || 'другой участник'}.`);
+    if (reason === 'forbidden') {
+      // Отказ по правам (guestScreen=false, см. README.md «Права и лидер»),
+      // а не потому что экран занят — busyPeerId в этом случае не приходит.
+      currentScreenOwnerPeerId = null;
+      updateScreenButtonState();
+      showRoomMessage('Лидер запретил показ экрана.');
+    } else {
+      currentScreenOwnerPeerId = busyPeerId;
+      updateScreenButtonState();
+      showRoomMessage(`Экран показывает ${peerNames.get(busyPeerId) || 'другой участник'}.`);
+    }
     if (pendingShareDecision) {
       pendingShareDecision.resolve(false);
       pendingShareDecision = null;
