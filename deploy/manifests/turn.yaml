@@ -1,0 +1,46 @@
+# TURN-сервер (turn-rs / ghcr.io/mycrl/turn-server) для пар, которым не
+# пробиться напрямую (симметричные NAT). Медиа через TURN идёт шифрованным
+# (DTLS-SRTP) — релей видит только байты и IP.
+#
+# hostNetwork: релей раздаёт UDP из диапазона 49160..49999 — пробрасывать
+# такой диапазон Service'ами бессмысленно, под сидит прямо на сети ноды.
+# Порты открыты в ОБЛАЧНОМ firewall Contabo (панель хостера, 2026-07-12):
+# UDP 3478 + 49160-49999 (см. registry, карточка хоста).
+#
+# Секреты (НЕ в git, созданы админом руками):
+#   - Secret turn/turn-config: config.toml целиком (realm, port-range,
+#     external=<публичный IP>:3478, static-credentials chat=<пароль>).
+#   - Secret chat-prod/turn-creds: TURN_URL/TURN_USERNAME/TURN_PASSWORD —
+#     их подхватывает Deployment chat (envFrom) и раздаёт клиентам в /config.
+apiVersion: v1
+kind: Namespace
+metadata: { name: turn }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: turn-server, namespace: turn }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }   # hostNetwork: два пода не поделят порт
+  selector: { matchLabels: { app: turn-server } }
+  template:
+    metadata: { labels: { app: turn-server } }
+    spec:
+      hostNetwork: true
+      terminationGracePeriodSeconds: 10
+      containers:
+      - name: turn
+        image: ghcr.io/mycrl/turn-server:latest
+        imagePullPolicy: IfNotPresent
+        # У образа нет ENTRYPOINT — без command kubelet принял бы args за
+        # исполняемый файл (ловили CrashLoop с «/--config… not found»).
+        command: ["turn-server"]
+        args: ["--config=/etc/turn-server/config.toml"]
+        volumeMounts:
+        - { name: config, mountPath: /etc/turn-server, readOnly: true }
+        resources:
+          requests: { memory: 32Mi, cpu: 25m }
+          limits: { memory: 256Mi, cpu: 500m }
+      volumes:
+      - name: config
+        secret: { secretName: turn-config }

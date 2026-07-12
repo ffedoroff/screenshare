@@ -13,19 +13,33 @@
 'use strict';
 
 // --- Анонимность: leaderToken из фрагмента ссылки (см. static/landing.js —
-// POST /api/rooms -> редирект на /r/<id>#lt=<token>) читается ДО ВСЕГО
-// остального и сразу вычищается из адресной строки через history.replaceState
-// — токен не должен светиться ни в адресной строке, ни в ссылке из
-// «Поделиться» (см. openSharePopup ниже, использует уже очищенный location.href).
-// Фрагмент никогда не уходит на сервер сам по себе (в отличие от query),
-// поэтому единственный способ его прочитать — этот же таб на этой же странице.
-const initialLeaderToken = (() => {
-  const match = location.hash.match(/(?:^|[&#])lt=([^&]+)/);
-  const token = match ? decodeURIComponent(match[1]) : null;
-  if (location.hash) {
-    history.replaceState(null, '', location.pathname + location.search);
+// POST /api/rooms -> редирект на /r/<id>#lt=<token>&k=<key>) читается ДО ВСЕГО
+// остального. Из адресной строки вычищается ТОЛЬКО одноразовый #lt (после
+// первого join он сожжён сервером и бесполезен, светить его незачем).
+//
+// Ключ комнаты #k СОЗНАТЕЛЬНО ОСТАЁТСЯ в адресной строке: ссылка = ключ по
+// самой модели (ей и делятся), а сохранение k в URL позволяет пережить F5 —
+// иначе перезагрузка выбрасывала бы из комнаты («ссылка неполная»), при том
+// что хранить ключ в storage запрещено (полная анонимность). Тот же паттерн
+// у Excalidraw. Фрагмент никогда не уходит на сервер сам по себе.
+//
+// Ключ комнаты (Ш1, E2E-шифрование, см. static/crypto.js): `k` парсится ЗДЕСЬ
+// ЖЕ — до того, как страница успела показать что-либо, и до какого-либо
+// обращения к сигналингу; от него позже выводятся sigKey/metaKey/chatKey
+// (см. deriveRoomKeys).
+const { initialLeaderToken, roomKeyBase64url } = (() => {
+  const hash = location.hash;
+  const ltMatch = hash.match(/(?:^|[&#])lt=([^&]+)/);
+  const kMatch = hash.match(/(?:^|[&#])k=([^&]+)/);
+  const lt = ltMatch ? decodeURIComponent(ltMatch[1]) : null;
+  // `k` — base64url, состоит только из URL-safe символов (A-Za-z0-9-_) —
+  // decodeURIComponent не нужен (и вреден не был бы, но не нужен).
+  const k = kMatch ? kMatch[1] : null;
+  if (lt) {
+    // Пересобираем фрагмент без lt, сохраняя k.
+    history.replaceState(null, '', location.pathname + location.search + (k ? `#k=${k}` : ''));
   }
-  return token;
+  return { initialLeaderToken: lt, roomKeyBase64url: k };
 })();
 
 // --- DOM ---
@@ -113,6 +127,19 @@ const screenShareSupported = !!(
 if (!screenShareSupported) {
   screenButton.classList.add('hidden');
 }
+
+// --- Ш1: криптографические ключи комнаты (см. static/crypto.js) ---
+// Выводятся один раз при старте страницы из roomKeyBase64url (см. init/
+// deriveRoomKeys ниже) — null, пока вывод не завершился (или не начинался).
+let sigKey = null; // K_sig — sdp/candidate/info в серверном релее
+let metaKey = null; // K_meta — отображаемое имя участника в join-room
+let chatKey = null; // K_chat — fallback-конверт чата через сервер
+// Взводится один раз на первую же неудачную расшифровку входящего
+// (SDP/ICE/stream-info с серверного релея) — почти всегда значит, что ключ
+// комнаты неверный (см. handleCryptoFailureOnce). Отдельно от terminalState,
+// чтобы не показать оверлей дважды при параллельных отказах нескольких
+// пиров сразу.
+let cryptoFailureHandled = false;
 
 // --- Общее состояние комнаты/сигналинга ---
 let signaling = null;
@@ -278,6 +305,95 @@ overlayActionButtonEl.addEventListener('click', () => {
     location.href = '/';
   }
 });
+
+// ---------- Ш1: криптографические ключи комнаты ----------
+
+/**
+ * Вывести sigKey/metaKey/chatKey из roomKeyBase64url (см. верх файла).
+ * Возвращает false при ЛЮБОЙ проблеме: `k` отсутствует в ссылке, не
+ * декодируется как base64url, декодируется не в 32 байта, либо сам
+ * HKDF/AES-GCM отказался (WebCrypto недоступен и т.п.) — вызывающая сторона
+ * (см. init ниже) трактует false как «ссылка неполная».
+ */
+async function deriveRoomKeys() {
+  if (!roomKeyBase64url) return false;
+  let rawKey;
+  try {
+    rawKey = RoomCrypto.base64urlToBytes(roomKeyBase64url);
+  } catch (err) {
+    console.error('Не удалось декодировать ключ комнаты из ссылки:', err);
+    return false;
+  }
+  try {
+    const keys = await RoomCrypto.deriveKeys(rawKey);
+    sigKey = keys.sig;
+    metaKey = keys.meta;
+    chatKey = keys.chat;
+    return true;
+  } catch (err) {
+    console.error('Не удалось вывести криптографические ключи комнаты:', err);
+    return false;
+  }
+}
+
+/** Оверлей «ссылка неполная» — вход без валидного `k` ИЛИ первая же неудачная расшифровка входящего (см. handleCryptoFailureOnce) трактуются одинаково: с этим ключом (или без него) в комнате всё равно ничего не заработает. */
+function showInvalidLinkOverlay() {
+  terminalState = true;
+  // join-modal видна ПО УМОЛЧАНИЮ (в разметке room.html у неё нет класса
+  // .hidden — её прячет/показывает только JS, см. showJoinModal/hideJoinModal
+  // ниже) и её z-index ВЫШЕ, чем у #overlay (см. static/style.css) — если её
+  // явно не спрятать здесь, она осталась бы поверх этого оверлея (и
+  // технически кликабельной) в сценарии «ключ невалиден ещё до входа»,
+  // когда showJoinModal() вообще не успел выполниться.
+  hideJoinModal();
+  showOverlay({
+    title: 'Ссылка неполная',
+    text: 'Попросите новую ссылку у участника комнаты.',
+    actionLabel: 'На главную',
+  });
+}
+
+/**
+ * Первая неудачная расшифровка входящего с серверного релея (SDP/ICE/
+ * stream-info — см. static/rtc.js: onCryptoFailure, и signaling.on('stream-info')
+ * ниже) — почти наверняка означает, что ключ комнаты у нас неверный
+ * (испорчен при копировании, урезан и т.п.): с правильным ключом GCM-тег
+ * почти никогда не собьётся сам по себе. Показываем тот же оверлей, что и
+ * при отсутствующем `k` — с точки зрения пользователя разница не важна,
+ * результат один и тот же («эта ссылка не работает, нужна новая»).
+ */
+function handleCryptoFailureOnce(err) {
+  if (cryptoFailureHandled || terminalState) return;
+  cryptoFailureHandled = true;
+  console.error('Похоже, ключ комнаты неверен (не удалось расшифровать входящее сообщение):', err);
+  showInvalidLinkOverlay();
+  if (signaling) signaling.close();
+}
+
+/** Зашифровать собственное имя (см. K_meta) для поля `name` в join-room — см. src/protocol.rs::ClientMessage::JoinRoom, поле остаётся String на проводе. */
+function encryptMyName() {
+  return RoomCrypto.encryptToBase64(metaKey, { name: myName || null });
+}
+
+/**
+ * Расшифровать имя ДРУГОГО участника (K_meta) — используется для peers из
+ * joined/peer-joined/join-request. Любая проблема (отсутствует, невалидный
+ * блоб, неверный ключ) -> null, что везде по коду трактуется как «Гость»
+ * (см. displayName в static/chat.js и label тайла в createTile ниже) —
+ * намеренно мягкий отказ: одно нерасшифровавшееся имя не должно ронять всю
+ * остальную комнату (в отличие от отказа расшифровки SDP, см.
+ * handleCryptoFailureOnce выше).
+ */
+async function decryptPeerName(cipherName) {
+  if (!cipherName) return null;
+  try {
+    const obj = await RoomCrypto.decryptFromBase64(metaKey, cipherName);
+    return obj && typeof obj.name === 'string' && obj.name ? obj.name : null;
+  } catch (err) {
+    console.warn('Не удалось расшифровать имя участника — показываем «Гость»:', err);
+    return null;
+  }
+}
 
 // ---------- Ненавязчивые сообщения ----------
 
@@ -829,12 +945,18 @@ wireSettingToggle(settingGuestScreenInput, 'guestScreen');
  * открыта — через неё (см. bus.js/rtc.js, Ф2), иначе — серверный релей как
  * раньше (fallback: пока mesh только устанавливается, шины ещё нет).
  * Формат сообщения на приёме единый для обоих путей — см. handleStreamInfo.
+ *
+ * Ш1 (E2E-шифрование): по шине `info` уходит КАК ЕСТЬ (P2P DataChannel уже
+ * E2E за счёт DTLS, см. static/crypto.js/rtc.js) — а вот серверный fallback
+ * шифрует `info` целиком под K_sig, сервер видит только {v,iv,ct}.
  */
 function sendStreamInfoTo(peerId, info) {
   if (bus.isOpen(peerId)) {
     bus.sendToPeer(peerId, { kind: 'stream-info', info });
   } else {
-    signaling.send('stream-info', { targetPeerId: peerId, info });
+    RoomCrypto.encrypt(sigKey, info).then((encInfo) => {
+      signaling.send('stream-info', { targetPeerId: peerId, info: encInfo });
+    });
   }
 }
 
@@ -1115,6 +1237,14 @@ function createRemotePeer(peerId, name, iceServers) {
     polite: myPeerId > peerId,
     signaling,
     targetPeerId: peerId,
+    // Ш1 (E2E-шифрование): offer/answer/ice-candidate к ЭТОМУ пиру всегда
+    // идут через серверный сигналинг-релей — RtcPeer шифрует/расшифровывает
+    // их сам под K_sig (см. static/rtc.js), room.js только выдаёт функции.
+    sigCrypto: {
+      encrypt: (obj) => RoomCrypto.encrypt(sigKey, obj),
+      decrypt: (blob) => RoomCrypto.decrypt(sigKey, blob),
+    },
+    onCryptoFailure: handleCryptoFailureOnce,
     onTrack: (event) => handleRemoteTrack(peerId, event),
     onStateChange: () => {},
     onBusMessage: (obj) => bus._dispatch(peerId, obj),
@@ -1255,6 +1385,17 @@ joinNameInputEl.addEventListener('keydown', (event) => {
 });
 
 async function init() {
+  // Ш1 (E2E-шифрование): ключ комнаты обязателен ДО показа чего-либо
+  // связанного с реальным входом — без него нет смысла даже спрашивать имя,
+  // всё равно ничего не заработает (см. README.md «Приватность»,
+  // deriveRoomKeys выше). Та же семантика, что и при отказе расшифровки
+  // первого входящего сообщения (см. showInvalidLinkOverlay).
+  const keysOk = await deriveRoomKeys();
+  if (!keysOk) {
+    showInvalidLinkOverlay();
+    return;
+  }
+
   // Анонимность (см. README.md): имя спрашивается заново при КАЖДОМ заходе
   // этой модалкой — никакого localStorage. join-room уходит только после
   // клика «Войти» (см. onJoinModalSubmit). При авто-reconnect модалка не
@@ -1301,15 +1442,19 @@ async function connectAndJoin() {
   }
 
   registerSignalingHandlers(iceServersCache);
+  // Ш1: имя шифруется под K_meta ВСЕГДА (даже пустое/null) — присутствие
+  // самого поля больше не сигнализирует ничего, сервер и так его не читает
+  // (см. static/crypto.js: encryptToBase64).
+  const encName = await encryptMyName();
   signaling.send('join-room', {
     roomId,
-    ...(myName ? { name: myName } : {}),
+    name: encName,
     ...(initialLeaderToken ? { leaderToken: initialLeaderToken } : {}),
   });
 }
 
 function registerSignalingHandlers(iceServers) {
-  signaling.on('joined', ({ peerId, peers: otherPeers, screenOwner, leaderId: joinedLeaderId, settings, pending }) => {
+  signaling.on('joined', async ({ peerId, peers: otherPeers, screenOwner, leaderId: joinedLeaderId, settings, pending }) => {
     // Реконнект ждёт именно этот ответ (см. sendJoinAndWait) — репортуем ему
     // исход в дополнение к обычной обработке ниже (при первом входе
     // pendingJoinResolve никогда не взведён).
@@ -1323,9 +1468,13 @@ function registerSignalingHandlers(iceServers) {
 
       ownTile = createTile(peerId, myName, true);
 
+      // Ш1: имена остальных участников приходят зашифрованными под K_meta
+      // (см. src/protocol.rs::PeerInfo.name) — расшифровываем перед любым
+      // отображением; не расшифровалось -> «Гость» (см. decryptPeerName).
       for (const p of otherPeers) {
-        peerNames.set(p.peerId, p.name || null);
-        createRemotePeer(p.peerId, p.name, iceServers);
+        const decodedName = await decryptPeerName(p.name);
+        peerNames.set(p.peerId, decodedName);
+        createRemotePeer(p.peerId, decodedName, iceServers);
       }
 
       currentScreenOwnerPeerId = screenOwner || null;
@@ -1334,7 +1483,9 @@ function registerSignalingHandlers(iceServers) {
       }
 
       roomSettings = settings;
-      pendingRequests = (pending || []).map((p) => ({ peerId: p.peerId, name: p.name || null }));
+      pendingRequests = await Promise.all(
+        (pending || []).map(async (p) => ({ peerId: p.peerId, name: await decryptPeerName(p.name) }))
+      );
       setLeaderIndicator(joinedLeaderId);
       updateSettingsButtonVisibility();
       renderJoinRequests();
@@ -1354,6 +1505,7 @@ function registerSignalingHandlers(iceServers) {
         initialPeerIds: otherPeers.map((p) => p.peerId),
         getLeaderId: () => leaderId,
         getGuestChatAllowed: () => (roomSettings ? roomSettings.guestChat : true),
+        chatKey,
       });
       return;
     }
@@ -1370,10 +1522,12 @@ function registerSignalingHandlers(iceServers) {
     // Лидерство при реконнекте может смениться (см. README.md «Права и
     // лидер»: сервер мог уже удалить нас и назначить нового лидера) — pending
     // видим заново, только если после реконнекта лидер снова мы.
-    pendingRequests = isLeader ? (pending || []).map((p) => ({ peerId: p.peerId, name: p.name || null })) : [];
+    pendingRequests = isLeader
+      ? await Promise.all((pending || []).map(async (p) => ({ peerId: p.peerId, name: await decryptPeerName(p.name) })))
+      : [];
     renderJoinRequests();
     applyGuestEnforcement();
-    reconcileAfterReconnect(otherPeers, screenOwner);
+    await reconcileAfterReconnect(otherPeers, screenOwner);
     refreshMediaRenderingForAllPeers();
   });
 
@@ -1394,8 +1548,8 @@ function registerSignalingHandlers(iceServers) {
     });
   });
 
-  signaling.on('join-request', ({ peerId, name }) => {
-    addPendingRequest(peerId, name);
+  signaling.on('join-request', async ({ peerId, name }) => {
+    addPendingRequest(peerId, await decryptPeerName(name));
   });
 
   signaling.on('join-request-cancelled', ({ peerId }) => {
@@ -1455,8 +1609,9 @@ function registerSignalingHandlers(iceServers) {
     });
   });
 
-  signaling.on('peer-joined', ({ peerId, name }) => {
-    peerNames.set(peerId, name || null);
+  signaling.on('peer-joined', async ({ peerId, name }) => {
+    const decodedName = await decryptPeerName(name);
+    peerNames.set(peerId, decodedName);
     if (peers.has(peerId)) {
       // Уже знаем этого пира — mesh пережил обрыв сигналинга (наш или его),
       // это просто повторный peer-joined от его собственного реконнекта.
@@ -1464,7 +1619,7 @@ function registerSignalingHandlers(iceServers) {
       cancelPendingPeerRemoval(peerId);
       return;
     }
-    createRemotePeer(peerId, name, iceServers);
+    createRemotePeer(peerId, decodedName, iceServers);
     updateParticipantCount();
   });
 
@@ -1498,7 +1653,14 @@ function registerSignalingHandlers(iceServers) {
   // конкретному пиру ещё не открыта (в основном bootstrap-окно сразу после
   // входа в комнату); дальше основной путь — bus.onMessage выше, этот
   // обработчик становится редким (см. handleStreamInfo — общая точка входа).
-  signaling.on('stream-info', ({ info }) => handleStreamInfo(info));
+  // Ш1: `info` с этого пути приходит зашифрованным под K_sig (см.
+  // sendStreamInfoTo) — по шине (bus.onMessage выше) info остаётся
+  // как есть, не завёрнутым.
+  signaling.on('stream-info', ({ info }) => {
+    RoomCrypto.decrypt(sigKey, info)
+      .then((plainInfo) => handleStreamInfo(plainInfo))
+      .catch((err) => handleCryptoFailureOnce(err));
+  });
 
   signaling.on('share-started', ({ peerId }) => {
     cancelScreenOwnerGrace(); // владелец подтверждён сервером — грейс больше не нужен
@@ -1574,11 +1736,12 @@ function waitForJoinOutcome(timeoutMs) {
 }
 
 /** Отправить join-room со своим прежним peerId (см. src/protocol.rs) и дождаться исхода. */
-function sendJoinAndWait() {
+async function sendJoinAndWait() {
   const promise = waitForJoinOutcome(RECONNECT_JOIN_TIMEOUT_MS);
+  const encName = await encryptMyName(); // Ш1: то же самое K_meta-шифрование имени, что и при первом входе (см. connectAndJoin)
   signaling.send('join-room', {
     roomId,
-    ...(myName ? { name: myName } : {}),
+    name: encName,
     ...(myPeerId ? { peerId: myPeerId } : {}),
   });
   return promise;
@@ -1684,15 +1847,16 @@ function giveUpReconnect() {
  * свежем списке — не удаляем сразу, а даём грейс-период (см.
  * schedulePeerRemoval) на случай, что они просто ещё не успели ре-джойниться.
  */
-function reconcileAfterReconnect(otherPeers, screenOwner) {
+async function reconcileAfterReconnect(otherPeers, screenOwner) {
   const freshIds = new Set(otherPeers.map((p) => p.peerId));
 
   for (const p of otherPeers) {
-    peerNames.set(p.peerId, p.name || null);
+    const decodedName = await decryptPeerName(p.name); // Ш1: тот же K_meta, что и в joined/peer-joined
+    peerNames.set(p.peerId, decodedName);
     if (peers.has(p.peerId)) {
       cancelPendingPeerRemoval(p.peerId);
     } else {
-      createRemotePeer(p.peerId, p.name, iceServersCache);
+      createRemotePeer(p.peerId, decodedName, iceServersCache);
     }
   }
 
@@ -2099,11 +2263,42 @@ function onSharePopupKeydown(event) {
   if (event.key === 'Escape') closeSharePopup();
 }
 
+/**
+ * Ссылка «Поделиться» (Ш1): собирается ЗАНОВО из location.pathname + ключа
+ * комнаты, запомненного при старте страницы (roomKeyBase64url, см. верх
+ * файла) — НЕ из location.href, потому что тот к этому моменту уже вычищен
+ * от фрагмента (см. init/history.replaceState) и leaderToken там в любом
+ * случае никогда не было бы (он одноразовый и только для создателя). Вид:
+ * `<origin>/r/<id>#k=<key>` — БЕЗ lt.
+ */
+function buildShareLink() {
+  return `${location.origin}${location.pathname}#k=${roomKeyBase64url}`;
+}
+
+/**
+ * Отрисовать QR ЛОКАЛЬНО в браузере (см. static/vendor/qrcode.js —
+ * kazuhikoarase/qrcode-generator, MIT) вместо похода на сервер: ссылка
+ * комнаты несёт секретный ключ (#k) и не должна покидать вкладку ради
+ * картинки. `qrcode(0, 'M')` — typeNumber=0 значит авто-подбор версии QR под
+ * длину текста, 'M' — стандартный уровень коррекции ошибок. createSvgTag
+ * строит SVG из чистых числовых координат (сам текст ссылки в разметку не
+ * попадает как HTML) — безопасно вставлять через innerHTML.
+ */
+function renderShareQr(text) {
+  sharePopupQrEl.textContent = '';
+  try {
+    const qr = qrcode(0, 'M');
+    qr.addData(text);
+    qr.make();
+    sharePopupQrEl.innerHTML = qr.createSvgTag(4, 12);
+  } catch (err) {
+    console.error('Не удалось построить QR-код комнаты:', err);
+  }
+}
+
 function openSharePopup() {
-  const link = location.href;
-  // QR — серверный SVG (см. GET /qr.svg?room=<id> в src/main.rs), кодирует ту
-  // же короткую ссылку /r/<roomId>.
-  sharePopupQrEl.src = `/qr.svg?room=${encodeURIComponent(roomId)}`;
+  const link = buildShareLink();
+  renderShareQr(link);
   sharePopupLinkEl.textContent = link;
   sharePopupEl.classList.remove('hidden');
   document.addEventListener('keydown', onSharePopupKeydown);
@@ -2120,7 +2315,7 @@ sharePopupCloseEl.addEventListener('click', closeSharePopup);
 sharePopupBackdropEl.addEventListener('click', closeSharePopup);
 
 sharePopupCopyButtonEl.addEventListener('click', async () => {
-  const success = await copyTextToClipboard(location.href);
+  const success = await copyTextToClipboard(buildShareLink());
   if (success) {
     const original = sharePopupCopyButtonEl.textContent;
     sharePopupCopyButtonEl.textContent = 'Скопировано';

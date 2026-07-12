@@ -9,6 +9,15 @@
 // навигации браузера, ни в Referer — токен долетает только до room.js на
 // этой же странице (см. там же — читается и сразу вычищается из адресной
 // строки через history.replaceState, прежде чем показать что-либо ещё).
+//
+// Ключ комнаты (Ш1, E2E-шифрование — см. static/crypto.js/room.js): здесь же,
+// рядом с leaderToken, генерируется случайный `k` (32 байта, base64url) и
+// кладётся ВТОРЫМ параметром того же фрагмента (#lt=...&k=...) — сервер его
+// не видит и вообще не участвует в его создании, это чисто клиентский
+// секрет. room.js парсит оба параметра фрагмента разом и точно так же
+// вычищает их из адресной строки. Из `k` room.js выводит ключи, которыми
+// шифруется всё, что проходит через серверный релей (SDP/ICE/имя участника/
+// fallback-чат) — см. README.md «Приватность».
 
 'use strict';
 
@@ -34,7 +43,9 @@ createButton.addEventListener('click', async () => {
     if (typeof data.leaderToken !== 'string' || !data.leaderToken) {
       throw new Error('в ответе нет leaderToken');
     }
-    location.href = `/r/${data.roomId}#lt=${encodeURIComponent(data.leaderToken)}`;
+    const roomKey = RoomCrypto.generateRoomKey();
+    const roomKeyB64 = RoomCrypto.bytesToBase64url(roomKey);
+    location.href = `/r/${data.roomId}#lt=${encodeURIComponent(data.leaderToken)}&k=${roomKeyB64}`;
   } catch (err) {
     console.error('Не удалось создать комнату:', err);
     showMessage('Не удалось создать комнату. Проверьте соединение и попробуйте снова.');

@@ -45,6 +45,16 @@
 // теперь возможна и от одного самого факта входа в комнату — perfect
 // negotiation ниже её штатно разруливает.
 //
+// Ш1 (E2E-шифрование, см. static/crypto.js): offer/answer/ice-candidate ВСЕГДА
+// идут через серверный сигналинг-релей (это как раз то сообщение, которым
+// P2P-соединение только устанавливается — по определению не может пойти по
+// ещё не существующей шине), поэтому sdp/candidate шифруются под K_sig
+// безусловно, на каждый такой обмен — см. sigCrypto в конструкторе и
+// handleDescription/handleCandidate ниже. Сама P2P-шина (DataChannel 'bus')
+// и медиатреки НЕ шифруются этим слоем — WebRTC обязан гнать их поверх DTLS,
+// это уже полноценный E2E между двумя конкретными пирами, второй прикладной
+// слой шифрования той же пары ничего не добавил бы к безопасности.
+//
 // Ф3: файловые DataChannel (см. static/chat.js — протокол передачи файлов).
 // В отличие от шины ('bus', одна на пару, создаётся один раз при входе),
 // файловый канал создаётся ПО ЗАПРОСУ, отдельный на каждую пару
@@ -59,11 +69,35 @@
 'use strict';
 
 class RtcPeer {
-  constructor({ iceServers, polite, signaling, targetPeerId, onTrack, onStateChange, onBusMessage, onBusOpen, onFileChannel }) {
+  constructor({
+    iceServers,
+    polite,
+    signaling,
+    targetPeerId,
+    onTrack,
+    onStateChange,
+    onBusMessage,
+    onBusOpen,
+    onFileChannel,
+    sigCrypto,
+    onCryptoFailure,
+  }) {
     this.signaling = signaling;
     this.targetPeerId = targetPeerId;
     this.polite = polite;
     this.onBusMessage = onBusMessage || null;
+    // Ш1 (E2E-шифрование, см. static/crypto.js): sdp/candidate идут через
+    // серверный сигналинг-релей (offer/answer/ice-candidate НИКОГДА не
+    // ходят по P2P-шине — сама шина устанавливается ЭТИМИ сообщениями,
+    // курица-яйцо), поэтому шифруются ВСЕГДА, а не только опционально.
+    // `sigCrypto` — { encrypt(obj) -> Promise<blob>, decrypt(blob) -> Promise<obj> },
+    // выданный вызывающей стороной (см. static/room.js: createRemotePeer) —
+    // сам RtcPeer ничего не знает про устройство ключа комнаты, только
+    // вызывает эти две функции. `onCryptoFailure` — колбэк на случай, если
+    // decrypt() отказал (см. handleDescription/handleCandidate ниже) —
+    // почти всегда означает неверный ключ комнаты у одной из сторон.
+    this.sigCrypto = sigCrypto;
+    this.onCryptoFailure = onCryptoFailure || null;
     // Ф2: колбэк на момент, когда шина к этому пиру открылась (после флаша
     // очереди) — используется для рассылки снапшота актуального состояния
     // (см. static/room.js: sendAllActiveStreamInfoTo) сразу по шине, закрывая
@@ -150,7 +184,14 @@ class RtcPeer {
       try {
         this.makingOffer = true;
         await pc.setLocalDescription();
-        signaling.send('offer', { targetPeerId, sdp: pc.localDescription });
+        // Шифруем ЦЕЛИКОМ {type, sdp} под K_sig — сервер видит только
+        // непрозрачный {v,iv,ct} вместо настоящего SDP (и его
+        // DTLS-отпечатков, см. заголовок static/crypto.js).
+        const encSdp = await this.sigCrypto.encrypt({
+          type: pc.localDescription.type,
+          sdp: pc.localDescription.sdp,
+        });
+        signaling.send('offer', { targetPeerId, sdp: encSdp });
       } catch (err) {
         console.error(`[peer ${targetPeerId}] Ошибка onnegotiationneeded:`, err);
       } finally {
@@ -160,9 +201,11 @@ class RtcPeer {
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        signaling.send('ice-candidate', {
-          targetPeerId,
-          candidate: event.candidate.toJSON(),
+        this.sigCrypto.encrypt(event.candidate.toJSON()).then((encCandidate) => {
+          signaling.send('ice-candidate', {
+            targetPeerId,
+            candidate: encCandidate,
+          });
         });
       }
     };
@@ -184,8 +227,21 @@ class RtcPeer {
   /**
    * Приём SDP-описания от удалённого пира — offer ИЛИ answer, разбираются по
    * description.type. Реализует детект и разрешение коллизии офферов.
+   * `encryptedDescription` — зашифрованный блоб {v,iv,ct} (см. K_sig в
+   * static/crypto.js) — расшифровывается ПЕРВЫМ делом, до какой-либо иной
+   * обработки; отказ расшифровки почти всегда значит, что у одной из сторон
+   * неверный ключ комнаты (см. onCryptoFailure).
    */
-  async handleDescription(description) {
+  async handleDescription(encryptedDescription) {
+    let description;
+    try {
+      description = await this.sigCrypto.decrypt(encryptedDescription);
+    } catch (err) {
+      console.error(`[peer ${this.targetPeerId}] Не удалось расшифровать SDP (неверный ключ комнаты?):`, err);
+      if (this.onCryptoFailure) this.onCryptoFailure(err);
+      return;
+    }
+
     const pc = this.pc;
     const isOffer = description.type === 'offer';
 
@@ -215,9 +271,13 @@ class RtcPeer {
     if (isOffer) {
       try {
         await pc.setLocalDescription();
+        const encAnswer = await this.sigCrypto.encrypt({
+          type: pc.localDescription.type,
+          sdp: pc.localDescription.sdp,
+        });
         this.signaling.send('answer', {
           targetPeerId: this.targetPeerId,
-          sdp: pc.localDescription,
+          sdp: encAnswer,
         });
       } catch (err) {
         console.error(`[peer ${this.targetPeerId}] Ошибка setLocalDescription (answer):`, err);
@@ -225,8 +285,17 @@ class RtcPeer {
     }
   }
 
-  /** Приём ICE-кандидата от удалённого пира (trickle). */
-  async handleCandidate(candidate) {
+  /** Приём ICE-кандидата от удалённого пира (trickle). `encryptedCandidate` — блоб {v,iv,ct}, расшифровывается первым делом (см. handleDescription про onCryptoFailure). */
+  async handleCandidate(encryptedCandidate) {
+    let candidate;
+    try {
+      candidate = await this.sigCrypto.decrypt(encryptedCandidate);
+    } catch (err) {
+      console.error(`[peer ${this.targetPeerId}] Не удалось расшифровать ICE-кандидат (неверный ключ комнаты?):`, err);
+      if (this.onCryptoFailure) this.onCryptoFailure(err);
+      return;
+    }
+
     if (!this.remoteSet) {
       this.candidateQueue.push(candidate);
       return;

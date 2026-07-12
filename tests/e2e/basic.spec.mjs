@@ -53,6 +53,14 @@ import {
   makeTestPngBuffer,
   makeTestTextFileBuffer,
   attachFilesToChat,
+  generateRoomKeyBase64url,
+  roomUrlWithKey,
+  leaderUrlWithKey,
+  getRoomKeyFromPage,
+  installSignalingFrameSpy,
+  allFramesSentOn,
+  framesOfTypeSentOn,
+  waitInvalidLinkOverlay,
 } from './helpers.mjs';
 
 const PORT = 3322;
@@ -259,6 +267,13 @@ async function main() {
     }
 
     const roomUrl = `${server.baseUrl}/r/${roomId}`;
+    // Ш1 (E2E-шифрование): ключ комнаты сгенерировал сам браузер Васи при
+    // клике «Создать комнату» (см. static/landing.js) — тест его заранее не
+    // знает, читаем прямо со страницы (см. getRoomKeyFromPage). Гостям
+    // ссылка нужна С #k (без него — «Ссылка неполная», см. ниже отдельный
+    // тест) и БЕЗ #lt (тот одноразовый и только для создателя).
+    const vasyaRoomKey = await getRoomKeyFromPage(vasyaPage);
+    const guestRoomUrl = roomUrlWithKey(server.baseUrl, roomId, vasyaRoomKey);
 
     // --- Петя и Оля открывают ту же ссылку ---
     const petyaContext = await browser.newContext();
@@ -278,8 +293,8 @@ async function main() {
     const meshSettledAtByLabel = new Map();
 
     const everyoneJoinedOk = await step('Петя и Оля открывают ссылку комнаты (модалка входа), у всех троих по 3 тайла, корона только у Васи', async () => {
-      await petyaPage.goto(roomUrl);
-      await olyaPage.goto(roomUrl);
+      await petyaPage.goto(guestRoomUrl);
+      await olyaPage.goto(guestRoomUrl);
       await joinRoom(petyaPage, 'Петя');
       await joinRoom(olyaPage, 'Оля');
       await waitForOverlayHidden(petyaPage);
@@ -566,41 +581,43 @@ async function main() {
       skip('Вася выключает камеру', 'камера не была успешно включена ранее');
     }
 
-    // --- Попап «Поделиться»: QR (серверный SVG) + ссылка вида /r/<id> ---
-    await step('Вася открывает попап «Поделиться» — QR грузится, ссылка ведёт на /r/<id>', async () => {
+    // --- Попап «Поделиться» (Ш1): QR рендерится ЛОКАЛЬНО (без похода на
+    // сервер — см. static/vendor/qrcode.js, static/room.js: renderShareQr),
+    // ссылка — вида /r/<id>#k=<ключ> (БЕЗ #lt). ---
+    await step('Вася открывает попап «Поделиться» — QR рендерится локальным SVG, ссылка ведёт на /r/<id>#k=<ключ>', async () => {
       await vasyaPage.click('#share-button');
       await vasyaPage.waitForSelector('#share-popup:not(.hidden)', { timeout: 5000 });
 
-      const qrSrc = await vasyaPage.getAttribute('#share-popup-qr', 'src');
-      assert.ok(
-        qrSrc && qrSrc.includes(`/qr.svg?room=${roomId}`),
-        `src у QR-картинки должен указывать на /qr.svg?room=${roomId}, получено: ${qrSrc}`
-      );
-
-      // Картинка реально загрузилась (не просто есть атрибут src).
+      // QR — не <img> с сетевым src, а локально сгенерированный <svg> внутри
+      // контейнера #share-popup-qr; непустой — реально содержит path-разметку
+      // модулей (не просто пустой тег).
       await vasyaPage.waitForFunction(
-        () => (document.getElementById('share-popup-qr')?.naturalWidth || 0) > 0,
+        () => !!document.querySelector('#share-popup-qr svg'),
         undefined,
         { polling: 100, timeout: 5000 }
       );
-
-      // И отдельно — что сервер реально отдаёт SVG с 200 (а не просто картинка
-      // как-то отрендерилась благодаря кэшу браузера).
-      const qrUrl = new URL(qrSrc, roomUrl).toString();
-      const res = await fetch(qrUrl);
-      assert.equal(res.status, 200, `GET ${qrUrl} должен вернуть 200, получено ${res.status}`);
-      assert.match(
-        res.headers.get('content-type') || '',
-        /image\/svg\+xml/,
-        'content-type ответа /qr.svg должен быть image/svg+xml'
-      );
+      const qrSvgInfo = await vasyaPage.evaluate(() => {
+        const svg = document.querySelector('#share-popup-qr svg');
+        const path = svg ? svg.querySelector('path') : null;
+        return { hasSvg: !!svg, pathLength: path ? (path.getAttribute('d') || '').length : 0 };
+      });
+      assert.ok(qrSvgInfo.hasSvg, 'в попапе должен быть отрендерен <svg> QR-кода');
+      assert.ok(qrSvgInfo.pathLength > 0, `QR SVG не должен быть пустым (path должен нести координаты модулей), получено: ${qrSvgInfo.pathLength}`);
 
       const linkText = (await vasyaPage.textContent('#share-popup-link')) || '';
       assert.match(
         linkText.trim(),
-        new RegExp(`/r/${roomId}$`),
-        `ссылка в попапе должна быть вида /r/${roomId}, получено: ${linkText}`
+        new RegExp(`/r/${roomId}#k=[A-Za-z0-9_-]+$`),
+        `ссылка в попапе должна быть вида /r/${roomId}#k=<ключ> (без #lt), получено: ${linkText}`
       );
+      assert.ok(!linkText.includes('lt='), `ссылка «Поделиться» не должна нести leaderToken: ${linkText}`);
+
+      // #k в ссылке — это РЕАЛЬНЫЙ ключ комнаты (тот же, что вывел сам Вася
+      // при входе, см. vasyaRoomKey выше), а не случайный мусор — сверяем
+      // напрямую, не заводя лишнего участника (тот утащил бы за собой новый
+      // stream-info-фрейм в bootstrap-окне и сломал бы следующую проверку).
+      const linkKey = linkText.trim().split('#k=')[1];
+      assert.equal(linkKey, vasyaRoomKey, `#k в ссылке «Поделиться» должен совпадать с реальным ключом комнаты (получено ${linkKey})`);
 
       await vasyaPage.click('#share-popup-close');
       // Не page.waitForSelector('#share-popup.hidden') — по умолчанию он ждёт
@@ -649,7 +666,11 @@ async function main() {
         const res = await fetch(`${server.baseUrl}/api/rooms`, { method: 'POST' });
         assert.ok(res.ok, `POST /api/rooms ответил статусом ${res.status}`);
         const { roomId: histRoomId } = await res.json();
-        const histRoomUrl = `${server.baseUrl}/r/${histRoomId}`;
+        // Ш1: комната создана напрямую через API (в обход лендинга) — ключ
+        // генерирует тест сам (см. generateRoomKeyBase64url), как это в
+        // реальности сделал бы браузер создателя.
+        const histRoomKey = generateRoomKeyBase64url();
+        const histRoomUrl = roomUrlWithKey(server.baseUrl, histRoomId, histRoomKey);
 
         const igorContext = await browser.newContext();
         const nastyaContext = await browser.newContext();
@@ -728,7 +749,8 @@ async function main() {
         const res = await fetch(`${server.baseUrl}/api/rooms`, { method: 'POST' });
         assert.ok(res.ok, `POST /api/rooms ответил статусом ${res.status}`);
         const { roomId: fmtRoomId } = await res.json();
-        const fmtRoomUrl = `${server.baseUrl}/r/${fmtRoomId}`;
+        const fmtRoomKey = generateRoomKeyBase64url(); // Ш1: см. комментарий у histRoomKey выше
+        const fmtRoomUrl = roomUrlWithKey(server.baseUrl, fmtRoomId, fmtRoomKey);
 
         const aContext = await browser.newContext();
         const bContext = await browser.newContext();
@@ -937,7 +959,8 @@ async function main() {
         const res = await fetch(`${server.baseUrl}/api/rooms`, { method: 'POST' });
         assert.ok(res.ok, `POST /api/rooms ответил статусом ${res.status}`);
         const { roomId: editRoomId } = await res.json();
-        const editRoomUrl = `${server.baseUrl}/r/${editRoomId}`;
+        const editRoomKey = generateRoomKeyBase64url(); // Ш1: см. комментарий у histRoomKey выше
+        const editRoomUrl = roomUrlWithKey(server.baseUrl, editRoomId, editRoomKey);
 
         const iContext = await browser.newContext();
         const pContext = await browser.newContext();
@@ -1133,7 +1156,8 @@ async function main() {
         const res = await fetch(`${server.baseUrl}/api/rooms`, { method: 'POST' });
         assert.ok(res.ok, `POST /api/rooms ответил статусом ${res.status}`);
         const { roomId: fileRoomId } = await res.json();
-        const fileRoomUrl = `${server.baseUrl}/r/${fileRoomId}`;
+        const fileRoomKey = generateRoomKeyBase64url(); // Ш1: см. комментарий у histRoomKey выше
+        const fileRoomUrl = roomUrlWithKey(server.baseUrl, fileRoomId, fileRoomKey);
 
         const eContext = await browser.newContext();
         const fContext = await browser.newContext();
@@ -1253,8 +1277,9 @@ async function main() {
         const res = await fetch(`${server.baseUrl}/api/rooms`, { method: 'POST' });
         assert.ok(res.ok, `POST /api/rooms ответил статусом ${res.status}`);
         const { roomId: permRoomId, leaderToken: permLeaderToken } = await res.json();
-        const permRoomUrl = `${server.baseUrl}/r/${permRoomId}`;
-        const permLeaderUrl = `${permRoomUrl}#lt=${encodeURIComponent(permLeaderToken)}`;
+        const permRoomKey = generateRoomKeyBase64url(); // Ш1: см. комментарий у histRoomKey выше
+        const permRoomUrl = roomUrlWithKey(server.baseUrl, permRoomId, permRoomKey);
+        const permLeaderUrl = leaderUrlWithKey(server.baseUrl, permRoomId, permLeaderToken, permRoomKey);
 
         const lidaContext = await browser.newContext();
         const goshaContext = await browser.newContext();
@@ -1491,6 +1516,7 @@ async function main() {
         assert.ok(res.ok, `POST /api/rooms ответил статусом ${res.status}`);
         const data = await res.json();
         const mobileRoomId = data.roomId;
+        const mobileRoomKey = generateRoomKeyBase64url(); // Ш1: см. комментарий у histRoomKey выше
 
         const mobileContext = await browser.newContext({
           viewport: { width: 390, height: 844 },
@@ -1502,7 +1528,7 @@ async function main() {
           await installMediaStubs(mobileContext);
           const mobilePage = await mobileContext.newPage();
 
-          await mobilePage.goto(`${server.baseUrl}/r/${mobileRoomId}`);
+          await mobilePage.goto(roomUrlWithKey(server.baseUrl, mobileRoomId, mobileRoomKey));
 
           // Модалка входа — первое, что видит участник; должна помещаться в
           // 390×844 без горизонтального скролла (mobile-first, см. README.md).
@@ -1571,6 +1597,167 @@ async function main() {
           );
         } finally {
           await mobileContext.close();
+        }
+      }
+    );
+
+    // === Ш1 (E2E-шифрование): проверки схемы самой по себе =================
+
+    // --- (а) WS-шпион: SDP не палится плейнтекстом, имя не палится плейнтекстом ---
+    await step(
+      'Ш1: серверные offer/answer-фреймы не содержат "v=0"/"fingerprint" (SDP зашифрован под K_sig), join-room не содержит введённого имени плейнтекстом',
+      async () => {
+        const res = await fetch(`${server.baseUrl}/api/rooms`, { method: 'POST' });
+        assert.ok(res.ok, `POST /api/rooms ответил статусом ${res.status}`);
+        const { roomId: spyRoomId } = await res.json();
+        const spyRoomKey = generateRoomKeyBase64url();
+        const spyRoomUrl = roomUrlWithKey(server.baseUrl, spyRoomId, spyRoomKey);
+
+        const spyAContext = await browser.newContext();
+        const spyBContext = await browser.newContext();
+        await installSignalingFrameSpy(spyAContext);
+        await installSignalingFrameSpy(spyBContext);
+        try {
+          const spyAPage = await spyAContext.newPage();
+          const spyBPage = await spyBContext.newPage();
+
+          const secretName = 'ОЧЕНЬ-СЕКРЕТНОЕ-ИМЯ-42';
+          await spyAPage.goto(spyRoomUrl);
+          await spyBPage.goto(spyRoomUrl);
+          await joinRoom(spyAPage, secretName);
+          await joinRoom(spyBPage, 'Обычный');
+          await waitForOverlayHidden(spyAPage);
+          await waitForOverlayHidden(spyBPage);
+          await waitForTileCount(spyAPage, 2, 10_000);
+          await waitForTileCount(spyBPage, 2, 10_000);
+
+          for (const [label, page] of [['A', spyAPage], ['B', spyBPage]]) {
+            const joinFrames = await framesOfTypeSentOn(page, 'join-room');
+            assert.ok(joinFrames.length > 0, `${label}: должен быть хотя бы один фрейм join-room`);
+            for (const frame of joinFrames) {
+              const raw = JSON.stringify(frame);
+              assert.ok(
+                !raw.includes(secretName),
+                `${label}: join-room фрейм не должен содержать введённое имя плейнтекстом: ${raw}`
+              );
+            }
+
+            const sdpFrames = [
+              ...(await framesOfTypeSentOn(page, 'offer')),
+              ...(await framesOfTypeSentOn(page, 'answer')),
+            ];
+            assert.ok(sdpFrames.length > 0, `${label}: должен быть хотя бы один offer/answer фрейм`);
+            for (const frame of sdpFrames) {
+              const raw = JSON.stringify(frame);
+              assert.ok(!raw.includes('v=0'), `${label}: SDP-фрейм не должен содержать "v=0" (сырой SDP) в открытом виде: ${raw}`);
+              assert.ok(!/fingerprint/i.test(raw), `${label}: SDP-фрейм не должен содержать "fingerprint" в открытом виде: ${raw}`);
+            }
+          }
+        } finally {
+          await spyAContext.close();
+          await spyBContext.close();
+        }
+      }
+    );
+
+    // --- (б) вход без #k -> оверлей «Ссылка неполная» ---
+    await step('Ш1: вход БЕЗ #k -> оверлей «Ссылка неполная», модалка входа не показывается', async () => {
+      const res = await fetch(`${server.baseUrl}/api/rooms`, { method: 'POST' });
+      assert.ok(res.ok, `POST /api/rooms ответил статусом ${res.status}`);
+      const { roomId: noKeyRoomId } = await res.json();
+
+      const noKeyContext = await browser.newContext();
+      try {
+        const noKeyPage = await noKeyContext.newPage();
+        await noKeyPage.goto(`${server.baseUrl}/r/${noKeyRoomId}`); // ссылка вовсе без #k
+        await waitInvalidLinkOverlay(noKeyPage);
+        const modalVisible = await noKeyPage.evaluate(
+          () => !document.getElementById('join-modal')?.classList.contains('hidden')
+        );
+        assert.equal(modalVisible, false, 'модалка входа не должна показываться без валидного ключа комнаты');
+      } finally {
+        await noKeyContext.close();
+      }
+
+      // Тот же оверлей — и если k формально не пуст, но не по формату
+      // (не декодируется в 32 байта): deriveRoomKeys отказывает синхронно,
+      // до какой-либо попытки подключения к сигналингу.
+      const badFormatContext = await browser.newContext();
+      try {
+        const badFormatPage = await badFormatContext.newPage();
+        await badFormatPage.goto(roomUrlWithKey(server.baseUrl, noKeyRoomId, 'not-a-valid-key'));
+        await waitInvalidLinkOverlay(badFormatPage);
+      } finally {
+        await badFormatContext.close();
+      }
+    });
+
+    // --- (в) вход с ИСПОРЧЕННЫМ (валидного вида, но неверным) k -> первый же
+    //     провал расшифровки входящего -> тот же оверлей «Ссылка неполная» ---
+    //
+    // Два дополняющих друг друга сценария:
+    //   1) «настоящий» — двое заходят в одну комнату с РАЗНЫМИ (случайными,
+    //      каждый сам по себе валидного вида) ключами; кто из двоих первым
+    //      столкнётся с чужим SDP/ICE, зависит от того, кто из пары
+    //      polite/impolite (см. static/rtc.js) — детерминированно неизвестно
+    //      заранее, поэтому проверяем ОБОИХ и требуем срабатывания хотя бы у
+    //      одного (это и есть наблюдаемое поведение реального расхождения
+    //      ключей — оно не обязано ударить по конкретной стороне).
+    //   2) детерминированный — прямая инъекция заведомо нерасшифровываемого
+    //      блоба через тот же приём, что и подделанные конверты чата в
+    //      других тестах этого файла (envelope.enc/bus._dispatch): здесь —
+    //      `signaling._dispatch({type:'stream-info', ...})` с мусорным
+    //      {v,iv,ct}, минуя реальный сервер — доказывает механизм
+    //      (handleCryptoFailureOnce) напрямую, без зависимости от таймингов
+    //      WebRTC-негоциации.
+    await step(
+      'Ш1: вход с валидным по формату, но НЕВЕРНЫМ k -> первый же провал расшифровки входящего -> оверлей «Ссылка неполная» (реальный SDP-обмен между двумя разными ключами + прямая инъекция мусорного блоба)',
+      async () => {
+        const res = await fetch(`${server.baseUrl}/api/rooms`, { method: 'POST' });
+        assert.ok(res.ok, `POST /api/rooms ответил статусом ${res.status}`);
+        const { roomId: wrongKeyRoomId } = await res.json();
+        const keyA = generateRoomKeyBase64url();
+        const keyB = generateRoomKeyBase64url(); // независимый случайный ключ той же формы — валиден, но не тот же
+        assert.notEqual(keyA, keyB, 'сгенерированные ключи должны отличаться, иначе тест не имеет смысла');
+
+        const aContext = await browser.newContext();
+        const bContext = await browser.newContext();
+        try {
+          const aPage = await aContext.newPage();
+          const bPage = await bContext.newPage();
+
+          await aPage.goto(roomUrlWithKey(server.baseUrl, wrongKeyRoomId, keyA));
+          await bPage.goto(roomUrlWithKey(server.baseUrl, wrongKeyRoomId, keyB));
+          await joinRoom(aPage, 'Первый');
+          await joinRoom(bPage, 'Второй');
+
+          // Сервер честно относит обоих в одну комнату (roomId совпал) — но
+          // SDP/ICE друг друга они расшифровать не могут (ключи разные): рано
+          // или поздно оверлей вылезает у ОДНОГО ИЗ ДВУХ (см. пояснение выше).
+          await Promise.race([waitInvalidLinkOverlay(aPage, 20_000), waitInvalidLinkOverlay(bPage, 20_000)]);
+        } finally {
+          await aContext.close();
+          await bContext.close();
+        }
+
+        // Детерминированная версия того же механизма — прямая инъекция.
+        const soloContext = await browser.newContext();
+        try {
+          const soloPage = await soloContext.newPage();
+          await soloPage.goto(roomUrlWithKey(server.baseUrl, wrongKeyRoomId, generateRoomKeyBase64url()));
+          await joinRoom(soloPage, 'Одиночка');
+          await waitForOverlayHidden(soloPage);
+
+          await soloPage.evaluate(() => {
+            signaling._dispatch({
+              type: 'stream-info',
+              fromPeerId: 'irrelevant-for-this-injection',
+              info: { v: 1, iv: 'AAAAAAAAAAAAAAAA', ct: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==' },
+            });
+          });
+          await waitInvalidLinkOverlay(soloPage, 5000);
+        } finally {
+          await soloContext.close();
         }
       }
     );

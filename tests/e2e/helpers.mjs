@@ -13,10 +13,52 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 import zlib from 'node:zlib';
+import nodeCrypto from 'node:crypto';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = path.resolve(__dirname, '../..');
 export const BINARY_PATH = path.join(REPO_ROOT, 'target/debug/screenshare');
+
+// --- Ш1 (E2E-шифрование, см. static/crypto.js): ключ комнаты в тестах ---
+//
+// Ключ комнаты `k` — чисто клиентский секрет (см. static/landing.js): в
+// реальном приложении его генерирует браузер при клике «Создать комнату» и
+// сервер о нём никогда не узнаёт. Когда сценарий заводит комнату НАПРЯМУЮ
+// через `POST /api/rooms` (в обход лендинга — так делает большинство
+// сценариев ниже, чтобы не гонять реальный клик по кнопке ради каждой новой
+// комнаты), ключ точно так же должен появиться на стороне теста — сервер
+// его не выдаст. `generateRoomKeyBase64url` — тот же формат, что и
+// `RoomCrypto.generateRoomKey()+bytesToBase64url()` (32 случайных байта,
+// base64url без паддинга — `Buffer.toString('base64url')` в Node даёт
+// побайтово то же самое).
+
+/** Случайный ключ комнаты для тестового сценария, создающего комнату напрямую через POST /api/rooms (см. заголовок раздела выше). */
+export function generateRoomKeyBase64url() {
+  return nodeCrypto.randomBytes(32).toString('base64url');
+}
+
+/** Ссылка гостя: `<baseUrl>/r/<roomId>#k=<key>` — без leaderToken (гость лидером не становится). */
+export function roomUrlWithKey(baseUrl, roomId, key) {
+  return `${baseUrl}/r/${roomId}#k=${key}`;
+}
+
+/** Ссылка создателя: `<baseUrl>/r/<roomId>#lt=<token>&k=<key>` — предъявляет leaderToken, становится лидером. */
+export function leaderUrlWithKey(baseUrl, roomId, leaderToken, key) {
+  return `${baseUrl}/r/${roomId}#lt=${encodeURIComponent(leaderToken)}&k=${key}`;
+}
+
+/**
+ * Прочитать ключ комнаты (base64url) со СТРАНИЦЫ уже вошедшего участника —
+ * top-level `const roomKeyBase64url` в static/room.js, тот же приём, что и
+ * чтение `leaderId`/`myPeerId`/`roomSettings`/`bus` в существующих тестах
+ * (обычный classic-script top-level scope, не модуль). Нужен там, где
+ * комната заведена через реальный лендинг (ключ сгенерировал сам браузер,
+ * тест его заранее не знает) — см. basic.spec.mjs, сценарий создания
+ * комнаты кликом.
+ */
+export async function getRoomKeyFromPage(page) {
+  return page.evaluate(() => roomKeyBase64url);
+}
 
 // Сколько ждём реальный getDisplayMedia в broadcaster-контексте, прежде чем
 // откатиться на синтетический источник (см. installCaptureStub).
@@ -356,6 +398,58 @@ export async function joinRoom(page, name) {
     await page.fill('#join-name-input', name);
   }
   await page.click('#join-modal-button');
+}
+
+// --- Ш1 (E2E-шифрование): шпион на ВСЕ фреймы серверного WebSocket ---
+//
+// Тот же приём, что и installChatWsSpy/installPcRegistry (см. basic.spec.mjs)
+// — оборачивает window.WebSocket до первой навигации (addInitScript). В
+// отличие от installChatWsSpy (там интересен только `type==='chat'`) этот
+// шпион копит АБСОЛЮТНО ВСЁ, что страница отправляет в сокет — нужен для
+// проверок Ш1: и `join-room` (не должно быть плейнтекстового имени), и
+// `offer`/`answer` (SDP должен быть уже зашифрованным блобом, а не текстом с
+// "v=0"/fingerprint).
+export function installSignalingFrameSpy(context) {
+  return context.addInitScript(() => {
+    window.__e2eAllFramesSent = [];
+    const RealWebSocket = window.WebSocket;
+    window.WebSocket = class extends RealWebSocket {
+      constructor(...args) {
+        super(...args);
+        const realSend = this.send.bind(this);
+        this.send = (data) => {
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed && typeof parsed.type === 'string') {
+              window.__e2eAllFramesSent.push(parsed);
+            }
+          } catch {
+            // не строка/не JSON — точно не наш фрейм
+          }
+          return realSend(data);
+        };
+      }
+    };
+  });
+}
+
+export async function allFramesSentOn(page) {
+  return page.evaluate(() => window.__e2eAllFramesSent || []);
+}
+
+/** Фреймы конкретного `type` из allFramesSentOn(page) — сокращение для частого фильтра. */
+export async function framesOfTypeSentOn(page, type) {
+  const frames = await allFramesSentOn(page);
+  return frames.filter((f) => f && f.type === type);
+}
+
+/** Оверлей «Ссылка неполная» (Ш1: нет валидного `k`, либо ключ неверен — см. static/room.js: showInvalidLinkOverlay). */
+export async function waitInvalidLinkOverlay(page, timeoutMs = 10_000) {
+  await page.waitForFunction(
+    () => document.getElementById('overlay-title')?.textContent === 'Ссылка неполная',
+    undefined,
+    { polling: 100, timeout: timeoutMs }
+  );
 }
 
 // --- Реестр RTCPeerConnection для ожидания реального "соединения устаканились" ---

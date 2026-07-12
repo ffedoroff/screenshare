@@ -9,6 +9,13 @@
 //   релеит как 'chat' { fromPeerId, envelope } и содержимое не разбирает и
 //   не хранит (см. src/ws.rs).
 //
+// Ш1 (E2E-шифрование, см. static/crypto.js): по шине конверт уходит КАК ЕСТЬ
+// (P2P DataChannel уже E2E за счёт DTLS) — а вот в fallback-пути через
+// сервер конверт целиком шифруется под K_chat, выведенный из ключа комнаты
+// (см. static/room.js): на проводе вместо открытого конверта уходит
+// {enc:{v,iv,ct}} (см. sendEnvelopeToPeer/attach ниже) — сервер видит только
+// непрозрачный блоб, как и остальной сигналинг-релей.
+//
 // Конверт сообщения (РАСШИРЯЕМЫЙ — расширения будущих волн должны лечь без
 // ломки формата):
 //   { v: 1, id, lamport, from, name, kind: 'text', text, replyTo, ts }
@@ -488,12 +495,13 @@ const ChatPanel = (() => {
     initialPeerIds,
     getLeaderId,
     getGuestChatAllowed,
+    chatKey,
   }) {
     if (!singleton) {
       const dom = buildDom(variant, toggleButton);
       singleton = createController(dom);
     }
-    singleton.attach({ signaling, bus, peerId, name, getPeerIds, initialPeerIds, getLeaderId, getGuestChatAllowed });
+    singleton.attach({ signaling, bus, peerId, name, getPeerIds, initialPeerIds, getLeaderId, getGuestChatAllowed, chatKey });
     return singleton.publicApi;
   }
 
@@ -521,6 +529,11 @@ const ChatPanel = (() => {
     let bus = null;
     let peerId = null;
     let myName = null;
+    // Ш1 (E2E-шифрование): K_chat, выведенный из ключа комнаты (см.
+    // static/crypto.js/room.js) — используется ТОЛЬКО для серверного
+    // fallback-релея (см. sendEnvelopeToPeer/attach ниже), по шине конверт
+    // не шифруется этим слоем.
+    let chatKey = null;
     let getPeerIds = () => [];
     // Права гостей (см. README.md, «Права и лидер»): getLeaderId/getGuestChatAllowed
     // — колбэки room.js, читающие ЖИВЫЕ leaderId/roomSettings.guestChat на
@@ -1281,12 +1294,21 @@ const ChatPanel = (() => {
       }
     }
 
-    /** Отправить конверт ОДНОМУ конкретному пиру (адресно) — та же логика шина/фоллбэк, что и в broadcastEnvelope, но для одного адресата (используется file-request). */
+    /**
+     * Отправить конверт ОДНОМУ конкретному пиру (адресно) — та же логика
+     * шина/фоллбэк, что и в broadcastEnvelope, но для одного адресата
+     * (используется file-request). Ш1 (E2E-шифрование, см. static/crypto.js):
+     * по шине конверт уходит КАК ЕСТЬ (P2P DataChannel уже E2E за счёт DTLS,
+     * см. static/rtc.js) — а вот серверный fallback шифрует конверт ЦЕЛИКОМ
+     * под K_chat, сервер видит только {enc:{v,iv,ct}} вместо содержимого.
+     */
     function sendEnvelopeToPeer(targetPeerId, envelope) {
       if (bus.isOpen(targetPeerId)) {
         bus.sendToPeer(targetPeerId, envelope);
       } else {
-        signaling.send('chat', { targetPeerId, envelope });
+        RoomCrypto.encrypt(chatKey, envelope).then((enc) => {
+          signaling.send('chat', { targetPeerId, envelope: { enc } });
+        });
       }
     }
 
@@ -1971,11 +1993,13 @@ const ChatPanel = (() => {
       initialPeerIds,
       getLeaderId: newGetLeaderId,
       getGuestChatAllowed: newGetGuestChatAllowed,
+      chatKey: newChatKey,
     }) {
       signaling = newSignaling;
       bus = newBus;
       peerId = newPeerId;
       myName = name || null;
+      chatKey = newChatKey || null;
       getPeerIds = typeof newGetPeerIds === 'function' ? newGetPeerIds : () => [];
       getLeaderId = typeof newGetLeaderId === 'function' ? newGetLeaderId : () => null;
       getGuestChatAllowed = typeof newGetGuestChatAllowed === 'function' ? newGetGuestChatAllowed : () => true;
@@ -1990,7 +2014,23 @@ const ChatPanel = (() => {
       setCollapsed(true);
 
       bus.onMessage(dispatchEnvelope);
-      signaling.on('chat', ({ fromPeerId, envelope }) => dispatchEnvelope(fromPeerId, envelope));
+      // Ш1 (E2E-шифрование): фоллбэк-релей сервера несёт конверт как
+      // {enc:{v,iv,ct}} (см. sendEnvelopeToPeer выше) — расшифровываем ПЕРЕД
+      // dispatchEnvelope; по шине конверт приходит как обычно (не завёрнут).
+      // Неверный ключ комнаты/повреждённый блоб — тихо логируем и
+      // игнорируем это одно сообщение (не валим всю панель чата — соседние
+      // конверты по шине продолжают работать как ни в чём не бывало).
+      signaling.on('chat', ({ fromPeerId, envelope }) => {
+        if (envelope && typeof envelope === 'object' && envelope.enc) {
+          RoomCrypto.decrypt(chatKey, envelope.enc)
+            .then((plain) => dispatchEnvelope(fromPeerId, plain))
+            .catch((err) => {
+              console.warn('Не удалось расшифровать fallback-конверт чата (неверный ключ комнаты?):', err);
+            });
+        } else {
+          dispatchEnvelope(fromPeerId, envelope);
+        }
+      });
       signaling.on('error', handleServerError);
 
       const candidates = Array.isArray(initialPeerIds) ? initialPeerIds.slice() : [];

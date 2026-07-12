@@ -7,9 +7,17 @@
 //!      адресный fallback, если шина до конкретного пира ещё не открыта, и
 //!      не хранит ни байта из содержимого чата.
 //!   2. Раздача статики фронтенда (`/`, `/r/{id}`, `/static/...`).
-//!   3. `GET /qr.svg?room=<id>` — QR-код на короткую ссылку комнаты.
-//! Плюс крошечный `/config` с ICE-серверами из переменных окружения.
+//!   3. Крошечный `/config` с ICE-серверами из переменных окружения.
 //! Медиа через сервер по-прежнему не проходит.
+//!
+//! Ш1 (E2E-шифрование, см. static/crypto.js): сервер релеит sdp/candidate/
+//! info/имя участника/fallback-чат уже ЗАШИФРОВАННЫМИ клиентом (ключ комнаты
+//! — секрет только фрагмента ссылки, сервер его никогда не видел и не
+//! видит) — с точки зрения этого файла и `ws.rs` ничего не изменилось, они
+//! как релеили опаковый JSON/строку, так и продолжают. QR-код (раньше
+//! `GET /qr.svg`) теперь рендерится ЛОКАЛЬНО в браузере (см.
+//! `static/vendor/qrcode.js`, `static/room.js`), чтобы ссылка с секретным
+//! `#k` не уходила на сервер ради картинки — этот эндпоинт удалён целиком.
 //!
 //! Приватность: на диске не остаётся ничего — ни IP/портов клиентов (в
 //! tracing-логах фигурируют только room/peer id), ни содержимого чата
@@ -25,13 +33,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::extract::{Path, State};
+use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse, Json, Response};
 use axum::routing::{get, post, put};
 use axum::Router;
-use qrcode::render::svg;
-use qrcode::QrCode;
 use serde_json::json;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -80,7 +86,6 @@ async fn main() {
         .route("/config", get(ice_config))
         .route("/healthz", get(healthz))
         .route("/version.json", get(version_json))
-        .route("/qr.svg", get(qr_svg))
         .route("/ws", get(ws::ws_handler))
         .route("/static/{*path}", get(static_file))
         .with_state(state);
@@ -256,7 +261,7 @@ async fn version_json() -> Json<serde_json::Value> {
 /// деплоя браузеры получали СТАРУЮ статику к новой разметке — страницы
 /// выглядели разломанными до истечения edge-TTL (поймано живой проверкой
 /// прода 2026-07-12). Файлы крошечные, безусловный no-cache дешевле и
-/// надёжнее ETag-механики; /qr.svg не трогаем — его содержимое неизменно.
+/// надёжнее ETag-механики.
 const NO_CACHE: (header::HeaderName, &str) = (header::CACHE_CONTROL, "no-cache");
 
 /// Отдать HTML-страницу из static/.
@@ -307,60 +312,6 @@ async fn ice_config() -> Json<serde_json::Value> {
         }
     }
     Json(json!({ "iceServers": servers }))
-}
-
-/// `GET /qr.svg?room=<roomId>`: QR-код, кодирующий короткую ссылку на комнату
-/// (`<proto>://<host>/r/<room>`). Комната может не существовать — не
-/// проверяем: QR на мёртвую/ещё не созданную комнату безвреден, а лишний
-/// поход в состояние комнат тут ни к чему.
-async fn qr_svg(Query(params): Query<HashMap<String, String>>, headers: HeaderMap) -> Response {
-    let Some(room) = params.get("room") else {
-        return (StatusCode::BAD_REQUEST, "missing room param").into_response();
-    };
-    if !is_valid_room_id(room) {
-        return (StatusCode::BAD_REQUEST, "invalid room id").into_response();
-    }
-
-    let host = headers
-        .get(header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("localhost");
-    let proto = headers
-        .get("x-forwarded-proto")
-        .and_then(|h| h.to_str().ok())
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            if host.starts_with("localhost") || host.starts_with("127.") {
-                "http".to_string()
-            } else {
-                "https".to_string()
-            }
-        });
-    let url = format!("{proto}://{host}/r/{room}");
-
-    let code = match QrCode::new(url.as_bytes()) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!("не удалось построить QR-код: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "qr encode error").into_response();
-        }
-    };
-    // Классический вид: чёрные модули на белом фоне (не белые на прозрачном —
-    // такие сканеры часто не читают), quiet zone 4 модуля (дефолт крейта).
-    let svg_body = code
-        .render()
-        .dark_color(svg::Color("#000000"))
-        .light_color(svg::Color("#ffffff"))
-        .build();
-
-    (
-        [
-            (header::CONTENT_TYPE, "image/svg+xml"),
-            (header::CACHE_CONTROL, "public, max-age=86400"),
-        ],
-        svg_body,
-    )
-        .into_response()
 }
 
 /// `room` валиден по `^[a-z0-9]{8}$` (то же множество символов, что генерирует

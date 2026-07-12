@@ -33,6 +33,11 @@ spec:
         env:
         - { name: PORT, value: "8080" }
         - { name: STATIC_DIR, value: "/app/static" }
+        # TURN-креды (turn.yaml + Secret turn-creds, создан админом руками):
+        # приложение отдаёт их клиентам в /config. optional — без секрета
+        # приложение живёт на одном STUN, как раньше.
+        envFrom:
+        - secretRef: { name: turn-creds, optional: true }
         ports: [ { containerPort: 8080 } ]
         readinessProbe: { httpGet: { path: /healthz, port: 8080 }, periodSeconds: 3 }
         livenessProbe:  { httpGet: { path: /healthz, port: 8080 }, initialDelaySeconds: 10, periodSeconds: 10 }

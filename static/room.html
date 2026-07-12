@@ -203,7 +203,11 @@
           </svg>
         </button>
         <h2 id="share-popup-title">Поделиться комнатой</h2>
-        <img id="share-popup-qr" class="share-popup-qr" src="" alt="QR-код со ссылкой на комнату" width="280" height="280" />
+        <!-- QR рендерится ЛОКАЛЬНО в браузере (см. static/vendor/qrcode.js,
+             static/room.js: renderShareQr) — никакого похода на сервер за
+             картинкой: ссылка комнаты (включая секретный #k) не должна
+             покидать вкладку ради QR. -->
+        <div id="share-popup-qr" class="share-popup-qr" role="img" aria-label="QR-код со ссылкой на комнату"></div>
         <div id="share-popup-link" class="share-popup-link"></div>
         <button id="share-popup-copy-button" class="share-popup-copy-button" type="button">Скопировать</button>
       </div>
@@ -287,6 +291,8 @@
     </div>
   </div>
 
+  <script src="/static/crypto.js?v=4"></script>
+  <script src="/static/vendor/qrcode.js?v=4"></script>
   <script src="/static/common.js?v=4"></script>
   <script src="/static/bus.js?v=4"></script>
   <script src="/static/rtc.js?v=4"></script>

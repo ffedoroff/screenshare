@@ -352,6 +352,37 @@ async function runTests() {
     }
   }
 
+  // --- 4c. Ш1: лимит имени поднят с 32 до 512 символов (name теперь шифрблоб
+  // клиента — длиннее открытого текста, см. src/ws.rs::CHAT_NAME_MAX_CHARS) —
+  // сервер по-прежнему прозрачен к содержимому: не проверяет, что это валидный
+  // шифрблоб, просто обрезает по новому лимиту символов. ---
+  console.log('4c. name: лимит поднят с 32 до 512 символов');
+  {
+    const name400 = 'x'.repeat(400); // укладывается в новый лимит (512) — не уложилось бы в прежний (32)
+    const { peer: pLong, joined: jLong } = await join(roomId, name400);
+    ok(jLong.type === 'joined', 'участник с именем 400 символов входит без ошибки');
+    ok(jLong.peerId, 'у вошедшего есть свой peerId');
+    await Promise.all([p1.next(), p2.next()]); // peer-joined у уже сидящих в комнате
+
+    const name600 = 'y'.repeat(600); // длиннее нового лимита (512) -> сервер обрезает
+    const { peer: pTooLong, joined: jTooLong } = await join(roomId, name600);
+    ok(jTooLong.type === 'joined', 'участник с именем 600 символов всё равно входит (не ошибка, просто обрежется)');
+    const [pj1, pj2, pjLong] = await Promise.all([p1.next(), p2.next(), pLong.next()]);
+    ok(
+      pj1.type === 'peer-joined' && pj1.name === 'y'.repeat(512),
+      `peer-joined с именем 600 символов обрезан сервером до 512 (получено ${pj1.name ? pj1.name.length : 'null'})`
+    );
+    ok(pj2.type === 'peer-joined' && pj2.name.length === 512, 'второй получатель тоже видит обрезанное до 512 имя');
+    ok(pjLong.type === 'peer-joined' && pjLong.name.length === 512, 'третий получатель тоже видит обрезанное до 512 имя');
+
+    // Прибираем обоих за собой — по одному, чтобы не гадать порядок peer-left.
+    pTooLong.ws.close();
+    await Promise.all([p1.next(), p2.next(), pLong.next()]); // peer-left ушедшего с длинным именем
+
+    pLong.ws.close();
+    await Promise.all([p1.next(), p2.next()]); // peer-left второго временного участника
+  }
+
   // --- 5. Третий участник видит ОБОИХ предыдущих в peers ---
   console.log('5. третий участник видит всех предыдущих; оба получают peer-joined');
   const { peer: p3, joined: j3 } = await join(roomId, 'Боб');
@@ -606,21 +637,8 @@ async function runTests() {
     ok((res.headers.get('content-type') || '').includes('text/html'), 'ответ /r/<id> — HTML');
   }
 
-  // --- 13. QR-код /qr.svg?room=<roomId> ---
-  console.log('13. GET /qr.svg');
-  {
-    const res = await fetch(`http://localhost:${PORT}/qr.svg?room=abcd2345`);
-    ok(res.status === 200, 'GET /qr.svg?room=abcd2345 -> 200');
-    ok((res.headers.get('content-type') || '').includes('image/svg+xml'), 'content-type image/svg+xml');
-    const body = await res.text();
-    ok(body.includes('<svg'), 'тело ответа содержит <svg');
-
-    const bad = await fetch(`http://localhost:${PORT}/qr.svg?room=${encodeURIComponent('../evil')}`);
-    ok(bad.status === 400, '?room=../evil -> 400');
-
-    const missing = await fetch(`http://localhost:${PORT}/qr.svg`);
-    ok(missing.status === 400, 'без параметра room -> 400');
-  }
+  // Ш1: /qr.svg удалён целиком — QR теперь рендерится локально в браузере
+  // (см. static/vendor/qrcode.js, static/room.js), сервер картинку не строит.
 
   // --- 14. Эфемерность: сервер не оставил файлов БД в CWD ---
   console.log('14. эфемерность: нет файлов БД');

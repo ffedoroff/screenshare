@@ -58,6 +58,8 @@ import {
   getChatDom,
   waitUntil,
   sleep,
+  generateRoomKeyBase64url,
+  roomUrlWithKey,
 } from './helpers.mjs';
 
 const PORT = 3333;
@@ -171,6 +173,21 @@ async function createRoomViaApi(baseUrl) {
   return data.roomId;
 }
 
+/**
+ * Ш1 (E2E-шифрование): комната создаётся напрямую через API (в обход
+ * лендинга) — ключ комнаты (`k`) сервер не выдаёт и не знает вовсе, поэтому
+ * тест генерирует его сам (см. generateRoomKeyBase64url в helpers.mjs) и
+ * возвращает СРАЗУ готовую ссылку для гостя (с `#k`, без leaderToken) —
+ * все участники ниже заходят именно по ней, иначе без валидного ключа
+ * упёрлись бы в оверлей «Ссылка неполная» (см. static/room.js).
+ */
+async function createRoomViaApiWithKey(baseUrl) {
+  const roomId = await createRoomViaApi(baseUrl);
+  const roomKey = generateRoomKeyBase64url();
+  const roomUrl = roomUrlWithKey(baseUrl, roomId, roomKey);
+  return { roomId, roomKey, roomUrl };
+}
+
 async function main() {
   await buildServer();
   await server.start();
@@ -192,14 +209,15 @@ async function main() {
     // напрямую по ссылке (не через лендинг — это уже покрыто basic.spec.mjs).
     // ============================================================
     let roomId = null;
+    let roomKey = null;
+    let roomUrl = null;
     const setupRoomOk = await step('подготовка: создаём комнату через POST /api/rooms', async () => {
-      roomId = await createRoomViaApi(server.baseUrl);
+      ({ roomId, roomKey, roomUrl } = await createRoomViaApiWithKey(server.baseUrl));
     });
     if (!setupRoomOk || !roomId) {
       console.log('FAIL - критическая ошибка: комната не создана, дальнейшие сценарии невозможны');
       return;
     }
-    const roomUrl = `${server.baseUrl}/r/${roomId}`;
 
     const vasyaContext = await browser.newContext();
     const petyaContext = await browser.newContext();
@@ -317,10 +335,25 @@ async function main() {
     // ============================================================
     if (scenarioBShareOk) {
       await step('(в) Оля перезагружает страницу — снова в комнате, старый шаринг освобождён сервером, история чата пуста (Ф1: сервер её не хранит, а к этому моменту Оля в комнате одна — спросить не у кого)', async () => {
-        // page.reload() — это полная перезагрузка (новый JS-контекст, не
-        // авто-reconnect внутри вкладки) — модалка входа показывается заново
-        // (анонимность, см. static/room.js), имя вводим снова.
-        await olyaPage.reload();
+        // НЕ page.reload(): Ш1 (E2E-шифрование, см. static/room.js) вычищает
+        // #k из адресной строки сразу при первой загрузке (history.replaceState,
+        // как и раньше с #lt) — обычный reload() перезагрузил бы уже ОБЕЗЛИЧЕННЫЙ
+        // URL без ключа и упёрся бы в оверлей «Ссылка неполная». Реальный
+        // пользователь в этой ситуации просто открыл бы ссылку заново (она у
+        // него сохранена — в чате, в истории браузера и т.п.) — здесь это и
+        // эмулируем: те же самые roomId+roomKey, но новая навигация.
+        //
+        // Просто `page.goto(roomUrl)` НЕ годится: текущий адрес олиной
+        // вкладки — та же страница БЕЗ фрагмента (он уже вычищен), а новый
+        // адрес отличается ТОЛЬКО фрагментом — по спецификации браузер в этом
+        // случае делает "same-document" навигацию (не перезагружая документ
+        // и не перевыполняя JS, просто меняя URL и hashchange), поэтому
+        // room.js не перезапустился бы и модалка входа не появилась бы
+        // повторно (обнаружено эмпирически на этом самом сценарии). Уводим
+        // сначала на about:blank — тогда следующий goto() гарантированно
+        // полноценная навигация (новый JS-контекст), как и настоящий reload().
+        await olyaPage.goto('about:blank');
+        await olyaPage.goto(roomUrl);
         await joinRoom(olyaPage, 'Оля');
         await waitForOverlayHidden(olyaPage);
 
@@ -503,8 +536,7 @@ async function main() {
     let ninaPage = null;
     let tolyaPage = null;
     const rateLimitPrepOk = await step('(ж, подготовка) новая комната — Нина и Толя заходят', async () => {
-      const newRoomId = await createRoomViaApi(server.baseUrl);
-      const newRoomUrl = `${server.baseUrl}/r/${newRoomId}`;
+      const { roomUrl: newRoomUrl } = await createRoomViaApiWithKey(server.baseUrl);
 
       const ninaContext = await browser.newContext();
       const tolyaContext = await browser.newContext();
@@ -578,8 +610,7 @@ async function main() {
     const restartPrepOk = await step(
       '(з, подготовка) новая комната — Вася/Петя/Оля заходят, Вася включает микрофон, Петя шарит экран, есть переписка',
       async () => {
-        const restartRoomId = await createRoomViaApi(server.baseUrl);
-        const restartRoomUrl = `${server.baseUrl}/r/${restartRoomId}`;
+        const { roomUrl: restartRoomUrl } = await createRoomViaApiWithKey(server.baseUrl);
 
         const vasya2Context = await browser.newContext();
         const petya2Context = await browser.newContext();
