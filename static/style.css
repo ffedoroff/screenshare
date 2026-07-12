@@ -1102,6 +1102,175 @@ body {
   cursor: not-allowed;
 }
 
+/* ---------- Прикрепление файлов (Ф3) ---------- */
+
+.chat-attach-button {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--bg-elevated-2);
+  color: var(--text-muted);
+  padding: 0;
+  cursor: pointer;
+}
+
+.chat-attach-button .icon {
+  width: 18px;
+  height: 18px;
+}
+
+.chat-attach-button:hover {
+  color: var(--text);
+  background: var(--bg-elevated);
+}
+
+.chat-attach-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Карточка файла — тот же пузырь-контейнер, что и текстовое сообщение
+   (.chat-message-text), но без белого текста для собственных сообщений:
+   карточка всегда нейтрального цвета, у своих сообщений различие только по
+   выравниванию (align-self через .chat-message--own, унаследовано). */
+.chat-file-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 180px;
+  max-width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-2) var(--space-3);
+}
+
+.chat-file-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.chat-file-icon {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius);
+  background: var(--bg-elevated-2);
+  color: var(--text-muted);
+}
+
+.chat-file-icon .icon {
+  width: 18px;
+  height: 18px;
+}
+
+.chat-file-info {
+  min-width: 0;
+  flex: 1;
+}
+
+.chat-file-name {
+  font-size: 0.86rem;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-file-size {
+  font-size: 0.74rem;
+  color: var(--text-muted);
+}
+
+.chat-file-note {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.chat-file-download-button {
+  align-self: flex-start;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--accent);
+  font-family: inherit;
+  font-size: 0.8rem;
+  font-weight: 600;
+  padding: 6px var(--space-3);
+  cursor: pointer;
+}
+
+.chat-file-download-button:hover {
+  background: var(--accent);
+  color: #fff;
+}
+
+.chat-file-download-button--disabled {
+  border-color: var(--border);
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
+
+.chat-file-download-button--disabled:hover {
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.chat-file-download-link {
+  align-self: flex-start;
+  border-radius: var(--radius);
+  background: var(--accent);
+  color: #fff;
+  text-decoration: none;
+  font-size: 0.8rem;
+  font-weight: 600;
+  padding: 6px var(--space-3);
+}
+
+.chat-file-download-link:hover {
+  background: var(--accent-hover);
+}
+
+/* Тонкая полоса прогресса приёма/отдачи — точечно обновляется через
+   .style.width на .chat-file-progress-bar (см. chat.js: setFileProgress),
+   без пересборки всей карточки на каждый чанк. */
+.chat-file-progress {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--bg-elevated-2);
+  overflow: hidden;
+}
+
+.chat-file-progress-bar {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  transition: width 0.12s linear;
+}
+
+.chat-file-image {
+  display: block;
+  max-width: 100%;
+  max-height: 240px;
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+
+.chat-file-audio {
+  width: 100%;
+  max-width: 260px;
+}
+
 @media (max-width: 700px) {
   .chat-panel {
     top: auto;

@@ -49,6 +49,9 @@ import {
   messageTextsInclude,
   getChatDom,
   waitUntil,
+  makeTestPngBuffer,
+  makeTestTextFileBuffer,
+  attachFilesToChat,
 } from './helpers.mjs';
 
 const PORT = 3322;
@@ -659,6 +662,126 @@ async function main() {
           await aContext.close();
           await bContext.close();
           await cContext.close();
+        }
+      }
+    );
+
+    // --- Передача файлов (Ф3): строго P2P, лениво по запросу ---
+    //
+    // Отдельная комната, Женя и Захар с самого начала (mesh дожидаемся явно —
+    // файловый DataChannel, в отличие от текста/реакций, не имеет серверного
+    // фоллбэка вовсе, поэтому гонка "канал шины ещё не открылся" тут не
+    // должна маскироваться удачным таймингом). Женя отправляет картинку
+    // ~50КБ (а) — авто-скачивание, инлайн-превью у Захара; затем "файл"
+    // ~300КБ text/plain (б) — Захар жмёт «Скачать», ждём исчезновения
+    // прогресса и сверяем итоговый Blob побайтово. Иван заходит ПОЗЖЕ, уже
+    // после отправки обоих файлов (в) — видит карточки из истории (не
+    // живьём) и всё ещё может их запросить, пока Женя (исходный отправитель)
+    // в комнате.
+    await step(
+      'Передача файлов: авто-скачивание картинки, ручное скачивание файла с прогрессом и сверкой размера, опоздавший скачивает из истории',
+      async () => {
+        const res = await fetch(`${server.baseUrl}/api/rooms`, { method: 'POST' });
+        assert.ok(res.ok, `POST /api/rooms ответил статусом ${res.status}`);
+        const { roomId: fileRoomId } = await res.json();
+        const fileRoomUrl = `${server.baseUrl}/r/${fileRoomId}`;
+
+        const eContext = await browser.newContext();
+        const fContext = await browser.newContext();
+        await installPcRegistry(eContext);
+        await installPcRegistry(fContext);
+        await installSavedName(eContext, 'Женя');
+        await installSavedName(fContext, 'Захар');
+        const ePage = await eContext.newPage();
+        const fPage = await fContext.newPage();
+
+        try {
+          await ePage.goto(fileRoomUrl);
+          await fPage.goto(fileRoomUrl);
+          await waitForOverlayHidden(ePage);
+          await waitForOverlayHidden(fPage);
+          // Именно waitForMeshSettled (не просто waitForTileCount) — файловый
+          // DataChannel требует РЕАЛЬНО открытой шины до конкретного пира, у
+          // текста/реакций есть серверный фоллбэк, у байтов файла — никогда.
+          await waitForMeshSettled([ePage, fPage], { tileCount: 2, connectionsPerPage: 1 });
+
+          await openChatPanel(ePage);
+          await openChatPanel(fPage);
+
+          // --- (а) картинка ~50КБ: авто-скачивание у Захара, инлайн-превью ---
+          const pngBuffer = makeTestPngBuffer({ width: 112, height: 112 });
+          await attachFilesToChat(ePage, [{ name: 'photo.png', mimeType: 'image/png', buffer: pngBuffer }]);
+
+          await fPage.waitForFunction(
+            () => (document.querySelector('.chat-file-image')?.naturalWidth || 0) > 0,
+            undefined,
+            { polling: 100, timeout: 10_000 }
+          );
+
+          // --- (б) "файл" ~300КБ (text/plain): у Захара карточка с кнопкой,
+          //     клик "Скачать" -> прогресс появляется и исчезает, итоговый
+          //     Blob совпадает по размеру с исходным. ---
+          const textBuffer = makeTestTextFileBuffer(300 * 1024);
+          await attachFilesToChat(ePage, [{ name: 'notes.txt', mimeType: 'text/plain', buffer: textBuffer }]);
+
+          const fFileCard = fPage.locator('.chat-file-card', { hasText: 'notes.txt' });
+          const fDownloadButton = fFileCard.locator('.chat-file-download-button');
+          await fDownloadButton.waitFor({ state: 'visible', timeout: 10_000 });
+          await fDownloadButton.click();
+
+          const fDownloadLink = fFileCard.locator('.chat-file-download-link');
+          await fDownloadLink.waitFor({ state: 'visible', timeout: 15_000 });
+
+          const progressStillThere = await fFileCard.locator('.chat-file-progress').count();
+          assert.equal(progressStillThere, 0, 'полоса прогресса должна исчезнуть после завершения передачи');
+
+          const fObjectUrl = await fDownloadLink.getAttribute('href');
+          const fBlobSize = await fPage.evaluate(async (url) => {
+            const blob = await (await fetch(url)).blob();
+            return blob.size;
+          }, fObjectUrl);
+          assert.equal(
+            fBlobSize,
+            textBuffer.length,
+            `скачанный файл должен совпадать по размеру с исходным (${textBuffer.length}), получено ${fBlobSize}`
+          );
+
+          // --- (в) опоздавший (Иван) видит карточки из истории и может
+          //     скачать, пока отправитель (Женя) ещё в комнате ---
+          const gContext = await browser.newContext();
+          await installPcRegistry(gContext);
+          await installSavedName(gContext, 'Иван');
+          const gPage = await gContext.newPage();
+          try {
+            await gPage.goto(fileRoomUrl);
+            await waitForOverlayHidden(gPage);
+            await waitForMeshSettled([ePage, fPage, gPage], { tileCount: 3, connectionsPerPage: 2 });
+            await openChatPanel(gPage);
+
+            const gFileCard = gPage.locator('.chat-file-card', { hasText: 'notes.txt' });
+            const gDownloadButton = gFileCard.locator('.chat-file-download-button');
+            await gDownloadButton.waitFor({ state: 'visible', timeout: 10_000 });
+            await gDownloadButton.click();
+
+            const gDownloadLink = gFileCard.locator('.chat-file-download-link');
+            await gDownloadLink.waitFor({ state: 'visible', timeout: 15_000 });
+
+            const gObjectUrl = await gDownloadLink.getAttribute('href');
+            const gBlobSize = await gPage.evaluate(async (url) => {
+              const blob = await (await fetch(url)).blob();
+              return blob.size;
+            }, gObjectUrl);
+            assert.equal(
+              gBlobSize,
+              textBuffer.length,
+              `опоздавший должен скачать файл из истории с тем же размером (${textBuffer.length}), получено ${gBlobSize}`
+            );
+          } finally {
+            await gContext.close();
+          }
+        } finally {
+          await eContext.close();
+          await fContext.close();
         }
       }
     );

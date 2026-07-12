@@ -12,6 +12,7 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
+import zlib from 'node:zlib';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = path.resolve(__dirname, '../..');
@@ -537,6 +538,89 @@ export async function messageTextsInclude(page, text, timeoutMs = 5000) {
     await new Promise((r) => setTimeout(r, 100));
   }
   return false;
+}
+
+// --- Передача файлов (Ф3): генерация тестовых файлов и хелпер вброса ---
+//
+// PNG собирается вручную (сигнатура + IHDR + один IDAT со случайными
+// пикселями, сжатыми zlib.deflateSync, + IEND) — так тест не тянет
+// сторонних зависимостей (canvas/pngjs) и не гадает с browser-side
+// canvas.toBlob(). Пиксели случайны намеренно: PNG со случайным шумом почти
+// не сжимается, поэтому итоговый размер файла предсказуемо близок к сырому
+// (ширина×высота×4 + служебные байты строк), а не схлопывается в
+// несколько байт, как было бы с однотонной заливкой.
+
+function crc32(buf) {
+  let crc = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) {
+    crc ^= buf[i];
+    for (let j = 0; j < 8; j++) {
+      crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function pngChunk(type, data) {
+  const lenBuf = Buffer.alloc(4);
+  lenBuf.writeUInt32BE(data.length, 0);
+  const typeBuf = Buffer.from(type, 'ascii');
+  const crcBuf = Buffer.alloc(4);
+  crcBuf.writeUInt32BE(crc32(Buffer.concat([typeBuf, data])), 0);
+  return Buffer.concat([lenBuf, typeBuf, data, crcBuf]);
+}
+
+/** Валидный PNG (RGBA, 8 бит) заданных размеров со случайными пикселями — размер файла ~width*height*4 байт. */
+export function makeTestPngBuffer({ width = 112, height = 112 } = {}) {
+  const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+
+  const ihdrData = Buffer.alloc(13);
+  ihdrData.writeUInt32BE(width, 0);
+  ihdrData.writeUInt32BE(height, 4);
+  ihdrData[8] = 8; // bit depth
+  ihdrData[9] = 6; // color type: RGBA
+  ihdrData[10] = 0; // compression method
+  ihdrData[11] = 0; // filter method
+  ihdrData[12] = 0; // interlace method
+  const ihdr = pngChunk('IHDR', ihdrData);
+
+  const raw = Buffer.alloc(height * (1 + width * 4));
+  let offset = 0;
+  for (let y = 0; y < height; y++) {
+    raw[offset++] = 0; // filter type: None
+    for (let x = 0; x < width * 4; x++) {
+      raw[offset++] = Math.floor(Math.random() * 256);
+    }
+  }
+  const idat = pngChunk('IDAT', zlib.deflateSync(raw));
+  const iend = pngChunk('IEND', Buffer.alloc(0));
+
+  return Buffer.concat([signature, ihdr, idat, iend]);
+}
+
+/** Текстовый "файл" заданного размера (повторяющаяся ASCII-фраза) — для проверки передачи произвольного (не картиночного) файла. */
+export function makeTestTextFileBuffer(sizeBytes) {
+  const phrase = Buffer.from('The quick brown fox jumps over the lazy dog. ', 'ascii');
+  const buf = Buffer.alloc(sizeBytes);
+  let pos = 0;
+  while (pos < sizeBytes) {
+    const n = Math.min(phrase.length, sizeBytes - pos);
+    phrase.copy(buf, pos, 0, n);
+    pos += n;
+  }
+  return buf;
+}
+
+/**
+ * Вбросить файлы в чат через скрытый `<input type=file>` скрепки (см.
+ * static/chat.js: buildDom -> .chat-file-input). setInputFiles не требует
+ * видимости элемента (в отличие от click) — работает даже пока сам инпут
+ * `hidden`, поэтому не обязательно предварительно открывать панель, хотя в
+ * тестах мы всё равно открываем её для остальных проверок по соседству.
+ * `files` — массив { name, mimeType, buffer } (см. Playwright FilePayload).
+ */
+export async function attachFilesToChat(page, files) {
+  await page.locator('.chat-file-input').setInputFiles(files);
 }
 
 export async function unreadBadgeCount(page) {

@@ -16,6 +16,13 @@
 // Bus не решает, ЧТО делать с сообщением не открытому пиру (fallback через
 // сервер и т.п.) — это уже забота вызывающего кода (chat.js), Bus — только
 // транспорт до тех пиров, с кем канал открыт.
+//
+// Ф3 (передача файлов, см. static/chat.js): помимо шинного канала 'bus',
+// пары обмениваются файлами по ОТДЕЛЬНЫМ DataChannel (один на файл×получателя,
+// см. RtcPeer.createFileChannel/onFileChannel в rtc.js) — этими каналами Bus
+// не управляет напрямую, но даёт доступ к сырому RtcPeer конкретного пира
+// через getPeer(peerId), т.к. создание/приём такого канала требует самого
+// RTCPeerConnection, а не только JSON-транспорта sendToPeer/broadcast.
 
 'use strict';
 
@@ -39,6 +46,11 @@ class Bus {
   isOpen(peerId) {
     const rtc = this._peers.get(peerId);
     return !!rtc && rtc.isBusOpen();
+  }
+
+  /** Сырой RtcPeer для `peerId` (или null) — нужен для файловых DataChannel (см. заголовок файла). */
+  getPeer(peerId) {
+    return this._peers.get(peerId) || null;
   }
 
   /** Отправить `obj` конкретному пиру (если канал ещё не открыт — уйдёт в очередь и будет отправлен по open). */

@@ -36,6 +36,34 @@
 // порядке (lamport, from), поэтому результат не зависит от порядка доставки
 // по сети (см. recomputeReactions).
 //
+// Передача файлов (Ф3) — строго P2P, сервер байты файла никогда не видит:
+//   { v: 1, id, lamport, from, name, kind: 'file-offer', fileId, fileName,
+//     size, mime, ts }
+// Оффер — обычный конверт по тому же транспорту (broadcast по шине +
+// fallback через сервер) и в том же общем буфере истории, что text/reaction
+// — опоздавший видит карточку файла из реплея истории точно так же, как
+// историческое текстовое сообщение (см. mergeHistory). Сам файл (File-объект)
+// живёт только у отправителя, в памяти вкладки (fileSendMap: fileId -> File)
+// — сервер и буфер истории носят только метаданные, не содержимое.
+//
+// Получатель, чтобы реально скачать файл, шлёт АДРЕСНЫЙ (не broadcast)
+// конверт отправителю:
+//   { v: 1, id, lamport, from, name, kind: 'file-request', fileId, ts }
+// Этот kind никогда не попадает в буфер истории (транзитный, как
+// history-request/response). Получив его, отправитель (если ещё держит File
+// с таким fileId) открывает ОТДЕЛЬНЫЙ DataChannel на существующем
+// RTCPeerConnection этой пары — pc.createDataChannel(`file-${fileId}-${кому}`)
+// — получатель ловит его через pc.ondatachannel по точному совпадению label
+// (см. RtcPeer.createFileChannel/onFileChannel в rtc.js). Первым сообщением
+// канала идёт JSON-мета { fileId, size, mime, name }, дальше — бинарные чанки
+// по FILE_CHUNK_SIZE байт (ArrayBuffer), с backpressure по bufferedAmount;
+// отправитель закрывает канал по завершении, получатель собирает Blob и
+// сверяет итоговый размер. Оффер без P2P-канала до отправителя (fallback-пара
+// или отправитель уже вышел) — карточка честно показывает недоступность
+// вместо попытки скачивания через сервер (сервер байты файла не гоняет
+// НИКОГДА — см. handleFileRequest/requestFileDownload/beginSendingFile/
+// beginReceivingFile ниже).
+//
 // Lamport-часы: на отправку — свой счётчик +1; на приём — max(свой,
 // полученный)+1. Порядок в ленте — сортировка по (lamport, from), поэтому
 // одинаков у всех участников независимо от порядка доставки по сети.
@@ -92,6 +120,14 @@ const ChatPanel = (() => {
   const HIGHLIGHT_DURATION_MS = 1200;
   const REACTION_EMOJIS = ['👍', '👎', '❤️', '😂', '😮', '😢'];
 
+  // --- Передача файлов (Ф3) ---
+  const FILE_SIZE_LIMIT_BYTES = 25 * 1024 * 1024; // 25МБ — жёсткий лимит на файл
+  const FILE_CHUNK_SIZE = 16 * 1024; // 16КБ на чанк
+  const FILE_BUFFERED_LOW_THRESHOLD = 256 * 1024; // bufferedamountlow срабатывает ниже этого
+  const FILE_BUFFERED_HIGH_WATERMARK = 1024 * 1024; // ждём слива, если накопилось больше
+  const AUTO_DOWNLOAD_IMAGE_MAX_BYTES = 2 * 1024 * 1024; // авто-скачивание картинок ≤2МБ
+  const FILE_REQUEST_TIMEOUT_MS = 8000; // сколько ждём открытия файлового канала после запроса
+
   // Статичная, не зависящая от пользовательских данных разметка — безопасна
   // для innerHTML (см. критичное требование к рендеру сообщений выше, оно
   // касается ТОЛЬКО пользовательского текста).
@@ -99,6 +135,34 @@ const ChatPanel = (() => {
     <polyline points="9 14 4 9 9 4"></polyline>
     <path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H13"></path>
   </svg>`;
+
+  const ATTACH_ICON_SVG = `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path>
+  </svg>`;
+
+  // Иконки файловой карточки по категории mime — статичная разметка, не
+  // зависит от пользовательских данных, безопасна для innerHTML.
+  const FILE_ICON_IMAGE_SVG = `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <rect x="3" y="3" width="18" height="18" rx="2"></rect>
+    <circle cx="8.5" cy="8.5" r="1.5"></circle>
+    <path d="M21 15l-5-5L5 21"></path>
+  </svg>`;
+  const FILE_ICON_AUDIO_SVG = `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M9 18V5l12-2v13"></path>
+    <circle cx="6" cy="18" r="3"></circle>
+    <circle cx="18" cy="16" r="3"></circle>
+  </svg>`;
+  const FILE_ICON_GENERIC_SVG = `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+    <polyline points="14 2 14 8 20 8"></polyline>
+  </svg>`;
+
+  function fileIconSvgForMime(mime) {
+    const m = String(mime || '');
+    if (m.startsWith('image/')) return FILE_ICON_IMAGE_SVG;
+    if (m.startsWith('audio/')) return FILE_ICON_AUDIO_SVG;
+    return FILE_ICON_GENERIC_SVG;
+  }
 
   /** Прочитать сохранённое имя участника (или null, если не задано/пусто). */
   function getSavedName() {
@@ -136,6 +200,25 @@ const ChatPanel = (() => {
   function truncateText(text, maxLen) {
     const str = String(text || '');
     return str.length > maxLen ? `${str.slice(0, maxLen)}…` : str;
+  }
+
+  /** CSS.escape с фоллбэком — как в scrollToMessageAndHighlight, вынесено сюда для переиспользования файловыми карточками. */
+  function escapeForSelector(value) {
+    return typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(value) : value;
+  }
+
+  /** Человекочитаемый размер файла: "512 Б", "12.3 КБ", "1.4 МБ" и т.п. */
+  function humanFileSize(bytes) {
+    const n = Number(bytes) || 0;
+    if (n < 1024) return `${n} Б`;
+    const units = ['КБ', 'МБ', 'ГБ'];
+    let value = n / 1024;
+    let unitIndex = 0;
+    while (value >= 1024 && unitIndex < units.length - 1) {
+      value /= 1024;
+      unitIndex++;
+    }
+    return `${value.toFixed(value < 10 ? 1 : 0)} ${units[unitIndex]}`;
   }
 
   /** uuid v4 (crypto.randomUUID — везде, где живёт RTCPeerConnection, доступен). */
@@ -277,6 +360,8 @@ const ChatPanel = (() => {
         <button type="button" class="chat-reply-bar-close" aria-label="Отменить ответ" title="Отменить ответ">×</button>
       </div>
       <div class="chat-input-row">
+        <button type="button" class="chat-attach-button" aria-label="Прикрепить файл" title="Прикрепить файл"></button>
+        <input type="file" class="chat-file-input" multiple hidden />
         <textarea class="chat-text-input" rows="1" placeholder="Сообщение…" maxlength="2000"></textarea>
         <button type="button" class="chat-send-button" aria-label="Отправить" title="Отправить">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -286,6 +371,7 @@ const ChatPanel = (() => {
         </button>
       </div>
     `;
+    panel.querySelector('.chat-attach-button').innerHTML = ATTACH_ICON_SVG; // статичная разметка
 
     // Попап-палитра реакций — общий на панель (не по одному на сообщение),
     // позиционируется абсолютно относительно панели при открытии (см.
@@ -319,6 +405,8 @@ const ChatPanel = (() => {
       reactionPopover,
       textInput: panel.querySelector('.chat-text-input'),
       sendButton: panel.querySelector('.chat-send-button'),
+      attachButton: panel.querySelector('.chat-attach-button'),
+      fileInput: panel.querySelector('.chat-file-input'),
     };
   }
 
@@ -357,6 +445,8 @@ const ChatPanel = (() => {
       reactionPopover,
       textInput,
       sendButton,
+      attachButton,
+      fileInput,
     } = dom;
 
     let signaling = null;
@@ -384,6 +474,19 @@ const ChatPanel = (() => {
     let historyResponseWaiters = new Map(); // peerId -> resolve(messages[])
     let replyTarget = null; // конверт сообщения, на которое сейчас отвечаем (или null)
     let activeReactionTarget = null; // msgId, для которого сейчас открыт попап реакций (или null)
+
+    // --- Состояние передачи файлов (Ф3) ---
+    // fileId -> File — файлы, которые МЫ отправили (держим, пока живёт вкладка/сессия),
+    // чтобы ответить на file-request отправкой по отдельному DataChannel.
+    let fileSendMap = new Map();
+    // fileId -> { status, progress, objectUrl, blobSize } — производное состояние
+    // карточки файла (и как отправителя, и как получателя), не хранится в конверте.
+    // status: 'offer' | 'requesting' | 'transferring' | 'sending' | 'sent' | 'done'
+    //       | 'unavailable' | 'no-p2p' | 'failed'.
+    let fileStates = new Map();
+    // fileId -> { targetPeerId, expectedLabel, mime, name, size } — запрос на
+    // скачивание, которого мы ждём (открытия входящего файлового DataChannel).
+    let pendingFileRequests = new Map();
 
     nameInput.value = getSavedName() || '';
     nameInput.addEventListener('input', () => {
@@ -485,6 +588,18 @@ const ChatPanel = (() => {
       }
     }
 
+    function buildMetaEl(msg) {
+      const meta = document.createElement('div');
+      meta.className = 'chat-message-meta';
+      const nameSpan = document.createElement('span');
+      nameSpan.textContent = displayName(msg);
+      const timeSpan = document.createElement('span');
+      timeSpan.textContent = formatTime(msg.ts || Date.now());
+      meta.appendChild(nameSpan);
+      meta.appendChild(timeSpan);
+      return meta;
+    }
+
     function renderMessageEl(msg) {
       const own = msg.from === peerId;
 
@@ -514,16 +629,7 @@ const ChatPanel = (() => {
       actions.appendChild(reactButton);
 
       item.appendChild(actions);
-
-      const meta = document.createElement('div');
-      meta.className = 'chat-message-meta';
-      const nameSpan = document.createElement('span');
-      nameSpan.textContent = displayName(msg);
-      const timeSpan = document.createElement('span');
-      timeSpan.textContent = formatTime(msg.ts || Date.now());
-      meta.appendChild(nameSpan);
-      meta.appendChild(timeSpan);
-      item.appendChild(meta);
+      item.appendChild(buildMetaEl(msg));
 
       if (msg.replyTo) {
         item.appendChild(buildReplyQuoteEl(msg.replyTo));
@@ -540,12 +646,214 @@ const ChatPanel = (() => {
       messagesEl.appendChild(item);
     }
 
-    /** Перерисовать всю ленту из `messages` (буфер маленький — до 50, полная перерисовка дешевле инкрементальной вставки в середину). Реакции — не самостоятельные пузыри в ленте, только текстовые сообщения. */
+    // --- Рендер карточки файла (Ф3) — kind='file-offer' ---
+    //
+    // В отличие от текстовых сообщений, тело карточки зависит не только от
+    // самого конверта (он неизменен), но и от производного состояния
+    // fileStates (запрошен ли файл, идёт ли передача, готов ли Blob) —
+    // поэтому тело строит отдельная renderFileCardBody(), вызываемая и при
+    // первом рендере, и при каждом смене статуса (см. setFileStatus).
+    // Прогресс внутри одного статуса обновляется точечно (setFileProgress),
+    // без пересборки DOM — иначе на каждый чанк (их могут быть сотни) была
+    // бы дорогая полная пересборка карточки.
+    function renderFileOfferEl(msg) {
+      const own = msg.from === peerId;
+
+      const item = document.createElement('div');
+      item.className = 'chat-message chat-message--file' + (own ? ' chat-message--own' : '');
+      item.dataset.msgId = msg.id;
+
+      item.appendChild(buildMetaEl(msg));
+
+      const card = document.createElement('div');
+      card.className = 'chat-file-card';
+      item.appendChild(card);
+      renderFileCardBody(card, msg, own);
+
+      messagesEl.appendChild(item);
+    }
+
+    /** Найти конверт file-offer по fileId в текущем буфере (для точечных обновлений статуса/прогресса). */
+    function findFileOfferByFileId(fileId) {
+      for (const msg of messages) {
+        if (msg.kind === 'file-offer' && msg.fileId === fileId) return msg;
+      }
+      return null;
+    }
+
+    function fileCardHeaderEl(msg) {
+      const header = document.createElement('div');
+      header.className = 'chat-file-header';
+
+      const icon = document.createElement('span');
+      icon.className = 'chat-file-icon';
+      icon.innerHTML = fileIconSvgForMime(msg.mime); // статичный набор SVG по категории mime, не пользовательские данные
+
+      const info = document.createElement('div');
+      info.className = 'chat-file-info';
+      const nameEl = document.createElement('div');
+      nameEl.className = 'chat-file-name';
+      nameEl.textContent = msg.fileName;
+      nameEl.title = msg.fileName;
+      const sizeEl = document.createElement('div');
+      sizeEl.className = 'chat-file-size';
+      sizeEl.textContent = humanFileSize(msg.size);
+      info.appendChild(nameEl);
+      info.appendChild(sizeEl);
+
+      header.appendChild(icon);
+      header.appendChild(info);
+      return header;
+    }
+
+    function fileProgressEl(fileId, fraction) {
+      const wrap = document.createElement('div');
+      wrap.className = 'chat-file-progress';
+      const bar = document.createElement('div');
+      bar.className = 'chat-file-progress-bar';
+      bar.dataset.fileId = fileId;
+      bar.style.width = `${Math.round((fraction || 0) * 100)}%`;
+      wrap.appendChild(bar);
+      return wrap;
+    }
+
+    /** Перестроить содержимое карточки `card` из msg + текущего fileStates.get(msg.fileId). */
+    function renderFileCardBody(card, msg, own) {
+      card.textContent = '';
+      const state = fileStates.get(msg.fileId) || { status: 'offer', progress: 0 };
+
+      if (state.status === 'done' && state.objectUrl) {
+        renderFileDoneBody(card, msg, state);
+        return;
+      }
+
+      card.appendChild(fileCardHeaderEl(msg));
+
+      if (state.status === 'requesting' || state.status === 'transferring' || state.status === 'sending') {
+        card.appendChild(fileProgressEl(msg.fileId, state.progress));
+        return;
+      }
+
+      if (state.status === 'unavailable') {
+        const note = document.createElement('div');
+        note.className = 'chat-file-note';
+        note.textContent = 'Отправитель недоступен';
+        card.appendChild(note);
+        return;
+      }
+
+      if (state.status === 'failed') {
+        const note = document.createElement('div');
+        note.className = 'chat-file-note';
+        note.textContent = 'Не удалось получить файл';
+        card.appendChild(note);
+        if (!own) {
+          const retryButton = document.createElement('button');
+          retryButton.type = 'button';
+          retryButton.className = 'chat-file-download-button';
+          retryButton.textContent = 'Повторить';
+          retryButton.addEventListener('click', () => requestFileDownload(msg));
+          card.appendChild(retryButton);
+        }
+        return;
+      }
+
+      // status === 'offer' (или 'sent'/начальное состояние без записи) —
+      // ничего не запрошено/отправлено ещё: своя карточка — просто
+      // информация, чужая — кнопка «Скачать» (либо пояснение недоступности).
+      if (own) return;
+
+      if (!getPeerIds().includes(msg.from)) {
+        const note = document.createElement('div');
+        note.className = 'chat-file-note';
+        note.textContent = 'Отправитель недоступен';
+        card.appendChild(note);
+        return;
+      }
+
+      if (!bus.isOpen(msg.from)) {
+        const note = document.createElement('div');
+        note.className = 'chat-file-download-button chat-file-download-button--disabled';
+        note.textContent = 'Недоступно: нет прямого соединения';
+        note.title = 'Между вами и отправителем нет прямого P2P-соединения — передача файлов работает только напрямую, через сервер файлы не передаются.';
+        card.appendChild(note);
+        return;
+      }
+
+      const downloadButton = document.createElement('button');
+      downloadButton.type = 'button';
+      downloadButton.className = 'chat-file-download-button';
+      downloadButton.textContent = 'Скачать';
+      downloadButton.addEventListener('click', () => requestFileDownload(msg));
+      card.appendChild(downloadButton);
+    }
+
+    /** Финальный вид готовой (status='done') карточки: превью картинки / audio-плеер / ссылка-скачивание. */
+    function renderFileDoneBody(card, msg, state) {
+      const mime = msg.mime || '';
+      if (mime.startsWith('image/')) {
+        const link = document.createElement('a');
+        link.href = state.objectUrl;
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        const img = document.createElement('img');
+        img.className = 'chat-file-image';
+        img.src = state.objectUrl;
+        img.alt = msg.fileName;
+        link.appendChild(img);
+        card.appendChild(link);
+        return;
+      }
+      if (mime.startsWith('audio/')) {
+        card.appendChild(fileCardHeaderEl(msg));
+        const audio = document.createElement('audio');
+        audio.className = 'chat-file-audio';
+        audio.controls = true;
+        audio.src = state.objectUrl;
+        card.appendChild(audio);
+        return;
+      }
+      card.appendChild(fileCardHeaderEl(msg));
+      const link = document.createElement('a');
+      link.className = 'chat-file-download-link';
+      link.href = state.objectUrl;
+      link.download = msg.fileName;
+      link.textContent = 'Скачать';
+      card.appendChild(link);
+    }
+
+    /** Точечно обновить только полосу прогресса (без пересборки карточки) — вызывается часто (на каждый чанк). */
+    function setFileProgress(fileId, fraction) {
+      const state = fileStates.get(fileId);
+      if (!state) return;
+      state.progress = fraction;
+      const bar = messagesEl.querySelector(
+        `.chat-file-progress-bar[data-file-id="${escapeForSelector(fileId)}"]`
+      );
+      if (bar) bar.style.width = `${Math.round(fraction * 100)}%`;
+    }
+
+    /** Сменить статус карточки файла и пересобрать её тело (структурное изменение — не только прогресс). */
+    function setFileStatus(fileId, status, extra) {
+      const prev = fileStates.get(fileId) || { progress: 0 };
+      const next = Object.assign({}, prev, { status }, extra || {});
+      fileStates.set(fileId, next);
+      const msg = findFileOfferByFileId(fileId);
+      if (!msg) return;
+      const safeMsgId = escapeForSelector(msg.id);
+      const item = messagesEl.querySelector(`.chat-message[data-msg-id="${safeMsgId}"]`);
+      if (!item) return; // сейчас не отрисована (например, ушла из HISTORY_CAP) — не страшно
+      const card = item.querySelector('.chat-file-card');
+      if (card) renderFileCardBody(card, msg, msg.from === peerId);
+    }
+
+    /** Перерисовать всю ленту из `messages` (буфер маленький — до 50, полная перерисовка дешевле инкрементальной вставки в середину). Реакции — не самостоятельные пузыри в ленте, только текстовые сообщения и карточки файлов. */
     function renderAll(forceScrollBottom) {
       const wasNearBottom = isNearBottom();
       messagesEl.textContent = '';
       for (const msg of messages) {
         if (msg.kind === 'text') renderMessageEl(msg);
+        else if (msg.kind === 'file-offer') renderFileOfferEl(msg);
       }
       if (forceScrollBottom || wasNearBottom) scrollToBottom();
     }
@@ -572,6 +880,9 @@ const ChatPanel = (() => {
       lamportClock = 0;
       sendTimes = [];
       historyResponseWaiters = new Map();
+      fileSendMap = new Map();
+      fileStates = new Map();
+      pendingFileRequests = new Map();
       cancelReply();
       closeReactionPopover();
     }
@@ -686,11 +997,16 @@ const ChatPanel = (() => {
     // --- Транспорт: broadcast конверта всем пирам (шина, где открыта; сервер-фоллбэк — где нет) ---
     function broadcastEnvelope(envelope) {
       for (const targetPeerId of getPeerIds()) {
-        if (bus.isOpen(targetPeerId)) {
-          bus.sendToPeer(targetPeerId, envelope);
-        } else {
-          signaling.send('chat', { targetPeerId, envelope });
-        }
+        sendEnvelopeToPeer(targetPeerId, envelope);
+      }
+    }
+
+    /** Отправить конверт ОДНОМУ конкретному пиру (адресно) — та же логика шина/фоллбэк, что и в broadcastEnvelope, но для одного адресата (используется file-request). */
+    function sendEnvelopeToPeer(targetPeerId, envelope) {
+      if (bus.isOpen(targetPeerId)) {
+        bus.sendToPeer(targetPeerId, envelope);
+      } else {
+        signaling.send('chat', { targetPeerId, envelope });
       }
     }
 
@@ -703,6 +1019,12 @@ const ChatPanel = (() => {
           break;
         case 'reaction':
           handleIncomingReaction(envelope);
+          break;
+        case 'file-offer':
+          handleIncomingFileOffer(envelope);
+          break;
+        case 'file-request':
+          handleFileRequest(fromPeerId, envelope);
           break;
         case 'history-request':
           handleHistoryRequest(fromPeerId);
@@ -739,6 +1061,276 @@ const ChatPanel = (() => {
       renderAll(false);
     }
 
+    // --- Передача файлов (Ф3) ---
+
+    function handleIncomingFileOffer(envelope) {
+      bumpLamportOnReceive(envelope.lamport);
+      const inserted = insertMessage(envelope);
+      if (!inserted) return;
+      renderAll(false);
+      if (panel.classList.contains('hidden')) {
+        unreadCount += 1;
+        updateUnreadBadge();
+      }
+      maybeAutoDownloadImage(envelope);
+    }
+
+    /** Картинки ≤2МБ скачиваются сами, без клика — только для ЖИВОГО оффера (не для реплея истории у опоздавшего). */
+    function maybeAutoDownloadImage(msg) {
+      if (msg.from === peerId) return;
+      const mime = msg.mime || '';
+      if (!mime.startsWith('image/')) return;
+      if (!(msg.size <= AUTO_DOWNLOAD_IMAGE_MAX_BYTES)) return;
+      requestFileDownload(msg);
+    }
+
+    /**
+     * Получатель жмёт «Скачать» (или авто для картинок) — шлём адресный
+     * file-request отправителю и ждём, что он откроет файловый DataChannel.
+     * Идемпотентно: повторный вызов, пока уже что-то происходит/готово, — no-op.
+     */
+    function requestFileDownload(msg) {
+      const fileId = msg.fileId;
+      const existing = fileStates.get(fileId);
+      if (existing && ['requesting', 'transferring', 'done'].includes(existing.status)) return;
+
+      if (!getPeerIds().includes(msg.from)) {
+        setFileStatus(fileId, 'unavailable');
+        return;
+      }
+
+      const expectedLabel = `file-${fileId}-${peerId}`;
+      pendingFileRequests.set(fileId, {
+        targetPeerId: msg.from,
+        expectedLabel,
+        mime: msg.mime,
+        name: msg.fileName,
+        size: msg.size,
+      });
+      setFileStatus(fileId, 'requesting', { progress: 0 });
+
+      lamportClock += 1;
+      const envelope = {
+        v: 1,
+        id: genId(),
+        lamport: lamportClock,
+        from: peerId,
+        name: myName || null,
+        kind: 'file-request',
+        fileId,
+        ts: Date.now(),
+      };
+      sendEnvelopeToPeer(msg.from, envelope);
+
+      setTimeout(() => {
+        const state = fileStates.get(fileId);
+        if (state && state.status === 'requesting') {
+          pendingFileRequests.delete(fileId);
+          setFileStatus(fileId, 'unavailable');
+        }
+      }, FILE_REQUEST_TIMEOUT_MS);
+    }
+
+    /** Отправитель получил адресный file-request — если файл ещё у нас, открываем файловый канал этому пиру. */
+    function handleFileRequest(fromPeerId, envelope) {
+      const file = fileSendMap.get(envelope.fileId);
+      if (!file) return; // не мы держим этот файл (или уже неактуально) — молча игнорируем
+      beginSendingFile(fromPeerId, file, envelope.fileId);
+    }
+
+    function waitForBufferedAmountLow(channel) {
+      return new Promise((resolve) => {
+        const onLow = () => {
+          channel.removeEventListener('bufferedamountlow', onLow);
+          resolve();
+        };
+        channel.addEventListener('bufferedamountlow', onLow);
+      });
+    }
+
+    /**
+     * Дождаться, пока весь буфер отправки СЛИТ (bufferedAmount === 0), перед
+     * закрытием канала. Грабли (обнаружены эмпирически на файле ~300КБ):
+     * channel.close() сразу после серии send() НЕ гарантирует, что уже
+     * поставленные в очередь, но ещё физически не отправленные байты долетят
+     * до собеседника — при достаточно большом файле (когда синхронный цикл
+     * send() успевает поставить в очередь больше одного SCTP-пакета) закрытие
+     * обрывает "хвост" данных: получатель стабильно видит receivedBytes=0
+     * (закрытие канала успевает раньше самого первого сообщения). Небольшие
+     * файлы (умещаются в один пакет) внешне "работали" и без этого ожидания —
+     * что и маскировало баг. 'bufferedamountlow' — событие ФРОНТА (срабатывает
+     * на переход через порог), поэтому если bufferedAmount успел стать 0 ДО
+     * того, как мы подписались, событие уже не придёт — опрашиваем сам
+     * bufferedAmount явно, а не полагаемся только на событие.
+     */
+    function waitForBufferedAmountZero(channel) {
+      return new Promise((resolve) => {
+        if (channel.bufferedAmount === 0) {
+          resolve();
+          return;
+        }
+        const iv = setInterval(() => {
+          if (channel.bufferedAmount === 0) {
+            clearInterval(iv);
+            resolve();
+          }
+        }, 30);
+      });
+    }
+
+    /** Отправитель: открыть файловый DataChannel конкретному запросившему пиру и прогнать файл чанками с backpressure. */
+    function beginSendingFile(requesterPeerId, file, fileId) {
+      const rtc = bus.getPeer(requesterPeerId);
+      if (!rtc) return; // пир уже ушёл между запросом и открытием канала
+
+      const label = `file-${fileId}-${requesterPeerId}`;
+      let channel;
+      try {
+        channel = rtc.createFileChannel(label);
+      } catch (err) {
+        console.error(`Не удалось открыть файловый DataChannel (${label}):`, err);
+        return;
+      }
+      channel.binaryType = 'arraybuffer';
+      channel.bufferedAmountLowThreshold = FILE_BUFFERED_LOW_THRESHOLD;
+
+      setFileStatus(fileId, 'sending', { progress: 0 });
+
+      channel.onerror = (event) => {
+        console.error(`Ошибка файлового DataChannel (отдача, fileId=${fileId}):`, event);
+      };
+
+      channel.onopen = async () => {
+        try {
+          channel.send(
+            JSON.stringify({
+              fileId,
+              size: file.size,
+              mime: file.type || 'application/octet-stream',
+              name: file.name,
+            })
+          );
+
+          let offset = 0;
+          while (offset < file.size) {
+            if (channel.bufferedAmount > FILE_BUFFERED_HIGH_WATERMARK) {
+              await waitForBufferedAmountLow(channel);
+            }
+            const slice = file.slice(offset, offset + FILE_CHUNK_SIZE);
+            const buf = await slice.arrayBuffer();
+            channel.send(buf);
+            offset += buf.byteLength;
+            setFileProgress(fileId, file.size === 0 ? 1 : Math.min(1, offset / file.size));
+          }
+          setFileStatus(fileId, 'sent', { progress: 1 });
+        } catch (err) {
+          console.error(`Ошибка отправки файла (fileId=${fileId}):`, err);
+        } finally {
+          try {
+            await waitForBufferedAmountZero(channel);
+            channel.close();
+          } catch (err) {
+            // канал мог уже закрыться/сломаться — не страшно
+          }
+        }
+      };
+    }
+
+    /**
+     * Получатель: пришёл входящий файловый DataChannel (см. onFileChannel в
+     * rtc.js, диспетчеризуется room.js -> publicApi.handleIncomingFileChannel).
+     * Матчим по ТОЧНОМУ совпадению label с тем, что сами же и ожидали
+     * (сконструирован в requestFileDownload) — парсить fileId/peerId из
+     * строки label не нужно (оба id — uuid с дефисами, наивный split был бы
+     * неоднозначным).
+     */
+    function handleIncomingFileChannel(fromPeerId, channel) {
+      for (const [fileId, req] of pendingFileRequests) {
+        if (req.expectedLabel === channel.label) {
+          pendingFileRequests.delete(fileId);
+          beginReceivingFile(fileId, channel, req);
+          return;
+        }
+      }
+      console.warn('Получен файловый DataChannel без ожидающего запроса, label=', channel.label);
+    }
+
+    function beginReceivingFile(fileId, channel, req) {
+      channel.binaryType = 'arraybuffer';
+      let meta = null;
+      const chunks = [];
+      let receivedBytes = 0;
+
+      setFileStatus(fileId, 'transferring', { progress: 0 });
+
+      channel.onmessage = (event) => {
+        if (typeof event.data === 'string') {
+          try {
+            meta = JSON.parse(event.data);
+          } catch (err) {
+            console.error(`Некорректная JSON-мета файлового канала (fileId=${fileId}):`, event.data, err);
+          }
+          return;
+        }
+        const buf = event.data;
+        chunks.push(buf);
+        receivedBytes += buf.byteLength;
+        const total = (meta && meta.size) || req.size || 0;
+        setFileProgress(fileId, total > 0 ? Math.min(1, receivedBytes / total) : 0);
+      };
+
+      channel.onerror = (event) => {
+        console.error(`Ошибка файлового DataChannel (приём, fileId=${fileId}):`, event);
+      };
+
+      channel.onclose = () => {
+        const total = typeof (meta && meta.size) === 'number' ? meta.size : req.size;
+        if (typeof total === 'number' && receivedBytes < total) {
+          // Канал закрылся раньше, чем пришли все байты — почти всегда потому,
+          // что отправитель вышел из комнаты посреди передачи.
+          setFileStatus(fileId, 'unavailable');
+          return;
+        }
+        const blob = new Blob(chunks, { type: (meta && meta.mime) || req.mime || 'application/octet-stream' });
+        const objectUrl = URL.createObjectURL(blob);
+        setFileStatus(fileId, 'done', { objectUrl, blobSize: blob.size, progress: 1 });
+      };
+    }
+
+    /** Выбор файлов (скрепка/drag&drop/paste) — проверка лимита размера, оптимистичная своя карточка, broadcast оффера. */
+    function handleFilesSelected(fileList) {
+      if (!signaling || !bus) return;
+      const files = Array.from(fileList || []);
+      for (const file of files) {
+        if (file.size > FILE_SIZE_LIMIT_BYTES) {
+          showError(`Файл «${file.name}» больше 25МБ — не отправлен.`);
+          continue;
+        }
+
+        const fileId = genId();
+        fileSendMap.set(fileId, file);
+
+        lamportClock += 1;
+        const envelope = {
+          v: 1,
+          id: genId(),
+          lamport: lamportClock,
+          from: peerId,
+          name: myName || null,
+          kind: 'file-offer',
+          fileId,
+          fileName: file.name,
+          size: file.size,
+          mime: file.type || 'application/octet-stream',
+          ts: Date.now(),
+        };
+
+        insertMessage(envelope);
+        renderAll(true);
+        broadcastEnvelope(envelope);
+      }
+    }
+
     function handleHistoryRequest(fromPeerId) {
       bus.sendToPeer(fromPeerId, {
         v: 1,
@@ -761,7 +1353,7 @@ const ChatPanel = (() => {
       let insertedAny = false;
       for (const msg of historyMessages) {
         if (!msg || typeof msg !== 'object') continue;
-        if (msg.kind !== 'text' && msg.kind !== 'reaction') continue;
+        if (msg.kind !== 'text' && msg.kind !== 'reaction' && msg.kind !== 'file-offer') continue;
         bumpLamportOnReceive(msg.lamport);
         if (insertMessage(msg)) insertedAny = true;
       }
@@ -908,19 +1500,53 @@ const ChatPanel = (() => {
       }
     });
 
+    // --- UI отправки файлов: скрепка, drag&drop, paste картинки из буфера ---
+    attachButton.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', () => {
+      handleFilesSelected(fileInput.files);
+      fileInput.value = ''; // сброс — иначе повторный выбор ТОГО ЖЕ файла не даст change
+    });
+
+    panel.addEventListener('dragover', (event) => {
+      event.preventDefault();
+    });
+    panel.addEventListener('drop', (event) => {
+      event.preventDefault();
+      const files = event.dataTransfer && event.dataTransfer.files;
+      if (files && files.length > 0) handleFilesSelected(files);
+    });
+
+    textInput.addEventListener('paste', (event) => {
+      const items = event.clipboardData && event.clipboardData.items;
+      if (!items) return;
+      const files = [];
+      for (const item of items) {
+        if (item.kind === 'file') {
+          const f = item.getAsFile();
+          if (f) files.push(f);
+        }
+      }
+      if (files.length > 0) {
+        event.preventDefault();
+        handleFilesSelected(files);
+      }
+    });
+
     function enableInput() {
       textInput.disabled = false;
       sendButton.disabled = false;
+      attachButton.disabled = false;
       textInput.placeholder = 'Сообщение…';
     }
 
     function disableInput(reason) {
       textInput.disabled = true;
       sendButton.disabled = true;
+      attachButton.disabled = true;
       textInput.placeholder = reason || 'Чат недоступен';
     }
 
-    const publicApi = { disableInput, enableInput };
+    const publicApi = { disableInput, enableInput, handleIncomingFileChannel };
 
     function handleServerError({ message }) {
       // Ошибки fallback-релея сервера (envelope > 8KB, серверный rate-limit

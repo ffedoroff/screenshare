@@ -44,15 +44,29 @@
 // возникала только при одновременном старте видео/аудио с двух сторон,
 // теперь возможна и от одного самого факта входа в комнату — perfect
 // negotiation ниже её штатно разруливает.
+//
+// Ф3: файловые DataChannel (см. static/chat.js — протокол передачи файлов).
+// В отличие от шины ('bus', одна на пару, создаётся один раз при входе),
+// файловый канал создаётся ПО ЗАПРОСУ, отдельный на каждую пару
+// (fileId, получатель), и инициатором может быть ЛЮБАЯ из сторон пары (кто
+// держит файл — не обязательно impolite), поэтому pc.ondatachannel должен
+// уметь ловить входящий канал НЕЗАВИСИМО от роли polite/impolite —
+// диспетчеризуется по префиксу label ('bus' -> шина, 'file-' -> файл).
+// Создание дополнительного DataChannel на уже установленном соединении не
+// требует новой SDP-негоциации (SCTP-ассоциация уже есть) — onnegotiationneeded
+// в норме не срабатывает повторно.
 
 'use strict';
 
 class RtcPeer {
-  constructor({ iceServers, polite, signaling, targetPeerId, onTrack, onStateChange, onBusMessage }) {
+  constructor({ iceServers, polite, signaling, targetPeerId, onTrack, onStateChange, onBusMessage, onFileChannel }) {
     this.signaling = signaling;
     this.targetPeerId = targetPeerId;
     this.polite = polite;
     this.onBusMessage = onBusMessage || null;
+    // Ф3: колбэк на входящий файловый DataChannel (label начинается с
+    // 'file-') — см. createFileChannel ниже и static/chat.js.
+    this.onFileChannel = onFileChannel || null;
 
     this.makingOffer = false;
     this.ignoreOffer = false;
@@ -110,12 +124,21 @@ class RtcPeer {
       // impolite создаёт канал — само создание триггерит onnegotiationneeded
       // ниже (если для этой пары ещё не было ни одной SCTP-негоциации).
       setupBusChannel(pc.createDataChannel('bus'));
-    } else {
-      // polite ничего не создаёт сама — ждёт канал от impolite-стороны.
-      pc.ondatachannel = (event) => {
-        if (event.channel.label === 'bus') setupBusChannel(event.channel);
-      };
     }
+    // pc.ondatachannel вешаем БЕЗУСЛОВНО с обеих сторон (не только у polite):
+    // 'bus' — только polite реально его тут дождётся (impolite создал канал
+    // сам, ей ondatachannel на него никогда не прилетит); входящий файловый
+    // канал ('file-...', см. заголовок файла) может прийти к ЛЮБОЙ из сторон
+    // независимо от polite/impolite, поэтому диспетчеризация по label здесь
+    // общая для обеих ролей.
+    pc.ondatachannel = (event) => {
+      const { channel } = event;
+      if (channel.label === 'bus') {
+        setupBusChannel(channel);
+      } else if (channel.label.startsWith('file-')) {
+        if (this.onFileChannel) this.onFileChannel(channel);
+      }
+    };
 
     pc.onnegotiationneeded = async () => {
       try {
@@ -251,6 +274,17 @@ class RtcPeer {
 
   isBusOpen() {
     return !!this.busChannel && this.busChannel.readyState === 'open';
+  }
+
+  /**
+   * Открыть НОВЫЙ отдельный DataChannel для передачи одного файла одному
+   * конкретному получателю (см. static/chat.js). `label` должен быть вида
+   * `file-${fileId}-${получатель}` — получатель заранее знает ожидаемый
+   * label целиком (сам его сконструировал) и матчит входящий канал по
+   * точному совпадению строки, парсинг label на составные части не нужен.
+   */
+  createFileChannel(label) {
+    return this.pc.createDataChannel(label);
   }
 
   close() {

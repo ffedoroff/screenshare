@@ -505,6 +505,14 @@ function createRemotePeer(peerId, name, iceServers) {
     onTrack: (event) => handleRemoteTrack(peerId, event),
     onStateChange: () => {},
     onBusMessage: (obj) => bus._dispatch(peerId, obj),
+    // Ф3: входящий файловый DataChannel — маршрутизируем в ChatPanel (там
+    // живёт протокол передачи файлов, см. static/chat.js). `chat` в момент
+    // регистрации этого колбэка может быть ещё не создан (для первых пиров
+    // ChatPanel.create() вызывается позже, см. joined ниже) — читаем
+    // переменную в момент самого вызова колбэка, а не при регистрации.
+    onFileChannel: (channel) => {
+      if (chat) chat.handleIncomingFileChannel(peerId, channel);
+    },
   });
   bus.addPeer(peerId, rtc);
 
