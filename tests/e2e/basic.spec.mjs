@@ -48,6 +48,7 @@ import {
   sendChatMessage,
   messageTextsInclude,
   getChatDom,
+  waitUntil,
 } from './helpers.mjs';
 
 const PORT = 3322;
@@ -475,6 +476,189 @@ async function main() {
         } finally {
           await igorContext.close();
           await nastyaContext.close();
+        }
+      }
+    );
+
+    // --- Форматирование, реплаи и реакции (Ф2) ---
+    //
+    // Отдельная комната, трое участников с самого начала (Аня, Боря, Витя —
+    // нужны для проверки "реакция видна ДРУГИМ участникам" (в), пока не
+    // ушедшим и не только автору), плюс четвёртый — Гриша — заходит ПОЗЖЕ,
+    // уже после того как сообщение и реакция отправлены: он должен увидеть
+    // и то, и другое из реплея истории (г), а не из живого эфира.
+    await step(
+      'Форматирование (bold/italic/strike/ссылка, <script> не исполняется), реплай с цитатой, реакции (live + из истории у опоздавшего)',
+      async () => {
+        const res = await fetch(`${server.baseUrl}/api/rooms`, { method: 'POST' });
+        assert.ok(res.ok, `POST /api/rooms ответил статусом ${res.status}`);
+        const { roomId: fmtRoomId } = await res.json();
+        const fmtRoomUrl = `${server.baseUrl}/r/${fmtRoomId}`;
+
+        const aContext = await browser.newContext();
+        const bContext = await browser.newContext();
+        const cContext = await browser.newContext();
+        await installSavedName(aContext, 'Аня');
+        await installSavedName(bContext, 'Боря');
+        await installSavedName(cContext, 'Витя');
+        const aPage = await aContext.newPage();
+        const bPage = await bContext.newPage();
+        const cPage = await cContext.newPage();
+
+        try {
+          await aPage.goto(fmtRoomUrl);
+          await bPage.goto(fmtRoomUrl);
+          await cPage.goto(fmtRoomUrl);
+          await waitForOverlayHidden(aPage);
+          await waitForOverlayHidden(bPage);
+          await waitForOverlayHidden(cPage);
+          await waitForTileCount(aPage, 3);
+          await waitForTileCount(bPage, 3);
+          await waitForTileCount(cPage, 3);
+
+          await openChatPanel(aPage);
+          await openChatPanel(bPage);
+          await openChatPanel(cPage);
+
+          // --- (а) форматирование: **bold** *italic* ~~strike~~ + ссылка + <script> ---
+          const fmtText =
+            '**wow** *si* ~~no~~ https://example.com/page and <script>window.__e2eXss=1</script>';
+          await sendChatMessage(aPage, fmtText);
+          await messageTextsInclude(bPage, fmtText).catch(() => {}); // подождать доставки (сравнение ниже по DOM, не по чистому тексту)
+
+          const bFmtMsg = bPage
+            .locator('.chat-message', { hasText: 'wow' })
+            .filter({ hasText: 'example.com' })
+            .last();
+          await bFmtMsg.locator('strong').first().waitFor({ state: 'visible', timeout: 5000 });
+
+          const strongText = await bFmtMsg.locator('strong').first().textContent();
+          assert.equal(strongText, 'wow', `<strong> должен содержать "wow", получено: ${strongText}`);
+          const emText = await bFmtMsg.locator('em').first().textContent();
+          assert.equal(emText, 'si', `<em> должен содержать "si", получено: ${emText}`);
+          const delText = await bFmtMsg.locator('del').first().textContent();
+          assert.equal(delText, 'no', `<del> должен содержать "no", получено: ${delText}`);
+
+          const linkEl = bFmtMsg.locator('a').first();
+          const linkHref = await linkEl.getAttribute('href');
+          assert.equal(
+            linkHref,
+            'https://example.com/page',
+            `ссылка должна вести на https://example.com/page, получено: ${linkHref}`
+          );
+          assert.equal(await linkEl.getAttribute('target'), '_blank', 'ссылка должна открываться в новой вкладке');
+          const linkRel = (await linkEl.getAttribute('rel')) || '';
+          assert.ok(
+            linkRel.includes('noopener') && linkRel.includes('noreferrer'),
+            `rel ссылки должен включать noopener noreferrer, получено: ${linkRel}`
+          );
+
+          const bFmtText = await bFmtMsg.locator('.chat-message-text').textContent();
+          assert.ok(!bFmtText.includes('**'), `сырых "**" не должно остаться в рендере: ${bFmtText}`);
+          assert.ok(!bFmtText.includes('~~'), `сырых "~~" не должно остаться в рендере: ${bFmtText}`);
+          assert.ok(
+            bFmtText.includes('<script>'),
+            `текст "<script>..." должен присутствовать как ВИДИМЫЙ текст: ${bFmtText}`
+          );
+
+          const xssRan = await bPage.evaluate(() => window.__e2eXss);
+          assert.equal(xssRan, undefined, '<script> из текста сообщения не должен исполниться');
+          const scriptTagCount = await bPage.evaluate(
+            () => document.querySelectorAll('.chat-message-text script').length
+          );
+          assert.equal(scriptTagCount, 0, 'тег <script> не должен появиться как реальный DOM-элемент');
+
+          // --- (б) реплай: у получателя видна цитата с именем автора оригинала ---
+          const originalText = `Оригинал-от-Бори-${Date.now()}`;
+          await sendChatMessage(bPage, originalText);
+          assert.ok(await messageTextsInclude(aPage, originalText), 'оригинал не дошёл до Ани');
+          assert.ok(await messageTextsInclude(cPage, originalText), 'оригинал не дошёл до Вити');
+
+          const aOriginalMsg = aPage.locator('.chat-message', { hasText: originalText }).last();
+          await aOriginalMsg.hover();
+          await aOriginalMsg.locator('.chat-message-action--reply').click();
+          await aPage.locator('.chat-reply-bar:not(.hidden)').waitFor({ state: 'visible', timeout: 3000 });
+          const replyBarText = (await aPage.locator('.chat-reply-bar-text').textContent()) || '';
+          assert.ok(replyBarText.includes('Боря'), `плашка реплая должна упоминать автора оригинала «Боря»: ${replyBarText}`);
+
+          const replyText = `Реплай-от-Ани-${Date.now()}`;
+          await sendChatMessage(aPage, replyText);
+          assert.ok(await messageTextsInclude(bPage, replyText), 'реплай не дошёл до Бори');
+
+          const bReplyMsg = bPage.locator('.chat-message', { hasText: replyText }).last();
+          const quoteNameText = await bReplyMsg.locator('.chat-reply-quote-name').textContent();
+          assert.ok(
+            quoteNameText.includes('Боря'),
+            `цитата реплая у получателя должна показывать имя автора оригинала «Боря»: ${quoteNameText}`
+          );
+
+          // --- (в) реакции: Аня ставит 👍 на сообщение Бори -> у Бори и Вити чип «👍 1»; toggle убирает ---
+          const aTargetMsg = aPage.locator('.chat-message', { hasText: originalText }).last();
+          await aTargetMsg.hover();
+          await aTargetMsg.locator('.chat-message-action--react').click();
+          await aPage.locator('.chat-reaction-popover:not(.hidden)').waitFor({ state: 'visible', timeout: 3000 });
+          await aPage.locator('.chat-reaction-popover-emoji[data-emoji="👍"]').click();
+
+          const bTargetMsg = bPage.locator('.chat-message', { hasText: originalText }).last();
+          const cTargetMsg = cPage.locator('.chat-message', { hasText: originalText }).last();
+          await bTargetMsg.locator('.chat-reaction-chip').first().waitFor({ state: 'visible', timeout: 5000 });
+          await cTargetMsg.locator('.chat-reaction-chip').first().waitFor({ state: 'visible', timeout: 5000 });
+          const bChipText = await bTargetMsg.locator('.chat-reaction-chip').first().textContent();
+          const cChipText = await cTargetMsg.locator('.chat-reaction-chip').first().textContent();
+          assert.ok(bChipText.includes('👍') && bChipText.includes('1'), `у Бори должен появиться чип «👍 1»: ${bChipText}`);
+          assert.ok(cChipText.includes('👍') && cChipText.includes('1'), `у Вити должен появиться чип «👍 1»: ${cChipText}`);
+
+          // toggle: повторный клик своей же реакции убирает её у всех
+          await aTargetMsg.hover();
+          await aTargetMsg.locator('.chat-message-action--react').click();
+          await aPage.locator('.chat-reaction-popover:not(.hidden)').waitFor({ state: 'visible', timeout: 3000 });
+          await aPage.locator('.chat-reaction-popover-emoji[data-emoji="👍"]').click();
+
+          await waitUntil(async () => (await bTargetMsg.locator('.chat-reaction-chip').count()) === 0, {
+            timeoutMs: 5000,
+            message: 'чип реакции должен исчезнуть у Бори после toggle-удаления',
+          });
+          await waitUntil(async () => (await cTargetMsg.locator('.chat-reaction-chip').count()) === 0, {
+            timeoutMs: 5000,
+            message: 'чип реакции должен исчезнуть у Вити после toggle-удаления',
+          });
+
+          // ставим реакцию заново — она должна быть в истории для опоздавшего (г)
+          await aTargetMsg.hover();
+          await aTargetMsg.locator('.chat-message-action--react').click();
+          await aPage.locator('.chat-reaction-popover:not(.hidden)').waitFor({ state: 'visible', timeout: 3000 });
+          await aPage.locator('.chat-reaction-popover-emoji[data-emoji="👍"]').click();
+          await bTargetMsg.locator('.chat-reaction-chip').first().waitFor({ state: 'visible', timeout: 5000 });
+
+          // --- (г) опоздавший (Гриша) видит и сообщение, и реакцию из истории ---
+          const dContext = await browser.newContext();
+          await installSavedName(dContext, 'Гриша');
+          const dPage = await dContext.newPage();
+          try {
+            await dPage.goto(fmtRoomUrl);
+            await waitForOverlayHidden(dPage);
+            await waitForTileCount(dPage, 4);
+            await openChatPanel(dPage);
+
+            assert.ok(
+              await messageTextsInclude(dPage, originalText),
+              'опоздавший не увидел историческое сообщение по DataChannel'
+            );
+
+            const dTargetMsg = dPage.locator('.chat-message', { hasText: originalText }).last();
+            await dTargetMsg.locator('.chat-reaction-chip').first().waitFor({ state: 'visible', timeout: 5000 });
+            const dChipText = await dTargetMsg.locator('.chat-reaction-chip').first().textContent();
+            assert.ok(
+              dChipText.includes('👍') && dChipText.includes('1'),
+              `опоздавший должен увидеть чип «👍 1» из реплея истории: ${dChipText}`
+            );
+          } finally {
+            await dContext.close();
+          }
+        } finally {
+          await aContext.close();
+          await bContext.close();
+          await cContext.close();
         }
       }
     );

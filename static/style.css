@@ -797,12 +797,240 @@ body {
   font-size: 0.88rem;
   overflow-wrap: break-word;
   white-space: pre-wrap;
+  transition: box-shadow 0.2s ease;
+}
+
+.chat-message-text strong {
+  font-weight: 700;
+}
+
+.chat-message-text a {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: currentColor;
+  /* overflow-wrap: break-word унаследован от .chat-message-text — этого
+     достаточно, чтобы очень длинная ссылка без пробелов не распирала пузырь.
+     word-break: break-all здесь был бы агрессивнее браузерного переноса по
+     словам и резал бы короткие ссылки посреди слова ("http" + "s://…") даже
+     когда они спокойно помещаются на строке целиком. */
+  overflow-wrap: anywhere;
 }
 
 .chat-message--own .chat-message-text {
   background: var(--accent);
   border-color: var(--accent);
   color: #fff;
+}
+
+/* Блок-цитата markdown (строки "> ") — левая полоска, чуть приглушённый текст. */
+.chat-md-quote {
+  border-left: 3px solid var(--border);
+  padding-left: var(--space-2);
+  margin: var(--space-1) 0;
+  color: var(--text-muted);
+}
+
+.chat-message--own .chat-message-text .chat-md-quote {
+  border-left-color: rgba(255, 255, 255, 0.5);
+  color: rgba(255, 255, 255, 0.85);
+}
+
+/* Кратковременная подсветка сообщения, к которому проскроллили по клику на реплай-цитату. */
+.chat-message-text--flash {
+  box-shadow: 0 0 0 2px var(--accent);
+}
+
+/* ---------- Реплаи ---------- */
+
+/* Кнопки-действия сообщения (ответить / реакция) — по умолчанию скрыты
+   (opacity), появляются мягко по ховеру самого сообщения (десктоп); на
+   тач-устройствах и узких экранах — всегда видимы (см. медиа-запросы ниже).
+   Обычный поток (не absolute) — прижаты вправо через align-self, а не
+   наложены поверх строки имя/время: у absolute-варианта с отрицательным
+   top для САМОГО ПЕРВОГО сообщения в короткой ленте кнопки уходили выше
+   собственного скролл-контейнера (.chat-messages, overflow-y: auto) и
+   визуально проваливались под шапку чата — недостаточно места сверху. */
+.chat-message-actions {
+  align-self: flex-end;
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease;
+}
+
+.chat-message:hover .chat-message-actions,
+.chat-message-actions:focus-within {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.chat-message-action {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--bg-elevated-2);
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 0;
+  font-size: 0.8rem;
+  line-height: 1;
+  box-shadow: var(--shadow);
+}
+
+.chat-message-action .icon {
+  width: 14px;
+  height: 14px;
+}
+
+.chat-message-action:hover {
+  color: var(--text);
+  background: var(--bg-elevated);
+}
+
+.chat-reply-quote {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  max-width: 100%;
+  padding: 3px var(--space-2);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.05);
+  font-size: 0.76rem;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.chat-reply-quote-name {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.chat-reply-quote-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-reply-quote--missing {
+  font-style: italic;
+  cursor: default;
+}
+
+.chat-message--own .chat-reply-quote {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.chat-reply-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-top: 1px solid var(--border);
+  background: var(--bg-elevated-2);
+  font-size: 0.8rem;
+  flex-shrink: 0;
+}
+
+.chat-reply-bar-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+}
+
+.chat-reply-bar-close {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 1rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+}
+
+.chat-reply-bar-close:hover {
+  color: var(--text);
+  background: var(--bg-elevated);
+}
+
+/* ---------- Реакции ---------- */
+
+.chat-message-reactions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 2px;
+}
+
+.chat-reaction-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 22px;
+  padding: 0 var(--space-2);
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated-2);
+  color: var(--text-muted);
+  font-size: 0.76rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.chat-reaction-chip:hover {
+  background: var(--bg-elevated);
+}
+
+.chat-reaction-chip--own {
+  border-color: var(--accent);
+  background: rgba(79, 140, 255, 0.2);
+  color: var(--text);
+}
+
+.chat-reaction-popover {
+  position: absolute;
+  z-index: 30;
+  display: flex;
+  gap: 4px;
+  padding: 6px;
+  background: var(--bg-elevated-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  max-width: calc(100% - 8px);
+}
+
+.chat-reaction-popover-emoji {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  cursor: pointer;
+  font-size: 1.05rem;
+  padding: 0;
+}
+
+.chat-reaction-popover-emoji:hover {
+  background: var(--bg-elevated);
 }
 
 .chat-error-banner {
@@ -969,6 +1197,55 @@ body {
 
   .chat-input-row {
     padding-bottom: calc(var(--space-3) + env(safe-area-inset-bottom));
+  }
+
+  /* На тач-устройствах ховера нет — кнопки «ответить»/«реакция» держим
+     постоянно видимыми (спец. требование мобильного UX) и увеличиваем тач-цель.
+     В обычном потоке (не absolute), прижаты вправо через align-self — иначе
+     постоянно видимые кнопки накрывали бы собой строку имя/время. */
+  .chat-message-actions {
+    position: static;
+    align-self: flex-end;
+    opacity: 1;
+    pointer-events: auto;
+    margin-bottom: 2px;
+  }
+
+  .chat-message-action {
+    width: 32px;
+    height: 32px;
+  }
+
+  .chat-message-action .icon {
+    width: 18px;
+    height: 18px;
+  }
+
+  .chat-reaction-popover {
+    max-width: calc(100vw - var(--space-4));
+  }
+}
+
+/* Тач-устройства без ховера (в т.ч. десктопные вьюпорты через touch-эмуляцию)
+   — кнопки действий сообщения всегда видимы, а не только по ховеру, и живут
+   в обычном потоке (см. комментарий в блоке max-width:640px выше). */
+@media (hover: none) {
+  .chat-message-actions {
+    position: static;
+    align-self: flex-end;
+    opacity: 1;
+    pointer-events: auto;
+    margin-bottom: 2px;
+  }
+
+  .chat-message-action {
+    width: 32px;
+    height: 32px;
+  }
+
+  .chat-message-action .icon {
+    width: 18px;
+    height: 18px;
   }
 }
 
