@@ -45,6 +45,7 @@ import {
   openChatPanel,
   sendChatMessage,
   messageTextsInclude,
+  getChatDom,
 } from './helpers.mjs';
 
 const PORT = 3322;
@@ -386,6 +387,20 @@ async function main() {
             () => document.getElementById('mic-button')?.getAttribute('aria-pressed') === 'true',
             undefined,
             { polling: 100, timeout: 5000 }
+          );
+
+          // Открытый чат на мобильном — полноэкранный вид (не боковая
+          // панель/bottom-sheet как на десктопе): проверяем, что панель чата
+          // покрывает почти весь вьюпорт.
+          await openChatPanel(mobilePage);
+          const chat = await getChatDom(mobilePage);
+          const chatBox = await chat.panel.boundingBox();
+          assert.ok(chatBox, 'панель чата должна быть видима после открытия');
+          const viewportArea = 390 * 844;
+          const chatArea = chatBox.width * chatBox.height;
+          assert.ok(
+            chatArea >= viewportArea * 0.95,
+            `открытый чат на мобильном должен покрывать почти весь экран (>=95%): ${JSON.stringify(chatBox)}`
           );
         } finally {
           await mobileContext.close();

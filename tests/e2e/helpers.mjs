@@ -415,7 +415,7 @@ export async function assertVideoPlaying(
 
 export async function getChatDom(page) {
   return {
-    toggleButton: page.locator('.chat-toggle-button'),
+    toggleButton: page.locator('#chat-button'),
     unreadBadge: page.locator('.chat-unread-badge'),
     panel: page.locator('.chat-panel'),
     messages: page.locator('.chat-message-text'),
@@ -426,8 +426,9 @@ export async function getChatDom(page) {
 }
 
 // Идемпотентно: если панель уже открыта — просто убеждаемся, что она видима.
-// Кнопка-тогглер при открытой панели скрыта (chat.js: setCollapsed(false)
-// прячет toggleButton), клик по ней в этом состоянии вечно бы ждал видимости.
+// Кнопка-тогглер (#chat-button в пилюле управления) всегда на месте и видима
+// — в отличие от старой плавающей кнопки, теперь она не прячется, пока чат
+// открыт, а просто переключает open/closed (см. chat.js: toggleButton click).
 export async function openChatPanel(page) {
   const chat = await getChatDom(page);
   const alreadyOpen = await chat.panel.evaluate((el) => !el.classList.contains('hidden'));

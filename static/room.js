@@ -30,6 +30,7 @@ const micButton = document.getElementById('mic-button');
 const cameraButton = document.getElementById('camera-button');
 const screenButton = document.getElementById('screen-button');
 const shareButton = document.getElementById('share-button');
+const chatButton = document.getElementById('chat-button');
 const leaveButton = document.getElementById('leave-button');
 const sharePopupEl = document.getElementById('share-popup');
 const sharePopupBackdropEl = document.getElementById('share-popup-backdrop');
@@ -588,7 +589,7 @@ function registerSignalingHandlers(iceServers) {
     updateScreenButtonState();
     updateParticipantCount();
 
-    chat = ChatPanel.create({ signaling, peerId, variant: 'room' });
+    chat = ChatPanel.create({ signaling, peerId, variant: 'room', toggleButton: chatButton });
   });
 
   signaling.on('room-not-found', () => {

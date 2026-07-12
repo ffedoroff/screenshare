@@ -9,6 +9,11 @@
 // Панель — синглтон на страницу: DOM создаётся один раз при первом вызове
 // ChatPanel.create(), повторные вызовы переиспользуют ту же разметку, но
 // сбрасывают историю и перевешивают обработчики на новый Signaling.
+//
+// Кнопка-тогл (открыть/закрыть чат, значок непрочитанных) — часть разметки
+// пилюли управления (#chat-button в room.html), а не создаётся здесь: её
+// элемент передаётся в ChatPanel.create({ toggleButton }) вызывающей
+// стороной. Сама панель (.chat-panel) по-прежнему создаётся и живёт в body.
 
 'use strict';
 
@@ -53,18 +58,7 @@ const ChatPanel = (() => {
   // подключениями, см. attach()).
   let singleton = null;
 
-  function buildDom(variant) {
-    const toggleButton = document.createElement('button');
-    toggleButton.type = 'button';
-    toggleButton.className = 'chat-toggle-button hidden';
-    toggleButton.setAttribute('aria-label', 'Открыть чат');
-    toggleButton.title = 'Чат';
-    toggleButton.innerHTML =
-      '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
-      '<path d="M4 4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h2v4l5-4h9a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2H4z"></path>' +
-      '</svg>' +
-      '<span class="chat-unread-badge hidden"></span>';
-
+  function buildDom(variant, toggleButton) {
     const panel = document.createElement('div');
     panel.className = `chat-panel chat-panel--${variant} hidden`;
     panel.innerHTML = `
@@ -92,7 +86,6 @@ const ChatPanel = (() => {
     `;
 
     document.body.appendChild(panel);
-    document.body.appendChild(toggleButton);
 
     return {
       toggleButton,
@@ -107,9 +100,9 @@ const ChatPanel = (() => {
     };
   }
 
-  function create({ signaling, peerId, variant }) {
+  function create({ signaling, peerId, variant, toggleButton }) {
     if (!singleton) {
-      const dom = buildDom(variant);
+      const dom = buildDom(variant, toggleButton);
       singleton = createController(dom);
     }
     singleton.attach(signaling, peerId);
@@ -183,7 +176,8 @@ const ChatPanel = (() => {
 
     function setCollapsed(collapsed) {
       panel.classList.toggle('hidden', collapsed);
-      toggleButton.classList.toggle('hidden', !collapsed);
+      toggleButton.classList.toggle('control-button--on', !collapsed);
+      toggleButton.setAttribute('aria-pressed', String(!collapsed));
       if (!collapsed) {
         unreadCount = 0;
         updateUnreadBadge();
@@ -231,7 +225,10 @@ const ChatPanel = (() => {
       textInput.value = '';
     }
 
-    toggleButton.addEventListener('click', () => setCollapsed(false));
+    toggleButton.addEventListener('click', () => {
+      const isOpen = !panel.classList.contains('hidden');
+      setCollapsed(isOpen);
+    });
     collapseButton.addEventListener('click', () => setCollapsed(true));
 
     sendButton.addEventListener('click', sendCurrentText);

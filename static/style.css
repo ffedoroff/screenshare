@@ -478,6 +478,7 @@ body {
 }
 
 .control-button {
+  position: relative;
   flex-shrink: 0;
   display: flex;
   align-items: center;
@@ -662,34 +663,10 @@ body {
   background: var(--accent-hover);
 }
 
-/* ---------- Чат ---------- */
-
-.chat-toggle-button {
-  position: fixed;
-  bottom: var(--space-4);
-  right: var(--space-4);
-  z-index: 30;
-  width: 52px;
-  height: 52px;
-  border-radius: 50%;
-  border: none;
-  background: var(--accent);
-  color: #fff;
-  cursor: pointer;
-  box-shadow: var(--shadow);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.chat-toggle-button .icon {
-  width: 24px;
-  height: 24px;
-}
-
-.chat-toggle-button:hover {
-  background: var(--accent-hover);
-}
+/* ---------- Чат ----------
+   Кнопка-тогл — обычная .control-button в пилюле управления (#chat-button в
+   room.html), значок непрочитанных — .chat-unread-badge поверх её правого
+   верхнего угла (см. position: relative на .control-button выше). */
 
 .chat-unread-badge {
   position: absolute;
@@ -954,18 +931,44 @@ body {
     height: 22px;
   }
 
-  /* Bottom-sheet чата не должен перекрывать панель управления снизу —
-     поднимаем его над панелью, а не поверх неё, чтобы оба были доступны. */
+  /* Открытый чат на телефоне — не bottom-sheet поверх комнаты, а отдельный
+     полноэкранный вид (своя шапка, список сообщений на всю высоту, инпут
+     снизу с safe-area). 100dvh, а не vh — vh не учитывает наезд/уход
+     мобильной клавиатуры и адресной строки браузера, из-за vh экран «прыгал»
+     бы при открытии клавиатуры для ввода сообщения. Панель управления при
+     этом ничего специально прятать не нужно: чат перекрывает весь вьюпорт
+     (inset: 0) и по z-index выше (.chat-panel: 25 > .control-panel: 20). */
   .chat-panel {
-    bottom: calc(84px + env(safe-area-inset-bottom));
-    height: 60vh;
-    height: 60dvh;
-    max-height: calc(100vh - 84px - env(safe-area-inset-bottom));
-    max-height: calc(100dvh - 84px - env(safe-area-inset-bottom));
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    width: 100%;
+    max-width: 100%;
+    height: 100vh;
+    height: 100dvh;
+    max-height: none;
+    border-radius: 0;
   }
 
-  .chat-toggle-button {
-    bottom: calc(84px + env(safe-area-inset-bottom));
+  .chat-header {
+    padding-top: calc(var(--space-3) + env(safe-area-inset-top));
+  }
+
+  /* Крестик закрытия — крупная тач-цель на весь экран, а не мелкая иконка
+     сворачивания боковой панели. */
+  .chat-collapse-button {
+    width: 44px;
+    height: 44px;
+  }
+
+  .chat-collapse-button .icon {
+    width: 22px;
+    height: 22px;
+  }
+
+  .chat-input-row {
+    padding-bottom: calc(var(--space-3) + env(safe-area-inset-bottom));
   }
 }
 
