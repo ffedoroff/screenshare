@@ -24,6 +24,8 @@ const screenVideoEl = document.getElementById('screen-video');
 const screenCaptionEl = document.getElementById('screen-caption');
 const tilesGridEl = document.getElementById('tiles-grid');
 const roomMessageEl = document.getElementById('room-message');
+const inviteCtaEl = document.getElementById('invite-cta');
+const inviteCtaButtonEl = document.getElementById('invite-cta-button');
 const micButton = document.getElementById('mic-button');
 const cameraButton = document.getElementById('camera-button');
 const screenButton = document.getElementById('screen-button');
@@ -151,6 +153,21 @@ function safePlay(el) {
 
 // ---------- Тайлы участников ----------
 
+/**
+ * Детерминированный оттенок из peerId — чтобы заглушки без камеры отличались
+ * друг от друга живым цветом, а не были одинаковыми синими кругами. Тот же
+ * peerId всегда даёт тот же градиент (в т.ч. между перезаходами), т.к. хэш
+ * чисто строковый, без случайности.
+ */
+function hueFromPeerId(peerId) {
+  let hash = 0;
+  const str = String(peerId || '');
+  for (let i = 0; i < str.length; i++) {
+    hash = (hash * 31 + str.charCodeAt(i)) | 0;
+  }
+  return Math.abs(hash) % 360;
+}
+
 function createTile(peerId, name, isOwn) {
   const tile = document.createElement('div');
   tile.className = 'tile' + (isOwn ? ' tile--own' : '');
@@ -168,6 +185,8 @@ function createTile(peerId, name, isOwn) {
 
   const placeholder = document.createElement('div');
   placeholder.className = 'tile-placeholder';
+  const hue = hueFromPeerId(peerId);
+  placeholder.style.background = `linear-gradient(135deg, hsl(${hue}, 70%, 45%), hsl(${(hue + 45) % 360}, 70%, 32%))`;
   const letter = document.createElement('span');
   letter.className = 'tile-placeholder-letter';
   const trimmedName = (name || '').trim();
@@ -194,6 +213,18 @@ function createTile(peerId, name, isOwn) {
 function updateParticipantCount() {
   const total = 1 + peers.size;
   participantCountEl.textContent = `Участников: ${total} / 6`;
+  updateSoloState();
+}
+
+/**
+ * Комната из одного человека (только свой тайл, экран никто не шарит) —
+ * собственный тайл крупнее и по центру, под ним — ненавязчивый призыв
+ * позвать кого-то (см. .tiles-grid--solo/.invite-cta в style.css).
+ */
+function updateSoloState() {
+  const solo = peers.size === 0 && screenStageEl.classList.contains('hidden');
+  tilesGridEl.classList.toggle('tiles-grid--solo', solo);
+  inviteCtaEl.classList.toggle('hidden', !solo);
 }
 
 function setTileSpeaking(peerId, speaking) {
@@ -234,6 +265,7 @@ function updateScreenButtonState() {
 function showScreenStageContainer() {
   screenStageEl.classList.remove('hidden');
   tilesGridEl.classList.add('tiles-grid--compact');
+  updateSoloState();
 }
 
 function hideScreenStage() {
@@ -241,6 +273,7 @@ function hideScreenStage() {
   tilesGridEl.classList.remove('tiles-grid--compact');
   screenVideoEl.srcObject = null;
   screenCaptionEl.textContent = '';
+  updateSoloState();
 }
 
 function showLocalScreenPreview() {
@@ -855,6 +888,7 @@ function closeSharePopup() {
 }
 
 shareButton.addEventListener('click', openSharePopup);
+inviteCtaButtonEl.addEventListener('click', openSharePopup);
 sharePopupCloseEl.addEventListener('click', closeSharePopup);
 sharePopupBackdropEl.addEventListener('click', closeSharePopup);
 

@@ -58,8 +58,12 @@ const ChatPanel = (() => {
     toggleButton.type = 'button';
     toggleButton.className = 'chat-toggle-button hidden';
     toggleButton.setAttribute('aria-label', 'Открыть чат');
+    toggleButton.title = 'Чат';
     toggleButton.innerHTML =
-      '💬<span class="chat-unread-badge hidden"></span>';
+      '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+      '<path d="M4 4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h2v4l5-4h9a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2H4z"></path>' +
+      '</svg>' +
+      '<span class="chat-unread-badge hidden"></span>';
 
     const panel = document.createElement('div');
     panel.className = `chat-panel chat-panel--${variant} hidden`;
@@ -67,13 +71,23 @@ const ChatPanel = (() => {
       <div class="chat-header">
         <span class="chat-title">Чат</span>
         <input type="text" class="chat-name-input" placeholder="Ваше имя" maxlength="40" />
-        <button type="button" class="chat-collapse-button" aria-label="Свернуть чат">✕</button>
+        <button type="button" class="chat-collapse-button" aria-label="Свернуть чат" title="Свернуть чат">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <line x1="5" y1="5" x2="19" y2="19"></line>
+            <line x1="19" y1="5" x2="5" y2="19"></line>
+          </svg>
+        </button>
       </div>
       <div class="chat-messages"></div>
       <div class="chat-error-banner hidden"></div>
       <div class="chat-input-row">
         <textarea class="chat-text-input" rows="1" placeholder="Сообщение…" maxlength="2000"></textarea>
-        <button type="button" class="chat-send-button">Отправить</button>
+        <button type="button" class="chat-send-button" aria-label="Отправить" title="Отправить">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <line x1="22" y1="2" x2="11" y2="13"></line>
+            <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+          </svg>
+        </button>
       </div>
     `;
 

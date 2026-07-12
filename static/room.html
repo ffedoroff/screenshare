@@ -4,9 +4,9 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>Комната — созвон</title>
-  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/style.css?v=3" />
 </head>
-<body>
+<body class="page-room">
   <div class="room-page">
     <!-- Оверлей текущего состояния: подключение / комната не найдена / заполнена / обрыв связи. -->
     <div id="overlay" class="overlay">
@@ -17,7 +17,9 @@
     </div>
 
     <div class="room-top-bar">
+      <span class="room-logo">Созвон</span>
       <span id="participant-count" class="participant-count">Участников: 1 / 6</span>
+      <span class="room-top-bar-spacer" aria-hidden="true"></span>
     </div>
 
     <div class="room-stage">
@@ -29,30 +31,83 @@
 
       <!-- Сетка тайлов участников (свой тайл — первым). -->
       <div id="tiles-grid" class="tiles-grid"></div>
+
+      <!-- Пустая комната (только свой тайл) — ненавязчивый призыв позвать людей. -->
+      <div id="invite-cta" class="invite-cta hidden">
+        <p>Пригласите участников, чтобы начать разговор</p>
+        <button id="invite-cta-button" class="invite-cta-button" type="button">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="12" r="2.5"></circle><circle cx="18" cy="6" r="2.5"></circle><circle cx="18" cy="18" r="2.5"></circle><line x1="8.2" y1="10.8" x2="15.8" y2="7.2"></line><line x1="8.2" y1="13.2" x2="15.8" y2="16.8"></line></svg>
+          Поделиться ссылкой
+        </button>
+      </div>
     </div>
 
     <!-- Ненавязчивые сообщения (отказ доступа к устройству, экран занят и т.п.). -->
     <div id="room-message" class="room-message hidden"></div>
 
     <div class="control-panel">
-      <button id="mic-button" class="control-button" type="button" aria-pressed="false" aria-label="Микрофон">
-        <span class="control-button-icon" aria-hidden="true">🎤</span><span class="control-button-label">Микрофон</span>
+      <button id="mic-button" class="control-button" type="button" aria-pressed="false" aria-label="Микрофон" title="Микрофон">
+        <span class="control-button-icon" aria-hidden="true">
+          <svg class="icon icon-on" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="9" y="2" width="6" height="11" rx="3"></rect>
+            <path d="M5 10a7 7 0 0 0 14 0"></path>
+            <line x1="12" y1="19" x2="12" y2="22"></line>
+            <line x1="8" y1="22" x2="16" y2="22"></line>
+          </svg>
+          <svg class="icon icon-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="9" y="2" width="6" height="11" rx="3"></rect>
+            <path d="M5 10a7 7 0 0 0 14 0"></path>
+            <line x1="12" y1="19" x2="12" y2="22"></line>
+            <line x1="8" y1="22" x2="16" y2="22"></line>
+            <line x1="3" y1="3" x2="21" y2="21"></line>
+          </svg>
+        </span>
       </button>
-      <button id="camera-button" class="control-button" type="button" aria-pressed="false" aria-label="Камера">
-        <span class="control-button-icon" aria-hidden="true">📷</span><span class="control-button-label">Камера</span>
+      <button id="camera-button" class="control-button" type="button" aria-pressed="false" aria-label="Камера" title="Камера">
+        <span class="control-button-icon" aria-hidden="true">
+          <svg class="icon icon-on" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="2" y="6" width="14" height="12" rx="2.5"></rect>
+            <path d="M16 10.5l6-4v11l-6-4z"></path>
+          </svg>
+          <svg class="icon icon-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="2" y="6" width="14" height="12" rx="2.5"></rect>
+            <path d="M16 10.5l6-4v11l-6-4z"></path>
+            <line x1="1" y1="1" x2="23" y2="23"></line>
+          </svg>
+        </span>
       </button>
       <!-- Кнопка «Экран» прячется скриптом (room.js), если у браузера нет
            navigator.mediaDevices.getDisplayMedia — так на мобильных
            (Android Chrome, iOS Safari), где веб-API захвата экрана не
            реализовано в принципе. -->
-      <button id="screen-button" class="control-button" type="button" aria-pressed="false" aria-label="Экран">
-        <span class="control-button-icon" aria-hidden="true">🖥️</span><span class="control-button-label">Экран</span>
+      <button id="screen-button" class="control-button" type="button" aria-pressed="false" aria-label="Экран" title="Показать экран">
+        <span class="control-button-icon" aria-hidden="true">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="4" width="18" height="12" rx="2"></rect>
+            <line x1="8" y1="20" x2="16" y2="20"></line>
+            <line x1="12" y1="16" x2="12" y2="20"></line>
+          </svg>
+        </span>
       </button>
-      <button id="share-button" class="control-button" type="button" aria-label="Поделиться ссылкой на комнату">
-        <span class="control-button-icon" aria-hidden="true">🔗</span><span class="control-button-label">Поделиться</span>
+      <button id="share-button" class="control-button" type="button" aria-label="Поделиться ссылкой на комнату" title="Поделиться ссылкой">
+        <span class="control-button-icon" aria-hidden="true">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="6" cy="12" r="2.5"></circle>
+            <circle cx="18" cy="6" r="2.5"></circle>
+            <circle cx="18" cy="18" r="2.5"></circle>
+            <line x1="8.2" y1="10.8" x2="15.8" y2="7.2"></line>
+            <line x1="8.2" y1="13.2" x2="15.8" y2="16.8"></line>
+          </svg>
+        </span>
       </button>
-      <button id="leave-button" class="control-button control-button--danger" type="button" aria-label="Покинуть комнату">
-        <span class="control-button-icon" aria-hidden="true">🚪</span><span class="control-button-label">Покинуть</span>
+      <button id="leave-button" class="control-button control-button--danger" type="button" aria-label="Покинуть комнату" title="Покинуть комнату">
+        <span class="control-button-icon" aria-hidden="true">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M9 4H5a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1h4"></path>
+            <polyline points="14 15 19 12 14 9"></polyline>
+            <line x1="19" y1="12" x2="7" y2="12"></line>
+          </svg>
+        </span>
       </button>
     </div>
 
@@ -60,7 +115,12 @@
     <div id="share-popup" class="share-popup hidden" role="dialog" aria-modal="true" aria-labelledby="share-popup-title">
       <div id="share-popup-backdrop" class="share-popup-backdrop"></div>
       <div class="share-popup-card">
-        <button id="share-popup-close" class="share-popup-close" type="button" aria-label="Закрыть">✕</button>
+        <button id="share-popup-close" class="share-popup-close" type="button" aria-label="Закрыть" title="Закрыть">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="5" y1="5" x2="19" y2="19"></line>
+            <line x1="19" y1="5" x2="5" y2="19"></line>
+          </svg>
+        </button>
         <h2 id="share-popup-title">Поделиться комнатой</h2>
         <img id="share-popup-qr" class="share-popup-qr" src="" alt="QR-код со ссылкой на комнату" width="280" height="280" />
         <div id="share-popup-link" class="share-popup-link"></div>
@@ -69,9 +129,9 @@
     </div>
   </div>
 
-  <script src="/static/common.js"></script>
-  <script src="/static/chat.js"></script>
-  <script src="/static/rtc.js"></script>
-  <script src="/static/room.js"></script>
+  <script src="/static/common.js?v=3"></script>
+  <script src="/static/chat.js?v=3"></script>
+  <script src="/static/rtc.js?v=3"></script>
+  <script src="/static/room.js?v=3"></script>
 </body>
 </html>
