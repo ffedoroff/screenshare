@@ -691,7 +691,7 @@ body {
   top: var(--space-4);
   right: var(--space-4);
   bottom: var(--space-4);
-  width: 320px;
+  width: 372px;
   max-width: calc(100vw - var(--space-8));
   background: var(--bg-elevated);
   border: 1px solid var(--border);
@@ -784,9 +784,18 @@ body {
 
 .chat-message-meta {
   display: flex;
+  align-items: baseline;
   gap: var(--space-2);
-  font-size: 0.72rem;
+  font-size: 0.8125rem; /* 13px */
   color: var(--text-muted);
+}
+
+/* Пометка «(изменено)» рядом со временем у отредактированных сообщений —
+   производная от messageOverlays (см. chat.js: recomputeMessageMeta),
+   не отдельное поле конверта. */
+.chat-message-meta-edited {
+  font-style: italic;
+  opacity: 0.75;
 }
 
 .chat-message-text {
@@ -794,10 +803,22 @@ body {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: var(--space-2) var(--space-3);
-  font-size: 0.88rem;
+  font-size: 0.9375rem; /* 15px */
+  line-height: 1.45;
   overflow-wrap: break-word;
   white-space: pre-wrap;
   transition: box-shadow 0.2s ease;
+}
+
+/* Тумбстоун удалённого сообщения (kind='delete', см. chat.js) — тот же
+   пузырь-контейнер, но приглушённый курсив вместо текста/markdown. */
+.chat-message-text--deleted {
+  font-style: italic;
+  color: var(--text-muted);
+}
+
+.chat-message--own .chat-message-text--deleted {
+  color: rgba(255, 255, 255, 0.75);
 }
 
 .chat-message-text strong {
@@ -869,8 +890,8 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 24px;
-  height: 24px;
+  width: 32px;
+  height: 32px;
   border: 1px solid var(--border);
   border-radius: 50%;
   background: var(--bg-elevated-2);
@@ -878,18 +899,32 @@ body {
   cursor: pointer;
   padding: 0;
   font-size: 0.8rem;
+  font-weight: 700;
   line-height: 1;
   box-shadow: var(--shadow);
 }
 
 .chat-message-action .icon {
-  width: 14px;
-  height: 14px;
+  width: 18px;
+  height: 18px;
 }
 
 .chat-message-action:hover {
   color: var(--text);
   background: var(--bg-elevated);
+}
+
+.chat-message-action--delete:hover {
+  color: var(--danger-hover);
+  border-color: var(--danger);
+}
+
+/* Состояние подтверждения удаления («✓?» на 3с, см. chat.js: buildDeleteButton) */
+.chat-message-action--confirm {
+  color: var(--danger-hover);
+  border-color: var(--danger);
+  background: rgba(229, 72, 77, 0.16);
+  font-size: 0.72rem;
 }
 
 .chat-reply-quote {
@@ -968,6 +1003,48 @@ body {
   background: var(--bg-elevated);
 }
 
+/* ---------- Редактирование (по образцу реплай-плашки выше, взаимоисключаются) ---------- */
+
+.chat-edit-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-top: 1px solid var(--border);
+  background: var(--bg-elevated-2);
+  font-size: 0.8rem;
+  flex-shrink: 0;
+}
+
+.chat-edit-bar-label {
+  flex: 1;
+  min-width: 0;
+  color: var(--accent-hover);
+  font-weight: 600;
+}
+
+.chat-edit-bar-close {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 1rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+}
+
+.chat-edit-bar-close:hover {
+  color: var(--text);
+  background: var(--bg-elevated);
+}
+
 /* ---------- Реакции ---------- */
 
 .chat-message-reactions {
@@ -980,14 +1057,14 @@ body {
 .chat-reaction-chip {
   display: inline-flex;
   align-items: center;
-  gap: 3px;
-  height: 22px;
+  gap: 4px;
+  height: 28px;
   padding: 0 var(--space-2);
   border-radius: 999px;
   border: 1px solid var(--border);
   background: var(--bg-elevated-2);
   color: var(--text-muted);
-  font-size: 0.76rem;
+  font-size: 1rem;
   line-height: 1;
   cursor: pointer;
 }
@@ -1019,13 +1096,13 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 32px;
-  height: 32px;
+  width: 40px;
+  height: 40px;
   border: none;
   border-radius: 8px;
   background: transparent;
   cursor: pointer;
-  font-size: 1.05rem;
+  font-size: 1.375rem; /* ~22px */
   padding: 0;
 }
 
@@ -1055,16 +1132,16 @@ body {
   flex: 1;
   min-width: 0;
   resize: none;
-  min-height: 38px;
-  max-height: 100px;
-  padding: var(--space-2);
+  min-height: 44px;
+  max-height: 120px;
+  padding: var(--space-2) var(--space-3);
   border-radius: var(--radius);
   border: 1px solid var(--border);
   background: var(--bg);
   color: var(--text);
   font-family: inherit;
-  font-size: 0.88rem;
-  line-height: 1.4;
+  font-size: 0.9375rem; /* 15px */
+  line-height: 1.45;
 }
 
 .chat-text-input:disabled {
@@ -1077,8 +1154,8 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 38px;
-  height: 38px;
+  width: 44px;
+  height: 44px;
   border: none;
   border-radius: 50%;
   background: var(--accent);
@@ -1089,8 +1166,8 @@ body {
 }
 
 .chat-send-button .icon {
-  width: 18px;
-  height: 18px;
+  width: 20px;
+  height: 20px;
 }
 
 .chat-send-button:hover {
@@ -1109,8 +1186,8 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 38px;
-  height: 38px;
+  width: 44px;
+  height: 44px;
   border: 1px solid var(--border);
   border-radius: 50%;
   background: var(--bg-elevated-2);
@@ -1120,8 +1197,8 @@ body {
 }
 
 .chat-attach-button .icon {
-  width: 18px;
-  height: 18px;
+  width: 20px;
+  height: 20px;
 }
 
 .chat-attach-button:hover {
@@ -1368,10 +1445,28 @@ body {
     padding-bottom: calc(var(--space-3) + env(safe-area-inset-bottom));
   }
 
-  /* На тач-устройствах ховера нет — кнопки «ответить»/«реакция» держим
-     постоянно видимыми (спец. требование мобильного UX) и увеличиваем тач-цель.
-     В обычном потоке (не absolute), прижаты вправо через align-self — иначе
-     постоянно видимые кнопки накрывали бы собой строку имя/время. */
+  /* Мобайл: текст сообщений 16px (заодно не даёт iOS зумить страницу при
+     фокусе — тот же порог применяем к textarea ниже), инпут и кнопки крупнее. */
+  .chat-message-text {
+    font-size: 1rem;
+  }
+
+  .chat-text-input {
+    min-height: 48px;
+    font-size: 1rem;
+  }
+
+  .chat-send-button,
+  .chat-attach-button {
+    width: 48px;
+    height: 48px;
+  }
+
+  /* На тач-устройствах ховера нет — кнопки «ответить»/«реакция»/«редактировать»/
+     «удалить» держим постоянно видимыми (спец. требование мобильного UX) и
+     увеличиваем тач-цель. В обычном потоке (не absolute), прижаты вправо через
+     align-self — иначе постоянно видимые кнопки накрывали бы собой строку
+     имя/время. */
   .chat-message-actions {
     position: static;
     align-self: flex-end;
@@ -1381,13 +1476,13 @@ body {
   }
 
   .chat-message-action {
-    width: 32px;
-    height: 32px;
+    width: 36px;
+    height: 36px;
   }
 
   .chat-message-action .icon {
-    width: 18px;
-    height: 18px;
+    width: 20px;
+    height: 20px;
   }
 
   .chat-reaction-popover {
@@ -1408,13 +1503,13 @@ body {
   }
 
   .chat-message-action {
-    width: 32px;
-    height: 32px;
+    width: 36px;
+    height: 36px;
   }
 
   .chat-message-action .icon {
-    width: 18px;
-    height: 18px;
+    width: 20px;
+    height: 20px;
   }
 }
 

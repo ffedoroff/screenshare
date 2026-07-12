@@ -540,6 +540,27 @@ export async function messageTextsInclude(page, text, timeoutMs = 5000) {
   return false;
 }
 
+/**
+ * Отправить текстовое сообщение и вернуть его сгенерированный id (см.
+ * chat.js: dataset.msgId на .chat-message) — нужно, когда дальше по тесту
+ * сообщение будут редактировать/удалять и его ТЕКСТ перестанет быть
+ * стабильным якорем для поиска элемента (в отличие от id, который не
+ * меняется). Id общий для всех участников (один и тот же конверт), поэтому
+ * им же можно искать `.chat-message[data-msg-id="..."]` и на других страницах.
+ */
+export async function sendChatMessageAndGetId(page, text) {
+  await sendChatMessage(page, text);
+  const id = await page.evaluate((t) => {
+    const items = Array.from(document.querySelectorAll('.chat-message--own'));
+    for (let i = items.length - 1; i >= 0; i--) {
+      const textEl = items[i].querySelector('.chat-message-text');
+      if (textEl && textEl.textContent === t) return items[i].dataset.msgId;
+    }
+    return null;
+  }, text);
+  return id;
+}
+
 // --- Передача файлов (Ф3): генерация тестовых файлов и хелпер вброса ---
 //
 // PNG собирается вручную (сигнатура + IHDR + один IDAT со случайными

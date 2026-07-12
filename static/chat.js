@@ -36,6 +36,29 @@
 // порядке (lamport, from), поэтому результат не зависит от порядка доставки
 // по сети (см. recomputeReactions).
 //
+// Редактирование и удаление — тем же приёмом (производное состояние,
+// пересчитываемое из буфера), тот же общий буфер истории/транспорт:
+//   { v: 1, id, lamport, from, name, kind: 'edit', target, text, ts }
+//   { v: 1, id, lamport, from, name, kind: 'delete', target, ts }
+// `target` — id сообщения (text или file-offer), которое правят/удаляют.
+// Конверт применяется, ТОЛЬКО ЕСЛИ envelope.from совпадает с `from`
+// оригинального сообщения (иначе молча игнорируется — см.
+// recomputeMessageMeta); оригинал ищется в том же буфере `messages`, поэтому
+// если он уже вытеснен из HISTORY_CAP, авторство проверить нечем и правка/
+// удаление тоже игнорируются (безопасный дефолт). 'edit' применим только к
+// kind='text' (у file-offer текста нет, редактировать нечего). Несколько
+// edit-конвертов на один target — побеждает последний в порядке (lamport,
+// from), т.к. `messages` уже отсортирован этим же компаратором и пересчёт
+// просто идёт по порядку, перезаписывая предыдущее значение (тот же приём,
+// что и в recomputeReactions). 'delete' на target — финальное состояние:
+// как только валидный delete применён, ПОСЛЕДУЮЩИЕ (с бОльшим lamport) edit
+// на тот же target больше не применяются — удаление их не отменяет.
+// edit/delete-конверты хранятся в общем буфере 50 наравне с text/reaction/
+// file-offer и точно так же уезжают опоздавшим в history-response —
+// опоздавший пересчитывает то же самое messageOverlays по всему реплею и
+// поэтому сразу видит финальное состояние (отредактированный текст или
+// тумбстоун), а не оригинал.
+//
 // Передача файлов (Ф3) — строго P2P, сервер байты файла никогда не видит:
 //   { v: 1, id, lamport, from, name, kind: 'file-offer', fileId, fileName,
 //     size, mime, ts }
@@ -139,6 +162,23 @@ const ChatPanel = (() => {
   const ATTACH_ICON_SVG = `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
     <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path>
   </svg>`;
+
+  // Редактирование/удаление своих сообщений — кнопки в .chat-message-actions
+  // (см. renderMessageEl/renderFileOfferEl), тот же стиль SVG-иконок, что и
+  // REPLY_ICON_SVG выше.
+  const EDIT_ICON_SVG = `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
+    <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
+  </svg>`;
+  const DELETE_ICON_SVG = `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <polyline points="3 6 5 6 21 6"></polyline>
+    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+    <line x1="10" y1="11" x2="10" y2="17"></line>
+    <line x1="14" y1="11" x2="14" y2="17"></line>
+  </svg>`;
+  // Сколько ждём второй (подтверждающий) клик по кнопке удаления, прежде чем
+  // откатить её обратно в исходное состояние (см. buildDeleteButton).
+  const DELETE_CONFIRM_MS = 3000;
 
   // Иконки файловой карточки по категории mime — статичная разметка, не
   // зависит от пользовательских данных, безопасна для innerHTML.
@@ -359,6 +399,10 @@ const ChatPanel = (() => {
         <span class="chat-reply-bar-text"></span>
         <button type="button" class="chat-reply-bar-close" aria-label="Отменить ответ" title="Отменить ответ">×</button>
       </div>
+      <div class="chat-edit-bar hidden">
+        <span class="chat-edit-bar-label">Редактирование</span>
+        <button type="button" class="chat-edit-bar-close" aria-label="Отменить редактирование" title="Отменить редактирование">×</button>
+      </div>
       <div class="chat-input-row">
         <button type="button" class="chat-attach-button" aria-label="Прикрепить файл" title="Прикрепить файл"></button>
         <input type="file" class="chat-file-input" multiple hidden />
@@ -402,6 +446,8 @@ const ChatPanel = (() => {
       replyBar: panel.querySelector('.chat-reply-bar'),
       replyBarText: panel.querySelector('.chat-reply-bar-text'),
       replyBarClose: panel.querySelector('.chat-reply-bar-close'),
+      editBar: panel.querySelector('.chat-edit-bar'),
+      editBarClose: panel.querySelector('.chat-edit-bar-close'),
       reactionPopover,
       textInput: panel.querySelector('.chat-text-input'),
       sendButton: panel.querySelector('.chat-send-button'),
@@ -442,6 +488,8 @@ const ChatPanel = (() => {
       replyBar,
       replyBarText,
       replyBarClose,
+      editBar,
+      editBarClose,
       reactionPopover,
       textInput,
       sendButton,
@@ -470,9 +518,14 @@ const ChatPanel = (() => {
     // пересчитывается заново из `messages` (см. recomputeReactions), поэтому
     // не зависит от порядка доставки/реплея истории.
     let reactions = new Map();
+    // msgId -> { deleted: boolean, editText: string|null } — производное
+    // состояние редактирования/удаления, тоже всегда пересчитывается заново
+    // из `messages` (см. recomputeMessageMeta), см. комментарий в шапке файла.
+    let messageOverlays = new Map();
     let sendTimes = []; // клиентский rate-limit: метки времени своих отправок
     let historyResponseWaiters = new Map(); // peerId -> resolve(messages[])
     let replyTarget = null; // конверт сообщения, на которое сейчас отвечаем (или null)
+    let editTarget = null; // конверт СВОЕГО сообщения, которое сейчас редактируем (или null) — взаимоисключается с replyTarget
     let activeReactionTarget = null; // msgId, для которого сейчас открыт попап реакций (или null)
 
     // --- Состояние передачи файлов (Ф3) ---
@@ -512,6 +565,49 @@ const ChatPanel = (() => {
       return null;
     }
 
+    /** Найти ЛЮБОЕ редактируемое/удаляемое сообщение (text или file-offer) по id — для проверки авторства edit/delete. */
+    function findEditableOriginalById(id) {
+      for (const msg of messages) {
+        if ((msg.kind === 'text' || msg.kind === 'file-offer') && msg.id === id) return msg;
+      }
+      return null;
+    }
+
+    /**
+     * Пересчитать map редактирования/удаления с нуля из `messages` — тот же
+     * приём, что и recomputeReactions: буфер уже отсортирован по (lamport,
+     * from), поэтому просто идём по порядку и перезаписываем состояние
+     * последним валидным edit/delete на каждый target (см. заголовок файла).
+     * Валидация авторства — envelope.from должен совпасть с from оригинала;
+     * оригинал не найден (уже вытеснен из HISTORY_CAP) — конверт игнорируется
+     * (безопасный дефолт, см. заголовок файла). Как только на target применён
+     * delete — последующие (с бОльшим lamport) edit больше не рассматриваются:
+     * удаление финально и не отменяется правками.
+     */
+    function recomputeMessageMeta() {
+      const next = new Map();
+      for (const msg of messages) {
+        if (msg.kind !== 'edit' && msg.kind !== 'delete') continue;
+        if (!msg.target || !msg.from) continue;
+        const original = findEditableOriginalById(msg.target);
+        if (!original || original.from !== msg.from) continue; // не автор оригинала (или оригинал уже недоступен) — игнор
+        let overlay = next.get(msg.target);
+        if (!overlay) {
+          overlay = { deleted: false, editText: null };
+          next.set(msg.target, overlay);
+        }
+        if (overlay.deleted) continue; // удаление уже применено — последующие правки его не отменяют
+        if (msg.kind === 'delete') {
+          overlay.deleted = true;
+          overlay.editText = null;
+        } else if (original.kind === 'text' && typeof msg.text === 'string') {
+          // 'edit' применим только к тексту — у file-offer текста нет.
+          overlay.editText = msg.text;
+        }
+      }
+      messageOverlays = next;
+    }
+
     /** Пересчитать map реакций с нуля из `messages`, применяя op'ы в порядке (lamport, from) — буфер уже так отсортирован. */
     function recomputeReactions() {
       const next = new Map();
@@ -543,12 +639,18 @@ const ChatPanel = (() => {
         quote.textContent = 'сообщение недоступно';
         return quote;
       }
+      const overlay = messageOverlays.get(targetId);
       const nameEl = document.createElement('span');
       nameEl.className = 'chat-reply-quote-name';
       nameEl.textContent = displayName(original);
       const textEl = document.createElement('span');
       textEl.className = 'chat-reply-quote-text';
-      textEl.textContent = truncateText(original.text, REPLY_PREVIEW_MAX_LEN);
+      if (overlay && overlay.deleted) {
+        textEl.textContent = 'Сообщение удалено';
+      } else {
+        const bodyText = overlay && typeof overlay.editText === 'string' ? overlay.editText : original.text;
+        textEl.textContent = truncateText(bodyText, REPLY_PREVIEW_MAX_LEN);
+      }
       quote.appendChild(nameEl);
       quote.appendChild(textEl);
       quote.addEventListener('click', () => scrollToMessageAndHighlight(targetId));
@@ -588,7 +690,8 @@ const ChatPanel = (() => {
       }
     }
 
-    function buildMetaEl(msg) {
+    /** `overlay` — messageOverlays.get(msg.id), передаётся вызывающей стороной, чтобы не пересчитывать/переискать здесь. */
+    function buildMetaEl(msg, overlay) {
       const meta = document.createElement('div');
       meta.className = 'chat-message-meta';
       const nameSpan = document.createElement('span');
@@ -597,39 +700,57 @@ const ChatPanel = (() => {
       timeSpan.textContent = formatTime(msg.ts || Date.now());
       meta.appendChild(nameSpan);
       meta.appendChild(timeSpan);
+      if (overlay && !overlay.deleted && typeof overlay.editText === 'string') {
+        const editedSpan = document.createElement('span');
+        editedSpan.className = 'chat-message-meta-edited';
+        editedSpan.textContent = '(изменено)';
+        meta.appendChild(editedSpan);
+      }
       return meta;
     }
 
     function renderMessageEl(msg) {
       const own = msg.from === peerId;
+      const overlay = messageOverlays.get(msg.id);
+      const isDeleted = !!(overlay && overlay.deleted);
 
       const item = document.createElement('div');
-      item.className = 'chat-message' + (own ? ' chat-message--own' : '');
+      item.className =
+        'chat-message' + (own ? ' chat-message--own' : '') + (isDeleted ? ' chat-message--deleted' : '');
       item.dataset.msgId = msg.id;
 
-      const actions = document.createElement('div');
-      actions.className = 'chat-message-actions';
+      // Тумбстоуну действия (ответить/реакция/редактировать/удалить) не положены.
+      if (!isDeleted) {
+        const actions = document.createElement('div');
+        actions.className = 'chat-message-actions';
 
-      const replyButton = document.createElement('button');
-      replyButton.type = 'button';
-      replyButton.className = 'chat-message-action chat-message-action--reply';
-      replyButton.setAttribute('aria-label', 'Ответить');
-      replyButton.title = 'Ответить';
-      replyButton.innerHTML = REPLY_ICON_SVG; // статичная разметка, не пользовательские данные
-      replyButton.addEventListener('click', () => startReply(msg));
-      actions.appendChild(replyButton);
+        const replyButton = document.createElement('button');
+        replyButton.type = 'button';
+        replyButton.className = 'chat-message-action chat-message-action--reply';
+        replyButton.setAttribute('aria-label', 'Ответить');
+        replyButton.title = 'Ответить';
+        replyButton.innerHTML = REPLY_ICON_SVG; // статичная разметка, не пользовательские данные
+        replyButton.addEventListener('click', () => startReply(msg));
+        actions.appendChild(replyButton);
 
-      const reactButton = document.createElement('button');
-      reactButton.type = 'button';
-      reactButton.className = 'chat-message-action chat-message-action--react';
-      reactButton.setAttribute('aria-label', 'Добавить реакцию');
-      reactButton.title = 'Реакция';
-      reactButton.textContent = '☺+';
-      reactButton.addEventListener('click', () => toggleReactionPopover(reactButton, msg.id));
-      actions.appendChild(reactButton);
+        const reactButton = document.createElement('button');
+        reactButton.type = 'button';
+        reactButton.className = 'chat-message-action chat-message-action--react';
+        reactButton.setAttribute('aria-label', 'Добавить реакцию');
+        reactButton.title = 'Реакция';
+        reactButton.textContent = '☺+';
+        reactButton.addEventListener('click', () => toggleReactionPopover(reactButton, msg.id));
+        actions.appendChild(reactButton);
 
-      item.appendChild(actions);
-      item.appendChild(buildMetaEl(msg));
+        if (own) {
+          actions.appendChild(buildEditButton(msg));
+          actions.appendChild(buildDeleteButton(msg));
+        }
+
+        item.appendChild(actions);
+      }
+
+      item.appendChild(buildMetaEl(msg, overlay));
 
       if (msg.replyTo) {
         item.appendChild(buildReplyQuoteEl(msg.replyTo));
@@ -637,13 +758,76 @@ const ChatPanel = (() => {
 
       const text = document.createElement('div');
       text.className = 'chat-message-text';
-      renderMessageBody(text, msg.text);
+      if (isDeleted) {
+        text.classList.add('chat-message-text--deleted');
+        text.textContent = 'Сообщение удалено';
+      } else {
+        const bodyText = overlay && typeof overlay.editText === 'string' ? overlay.editText : msg.text;
+        renderMessageBody(text, bodyText);
+      }
       item.appendChild(text);
 
-      const reactionsRow = buildReactionsRowEl(msg.id);
-      if (reactionsRow) item.appendChild(reactionsRow);
+      if (!isDeleted) {
+        const reactionsRow = buildReactionsRowEl(msg.id);
+        if (reactionsRow) item.appendChild(reactionsRow);
+      }
 
       messagesEl.appendChild(item);
+    }
+
+    /** Карандаш — только на СВОИХ text-сообщениях (см. renderMessageEl); file-offer редактировать нельзя. */
+    function buildEditButton(msg) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'chat-message-action chat-message-action--edit';
+      btn.setAttribute('aria-label', 'Редактировать');
+      btn.title = 'Редактировать';
+      btn.innerHTML = EDIT_ICON_SVG; // статичная разметка, не пользовательские данные
+      btn.addEventListener('click', () => startEdit(msg));
+      return btn;
+    }
+
+    /**
+     * Корзина — на СВОИХ text- и file-offer-сообщениях. Первый клик переводит
+     * кнопку в состояние подтверждения («✓?») на DELETE_CONFIRM_MS; второй
+     * клик в этом окне шлёт delete; таймаут без второго клика — откат в
+     * исходную иконку без отправки чего-либо.
+     */
+    function buildDeleteButton(msg) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'chat-message-action chat-message-action--delete';
+      btn.setAttribute('aria-label', 'Удалить');
+      btn.title = 'Удалить';
+      btn.innerHTML = DELETE_ICON_SVG; // статичная разметка, не пользовательские данные
+      let confirmTimer = null;
+
+      function resetToIdle() {
+        if (confirmTimer) {
+          clearTimeout(confirmTimer);
+          confirmTimer = null;
+        }
+        btn.classList.remove('chat-message-action--confirm');
+        btn.innerHTML = DELETE_ICON_SVG;
+        btn.setAttribute('aria-label', 'Удалить');
+        btn.title = 'Удалить';
+      }
+
+      btn.addEventListener('click', () => {
+        if (confirmTimer) {
+          clearTimeout(confirmTimer);
+          confirmTimer = null;
+          sendDeleteMessage(msg.id);
+          return;
+        }
+        btn.classList.add('chat-message-action--confirm');
+        btn.textContent = '✓?';
+        btn.setAttribute('aria-label', 'Подтвердите удаление');
+        btn.title = 'Нажмите ещё раз, чтобы подтвердить удаление';
+        confirmTimer = setTimeout(resetToIdle, DELETE_CONFIRM_MS);
+      });
+
+      return btn;
     }
 
     // --- Рендер карточки файла (Ф3) — kind='file-offer' ---
@@ -658,12 +842,42 @@ const ChatPanel = (() => {
     // бы дорогая полная пересборка карточки.
     function renderFileOfferEl(msg) {
       const own = msg.from === peerId;
+      const overlay = messageOverlays.get(msg.id);
+      const isDeleted = !!(overlay && overlay.deleted);
 
       const item = document.createElement('div');
-      item.className = 'chat-message chat-message--file' + (own ? ' chat-message--own' : '');
+      item.className =
+        'chat-message chat-message--file' +
+        (own ? ' chat-message--own' : '') +
+        (isDeleted ? ' chat-message--deleted' : '');
       item.dataset.msgId = msg.id;
 
-      item.appendChild(buildMetaEl(msg));
+      // Файловые офферы удалять можно (тумбстоун ниже), редактировать —
+      // нет (см. заголовок файла), поэтому в actions только корзина, и
+      // только пока не удалено.
+      if (!isDeleted && own) {
+        const actions = document.createElement('div');
+        actions.className = 'chat-message-actions';
+        actions.appendChild(buildDeleteButton(msg));
+        item.appendChild(actions);
+      }
+
+      item.appendChild(buildMetaEl(msg, overlay));
+
+      if (isDeleted) {
+        // Тумбстоун вместо карточки. ВАЖНО: удаление офера — это только
+        // сокрытие карточки в ленте, оно НЕ отзывает уже переданные/принятые
+        // копии файла — получатели, успевшие скачать (Blob/objectUrl) до
+        // удаления, сохраняют доступ к своей локальной копии; это ожидаемое
+        // поведение строго P2P-модели (сервер файл не хранит и отозвать
+        // нечего, см. заголовок файла про Ф3).
+        const text = document.createElement('div');
+        text.className = 'chat-message-text chat-message-text--deleted';
+        text.textContent = 'Сообщение удалено';
+        item.appendChild(text);
+        messagesEl.appendChild(item);
+        return;
+      }
 
       const card = document.createElement('div');
       card.className = 'chat-file-card';
@@ -877,6 +1091,7 @@ const ChatPanel = (() => {
       messages = [];
       seenIds = new Set();
       reactions = new Map();
+      messageOverlays = new Map();
       lamportClock = 0;
       sendTimes = [];
       historyResponseWaiters = new Map();
@@ -884,6 +1099,7 @@ const ChatPanel = (() => {
       fileStates = new Map();
       pendingFileRequests = new Map();
       cancelReply();
+      cancelEditAndClear();
       closeReactionPopover();
     }
 
@@ -915,6 +1131,7 @@ const ChatPanel = (() => {
 
     // --- Реплаи: компактная плашка над инпутом ---
     function startReply(msg) {
+      cancelEditAndClear(); // реплай и редактирование взаимоисключаются (см. заголовок файла)
       replyTarget = msg;
       replyBarText.textContent = `Ответ ${displayName(msg)}: ${truncateText(msg.text, REPLY_PREVIEW_MAX_LEN)}`;
       replyBar.classList.remove('hidden');
@@ -928,6 +1145,35 @@ const ChatPanel = (() => {
     }
 
     replyBarClose.addEventListener('click', cancelReply);
+
+    // --- Редактирование своего сообщения: плашка над инпутом, по образцу
+    // реплай-плашки выше, взаимоисключается с ней (см. заголовок файла). ---
+    function startEdit(msg) {
+      cancelReply();
+      editTarget = msg;
+      const overlay = messageOverlays.get(msg.id);
+      const currentText = overlay && typeof overlay.editText === 'string' ? overlay.editText : msg.text;
+      textInput.value = currentText;
+      editBar.classList.remove('hidden');
+      closeReactionPopover();
+      textInput.focus();
+      const len = textInput.value.length;
+      textInput.setSelectionRange(len, len); // курсор в конец — иначе браузер ставит его в начало при программной установке value
+    }
+
+    function cancelEdit() {
+      editTarget = null;
+      editBar.classList.add('hidden');
+    }
+
+    /** Esc/крестик — отменяет редактирование И очищает textarea (в отличие от cancelReply, который поле ввода не трогает). */
+    function cancelEditAndClear() {
+      const wasEditing = !!editTarget;
+      cancelEdit();
+      if (wasEditing) textInput.value = '';
+    }
+
+    editBarClose.addEventListener('click', cancelEditAndClear);
 
     // --- Реакции: общий попап-палитра, позиционируется под кнопкой сообщения ---
     function openReactionPopover(anchorEl, msgId) {
@@ -982,7 +1228,14 @@ const ChatPanel = (() => {
       closeReactionPopover();
     });
     document.addEventListener('keydown', (event) => {
-      if (event.key === 'Escape' && !reactionPopover.classList.contains('hidden')) closeReactionPopover();
+      if (event.key !== 'Escape') return;
+      if (!reactionPopover.classList.contains('hidden')) {
+        closeReactionPopover();
+        return;
+      }
+      if (!editBar.classList.contains('hidden')) {
+        cancelEditAndClear();
+      }
     });
 
     // --- Rate-limit (клиентский, мягкий) — только для текстовых сообщений ---
@@ -1019,6 +1272,10 @@ const ChatPanel = (() => {
           break;
         case 'reaction':
           handleIncomingReaction(envelope);
+          break;
+        case 'edit':
+        case 'delete':
+          handleIncomingEditOrDelete(envelope);
           break;
         case 'file-offer':
           handleIncomingFileOffer(envelope);
@@ -1058,6 +1315,15 @@ const ChatPanel = (() => {
       const inserted = insertMessage(envelope);
       if (!inserted) return;
       recomputeReactions();
+      renderAll(false);
+    }
+
+    /** kind='edit'|'delete' — авторство проверяется внутри recomputeMessageMeta (см. её заголовок и заголовок файла); чужой from на конверте молча не применится. */
+    function handleIncomingEditOrDelete(envelope) {
+      bumpLamportOnReceive(envelope.lamport);
+      const inserted = insertMessage(envelope);
+      if (!inserted) return;
+      recomputeMessageMeta();
       renderAll(false);
     }
 
@@ -1349,16 +1615,19 @@ const ChatPanel = (() => {
       waiter(Array.isArray(envelope.messages) ? envelope.messages : []);
     }
 
+    const KNOWN_HISTORY_KINDS = new Set(['text', 'reaction', 'file-offer', 'edit', 'delete']);
+
     function mergeHistory(historyMessages) {
       let insertedAny = false;
       for (const msg of historyMessages) {
         if (!msg || typeof msg !== 'object') continue;
-        if (msg.kind !== 'text' && msg.kind !== 'reaction' && msg.kind !== 'file-offer') continue;
+        if (!KNOWN_HISTORY_KINDS.has(msg.kind)) continue;
         bumpLamportOnReceive(msg.lamport);
         if (insertMessage(msg)) insertedAny = true;
       }
       if (insertedAny) {
         recomputeReactions();
+        recomputeMessageMeta();
         renderAll(true);
       }
     }
@@ -1436,6 +1705,13 @@ const ChatPanel = (() => {
         return;
       }
 
+      // Плашка редактирования открыта — эта отправка правит существующее
+      // сообщение (kind='edit'), а не создаёт новое (см. startEdit).
+      if (editTarget) {
+        sendEditMessage(text);
+        return;
+      }
+
       lamportClock += 1;
       const envelope = {
         v: 1,
@@ -1456,6 +1732,60 @@ const ChatPanel = (() => {
       insertMessage(envelope);
       renderAll(true);
 
+      broadcastEnvelope(envelope);
+    }
+
+    /** Rate-limit уже проверен в sendCurrentText — единый счётчик на текст и правки. */
+    function sendEditMessage(text) {
+      const targetId = editTarget.id;
+      lamportClock += 1;
+      const envelope = {
+        v: 1,
+        id: genId(),
+        lamport: lamportClock,
+        from: peerId,
+        name: myName || null,
+        kind: 'edit',
+        target: targetId,
+        text,
+        ts: Date.now(),
+      };
+      textInput.value = '';
+      cancelEdit();
+
+      if (insertMessage(envelope)) {
+        recomputeMessageMeta();
+        renderAll(true);
+      }
+      broadcastEnvelope(envelope);
+    }
+
+    /**
+     * Вызывается из buildDeleteButton по второму (подтверждающему) клику.
+     * Не через клиентский rate-limit (см. заголовок файла: reaction-подобное
+     * лёгкое действие с собственным 3-секундным подтверждением через UI, а не
+     * полноценная отправка текста).
+     */
+    function sendDeleteMessage(targetId) {
+      lamportClock += 1;
+      const envelope = {
+        v: 1,
+        id: genId(),
+        lamport: lamportClock,
+        from: peerId,
+        name: myName || null,
+        kind: 'delete',
+        target: targetId,
+        ts: Date.now(),
+      };
+
+      // Удаляем то, что прямо сейчас редактируем — закрываем плашку и чистим ввод.
+      if (editTarget && editTarget.id === targetId) cancelEditAndClear();
+
+      if (insertMessage(envelope)) {
+        recomputeMessageMeta();
+        renderAll(false);
+      }
       broadcastEnvelope(envelope);
     }
 

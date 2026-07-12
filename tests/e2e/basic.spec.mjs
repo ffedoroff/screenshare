@@ -46,6 +46,7 @@ import {
   assertVideoPlaying,
   openChatPanel,
   sendChatMessage,
+  sendChatMessageAndGetId,
   messageTextsInclude,
   getChatDom,
   waitUntil,
@@ -662,6 +663,203 @@ async function main() {
           await aContext.close();
           await bContext.close();
           await cContext.close();
+        }
+      }
+    );
+
+    // --- Редактирование и удаление своих сообщений ---
+    //
+    // Отдельная комната: Инна и Паша с самого начала (Паша нужен, чтобы видеть
+    // и правки, и удаление "живьём", а не только у автора). Два независимых
+    // сообщения — М1 редактируют (но не удаляют), М2 сначала получает реакцию
+    // от Паши, потом удаляется — так тесты (а)/(б) не смешивают эффекты, и
+    // опоздавший Слава (в) может отдельно проверить оба производных состояния
+    // (отредактированный текст и тумбстоун) из реплея истории. Негативный
+    // случай (г) — подделанный конверт 'edit' с чужим `from`, вброшенный
+    // напрямую в обработчик шины (bus._dispatch) у Паши, минуя реальный
+    // DataChannel: bus — обычный top-level `const` в room.js (классический,
+    // не module, script) и потому виден из page.evaluate() ровно так же, как
+    // ChatPanel виден из room.js (тот же общий top-level scope документа).
+    await step(
+      'Редактирование (текст + «(изменено)») и удаление (тумбстоун, реакции пропадают) своих сообщений, включая реплей опоздавшему и игнор чужого from',
+      async () => {
+        const res = await fetch(`${server.baseUrl}/api/rooms`, { method: 'POST' });
+        assert.ok(res.ok, `POST /api/rooms ответил статусом ${res.status}`);
+        const { roomId: editRoomId } = await res.json();
+        const editRoomUrl = `${server.baseUrl}/r/${editRoomId}`;
+
+        const iContext = await browser.newContext();
+        const pContext = await browser.newContext();
+        await installSavedName(iContext, 'Инна');
+        await installSavedName(pContext, 'Паша');
+        const iPage = await iContext.newPage();
+        const pPage = await pContext.newPage();
+
+        try {
+          await iPage.goto(editRoomUrl);
+          await pPage.goto(editRoomUrl);
+          await waitForOverlayHidden(iPage);
+          await waitForOverlayHidden(pPage);
+          await waitForTileCount(iPage, 2);
+          await waitForTileCount(pPage, 2);
+
+          await openChatPanel(iPage);
+          await openChatPanel(pPage);
+
+          // --- (а) редактирование: М1 ---
+          const original1 = `Оригинал-1-${Date.now()}`;
+          const msg1Id = await sendChatMessageAndGetId(iPage, original1);
+          assert.ok(msg1Id, 'не удалось получить id только что отправленного сообщения М1 у Инны');
+          assert.ok(await messageTextsInclude(pPage, original1), 'М1 не дошло до Паши');
+
+          const iMsg1Sel = `.chat-message[data-msg-id="${msg1Id}"]`;
+          await iPage.locator(iMsg1Sel).hover();
+          await iPage.locator(iMsg1Sel).locator('.chat-message-action--edit').click();
+          await iPage.locator('.chat-edit-bar:not(.hidden)').waitFor({ state: 'visible', timeout: 3000 });
+          const editBarValue = await iPage.locator('.chat-text-input').inputValue();
+          assert.equal(editBarValue, original1, `textarea при открытии редактирования должна содержать текущий текст М1: ${editBarValue}`);
+
+          const edited1 = `Правка-1-${Date.now()}`;
+          await iPage.locator('.chat-text-input').fill(edited1);
+          await iPage.locator('.chat-send-button').click();
+
+          // У автора (Инна): новый текст + «(изменено)», плашка редактирования закрылась.
+          await iPage.locator(`${iMsg1Sel} .chat-message-text`).filter({ hasText: edited1 }).waitFor({ timeout: 5000 });
+          // НЕ locator('.chat-edit-bar.hidden').waitFor(), т.к. .hidden — это
+          // display:none и по умолчанию waitFor ждёт ВИДИМОСТЬ совпавшего
+          // элемента (см. такой же приём в helpers.mjs::waitForOverlayHidden) —
+          // проверяем classList напрямую через waitForFunction.
+          await iPage.waitForFunction(
+            () => document.querySelector('.chat-edit-bar')?.classList.contains('hidden'),
+            undefined,
+            { polling: 100, timeout: 3000 }
+          );
+          const iMeta1 = await iPage.locator(`${iMsg1Sel} .chat-message-meta-edited`).count();
+          assert.ok(iMeta1 > 0, 'у автора после редактирования должна появиться пометка «(изменено)»');
+
+          // У Паши (не автор): тот же новый текст + та же пометка, оригинал пропал.
+          const pMsg1Sel = `.chat-message[data-msg-id="${msg1Id}"]`;
+          await waitUntil(
+            async () => (await pPage.locator(`${pMsg1Sel} .chat-message-text`).textContent())?.includes(edited1),
+            { timeoutMs: 5000, message: 'у Паши текст М1 должен смениться на отредактированный' }
+          );
+          const pMeta1 = await pPage.locator(`${pMsg1Sel} .chat-message-meta-edited`).count();
+          assert.ok(pMeta1 > 0, 'у Паши тоже должна быть видна пометка «(изменено)»');
+          assert.ok(!(await messageTextsInclude(pPage, original1, 300)), 'оригинальный текст М1 не должен остаться в ленте у Паши после правки');
+
+          // --- (б) удаление: М2 (сначала получает реакцию от Паши, потом удаляется) ---
+          const original2 = `Оригинал-2-${Date.now()}`;
+          const msg2Id = await sendChatMessageAndGetId(iPage, original2);
+          assert.ok(msg2Id, 'не удалось получить id только что отправленного сообщения М2 у Инны');
+          assert.ok(await messageTextsInclude(pPage, original2), 'М2 не дошло до Паши');
+
+          const iMsg2Sel = `.chat-message[data-msg-id="${msg2Id}"]`;
+          const pMsg2Sel = `.chat-message[data-msg-id="${msg2Id}"]`;
+
+          await pPage.locator(pMsg2Sel).hover();
+          await pPage.locator(pMsg2Sel).locator('.chat-message-action--react').click();
+          await pPage.locator('.chat-reaction-popover:not(.hidden)').waitFor({ state: 'visible', timeout: 3000 });
+          await pPage.locator('.chat-reaction-popover-emoji[data-emoji="👍"]').click();
+          await iPage.locator(`${iMsg2Sel} .chat-reaction-chip`).first().waitFor({ state: 'visible', timeout: 5000 });
+
+          await iPage.locator(iMsg2Sel).hover();
+          const iDeleteBtn2 = iPage.locator(iMsg2Sel).locator('.chat-message-action--delete');
+          await iDeleteBtn2.click(); // первый клик — переход в состояние подтверждения
+          await iPage.locator(`${iMsg2Sel} .chat-message-action--confirm`).waitFor({ timeout: 2000 });
+          await iDeleteBtn2.click(); // второй клик в течение 3с — подтверждение, шлём delete
+
+          // У автора: тумбстоун вместо текста, реакции и кнопки действий пропали.
+          await iPage.locator(`${iMsg2Sel} .chat-message-text--deleted`).waitFor({ timeout: 5000 });
+          const iTombstoneText = await iPage.locator(`${iMsg2Sel} .chat-message-text`).textContent();
+          assert.equal(iTombstoneText, 'Сообщение удалено', `тумбстоун у автора должен показывать «Сообщение удалено»: ${iTombstoneText}`);
+          assert.equal(await iPage.locator(`${iMsg2Sel} .chat-reaction-chip`).count(), 0, 'у автора чипы реакций должны исчезнуть у удалённого сообщения');
+          assert.equal(await iPage.locator(`${iMsg2Sel} .chat-message-actions`).count(), 0, 'у тумбстоуна не должно быть кнопок действий');
+
+          // У Паши: то же самое — тумбстоун, чипы реакций пропали.
+          await pPage.locator(`${pMsg2Sel} .chat-message-text--deleted`).waitFor({ timeout: 5000 });
+          const pTombstoneText = await pPage.locator(`${pMsg2Sel} .chat-message-text`).textContent();
+          assert.equal(pTombstoneText, 'Сообщение удалено', `тумбстоун у Паши должен показывать «Сообщение удалено»: ${pTombstoneText}`);
+          await waitUntil(async () => (await pPage.locator(`${pMsg2Sel} .chat-reaction-chip`).count()) === 0, {
+            timeoutMs: 5000,
+            message: 'у Паши чипы реакций должны исчезнуть у удалённого сообщения',
+          });
+
+          // --- (в) опоздавший (Слава) видит из реплея истории: отредактированный
+          //     текст М1 (не оригинал) и тумбстоун вместо удалённого М2 ---
+          const sContext = await browser.newContext();
+          await installSavedName(sContext, 'Слава');
+          const sPage = await sContext.newPage();
+          try {
+            await sPage.goto(editRoomUrl);
+            await waitForOverlayHidden(sPage);
+            await waitForTileCount(sPage, 3);
+            await openChatPanel(sPage);
+
+            assert.ok(
+              await messageTextsInclude(sPage, edited1),
+              'опоздавший должен увидеть отредактированный текст М1 из реплея истории'
+            );
+            assert.ok(
+              !(await messageTextsInclude(sPage, original1, 300)),
+              'опоздавший НЕ должен увидеть оригинальный (не отредактированный) текст М1'
+            );
+            const sMsg1Sel = `.chat-message[data-msg-id="${msg1Id}"]`;
+            assert.ok(
+              (await sPage.locator(`${sMsg1Sel} .chat-message-meta-edited`).count()) > 0,
+              'опоздавший должен увидеть пометку «(изменено)» у М1'
+            );
+
+            const sMsg2Sel = `.chat-message[data-msg-id="${msg2Id}"]`;
+            await sPage.locator(`${sMsg2Sel} .chat-message-text--deleted`).waitFor({ timeout: 5000 });
+            const sTombstoneText = await sPage.locator(`${sMsg2Sel} .chat-message-text`).textContent();
+            assert.equal(
+              sTombstoneText,
+              'Сообщение удалено',
+              `опоздавший должен увидеть тумбстоун вместо оригинала М2: ${sTombstoneText}`
+            );
+            assert.ok(
+              !(await messageTextsInclude(sPage, original2, 300)),
+              'опоздавший НЕ должен увидеть оригинальный текст удалённого М2'
+            );
+          } finally {
+            await sContext.close();
+          }
+
+          // --- (г) негатив: конверт 'edit' с ЧУЖИМ from — должен быть проигнорирован ---
+          // Прямая инъекция в обработчик шины у Паши (bus._dispatch), минуя
+          // реальный DataChannel: имитируем злоумышленника, который прислал бы
+          // envelope с kind='edit' и подделанным `from`, целясь в М1 (сейчас
+          // отображается как `edited1` у Паши, автор — Инна с ЕЁ настоящим peerId).
+          const forgedResult = await pPage.evaluate(
+            ({ targetId }) => {
+              bus._dispatch('forged-peer-id-not-the-real-author', {
+                v: 1,
+                id: 'forged-edit-envelope-id',
+                lamport: 999999,
+                from: 'forged-peer-id-not-the-real-author',
+                name: 'Мошенник',
+                kind: 'edit',
+                target: targetId,
+                text: 'ВЗЛОМАНО',
+                ts: Date.now(),
+              });
+              const el = document.querySelector(`.chat-message[data-msg-id="${targetId}"] .chat-message-text`);
+              return el ? el.textContent : null;
+            },
+            { targetId: msg1Id }
+          );
+          assert.equal(
+            forgedResult,
+            edited1,
+            `конверт edit с чужим from должен быть проигнорирован — текст должен остаться «${edited1}», получено: ${forgedResult}`
+          );
+          assert.ok(
+            !(await messageTextsInclude(pPage, 'ВЗЛОМАНО', 300)),
+            'подделанный текст «ВЗЛОМАНО» не должен появиться в ленте у Паши'
+          );
+        } finally {
+          await iContext.close();
+          await pContext.close();
         }
       }
     );
