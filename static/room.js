@@ -69,15 +69,34 @@ const joinRequestsEl = document.getElementById('join-requests');
 const settingsPanelEl = document.getElementById('settings-panel');
 const settingsPanelBackdropEl = document.getElementById('settings-panel-backdrop');
 const settingsPanelCloseEl = document.getElementById('settings-panel-close');
+const settingsRoomSectionEl = document.getElementById('settings-room-section');
 const settingLobbyInput = document.getElementById('setting-lobby');
 const settingGuestChatInput = document.getElementById('setting-guest-chat');
 const settingGuestAudioInput = document.getElementById('setting-guest-audio');
 const settingGuestVideoInput = document.getElementById('setting-guest-video');
 const settingGuestScreenInput = document.getElementById('setting-guest-screen');
 
+// --- DOM: устройства (см. заголовок раздела «Выбор камеры и микрофона» ниже) — видно ВСЕМ участникам, не только лидеру ---
+const settingMicDeviceSelect = document.getElementById('setting-mic-device');
+const settingCameraDeviceSelect = document.getElementById('setting-camera-device');
+
+// --- DOM: fullscreen кнопки сцены шаринга экрана ---
+const screenFullscreenButtonEl = document.getElementById('screen-fullscreen-button');
+
 // Статичная разметка (не зависит от пользовательских данных) — безопасна для innerHTML.
 const CROWN_ICON_SVG =
   '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M3 19h18l-1.6-9.6-5.2 3.6L12 5l-2.2 8-5.2-3.6L3 19z"/></svg>';
+
+// Значок перечёркнутого микрофона на тайле (см. раздел «Индикатор
+// «микрофон выключен»» ниже) — тоже статичная разметка.
+const MIC_OFF_ICON_SVG =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+  '<rect x="9" y="2" width="6" height="11" rx="3"></rect>' +
+  '<path d="M5 10a7 7 0 0 0 14 0"></path>' +
+  '<line x1="12" y1="19" x2="12" y2="22"></line>' +
+  '<line x1="8" y1="22" x2="16" y2="22"></line>' +
+  '<line x1="3" y1="3" x2="21" y2="21"></line>' +
+  '</svg>';
 
 // roomId — последний сегмент пути, например /r/abc123 -> "abc123".
 const roomId = location.pathname.split('/').filter(Boolean).pop();
@@ -183,6 +202,22 @@ let camStream = null;
 let camTrack = null;
 let camRequestInProgress = false;
 
+// --- Выбор устройств (см. раздел «Камера и микрофон» ниже) ---
+//
+// Выбор пользователя живёт ТОЛЬКО в памяти вкладки (никакого localStorage —
+// анонимность, см. README.md) и переживает выключение/включение мика или
+// камеры кнопкой, но не reload/переход в другую комнату.
+// selected*DeviceId — то, что выбрано в селекте прямо сейчас (желаемое);
+// current*DeviceId — deviceId, реально стоящий за активным треком (что
+// сейчас физически захвачено). Они расходятся, когда пользователь выбрал
+// устройство, ПОКА мик/камера выключены кнопкой — реальное переключение
+// тогда откладывается до следующего включения (см. micButton/cameraButton
+// click).
+let selectedMicDeviceId = null;
+let selectedCamDeviceId = null;
+let currentMicDeviceId = null;
+let currentCamDeviceId = null;
+
 let screenStream = null;
 // peerId текущего владельца экрана (может быть myPeerId) или null.
 let currentScreenOwnerPeerId = null;
@@ -203,6 +238,9 @@ const micMonitors = new Map();
 // streamId -> peerId, чей это входящий поток камеры — нужно, чтобы применить
 // обновление `enabled` из повторного stream-info (см. broadcastStreamEnabled).
 const cameraStreamOwner = new Map();
+// То же самое для потоков микрофона — нужно применять обновление `enabled`
+// к индикатору «микрофон выключен» на тайле (см. applyMicEnabledUpdate).
+const micStreamOwner = new Map();
 
 let chat = null;
 
@@ -365,10 +403,20 @@ function createTile(peerId, name, isOwn) {
   crown.setAttribute('aria-hidden', 'true');
   crown.innerHTML = CROWN_ICON_SVG; // статичная разметка, не пользовательские данные
 
+  // Индикатор «микрофон выключен/отсутствует» (см. static/style.css:
+  // .tile-mic-off) — виден ПО УМОЛЧАНИЮ (не .hidden): до первого
+  // включения/stream-info трека у этого участника действительно ещё нет,
+  // что по заданию тоже показывает значок (см. setTileMicOff/applyMicEnabledUpdate).
+  const micOff = document.createElement('span');
+  micOff.className = 'tile-mic-off';
+  micOff.setAttribute('aria-hidden', 'true');
+  micOff.innerHTML = MIC_OFF_ICON_SVG; // статичная разметка, не пользовательские данные
+
   tile.appendChild(video);
   tile.appendChild(placeholder);
   tile.appendChild(label);
   tile.appendChild(crown);
+  tile.appendChild(micOff);
 
   if (isOwn) {
     tilesGridEl.prepend(tile);
@@ -376,7 +424,13 @@ function createTile(peerId, name, isOwn) {
     tilesGridEl.appendChild(tile);
   }
 
-  return { root: tile, videoEl: video, placeholderEl: placeholder, labelEl: label, crownEl: crown };
+  return { root: tile, videoEl: video, placeholderEl: placeholder, labelEl: label, crownEl: crown, micOffEl: micOff };
+}
+
+/** Показать/скрыть значок «микрофон выключен» на конкретном объекте тайла (свой ownTile или peers.get(id).tile). */
+function setTileMicOffIndicator(tile, micOff) {
+  if (!tile) return;
+  tile.micOffEl.classList.toggle('hidden', !micOff);
 }
 
 function updateParticipantCount() {
@@ -422,11 +476,16 @@ function updateOwnTileLabel() {
   ownTile.labelEl.textContent = text;
 }
 
-/** Шестерёнка настроек видна ТОЛЬКО лидеру; потеряв лидерство — закрываем панель настроек и список заявок (они больше не наши). */
+/**
+ * Шестерёнка настроек видна ВСЕМ (секция «Устройства» — выбор микрофона/
+ * камеры — общая возможность). Секция «Комната» (лобби + права гостей)
+ * внутри панели видна только лидеру — потеряв лидерство, прячем её и
+ * список заявок (они больше не наши), но саму панель НЕ закрываем: гость
+ * вполне мог в этот момент выбирать устройство.
+ */
 function updateSettingsButtonVisibility() {
-  settingsButton.classList.toggle('hidden', !isLeader);
+  settingsRoomSectionEl.classList.toggle('hidden', !isLeader);
   if (!isLeader) {
-    closeSettingsPanel();
     pendingRequests = [];
     renderJoinRequests();
   }
@@ -524,6 +583,8 @@ function applyGuestEnforcement() {
   if (restrictAudio && micTrack && micTrack.enabled) {
     micTrack.enabled = false;
     setMicButtonOn(false);
+    updateOwnMicIndicator();
+    broadcastStreamEnabled(micStream, 'mic', false);
   }
 
   cameraButton.disabled = restrictVideo;
@@ -669,12 +730,75 @@ function syncSettingsPanelInputs() {
 
 function openSettingsPanel() {
   syncSettingsPanelInputs();
+  refreshDeviceLists();
   settingsPanelEl.classList.remove('hidden');
 }
 
 function closeSettingsPanel() {
   settingsPanelEl.classList.add('hidden');
 }
+
+// ---------- Устройства: селекты микрофона/камеры (видно всем участникам) ----------
+//
+// enumerateDevices() отдаёт человекочитаемые label ТОЛЬКО после того, как
+// пользователь хоть раз выдал разрешение на mic/camera в этой вкладке (до
+// этого — пустая строка у всех устройств, спецификация намеренно не палит
+// железо без разрешения) — поэтому до первого разрешения показываем
+// пронумерованный фоллбэк «Микрофон 1», «Камера 2» и т.п. Список
+// перестраивается при каждом открытии панели и по событию devicechange
+// (см. ниже) — воткнули/вынули устройство, список должен обновиться, даже
+// если панель уже открыта.
+async function refreshDeviceLists() {
+  if (!navigator.mediaDevices || typeof navigator.mediaDevices.enumerateDevices !== 'function') return;
+  let devices;
+  try {
+    devices = await navigator.mediaDevices.enumerateDevices();
+  } catch (err) {
+    console.warn('enumerateDevices не удался:', err);
+    return;
+  }
+  fillDeviceSelect(
+    settingMicDeviceSelect,
+    devices.filter((d) => d.kind === 'audioinput'),
+    'Микрофон'
+  );
+  fillDeviceSelect(
+    settingCameraDeviceSelect,
+    devices.filter((d) => d.kind === 'videoinput'),
+    'Камера'
+  );
+}
+
+function fillDeviceSelect(selectEl, list, labelPrefix) {
+  // Сохраняем текущий выбор селекта (пользователь мог уже выбрать устройство
+  // в этой же сессии до перестройки списка, см. selected*DeviceId) — приоритет
+  // у него, иначе оставляем то, что уже стояло в самом селекте.
+  const wantId = selectEl.dataset.selectedDeviceId || selectEl.value || '';
+  selectEl.textContent = '';
+  list.forEach((d, i) => {
+    const opt = document.createElement('option');
+    opt.value = d.deviceId;
+    opt.textContent = d.label || `${labelPrefix} ${i + 1}`;
+    selectEl.appendChild(opt);
+  });
+  if (wantId && list.some((d) => d.deviceId === wantId)) {
+    selectEl.value = wantId;
+  }
+}
+
+if (navigator.mediaDevices && typeof navigator.mediaDevices.addEventListener === 'function') {
+  navigator.mediaDevices.addEventListener('devicechange', refreshDeviceLists);
+}
+
+settingMicDeviceSelect.addEventListener('change', () => {
+  settingMicDeviceSelect.dataset.selectedDeviceId = settingMicDeviceSelect.value;
+  applyMicDeviceChange(settingMicDeviceSelect.value || null);
+});
+
+settingCameraDeviceSelect.addEventListener('change', () => {
+  settingCameraDeviceSelect.dataset.selectedDeviceId = settingCameraDeviceSelect.value;
+  applyCameraDeviceChange(settingCameraDeviceSelect.value || null);
+});
 
 /** Шлёт update-settings ЦЕЛИКОМ (не патч, см. src/protocol.rs) — сервер рассылает settings-changed всем, включая нас (см. registerSignalingHandlers). */
 function sendSettingsUpdate(partial) {
@@ -812,6 +936,10 @@ function handleStreamInfo(info) {
       // Повторный stream-info для уже подключённого потока камеры — это
       // toggle enabled (см. broadcastStreamEnabled), а не новый трек.
       applyCameraEnabledUpdate(streamId, meta.enabled);
+    } else if (hadMetaBefore && meta.kind === 'mic' && typeof meta.enabled === 'boolean') {
+      // Тот же toggle enabled, но для микрофона — двигает индикатор
+      // «микрофон выключен» на тайле (см. applyMicEnabledUpdate).
+      applyMicEnabledUpdate(streamId, meta.enabled);
     }
   }
 }
@@ -845,10 +973,13 @@ function handleRemoteTrack(peerId, event) {
 function routeRemoteTrack(peerId, streamId, stream, track, meta) {
   if (!peers.has(peerId)) return; // пир уже ушёл, пока летела информация
   if (meta.kind === 'mic') {
+    micStreamOwner.set(streamId, peerId);
     // Ссылку храним всегда (см. заголовок раздела «Права гостей: применение
     // на стороне получателя») — рендерим только если разрешено прямо сейчас.
-    getOrCreateMediaRefs(peerId).mic = { stream, track };
+    const enabled = meta.enabled !== false;
+    getOrCreateMediaRefs(peerId).mic = { stream, track, enabled };
     refreshMediaRenderingForPeer(peerId);
+    setTileMicOffIndicator(peers.get(peerId).tile, !enabled);
   } else if (meta.kind === 'camera') {
     cameraStreamOwner.set(streamId, peerId);
     getOrCreateMediaRefs(peerId).camera = { stream, track, enabled: meta.enabled !== false };
@@ -966,6 +1097,16 @@ function applyCameraEnabledUpdate(streamId, enabled) {
   if (allowed) showTileVideo(peerId, enabled);
 }
 
+/** Применить обновление `enabled` для уже подключённого потока микрофона (toggle) — двигает индикатор «микрофон выключен» на тайле (см. static/style.css: .tile-mic-off), независимо от прав гостя на рендер аудио. */
+function applyMicEnabledUpdate(streamId, enabled) {
+  const peerId = micStreamOwner.get(streamId);
+  if (!peerId) return;
+  const refs = peerMediaRefs.get(peerId);
+  if (refs && refs.mic) refs.mic.enabled = enabled;
+  const entry = peers.get(peerId);
+  if (entry) setTileMicOffIndicator(entry.tile, !enabled);
+}
+
 // ---------- Пиры: создание/удаление ----------
 
 function createRemotePeer(peerId, name, iceServers) {
@@ -1017,6 +1158,9 @@ function removeRemotePeer(peerId) {
   cleanupMicAudio(peerId);
   for (const [streamId, ownerPeerId] of cameraStreamOwner) {
     if (ownerPeerId === peerId) cameraStreamOwner.delete(streamId);
+  }
+  for (const [streamId, ownerPeerId] of micStreamOwner) {
+    if (ownerPeerId === peerId) micStreamOwner.delete(streamId);
   }
 
   if (currentScreenOwnerPeerId === peerId) {
@@ -1605,6 +1749,65 @@ function setMicButtonOn(on) {
   micButton.setAttribute('aria-pressed', String(on));
 }
 
+/** Индикатор «микрофон выключен» на своём тайле — по факту наличия и enabled текущего micTrack. */
+function updateOwnMicIndicator() {
+  setTileMicOffIndicator(ownTile, !(micTrack && micTrack.enabled));
+}
+
+/**
+ * Живая замена устройства микрофона БЕЗ ренегоциации: новый getUserMedia ->
+ * RTCRtpSender.replaceTrack на всех уже существующих соединениях (спецификация
+ * гарантирует, что replaceTrack не триггерит onnegotiationneeded — приёмники
+ * не видят нового ontrack, тот же remote-трек просто начинает нести другое
+ * содержимое) -> старый трек останавливаем. `enabledValue` — состояние
+ * (включён/выключен), которое должен получить новый трек: вызывающая сторона
+ * решает (при обычном переключении «на лету» сохраняем текущее, при
+ * отложенном включении после смены устройства, пока мик молчал — то, что
+ * получилось бы обычным кликом «включить»).
+ */
+async function liveSwitchMicTrack(deviceId, enabledValue) {
+  let newStream;
+  try {
+    newStream = await navigator.mediaDevices.getUserMedia({
+      audio: deviceId ? { deviceId: { exact: deviceId } } : true,
+    });
+  } catch (err) {
+    console.warn('Не удалось переключить микрофон:', err);
+    showRoomMessage('Не удалось переключить микрофон.');
+    return;
+  }
+  const newTrack = newStream.getAudioTracks()[0];
+  newTrack.enabled = enabledValue;
+  for (const entry of peers.values()) {
+    const sender = entry.rtc.pc.getSenders().find((s) => s.track === micTrack);
+    if (sender) {
+      try {
+        await sender.replaceTrack(newTrack);
+      } catch (err) {
+        console.warn('replaceTrack(mic) не удался:', err);
+      }
+    }
+  }
+  const oldTrack = micTrack;
+  micStream.removeTrack(oldTrack);
+  micStream.addTrack(newTrack);
+  oldTrack.stop();
+  micTrack = newTrack;
+  currentMicDeviceId = deviceId || null;
+}
+
+/** Выбор устройства в селекте (см. static/room.html: #setting-mic-device). */
+async function applyMicDeviceChange(deviceId) {
+  selectedMicDeviceId = deviceId || null;
+  // Мик сейчас реально включён — переключаем немедленно (см. задание, п.1).
+  // Иначе (выключен кнопкой или ещё ни разу не запрошен) — только запомнили
+  // выбор, реальное переключение случится при следующем включении (см.
+  // micButton click ниже).
+  if (!micTrack || !micTrack.enabled) return;
+  await liveSwitchMicTrack(selectedMicDeviceId, true);
+  updateOwnMicIndicator();
+}
+
 micButton.addEventListener('click', async () => {
   if (micRequestInProgress) return;
 
@@ -1612,7 +1815,9 @@ micButton.addEventListener('click', async () => {
     micRequestInProgress = true;
     let stream;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: selectedMicDeviceId ? { deviceId: { exact: selectedMicDeviceId } } : true,
+      });
     } catch (err) {
       console.warn('Доступ к микрофону отклонён:', err);
       showRoomMessage('Не удалось получить доступ к микрофону.');
@@ -1623,11 +1828,24 @@ micButton.addEventListener('click', async () => {
 
     micStream = stream;
     micTrack = stream.getAudioTracks()[0];
+    currentMicDeviceId = selectedMicDeviceId;
     broadcastLocalStream(stream, 'mic');
     setMicButtonOn(true);
+    updateOwnMicIndicator();
+    refreshDeviceLists(); // разрешение получено — у enumerateDevices теперь есть labels
   } else {
-    micTrack.enabled = !micTrack.enabled;
+    const turningOn = !micTrack.enabled;
+    if (turningOn && selectedMicDeviceId && selectedMicDeviceId !== currentMicDeviceId) {
+      // Пока молчали, выбрали другое устройство в настройках — подхватываем
+      // его именно сейчас, при включении (см. задание, «при выключенном —
+      // запомнить и использовать при следующем включении»).
+      await liveSwitchMicTrack(selectedMicDeviceId, true);
+    } else {
+      micTrack.enabled = turningOn;
+    }
     setMicButtonOn(micTrack.enabled);
+    updateOwnMicIndicator();
+    broadcastStreamEnabled(micStream, 'mic', micTrack.enabled);
   }
 });
 
@@ -1638,6 +1856,59 @@ function setCameraButtonOn(on) {
   cameraButton.setAttribute('aria-pressed', String(on));
 }
 
+function cameraConstraintsFor(deviceId) {
+  return {
+    width: { ideal: 640 },
+    height: { ideal: 360 },
+    frameRate: { ideal: 15 },
+    // deviceId и facingMode вместе не нужны — конкретное устройство уже
+    // однозначно выбрано; facingMode (фронтальная по умолчанию на телефоне)
+    // остаётся только фоллбэком, пока пользователь ничего не выбрал сам.
+    ...(deviceId ? { deviceId: { exact: deviceId } } : { facingMode: 'user' }),
+  };
+}
+
+/** Живая замена устройства камеры БЕЗ ренегоциации — см. liveSwitchMicTrack, тот же приём для video. */
+async function liveSwitchCamTrack(deviceId, enabledValue) {
+  let newStream;
+  try {
+    newStream = await navigator.mediaDevices.getUserMedia({ video: cameraConstraintsFor(deviceId) });
+  } catch (err) {
+    console.warn('Не удалось переключить камеру:', err);
+    showRoomMessage('Не удалось переключить камеру.');
+    return;
+  }
+  const newTrack = newStream.getVideoTracks()[0];
+  newTrack.enabled = enabledValue;
+  for (const entry of peers.values()) {
+    const sender = entry.rtc.pc.getSenders().find((s) => s.track === camTrack);
+    if (sender) {
+      try {
+        await sender.replaceTrack(newTrack);
+      } catch (err) {
+        console.warn('replaceTrack(camera) не удался:', err);
+      }
+    }
+  }
+  const oldTrack = camTrack;
+  camStream.removeTrack(oldTrack);
+  camStream.addTrack(newTrack);
+  oldTrack.stop();
+  camTrack = newTrack;
+  currentCamDeviceId = deviceId || null;
+  if (ownTile) {
+    ownTile.videoEl.srcObject = camStream;
+    safePlay(ownTile.videoEl);
+  }
+}
+
+/** Выбор устройства в селекте (см. static/room.html: #setting-camera-device). */
+async function applyCameraDeviceChange(deviceId) {
+  selectedCamDeviceId = deviceId || null;
+  if (!camTrack || !camTrack.enabled) return;
+  await liveSwitchCamTrack(selectedCamDeviceId, true);
+}
+
 cameraButton.addEventListener('click', async () => {
   if (camRequestInProgress) return;
 
@@ -1645,14 +1916,7 @@ cameraButton.addEventListener('click', async () => {
     camRequestInProgress = true;
     let stream;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          width: { ideal: 640 },
-          height: { ideal: 360 },
-          frameRate: { ideal: 15 },
-          facingMode: 'user', // на телефоне — фронтальная камера по умолчанию
-        },
-      });
+      stream = await navigator.mediaDevices.getUserMedia({ video: cameraConstraintsFor(selectedCamDeviceId) });
     } catch (err) {
       console.warn('Доступ к камере отклонён:', err);
       showRoomMessage('Не удалось получить доступ к камере.');
@@ -1663,6 +1927,7 @@ cameraButton.addEventListener('click', async () => {
 
     camStream = stream;
     camTrack = stream.getVideoTracks()[0];
+    currentCamDeviceId = selectedCamDeviceId;
     broadcastLocalStream(stream, 'camera');
 
     if (ownTile) {
@@ -1672,8 +1937,14 @@ cameraButton.addEventListener('click', async () => {
       ownTile.placeholderEl.classList.add('hidden');
     }
     setCameraButtonOn(true);
+    refreshDeviceLists(); // разрешение получено — у enumerateDevices теперь есть labels
   } else {
-    camTrack.enabled = !camTrack.enabled;
+    const turningOn = !camTrack.enabled;
+    if (turningOn && selectedCamDeviceId && selectedCamDeviceId !== currentCamDeviceId) {
+      await liveSwitchCamTrack(selectedCamDeviceId, true);
+    } else {
+      camTrack.enabled = turningOn;
+    }
     setCameraButtonOn(camTrack.enabled);
     if (ownTile) {
       ownTile.videoEl.classList.toggle('hidden', !camTrack.enabled);
@@ -1748,6 +2019,54 @@ function stopScreenShare() {
   currentScreenOwnerPeerId = null;
   updateScreenButtonState();
 }
+
+// ---------- Fullscreen сцены шаринга экрана ----------
+//
+// Fullscreen API у современных Chrome/Safari не требует webkit-префикса на
+// десктопе, но iOS Safari (даже актуальные версии на момент написания —
+// см. caniyouse.com/fullscreen) поддерживает requestFullscreen() на
+// произвольном элементе не везде так же надёжно, как webkitRequestFullscreen
+// — поэтому пробуем стандартный метод первым и откатываемся на webkit-версию
+// как на iOS-фоллбэк. Тот же приём для exitFullscreen/fullscreenElement.
+function requestFullscreenCompat(el) {
+  const fn = el.requestFullscreen || el.webkitRequestFullscreen;
+  if (!fn) return Promise.reject(new Error('Fullscreen API недоступен'));
+  return fn.call(el);
+}
+
+function exitFullscreenCompat() {
+  const fn = document.exitFullscreen || document.webkitExitFullscreen;
+  if (!fn) return Promise.resolve();
+  return fn.call(document);
+}
+
+function isFullscreenActive() {
+  return !!(document.fullscreenElement || document.webkitFullscreenElement);
+}
+
+function updateFullscreenButtonState() {
+  const active = isFullscreenActive();
+  screenFullscreenButtonEl.setAttribute('aria-pressed', String(active));
+  screenFullscreenButtonEl.title = active ? 'Выйти из полноэкранного режима' : 'На весь экран';
+  screenFullscreenButtonEl.setAttribute('aria-label', screenFullscreenButtonEl.title);
+}
+
+screenFullscreenButtonEl.addEventListener('click', async () => {
+  try {
+    if (isFullscreenActive()) {
+      await exitFullscreenCompat();
+    } else {
+      await requestFullscreenCompat(screenStageEl);
+    }
+  } catch (err) {
+    // Fullscreen может быть недоступен (headless-браузер, запрет окружения и
+    // т.п.) — не ломаем остальной UI, просто логируем.
+    console.warn('Fullscreen недоступен:', err);
+  }
+});
+
+document.addEventListener('fullscreenchange', updateFullscreenButtonState);
+document.addEventListener('webkitfullscreenchange', updateFullscreenButtonState);
 
 // ---------- Поделиться (попап с QR + ссылка) ----------
 

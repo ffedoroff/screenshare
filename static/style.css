@@ -295,6 +295,48 @@ body {
   font-size: 0.8rem;
 }
 
+/* Кнопка «на весь экран» — угол сцены шаринга (см. static/room.js:
+   requestFullscreenCompat). Иконка/title меняются местами при входе/выходе
+   из fullscreen через fullscreenchange (в т.ч. -webkit- для iOS Safari). */
+.screen-fullscreen-button {
+  position: absolute;
+  top: var(--space-2);
+  right: var(--space-2);
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  cursor: pointer;
+  touch-action: manipulation;
+  transition: background-color 0.15s ease;
+}
+
+.screen-fullscreen-button svg {
+  width: 18px;
+  height: 18px;
+}
+
+.screen-fullscreen-button:hover {
+  background: rgba(0, 0, 0, 0.75);
+}
+
+/* В нативном fullscreen сцена занимает весь экран — вертикальные
+   ограничения (max-height/border-radius) уместны только в обычном потоке. */
+.screen-stage:fullscreen,
+.screen-stage:-webkit-full-screen {
+  max-width: none;
+  max-height: 100vh;
+  width: 100vw;
+  height: 100vh;
+  border-radius: 0;
+  border: none;
+}
+
 .tiles-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(220px, 260px));
@@ -1637,6 +1679,32 @@ body {
   display: block;
 }
 
+/* ---------- Индикатор «микрофон выключен/отсутствует» на тайле ---------- */
+/* Правый верхний угол (корона лидера — левый, см. выше) — маленький значок
+   перечёркнутого микрофона. Видим по умолчанию (см. static/room.js:
+   createTile) — до первого stream-info/включения мика трек либо выключен,
+   либо его ещё вовсе нет, оба случая по заданию показывают значок. */
+.tile-mic-off {
+  position: absolute;
+  top: var(--space-2);
+  right: var(--space-2);
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  backdrop-filter: blur(2px);
+}
+
+.tile-mic-off svg {
+  width: 14px;
+  height: 14px;
+  display: block;
+}
+
 /* ---------- Заявки лобби (только у лидера) ---------- */
 
 .join-requests {
@@ -1780,6 +1848,27 @@ body {
 
 .settings-row-label {
   font-size: 0.92rem;
+}
+
+/* Строка с выбором устройства (селект вместо тумблера) — «Устройства»,
+   видна всем участникам (см. static/room.html). */
+.settings-row--select {
+  cursor: default;
+}
+
+.settings-select {
+  flex-shrink: 1;
+  min-width: 0;
+  max-width: 60%;
+  height: 36px;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg-elevated-2);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.85rem;
+  cursor: pointer;
 }
 
 .settings-toggle {

@@ -3,8 +3,11 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f1114" />
   <title>Комната — созвон</title>
   <link rel="stylesheet" href="/static/style.css?v=4" />
+  <link rel="manifest" href="/static/manifest.webmanifest" />
+  <link rel="apple-touch-icon" href="/static/icon-192.png" />
 </head>
 <body class="page-room">
   <div class="room-page">
@@ -66,6 +69,17 @@
       <div id="screen-stage" class="screen-stage hidden">
         <video id="screen-video" class="screen-video" autoplay playsinline></video>
         <div id="screen-caption" class="screen-caption"></div>
+        <!-- Развернуть показ экрана на весь экран (Fullscreen API на
+             контейнере сцены, см. static/room.js) — крестик/Esc выходит
+             штатными средствами браузера. -->
+        <button id="screen-fullscreen-button" class="screen-fullscreen-button" type="button" aria-pressed="false" aria-label="На весь экран" title="На весь экран">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M8 3H5a2 2 0 0 0-2 2v3"></path>
+            <path d="M16 3h3a2 2 0 0 1 2 2v3"></path>
+            <path d="M8 21H5a2 2 0 0 1-2-2v-3"></path>
+            <path d="M16 21h3a2 2 0 0 0 2-2v-3"></path>
+          </svg>
+        </button>
       </div>
 
       <!-- Сетка тайлов участников (свой тайл — первым). -->
@@ -90,10 +104,13 @@
     <div id="join-requests" class="join-requests hidden"></div>
 
     <div class="control-panel">
-      <!-- Шестерёнка настроек комнаты — видна ТОЛЬКО лидеру (см.
-           static/room.js: updateSettingsButtonVisibility()). Бейдж — число
-           заявок в лобби, ждущих решения. -->
-      <button id="settings-button" class="control-button hidden" type="button" aria-pressed="false" aria-label="Настройки комнаты" title="Настройки комнаты">
+      <!-- Шестерёнка настроек — видна ВСЕМ участникам (секция «Устройства» —
+           выбор микрофона/камеры, доступна каждому); секция «Комната»
+           (лобби + права гостей) внутри панели скрыта для не-лидера (см.
+           static/room.js: updateSettingsButtonVisibility(), #settings-room-section).
+           Бейдж — число заявок в лобби, ждущих решения (виден только лидеру,
+           у остальных всегда 0). -->
+      <button id="settings-button" class="control-button" type="button" aria-pressed="false" aria-label="Настройки" title="Настройки">
         <span class="control-button-icon" aria-hidden="true">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <circle cx="12" cy="12" r="3"></circle>
@@ -192,9 +209,12 @@
       </div>
     </div>
 
-    <!-- Настройки комнаты (только лидер): попап на десктопе, bottom-sheet на
-         мобильном (см. media-запрос в style.css) — тумблер лобби + права
-         гостей. Изменение шлёт update-settings, см. static/room.js. -->
+    <!-- Настройки: попап на десктопе, bottom-sheet на мобильном (см.
+         media-запрос в style.css). Секция «Устройства» (выбор микрофона/
+         камеры) видна ВСЕМ участникам; секция «Комната» (лобби + права
+         гостей, #settings-room-section) — только лидеру, скрывается/
+         показывается через static/room.js: updateSettingsButtonVisibility().
+         Изменение прав шлёт update-settings, см. static/room.js. -->
     <div id="settings-panel" class="settings-panel hidden" role="dialog" aria-modal="true" aria-labelledby="settings-panel-title">
       <div id="settings-panel-backdrop" class="settings-panel-backdrop"></div>
       <div class="settings-panel-card">
@@ -204,49 +224,65 @@
             <line x1="19" y1="5" x2="5" y2="19"></line>
           </svg>
         </button>
-        <h2 id="settings-panel-title">Настройки комнаты</h2>
+        <h2 id="settings-panel-title">Настройки</h2>
 
-        <label class="settings-row">
-          <span class="settings-row-label">Комната ожидания</span>
-          <span class="settings-toggle">
-            <input type="checkbox" id="setting-lobby" />
-            <span class="settings-toggle-track"><span class="settings-toggle-thumb"></span></span>
-          </span>
-        </label>
+        <div class="settings-section-label">Устройства</div>
 
-        <div class="settings-section-label">Гостям разрешено:</div>
-
-        <label class="settings-row">
-          <span class="settings-row-label">Чат</span>
-          <span class="settings-toggle">
-            <input type="checkbox" id="setting-guest-chat" />
-            <span class="settings-toggle-track"><span class="settings-toggle-thumb"></span></span>
-          </span>
-        </label>
-
-        <label class="settings-row">
+        <label class="settings-row settings-row--select">
           <span class="settings-row-label">Микрофон</span>
-          <span class="settings-toggle">
-            <input type="checkbox" id="setting-guest-audio" />
-            <span class="settings-toggle-track"><span class="settings-toggle-thumb"></span></span>
-          </span>
+          <select id="setting-mic-device" class="settings-select"></select>
         </label>
 
-        <label class="settings-row">
+        <label class="settings-row settings-row--select">
           <span class="settings-row-label">Камера</span>
-          <span class="settings-toggle">
-            <input type="checkbox" id="setting-guest-video" />
-            <span class="settings-toggle-track"><span class="settings-toggle-thumb"></span></span>
-          </span>
+          <select id="setting-camera-device" class="settings-select"></select>
         </label>
 
-        <label class="settings-row">
-          <span class="settings-row-label">Показ экрана</span>
-          <span class="settings-toggle">
-            <input type="checkbox" id="setting-guest-screen" />
-            <span class="settings-toggle-track"><span class="settings-toggle-thumb"></span></span>
-          </span>
-        </label>
+        <div id="settings-room-section">
+          <div class="settings-section-label">Комната</div>
+
+          <label class="settings-row">
+            <span class="settings-row-label">Комната ожидания</span>
+            <span class="settings-toggle">
+              <input type="checkbox" id="setting-lobby" />
+              <span class="settings-toggle-track"><span class="settings-toggle-thumb"></span></span>
+            </span>
+          </label>
+
+          <div class="settings-section-label">Гостям разрешено:</div>
+
+          <label class="settings-row">
+            <span class="settings-row-label">Чат</span>
+            <span class="settings-toggle">
+              <input type="checkbox" id="setting-guest-chat" />
+              <span class="settings-toggle-track"><span class="settings-toggle-thumb"></span></span>
+            </span>
+          </label>
+
+          <label class="settings-row">
+            <span class="settings-row-label">Микрофон</span>
+            <span class="settings-toggle">
+              <input type="checkbox" id="setting-guest-audio" />
+              <span class="settings-toggle-track"><span class="settings-toggle-thumb"></span></span>
+            </span>
+          </label>
+
+          <label class="settings-row">
+            <span class="settings-row-label">Камера</span>
+            <span class="settings-toggle">
+              <input type="checkbox" id="setting-guest-video" />
+              <span class="settings-toggle-track"><span class="settings-toggle-thumb"></span></span>
+            </span>
+          </label>
+
+          <label class="settings-row">
+            <span class="settings-row-label">Показ экрана</span>
+            <span class="settings-toggle">
+              <input type="checkbox" id="setting-guest-screen" />
+              <span class="settings-toggle-track"><span class="settings-toggle-thumb"></span></span>
+            </span>
+          </label>
+        </div>
       </div>
     </div>
   </div>

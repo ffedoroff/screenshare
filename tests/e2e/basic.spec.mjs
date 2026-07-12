@@ -328,11 +328,67 @@ async function main() {
       skip('микрофон/спикинг', 'камера Васи не заработала');
     }
 
+    // --- Настройки: селекты устройств наполняются (fake-флаги дают fake-устройства) ---
+    await step(
+      'У Васи в настройках наполняются селекты микрофона/камеры (enumerateDevices не застаблен — реальный список, включая fake-устройства из CAPTURE_FLAGS)',
+      async () => {
+        await vasyaPage.click('#settings-button');
+        await vasyaPage.waitForSelector('#settings-panel:not(.hidden)', { timeout: 3000 });
+        // refreshDeviceLists() внутри openSettingsPanel асинхронный
+        // (enumerateDevices — Promise) — ждём реального появления опций, а не
+        // считаем сразу же после клика (гонка, см. static/room.js).
+        await vasyaPage.waitForFunction(
+          () => document.querySelectorAll('#setting-mic-device option').length > 0,
+          undefined,
+          { polling: 100, timeout: 3000 }
+        );
+        const micCount = await vasyaPage.locator('#setting-mic-device option').count();
+        const camCount = await vasyaPage.locator('#setting-camera-device option').count();
+        assert.ok(micCount > 0, `селект микрофона должен быть наполнен хотя бы одним устройством, получено ${micCount}`);
+        assert.ok(camCount > 0, `селект камеры должен быть наполнен хотя бы одним устройством, получено ${camCount}`);
+        await vasyaPage.click('#settings-panel-close');
+      }
+    );
+
+    // --- Смена камеры "на лету" (устройство включено) — без ренегоциации ---
+    if (camOk) {
+      await step(
+        'Вася меняет камеру в настройках, пока она включена (replaceTrack без ренегоциации) — видео у Пети остаётся живым',
+        async () => {
+          await vasyaPage.click('#settings-button');
+          await vasyaPage.waitForSelector('#settings-panel:not(.hidden)', { timeout: 3000 });
+          await vasyaPage.waitForFunction(
+            () => document.querySelectorAll('#setting-camera-device option').length > 0,
+            undefined,
+            { polling: 100, timeout: 3000 }
+          );
+          // Единственное фейковое устройство переизбирается заново — тесту
+          // важен не факт смены НА ДРУГОЕ железо (в CI его нет), а то, что сам
+          // путь "включена -> getUserMedia -> RTCRtpSender.replaceTrack" не
+          // рвёт уже установленное соединение (см. static/room.js:
+          // applyCameraDeviceChange/liveSwitchCamTrack).
+          const hadOption = await vasyaPage.evaluate(() => {
+            const el = document.getElementById('setting-camera-device');
+            if (!el.options.length) return false;
+            el.value = el.options[0].value;
+            el.dispatchEvent(new Event('change'));
+            return true;
+          });
+          assert.ok(hadOption, 'у камеры должен быть хотя бы один вариант в селекте');
+          await vasyaPage.click('#settings-panel-close');
+          await assertVideoPlaying(petyaPage, { selector: `${vasyaTileSel} video`, waitMs: 1500 });
+        }
+      );
+    } else {
+      skip('смена камеры на лету', 'камера Васи не заработала');
+    }
+
     // --- Вася включает микрофон ---
-    const micOk = await step('Вася включает микрофон — у Пети и Оли speaking-индикация на его тайле', async () => {
+    const micOk = await step('Вася включает микрофон — у Пети и Оли speaking-индикация на его тайле, индикатор «мик выключен» пропадает', async () => {
       await vasyaPage.click('#mic-button');
       for (const page of [petyaPage, olyaPage]) {
         await waitForClassOnSelector(page, vasyaTileSel, 'tile--speaking', true, 8000);
+        await waitForClassOnSelector(page, `${vasyaTileSel} .tile-mic-off`, 'hidden', true, 4000);
       }
     });
 
@@ -359,6 +415,45 @@ async function main() {
     if (!petyaShareOk) {
       skip('Петя прекращает показ', 'шаринг экрана не заработал');
       skip('Оля начинает свой показ', 'шаринг экрана не заработал');
+      skip('кнопка fullscreen сцены шаринга', 'шаринг экрана не заработал');
+    }
+
+    // --- Кнопка fullscreen на сцене шаринга: клик не должен ронять страницу ---
+    // (сам вход в fullscreen в headless-браузере не проверяем — см. static/room.js:
+    // requestFullscreenCompat ловит ошибку сама и не пробрасывает её выше).
+    if (petyaShareOk) {
+      await step('Кнопка fullscreen на сцене шаринга видна у Оли, клик по ней не роняет страницу', async () => {
+        const btn = olyaPage.locator('#screen-fullscreen-button');
+        await btn.waitFor({ state: 'visible', timeout: 3000 });
+        await btn.click();
+        await sleep(200);
+        const stillResponsive = await olyaPage.evaluate(() => !!document.getElementById('screen-fullscreen-button'));
+        assert.ok(stillResponsive, 'страница должна остаться отзывчивой после клика по fullscreen-кнопке');
+
+        // Headless Chrome реально выполняет переход в fullscreen (это не
+        // no-op) — тогда полноэкранный элемент перекрывает остальную
+        // страницу (чат и т.п. в следующих шагах). Настоящий пользователь
+        // вышел бы через Esc, но синтетическое page.keyboard.press('Escape')
+        // не долетает до браузерного обработчика fullscreen-Esc (проверено
+        // отдельным прогоном) — поэтому выходим программно тем же API,
+        // которым пользуется сама кнопка (см. static/room.js: exitFullscreenCompat).
+        const isFullscreen = await olyaPage.evaluate(
+          () => !!(document.fullscreenElement || document.webkitFullscreenElement)
+        );
+        if (isFullscreen) {
+          await olyaPage.evaluate(() => {
+            const fn = document.exitFullscreen || document.webkitExitFullscreen;
+            return fn ? fn.call(document) : undefined;
+          });
+          await olyaPage
+            .waitForFunction(
+              () => !(document.fullscreenElement || document.webkitFullscreenElement),
+              undefined,
+              { polling: 100, timeout: 3000 }
+            )
+            .catch(() => {});
+        }
+      });
     }
 
     // --- Петя прекращает показ ---
@@ -443,10 +538,11 @@ async function main() {
 
     // --- Вася выключает микрофон и камеру обратно ---
     if (micOk) {
-      await step('Вася выключает микрофон повторным кликом — speaking-индикация гаснет у остальных', async () => {
+      await step('Вася выключает микрофон повторным кликом — speaking-индикация гаснет у остальных, индикатор «мик выключен» появляется', async () => {
         await vasyaPage.click('#mic-button');
         for (const page of [petyaPage, olyaPage]) {
           await waitForClassOnSelector(page, vasyaTileSel, 'tile--speaking', false, 6000);
+          await waitForClassOnSelector(page, `${vasyaTileSel} .tile-mic-off`, 'hidden', false, 4000);
         }
       });
     } else {
@@ -730,6 +826,26 @@ async function main() {
             quoteNameText.includes('Боря'),
             `цитата реплая у получателя должна показывать имя автора оригинала «Боря»: ${quoteNameText}`
           );
+
+          // --- (б-2) реплай на ФОРМАТИРОВАННОЕ сообщение (**wow** ... из (а)) —
+          // плашка над инпутом и цитата в полученном реплае должны показывать
+          // ПЛЕЙН-текст, без сырых markdown-маркеров (см. static/chat.js:
+          // stripMarkdownForPreview) ---
+          await bFmtMsg.hover();
+          await bFmtMsg.locator('.chat-message-action--reply').click();
+          await bPage.locator('.chat-reply-bar:not(.hidden)').waitFor({ state: 'visible', timeout: 3000 });
+          const fmtReplyBarText = (await bPage.locator('.chat-reply-bar-text').textContent()) || '';
+          assert.ok(!fmtReplyBarText.includes('**'), `плашка реплая не должна показывать сырые "**": ${fmtReplyBarText}`);
+          assert.ok(fmtReplyBarText.includes('wow'), `плашка реплая должна содержать текст оригинала: ${fmtReplyBarText}`);
+
+          const fmtReplyText = `Реплай-на-форматированное-${Date.now()}`;
+          await sendChatMessage(bPage, fmtReplyText);
+          assert.ok(await messageTextsInclude(cPage, fmtReplyText), 'реплай на форматированное сообщение не дошёл до Вити');
+
+          const cFmtReplyMsg = cPage.locator('.chat-message', { hasText: fmtReplyText }).last();
+          const fmtQuoteText = await cFmtReplyMsg.locator('.chat-reply-quote-text').textContent();
+          assert.ok(!fmtQuoteText.includes('**'), `цитата реплая не должна показывать сырые "**": ${fmtQuoteText}`);
+          assert.ok(fmtQuoteText.includes('wow'), `цитата реплая должна содержать текст оригинала: ${fmtQuoteText}`);
 
           // --- (в) реакции: Аня ставит 👍 на сообщение Бори -> у Бори и Вити чип «👍 1»; toggle убирает ---
           const aTargetMsg = aPage.locator('.chat-message', { hasText: originalText }).last();
@@ -1170,11 +1286,30 @@ async function main() {
             () => document.querySelector('.tile--own .tile-crown')?.classList.contains('hidden')
           );
           assert.equal(goshaOwnCrownHidden, true, 'у Гоши на своём тайле короны быть не должно');
+          // Шестерёнка настроек видна ВСЕМ (секция «Устройства» — выбор
+          // микрофона/камеры общая), но секция «Комната» (лобби + права
+          // гостей) внутри панели — только у лидера.
           await goshaPage.waitForFunction(
-            () => document.getElementById('settings-button')?.classList.contains('hidden'),
+            () => !document.getElementById('settings-button')?.classList.contains('hidden'),
             undefined,
             { polling: 100, timeout: 3000 }
           );
+          await goshaPage.click('#settings-button');
+          await goshaPage.waitForFunction(
+            () => document.getElementById('settings-room-section')?.classList.contains('hidden'),
+            undefined,
+            { polling: 100, timeout: 3000 }
+          );
+          // refreshDeviceLists() асинхронный (enumerateDevices — Promise) —
+          // ждём реального появления опций, а не считаем сразу после клика.
+          await goshaPage.waitForFunction(
+            () => document.querySelectorAll('#setting-mic-device option').length > 0,
+            undefined,
+            { polling: 100, timeout: 3000 }
+          );
+          const goshaMicOptionsCount = await goshaPage.locator('#setting-mic-device option').count();
+          assert.ok(goshaMicOptionsCount > 0, 'у Гоши селект микрофона должен наполниться хотя бы одним устройством');
+          await goshaPage.click('#settings-panel-close');
 
           // --- (б) лидер включает лобби ---
           await lidaPage.click('#settings-button');
@@ -1304,8 +1439,10 @@ async function main() {
             { polling: 50, timeout: 8000 }
           );
           await waitCrownVisible(goshaPage, '.tile--own', true);
+          // Гоша стал лидером — секция «Комната» внутри панели настроек
+          // теперь тоже его (шестерёнка была видна и раньше, см. проверку выше).
           await goshaPage.waitForFunction(
-            () => !document.getElementById('settings-button')?.classList.contains('hidden'),
+            () => !document.getElementById('settings-room-section')?.classList.contains('hidden'),
             undefined,
             { polling: 100, timeout: 5000 }
           );

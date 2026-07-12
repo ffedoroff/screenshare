@@ -234,6 +234,26 @@ const ChatPanel = (() => {
     return str.length > maxLen ? `${str.slice(0, maxLen)}…` : str;
   }
 
+  /**
+   * Убрать markdown-маркеры (**жирный**, *курсив*, ~~зачёркнутый~~, "> "
+   * цитата) из текста для PLAIN-TEXT превью — реплай-плашка над инпутом
+   * (startReply) и цитата оригинала в самом сообщении (buildReplyQuoteEl) не
+   * рендерят разметку (места мало, важнее компактность), поэтому маркеры не
+   * должны "протекать" в них сырыми звёздочками. Тот же синтаксис, что
+   * renderMessageBody/INLINE_MD_RE рендерят полноценно — здесь просто снятие
+   * маркеров, без построения DOM. Переводы строк схлопываются в пробел —
+   * превью однострочное.
+   */
+  function stripMarkdownForPreview(text) {
+    return String(text || '')
+      .split('\n')
+      .map((line) => (line.startsWith('> ') ? line.slice(2) : line))
+      .join(' ')
+      .replace(/\*\*(?!\s)([^*]+?)(?<!\s)\*\*/g, '$1')
+      .replace(/~~(?!\s)([^~]+?)(?<!\s)~~/g, '$1')
+      .replace(/\*(?!\s)([^*]+?)(?<!\s)\*/g, '$1');
+  }
+
   /** CSS.escape с фоллбэком — как в scrollToMessageAndHighlight, вынесено сюда для переиспользования файловыми карточками. */
   function escapeForSelector(value) {
     return typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(value) : value;
@@ -656,7 +676,7 @@ const ChatPanel = (() => {
         textEl.textContent = 'Сообщение удалено';
       } else {
         const bodyText = overlay && typeof overlay.editText === 'string' ? overlay.editText : original.text;
-        textEl.textContent = truncateText(bodyText, REPLY_PREVIEW_MAX_LEN);
+        textEl.textContent = truncateText(stripMarkdownForPreview(bodyText), REPLY_PREVIEW_MAX_LEN);
       }
       quote.appendChild(nameEl);
       quote.appendChild(textEl);
@@ -1140,7 +1160,7 @@ const ChatPanel = (() => {
     function startReply(msg) {
       cancelEditAndClear(); // реплай и редактирование взаимоисключаются (см. заголовок файла)
       replyTarget = msg;
-      replyBarText.textContent = `Ответ ${displayName(msg)}: ${truncateText(msg.text, REPLY_PREVIEW_MAX_LEN)}`;
+      replyBarText.textContent = `Ответ ${displayName(msg)}: ${truncateText(stripMarkdownForPreview(msg.text), REPLY_PREVIEW_MAX_LEN)}`;
       replyBar.classList.remove('hidden');
       closeReactionPopover();
       textInput.focus();
