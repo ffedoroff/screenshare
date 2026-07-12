@@ -179,10 +179,18 @@ async fn version_json() -> Json<serde_json::Value> {
     }))
 }
 
+/// Запрет кэширования страниц и статики. Без этого Cloudflare кэширует
+/// .css/.js на edge по расширению (origin не слал Cache-Control), и после
+/// деплоя браузеры получали СТАРУЮ статику к новой разметке — страницы
+/// выглядели разломанными до истечения edge-TTL (поймано живой проверкой
+/// прода 2026-07-12). Файлы крошечные, безусловный no-cache дешевле и
+/// надёжнее ETag-механики; /qr.svg не трогаем — его содержимое неизменно.
+const NO_CACHE: (header::HeaderName, &str) = (header::CACHE_CONTROL, "no-cache");
+
 /// Отдать HTML-страницу из static/.
 async fn page(name: &str) -> Response {
     match tokio::fs::read_to_string(format!("{}/{name}", *STATIC_DIR)).await {
-        Ok(body) => Html(body).into_response(),
+        Ok(body) => ([NO_CACHE], Html(body)).into_response(),
         Err(e) => {
             tracing::error!("нет файла статики {name}: {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, "static file missing").into_response()
@@ -205,7 +213,7 @@ async fn static_file(Path(path): Path<String>) -> Response {
         _ => "application/octet-stream",
     };
     match tokio::fs::read(format!("{}/{path}", *STATIC_DIR)).await {
-        Ok(body) => ([(header::CONTENT_TYPE, content_type)], body).into_response(),
+        Ok(body) => ([(header::CONTENT_TYPE, content_type), (NO_CACHE.0, NO_CACHE.1)], body).into_response(),
         Err(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
 }
