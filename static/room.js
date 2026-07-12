@@ -700,6 +700,20 @@ wireSettingToggle(settingGuestScreenInput, 'guestScreen');
 
 // ---------- Локальные потоки: рассылка новым и уже существующим пирам ----------
 
+/**
+ * Отправить stream-info одному пиру: если DataChannel-шина до него уже
+ * открыта — через неё (см. bus.js/rtc.js, Ф2), иначе — серверный релей как
+ * раньше (fallback: пока mesh только устанавливается, шины ещё нет).
+ * Формат сообщения на приёме единый для обоих путей — см. handleStreamInfo.
+ */
+function sendStreamInfoTo(peerId, info) {
+  if (bus.isOpen(peerId)) {
+    bus.sendToPeer(peerId, { kind: 'stream-info', info });
+  } else {
+    signaling.send('stream-info', { targetPeerId: peerId, info });
+  }
+}
+
 /** Добавить трек(и) `stream` во все существующие PeerConnection и разослать stream-info. */
 function broadcastLocalStream(stream, kind) {
   const info = { [stream.id]: { kind, name: myName || null, enabled: true } };
@@ -707,7 +721,7 @@ function broadcastLocalStream(stream, kind) {
     for (const track of stream.getTracks()) {
       entry.rtc.pc.addTrack(track, stream);
     }
-    signaling.send('stream-info', { targetPeerId: peerId, info });
+    sendStreamInfoTo(peerId, info);
   }
 }
 
@@ -731,7 +745,7 @@ function broadcastLocalStream(stream, kind) {
 function broadcastStreamEnabled(stream, kind, enabled) {
   const info = { [stream.id]: { kind, name: myName || null, enabled } };
   for (const peerId of peers.keys()) {
-    signaling.send('stream-info', { targetPeerId: peerId, info });
+    sendStreamInfoTo(peerId, info);
   }
 }
 
@@ -751,18 +765,64 @@ function removeLocalStreamFromAllPeers(stream) {
   }
 }
 
-/** Сообщить конкретному (обычно только что появившемуся) пиру обо всех своих активных потоках. */
+/**
+ * Сообщить конкретному пиру обо всех своих активных потоках (снапшот) —
+ * вызывается ДВАЖДЫ за жизнь пары (см. createRemotePeer):
+ *   1) сразу при создании пира — шина ещё не открыта, уйдёт через серверный
+ *      релей (обычный bootstrap-путь, пока mesh только устанавливается);
+ *   2) повторно в момент открытия шины к этому пиру (onBusOpen) — на этот
+ *      раз уйдёт уже по шине (sendStreamInfoTo видит bus.isOpen() === true).
+ * Повтор №2 закрывает гонку «оффер с треками ушёл раньше, чем открылась
+ * шина»: даже если сервер потерял/задержал первую посылку, актуальное
+ * состояние гарантированно долетит по P2P-каналу сразу же, как только он
+ * готов — после этого точечные обновления (broadcastLocalStream/
+ * broadcastStreamEnabled) уже почти всегда идут по шине.
+ */
 function sendAllActiveStreamInfoTo(peerId) {
   const info = {};
   if (micStream) info[micStream.id] = { kind: 'mic', name: myName || null, enabled: micTrack ? micTrack.enabled : true };
   if (camStream) info[camStream.id] = { kind: 'camera', name: myName || null, enabled: camTrack ? camTrack.enabled : true };
   if (screenStream) info[screenStream.id] = { kind: 'screen', name: myName || null, enabled: true };
   if (Object.keys(info).length > 0) {
-    signaling.send('stream-info', { targetPeerId: peerId, info });
+    sendStreamInfoTo(peerId, info);
   }
 }
 
 // ---------- Входящие треки: маршрутизация по stream-info ----------
+
+/**
+ * Единая точка приёма stream-info — не важно, пришёл ли он по DataChannel-
+ * шине (см. bus.onMessage ниже) или по серверному релею-фоллбэку (см.
+ * signaling.on('stream-info', ...) в registerSignalingHandlers): формат
+ * `info` в обоих случаях один и тот же (см. sendStreamInfoTo), поэтому вся
+ * логика маршрутизации/дедупликации живёт здесь один раз.
+ */
+function handleStreamInfo(info) {
+  if (!info || typeof info !== 'object') return;
+  for (const [streamId, meta] of Object.entries(info)) {
+    const hadMetaBefore = streamInfoMap.has(streamId);
+    streamInfoMap.set(streamId, meta);
+    const queue = pendingTracks.get(streamId);
+    if (queue) {
+      pendingTracks.delete(streamId);
+      for (const item of queue) {
+        routeRemoteTrack(item.peerId, streamId, item.stream, item.track, meta);
+      }
+    } else if (hadMetaBefore && meta.kind === 'camera' && typeof meta.enabled === 'boolean') {
+      // Повторный stream-info для уже подключённого потока камеры — это
+      // toggle enabled (см. broadcastStreamEnabled), а не новый трек.
+      applyCameraEnabledUpdate(streamId, meta.enabled);
+    }
+  }
+}
+
+// Приём stream-info с шины (Ф2) — обычный путь, как только mesh-пара
+// установлена; обработчик общий с сервером-фоллбэком (handleStreamInfo
+// выше). Сообщения чата и прочих фич шины (см. chat.js: dispatchEnvelope,
+// envelope.kind) сюда не попадают — фильтруем по kind: 'stream-info'.
+bus.onMessage((_fromPeerId, obj) => {
+  if (obj && obj.kind === 'stream-info') handleStreamInfo(obj.info);
+});
 
 function handleRemoteTrack(peerId, event) {
   const track = event.track;
@@ -917,6 +977,10 @@ function createRemotePeer(peerId, name, iceServers) {
     onTrack: (event) => handleRemoteTrack(peerId, event),
     onStateChange: () => {},
     onBusMessage: (obj) => bus._dispatch(peerId, obj),
+    // Ф2: как только шина к этому пиру открылась — сразу переслать ему по
+    // ней снапшот всех наших актуальных stream-info (см.
+    // sendAllActiveStreamInfoTo, там же почему это нужно ВТОРЫМ разом).
+    onBusOpen: () => sendAllActiveStreamInfoTo(peerId),
     // Ф3: входящий файловый DataChannel — маршрутизируем в ChatPanel (там
     // живёт протокол передачи файлов, см. static/chat.js). `chat` в момент
     // регистрации этого колбэка может быть ещё не создан (для первых пиров
@@ -1286,24 +1350,11 @@ function registerSignalingHandlers(iceServers) {
     await entry.rtc.handleCandidate(candidate);
   });
 
-  signaling.on('stream-info', ({ info }) => {
-    if (!info || typeof info !== 'object') return;
-    for (const [streamId, meta] of Object.entries(info)) {
-      const hadMetaBefore = streamInfoMap.has(streamId);
-      streamInfoMap.set(streamId, meta);
-      const queue = pendingTracks.get(streamId);
-      if (queue) {
-        pendingTracks.delete(streamId);
-        for (const item of queue) {
-          routeRemoteTrack(item.peerId, streamId, item.stream, item.track, meta);
-        }
-      } else if (hadMetaBefore && meta.kind === 'camera' && typeof meta.enabled === 'boolean') {
-        // Повторный stream-info для уже подключённого потока камеры — это
-        // toggle enabled (см. broadcastStreamEnabled), а не новый трек.
-        applyCameraEnabledUpdate(streamId, meta.enabled);
-      }
-    }
-  });
+  // Серверный релей-фоллбэк (см. sendStreamInfoTo) — актуален, пока шина к
+  // конкретному пиру ещё не открыта (в основном bootstrap-окно сразу после
+  // входа в комнату); дальше основной путь — bus.onMessage выше, этот
+  // обработчик становится редким (см. handleStreamInfo — общая точка входа).
+  signaling.on('stream-info', ({ info }) => handleStreamInfo(info));
 
   signaling.on('share-started', ({ peerId }) => {
     cancelScreenOwnerGrace(); // владелец подтверждён сервером — грейс больше не нужен

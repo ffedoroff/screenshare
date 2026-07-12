@@ -59,11 +59,16 @@
 'use strict';
 
 class RtcPeer {
-  constructor({ iceServers, polite, signaling, targetPeerId, onTrack, onStateChange, onBusMessage, onFileChannel }) {
+  constructor({ iceServers, polite, signaling, targetPeerId, onTrack, onStateChange, onBusMessage, onBusOpen, onFileChannel }) {
     this.signaling = signaling;
     this.targetPeerId = targetPeerId;
     this.polite = polite;
     this.onBusMessage = onBusMessage || null;
+    // Ф2: колбэк на момент, когда шина к этому пиру открылась (после флаша
+    // очереди) — используется для рассылки снапшота актуального состояния
+    // (см. static/room.js: sendAllActiveStreamInfoTo) сразу по шине, закрывая
+    // гонку «оффер с треками ушёл раньше, чем открылась шина».
+    this.onBusOpen = onBusOpen || null;
     // Ф3: колбэк на входящий файловый DataChannel (label начинается с
     // 'file-') — см. createFileChannel ниже и static/chat.js.
     this.onFileChannel = onFileChannel || null;
@@ -102,6 +107,7 @@ class RtcPeer {
             console.error(`[peer ${targetPeerId}] Ошибка отправки в шину (флаш очереди):`, err);
           }
         }
+        if (this.onBusOpen) this.onBusOpen();
       };
 
       channel.onmessage = (event) => {

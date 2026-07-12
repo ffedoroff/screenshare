@@ -124,9 +124,19 @@ async function waitForClassOnSelector(page, selector, className, present, timeou
 // моменту отправки чата) фреймов 'chat' в серверном сокете быть не должно
 // вообще ни у одного из участников. Ставится ДО первой навигации
 // (addInitScript выполняется при каждой загрузке страницы контекста).
+//
+// Ф2: заодно запоминаем и фреймы type === 'stream-info' (метки медиатреков
+// kind/имя/enabled, см. static/room.js: sendStreamInfoTo) — вместе с
+// временем отправки (Date.now() того же браузерного контекста, что и
+// сравнение в тесте). stream-info по протоколу ВСЕГДА разрешён через сервер
+// в bootstrap-окне сразу после входа в комнату (шина до конкретного пира
+// ещё не открылась — см. static/rtc.js: onBusOpen), поэтому сам факт
+// присутствия такого фрейма не баг — баг это фрейм ПОСЛЕ bootstrap-окна
+// (см. проверку ниже в main()).
 function installChatWsSpy(context) {
   return context.addInitScript(() => {
     window.__e2eChatFramesSent = [];
+    window.__e2eStreamInfoFramesSent = [];
     const RealWebSocket = window.WebSocket;
     window.WebSocket = class extends RealWebSocket {
       constructor(...args) {
@@ -137,9 +147,11 @@ function installChatWsSpy(context) {
             const parsed = JSON.parse(data);
             if (parsed && parsed.type === 'chat') {
               window.__e2eChatFramesSent.push(parsed);
+            } else if (parsed && parsed.type === 'stream-info') {
+              window.__e2eStreamInfoFramesSent.push({ ts: Date.now(), frame: parsed });
             }
           } catch {
-            // не строка/не JSON — точно не наш chat-фрейм
+            // не строка/не JSON — точно не наш фрейм
           }
           return realSend(data);
         };
@@ -150,6 +162,50 @@ function installChatWsSpy(context) {
 
 async function chatFramesSentOn(page) {
   return page.evaluate(() => window.__e2eChatFramesSent || []);
+}
+
+async function streamInfoFramesSentOn(page) {
+  return page.evaluate(() => window.__e2eStreamInfoFramesSent || []);
+}
+
+// Сколько миллисекунд после установления mesh-пары (connectionState
+// 'connected' у обоих RTCPeerConnection, см. waitForMeshSettled) серверный
+// релей stream-info ещё считается штатным bootstrap-путём (шина открывается
+// не мгновенно после connected — SCTP-négotiation датаканала идёт следом,
+// см. static/rtc.js). После этого окна ЛЮБОЙ новый stream-info должен идти
+// только по шине (см. onBusOpen в static/rtc.js/room.js — снапшот, отправленный
+// сразу по открытию шины, и делает серверный путь редким).
+const STREAM_INFO_BOOTSTRAP_WINDOW_MS = 3000;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Проверить, что ни у одной из `pagesByLabel` не было stream-info фреймов
+ * через сервер ПОСЛЕ bootstrap-окна (см. STREAM_INFO_BOOTSTRAP_WINDOW_MS).
+ * `settledAtByLabel` — Map<label, ts> с момента, когда у соответствующей
+ * страницы mesh стал 'connected' (см. вызовы ниже в main()). Если с этого
+ * момента реально прошло меньше окна — досыпаем разницу, чтобы не ловить
+ * ложный «зелёный» результат только потому, что предыдущие шаги отработали
+ * быстрее ожидаемого.
+ */
+async function assertNoLateStreamInfoOverServer(pagesByLabel, settledAtByLabel) {
+  const oldestSettledAt = Math.min(...settledAtByLabel.values());
+  const elapsed = Date.now() - oldestSettledAt;
+  if (elapsed < STREAM_INFO_BOOTSTRAP_WINDOW_MS) {
+    await sleep(STREAM_INFO_BOOTSTRAP_WINDOW_MS - elapsed);
+  }
+  for (const [label, page] of pagesByLabel) {
+    const settledAt = settledAtByLabel.get(label);
+    const frames = await streamInfoFramesSentOn(page);
+    const late = frames.filter((f) => f.ts > settledAt + STREAM_INFO_BOOTSTRAP_WINDOW_MS);
+    assert.equal(
+      late.length,
+      0,
+      `у ${label} после bootstrap-окна (${STREAM_INFO_BOOTSTRAP_WINDOW_MS}мс от установления mesh) ушли stream-info фреймы через сервер вместо шины: ${JSON.stringify(late)}`
+    );
+  }
 }
 
 async function main() {
@@ -216,6 +272,11 @@ async function main() {
     const petyaPage = await petyaContext.newPage();
     const olyaPage = await olyaContext.newPage();
 
+    // peerId-метка -> ts (в часах браузерного контекста той же страницы),
+    // когда mesh у неё стал 'connected' — см. assertNoLateStreamInfoOverServer
+    // ниже (bootstrap-окно stream-info отсчитывается от этого момента).
+    const meshSettledAtByLabel = new Map();
+
     const everyoneJoinedOk = await step('Петя и Оля открывают ссылку комнаты (модалка входа), у всех троих по 3 тайла, корона только у Васи', async () => {
       await petyaPage.goto(roomUrl);
       await olyaPage.goto(roomUrl);
@@ -227,6 +288,10 @@ async function main() {
       // waitForMeshSettled ждёт и тайлы, и что у всех троих обе mesh-связи
       // (шина + сигналинг) реально дошли до connected — см. helpers.mjs.
       await waitForMeshSettled([vasyaPage, petyaPage, olyaPage], { tileCount: 3, connectionsPerPage: 2 });
+
+      for (const [label, page] of [['Вася', vasyaPage], ['Петя', petyaPage], ['Оля', olyaPage]]) {
+        meshSettledAtByLabel.set(label, await page.evaluate(() => Date.now()));
+      }
 
       // (а) Вася — лидер (корона на его тайле у остальных), у Пети/Оли короны нет.
       const vasyaTileSel = await tileSelector('Вася');
@@ -452,6 +517,28 @@ async function main() {
         { polling: 100, timeout: 5000 }
       );
     });
+
+    // --- Живой mesh: НОВЫЕ stream-info (камера/мик вкл/выкл ПОСЛЕ установления
+    // связи, выше по сценарию) не должны были уйти через сервер за пределами
+    // bootstrap-окна — основной путь теперь DataChannel-шина (см. static/rtc.js:
+    // onBusOpen, static/room.js: sendStreamInfoTo/handleStreamInfo).
+    if (everyoneJoinedOk) {
+      await step(
+        `Ни один stream-info фрейм не ушёл в серверный WebSocket ПОСЛЕ bootstrap-окна (${STREAM_INFO_BOOTSTRAP_WINDOW_MS}мс от установления mesh) ни у кого из троих`,
+        async () => {
+          await assertNoLateStreamInfoOverServer(
+            [
+              ['Вася', vasyaPage],
+              ['Петя', petyaPage],
+              ['Оля', olyaPage],
+            ],
+            meshSettledAtByLabel
+          );
+        }
+      );
+    } else {
+      skip('проверка "новый stream-info не идёт через сервер после bootstrap-окна"', 'mesh не установился');
+    }
 
     await vasyaContext.close();
     await petyaContext.close();
