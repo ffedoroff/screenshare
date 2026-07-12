@@ -90,6 +90,13 @@ const settingGuestAudioInput = document.getElementById('setting-guest-audio');
 const settingGuestVideoInput = document.getElementById('setting-guest-video');
 const settingGuestScreenInput = document.getElementById('setting-guest-screen');
 
+// --- DOM: «Соединение и приватность» (см. раздел ниже) — видно ВСЕМ участникам ---
+const settingsCryptoRowEl = document.getElementById('settings-crypto-row');
+const settingsCryptoTextEl = document.getElementById('settings-crypto-text');
+const settingsPeersListEl = document.getElementById('settings-peers-list');
+const settingsSignalingCountEl = document.getElementById('settings-signaling-count');
+const settingsFallbackCountEl = document.getElementById('settings-fallback-count');
+
 // --- DOM: устройства (см. заголовок раздела «Выбор камеры и микрофона» ниже) — видно ВСЕМ участникам, не только лидеру ---
 const settingMicDeviceSelect = document.getElementById('setting-mic-device');
 const settingCameraDeviceSelect = document.getElementById('setting-camera-device');
@@ -847,11 +854,160 @@ function syncSettingsPanelInputs() {
 function openSettingsPanel() {
   syncSettingsPanelInputs();
   refreshDeviceLists();
+  refreshConnectionSection();
+  if (connectionSectionTimer) clearInterval(connectionSectionTimer);
+  connectionSectionTimer = setInterval(refreshConnectionSection, CONNECTION_SECTION_REFRESH_MS);
   settingsPanelEl.classList.remove('hidden');
 }
 
 function closeSettingsPanel() {
   settingsPanelEl.classList.add('hidden');
+  if (connectionSectionTimer) {
+    clearInterval(connectionSectionTimer);
+    connectionSectionTimer = null;
+  }
+}
+
+// ---------- «Соединение и приватность»: режим по каждому пиру + что видит сервер ----------
+//
+// Видна ВСЕМ участникам (в отличие от #settings-room-section выше, только
+// лидер) — задел задачи «показать, в каком режиме работаем и что уходит на
+// сервер». Три части:
+//   1) статичная строка шифрования — из RoomCrypto.getCryptoInfo(), НЕ
+//      хардкодим текст алгоритма (см. static/crypto.js);
+//   2) режим соединения с каждым пиром — P2P/TURN-релей/серверный fallback/
+//      устанавливается — см. computePeerConnectionMode ниже;
+//   3) статичный список того, что видит сервер, плюс счётчики за сессию
+//      (см. static/common.js: ConnStats — инкрементируется в местах реальной
+//      отправки через signaling.send в rtc.js/room.js/chat.js).
+// Обновляется при открытии шита и раз в CONNECTION_SECTION_REFRESH_MS, пока
+// шит открыт — таймер чистится в closeSettingsPanel() выше.
+
+const CONNECTION_SECTION_REFRESH_MS = 5000;
+let connectionSectionTimer = null;
+
+const PEER_MODE_LABELS = {
+  p2p: 'напрямую (P2P)',
+  turn: 'через TURN-релей',
+  fallback: 'через сервер (fallback)',
+  connecting: 'устанавливается…',
+};
+
+/** Отрисовать строку шифрования из getCryptoInfo() — текст алгоритма НЕ хардкодится, кроме шаблона фразы. */
+function renderCryptoInfo() {
+  const info = RoomCrypto.getCryptoInfo();
+  if (!info.active) {
+    settingsCryptoRowEl.classList.add('settings-crypto-row--off');
+    settingsCryptoTextEl.textContent = 'E2E-шифрование выключено — сервер может видеть содержимое';
+    return;
+  }
+  settingsCryptoRowEl.classList.remove('settings-crypto-row--off');
+  settingsCryptoTextEl.textContent =
+    `E2E-шифрование: ${info.algorithm} · ключ ${info.keyBits} бит · ${info.kdf}`;
+}
+
+/**
+ * Selected candidate-pair из отчёта pc.getStats() — спек-путь через
+ * `transport.selectedCandidatePairId` (см. https://www.w3.org/TR/webrtc-stats/),
+ * с фоллбэком на легаси-признаки (`selected`/`nominated`+`succeeded`
+ * непосредственно на candidate-pair) для браузеров, где transport-статы
+ * этого поля не несут.
+ */
+function findSelectedCandidatePair(statsReport) {
+  for (const stat of statsReport.values()) {
+    if (stat.type === 'transport' && stat.selectedCandidatePairId) {
+      const pair = statsReport.get(stat.selectedCandidatePairId);
+      if (pair) return pair;
+    }
+  }
+  for (const stat of statsReport.values()) {
+    if (stat.type === 'candidate-pair' && (stat.selected || (stat.nominated && stat.state === 'succeeded'))) {
+      return stat;
+    }
+  }
+  return null;
+}
+
+/** 'p2p' или 'turn' по типам локального/удалённого кандидата уже выбранной пары. */
+function candidatePairMode(pair, statsReport) {
+  const local = statsReport.get(pair.localCandidateId);
+  const remote = statsReport.get(pair.remoteCandidateId);
+  const localType = local && local.candidateType;
+  const remoteType = remote && remote.candidateType;
+  return localType === 'relay' || remoteType === 'relay' ? 'turn' : 'p2p';
+}
+
+/**
+ * Режим соединения с одним пиром — приоритет ровно как в задании:
+ *  1) есть selected candidate-pair -> 'p2p' (host/srflx/prflx с обеих
+ *     сторон) или 'turn' (кто-то из пары — relay);
+ *  2) пары ещё нет и DataChannel-шина к пиру не открыта -> 'fallback'
+ *     (весь трафик до пира — через серверный релей: signaling.send для
+ *     ещё не устаканившегося mesh);
+ *  3) иначе (пары нет, но шина каким-то образом уже открыта — гоночный
+ *     край, в норме недостижимо) -> 'connecting'.
+ */
+async function computePeerConnectionMode(peerId, entry) {
+  const pc = entry.rtc && entry.rtc.pc;
+  if (!pc) return 'connecting';
+  try {
+    const statsReport = await pc.getStats();
+    const pair = findSelectedCandidatePair(statsReport);
+    if (pair) return candidatePairMode(pair, statsReport);
+  } catch (err) {
+    console.warn(`[peer ${peerId}] getStats() для секции настроек не удался:`, err);
+  }
+  return bus.isOpen(peerId) ? 'connecting' : 'fallback';
+}
+
+/** Перерисовать список «Соединения с участниками» — режим у каждого пира считается асинхронно (getStats), поэтому вся отрисовка целиком после Promise.all, без мигания частично готового списка. */
+async function renderPeerConnectionsList() {
+  const entries = Array.from(peers.entries());
+  if (entries.length === 0) {
+    settingsPeersListEl.textContent = '';
+    const li = document.createElement('li');
+    li.className = 'settings-peer-row settings-peer-row--empty';
+    li.textContent = 'Пока никого — вы одни в комнате.';
+    settingsPeersListEl.appendChild(li);
+    return;
+  }
+
+  const modes = await Promise.all(
+    entries.map(([peerId, entry]) => computePeerConnectionMode(peerId, entry))
+  );
+
+  settingsPeersListEl.textContent = '';
+  entries.forEach(([peerId], i) => {
+    const mode = modes[i];
+    const li = document.createElement('li');
+    li.className = 'settings-peer-row';
+
+    const dot = document.createElement('span');
+    dot.className = `settings-peer-dot settings-peer-dot--${mode}`;
+    dot.setAttribute('aria-hidden', 'true');
+
+    const label = document.createElement('span');
+    label.className = 'settings-peer-label';
+    label.textContent = `${peerNames.get(peerId) || 'Гость'} — ${PEER_MODE_LABELS[mode]}`;
+
+    li.appendChild(dot);
+    li.appendChild(label);
+    settingsPeersListEl.appendChild(li);
+  });
+}
+
+/** Динамические счётчики «что видит сервер» — см. static/common.js: ConnStats. */
+function renderServerCounters() {
+  settingsSignalingCountEl.textContent = String(ConnStats.signalingRelayCount);
+  settingsFallbackCountEl.textContent = String(ConnStats.fallbackChatCount);
+}
+
+function refreshConnectionSection() {
+  renderCryptoInfo();
+  renderServerCounters();
+  renderPeerConnectionsList().catch((err) => {
+    console.error('Не удалось обновить список соединений в настройках:', err);
+  });
 }
 
 // ---------- Устройства: селекты микрофона/камеры (видно всем участникам) ----------
@@ -956,6 +1112,7 @@ function sendStreamInfoTo(peerId, info) {
   } else {
     RoomCrypto.encrypt(sigKey, info).then((encInfo) => {
       signaling.send('stream-info', { targetPeerId: peerId, info: encInfo });
+      ConnStats.incSignalingRelay();
     });
   }
 }

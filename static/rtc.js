@@ -192,6 +192,7 @@ class RtcPeer {
           sdp: pc.localDescription.sdp,
         });
         signaling.send('offer', { targetPeerId, sdp: encSdp });
+        ConnStats.incSignalingRelay();
       } catch (err) {
         console.error(`[peer ${targetPeerId}] Ошибка onnegotiationneeded:`, err);
       } finally {
@@ -206,6 +207,7 @@ class RtcPeer {
             targetPeerId,
             candidate: encCandidate,
           });
+          ConnStats.incSignalingRelay();
         });
       }
     };
@@ -279,6 +281,7 @@ class RtcPeer {
           targetPeerId: this.targetPeerId,
           sdp: encAnswer,
         });
+        ConnStats.incSignalingRelay();
       } catch (err) {
         console.error(`[peer ${this.targetPeerId}] Ошибка setLocalDescription (answer):`, err);
       }

@@ -26,6 +26,28 @@ async function fetchIceServers() {
 }
 
 /**
+ * Счётчики за сессию для секции настроек «Соединение и приватность» (см.
+ * static/room.js: refreshConnectionSection) — сколько раз реально ушло
+ * что-то ЧЕРЕЗ СЕРВЕР (не по P2P-шине). Общий top-level объект классического
+ * скрипта (см. RoomCrypto в static/crypto.js — тот же приём), виден и в
+ * rtc.js (offer/answer/ice-candidate — они ВСЕГДА идут через сигналинг,
+ * шина ими же и устанавливается), и в room.js (stream-info-фоллбэк), и в
+ * chat.js (фоллбэк чата). Начальный «бутстрап»-всплеск на пира неизбежен —
+ * это честно показывается в счётчике, а не прячется (см. задание Ш1).
+ */
+const ConnStats = {
+  signalingRelayCount: 0, // offer/answer/ice-candidate/stream-info(fallback) — через серверный релей
+  fallbackChatCount: 0, // сообщения чата, ушедшие через сервер (P2P-шина к пиру не была открыта)
+
+  incSignalingRelay() {
+    this.signalingRelayCount++;
+  },
+  incFallbackChat() {
+    this.fallbackChatCount++;
+  },
+};
+
+/**
  * Обёртка над WebSocket-сигналингом.
  * — открывает соединение (ws:// или wss:// в зависимости от протокола страницы);
  * — отправляет/принимает JSON-сообщения вида { type, ...поля };

@@ -365,6 +365,40 @@ async function main() {
       }
     );
 
+    // --- Настройки: секция «Соединение и приватность» (видна ВСЕМ) ---
+    await step(
+      'В настройках есть секция «Соединение и приватность»: строка шифрования содержит AES-256-GCM/256 бит, режим соединения с устаканившимся пиром в итоге «напрямую (P2P)», счётчик сигналинга через сервер > 0',
+      async () => {
+        await vasyaPage.click('#settings-button');
+        await vasyaPage.waitForSelector('#settings-panel:not(.hidden)', { timeout: 3000 });
+
+        const cryptoText = await vasyaPage.locator('#settings-crypto-text').textContent();
+        assert.ok(cryptoText.includes('AES-256-GCM'), `строка шифрования должна содержать "AES-256-GCM": ${cryptoText}`);
+        assert.ok(cryptoText.includes('256'), `строка шифрования должна содержать "256" (бит ключа): ${cryptoText}`);
+
+        // Режим соединения с уже устаканившимся (waitForMeshSettled выше)
+        // mesh-пиром должен в итоге стать «напрямую (P2P)» — секция
+        // обновляется раз в 5с, пока открыта (см. static/room.js:
+        // CONNECTION_SECTION_REFRESH_MS), поэтому поллим с запасом до 10с.
+        await vasyaPage.waitForFunction(
+          () => {
+            const rows = Array.from(document.querySelectorAll('#settings-peers-list .settings-peer-row'));
+            return rows.some((row) => row.textContent.includes('напрямую (P2P)'));
+          },
+          undefined,
+          { polling: 200, timeout: 10_000 }
+        );
+
+        const signalingCountText = await vasyaPage.locator('#settings-signaling-count').textContent();
+        assert.ok(
+          Number(signalingCountText) > 0,
+          `счётчик сигналинга через сервер должен быть > 0 (bootstrap-обмен offer/answer/ice неизбежен), получено ${signalingCountText}`
+        );
+
+        await vasyaPage.click('#settings-panel-close');
+      }
+    );
+
     // --- Смена камеры "на лету" (устройство включено) — без ренегоциации ---
     if (camOk) {
       await step(

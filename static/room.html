@@ -287,6 +287,38 @@
             </span>
           </label>
         </div>
+
+        <!-- «Соединение и приватность» — видна ВСЕМ участникам (в отличие от
+             #settings-room-section выше). Наполняется/обновляется в
+             static/room.js: refreshConnectionSection() — при открытии панели
+             и каждые 5с, пока она открыта (таймер чистится при закрытии). -->
+        <div id="settings-conn-section">
+          <div class="settings-section-label">Соединение и приватность</div>
+
+          <div id="settings-crypto-row" class="settings-crypto-row">
+            <svg class="settings-crypto-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="5" y="11" width="14" height="9" rx="1.5"></rect>
+              <path d="M8 11V8a4 4 0 0 1 8 0v3"></path>
+            </svg>
+            <span id="settings-crypto-text"></span>
+          </div>
+
+          <div class="settings-section-label">Соединения с участниками</div>
+          <ul id="settings-peers-list" class="settings-peers-list"></ul>
+
+          <div class="settings-section-label">Что видит сервер</div>
+          <ul class="settings-server-list">
+            <li>IP и порт подключения</li>
+            <li>id комнаты и участников</li>
+            <li>времена входа/выхода</li>
+            <li>факт и владелец показа экрана</li>
+          </ul>
+          <div class="settings-server-counters">
+            <div>Сигналинг-сообщений через сервер: <span id="settings-signaling-count">0</span> (зашифровано)</div>
+            <div>Fallback-сообщений чата: <span id="settings-fallback-count">0</span> (зашифровано)</div>
+          </div>
+          <div class="settings-server-summary">Содержимое звонков, чата и имена сервер прочитать не может.</div>
+        </div>
       </div>
     </div>
   </div>

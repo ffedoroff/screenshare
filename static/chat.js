@@ -1308,6 +1308,7 @@ const ChatPanel = (() => {
       } else {
         RoomCrypto.encrypt(chatKey, envelope).then((enc) => {
           signaling.send('chat', { targetPeerId, envelope: { enc } });
+          ConnStats.incFallbackChat();
         });
       }
     }

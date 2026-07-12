@@ -1946,4 +1946,115 @@ body {
   .settings-row {
     min-height: 48px;
   }
+
+  .settings-crypto-row,
+  .settings-peer-row {
+    min-height: 48px;
+  }
+}
+
+/* ---------- «Соединение и приватность» (см. static/room.js:
+   refreshConnectionSection) — видна ВСЕМ участникам, ниже «Устройств». ---------- */
+
+.settings-crypto-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 44px;
+  font-size: 0.9rem;
+}
+
+.settings-crypto-icon {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  color: var(--text-muted);
+}
+
+/* Ш1 теоретически выключен (RoomCrypto.getCryptoInfo().active === false) —
+   строка красная, тревожная, а не просто нейтрально серая. */
+.settings-crypto-row--off {
+  color: var(--danger);
+}
+
+.settings-crypto-row--off .settings-crypto-icon {
+  color: var(--danger);
+}
+
+.settings-peers-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.settings-peer-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 44px;
+  font-size: 0.88rem;
+}
+
+.settings-peer-row--empty {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+/* Цветная точка режима соединения: зелёная — P2P, жёлтая — TURN-релей,
+   оранжевая — серверный fallback, серая — ещё устанавливается. */
+.settings-peer-dot {
+  flex-shrink: 0;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+
+.settings-peer-dot--p2p {
+  background: var(--success);
+}
+
+.settings-peer-dot--turn {
+  background: #eab308;
+}
+
+.settings-peer-dot--fallback {
+  background: #f97316;
+}
+
+.settings-peer-dot--connecting {
+  background: var(--text-muted);
+}
+
+.settings-peer-label {
+  overflow-wrap: anywhere;
+}
+
+.settings-server-list {
+  margin: var(--space-1) 0;
+  padding-left: var(--space-4);
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.settings-server-counters {
+  font-size: 0.82rem;
+  color: var(--text-muted);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: var(--space-2);
+}
+
+.settings-server-summary {
+  font-size: 0.85rem;
+  font-weight: 600;
+  margin-top: var(--space-2);
+  padding: var(--space-2) 0;
+  color: var(--success);
 }
