@@ -131,6 +131,23 @@ async function createRoom(body, roomsUrl = ROOMS_URL) {
   return { status: res.status, roomId: json && json.roomId };
 }
 
+// PUT /api/rooms/<roomId> — идемпотентное восстановление (см. src/main.rs::restore_room).
+async function restoreRoom(roomId) {
+  const res = await fetch(`${ROOMS_URL}/${encodeURIComponent(roomId)}`, { method: 'PUT' });
+  let json = null;
+  try { json = await res.json(); } catch { /* не JSON — ниже проверим статус */ }
+  return { status: res.status, roomId: json && json.roomId };
+}
+
+// Простой uuid v4 генератор для тестового клиента (совпадать с крипто-стойким не обязано).
+function genUuid() {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
 // --- WS-клиент для теста --------------------------------------------------
 
 function connect(wsUrl = URL) {
@@ -159,10 +176,13 @@ function connect(wsUrl = URL) {
 }
 
 // Подключиться и войти в комнату одним шагом; возвращает { peer, joined }.
-async function join(roomId, name, wsUrl = URL) {
+// `peerId` (опционально) — см. src/protocol.rs::ClientMessage::JoinRoom и
+// раздел 5b ниже.
+async function join(roomId, name, wsUrl = URL, peerId = undefined) {
   const peer = await connect(wsUrl);
   const msg = { type: 'join-room', roomId };
   if (name !== undefined) msg.name = name;
+  if (peerId !== undefined) msg.peerId = peerId;
   peer.send(msg);
   const joined = await peer.next();
   return { peer, joined };
@@ -226,6 +246,31 @@ async function runTests() {
       'опциональное тело {name} игнорируется, комната всё равно создаётся');
   }
 
+  // --- 2b. PUT /api/rooms/{roomId} — идемпотентное восстановление ---
+  console.log('2b. PUT /api/rooms/{roomId}');
+  {
+    // Комнаты с таким id ещё нет (никогда не создавалась) -> 201, комната создана.
+    const freshId = 'zx9k2m7q'; // валидный формат ^[a-z0-9]{8}$, заведомо не существовал
+    const created = await restoreRoom(freshId);
+    ok(created.status === 201, `восстановление НЕсуществующей комнаты -> 201 (status=${created.status})`);
+    ok(created.roomId === freshId, 'в ответе тот же roomId, что запрошен');
+
+    // Вход в только что восстановленную комнату работает как обычно.
+    const { peer, joined } = await join(freshId);
+    ok(joined.type === 'joined' && joined.peers.length === 0, 'вход в восстановленную комнату успешен, участников ещё 0');
+
+    // Комната уже существует (мы только что в неё вошли) -> 200, ничего не пересоздано.
+    const already = await restoreRoom(freshId);
+    ok(already.status === 200, `восстановление УЖЕ существующей комнаты -> 200 (status=${already.status})`);
+    peer.ws.close();
+
+    // Кривой id (не соответствует ^[a-z0-9]{8}$) -> 400.
+    const bad1 = await restoreRoom('AB');
+    ok(bad1.status === 400, `слишком короткий/с заглавными id -> 400 (status=${bad1.status})`);
+    const bad2 = await restoreRoom('../evil12');
+    ok(bad2.status === 400, `id с недопустимыми символами -> 400 (status=${bad2.status})`);
+  }
+
   // --- 3. Первый участник входит в свежесозданную комнату ---
   console.log('3. первый участник входит: peers=[], screenOwner=null');
   const { peer: p1, joined: j1 } = await join(roomId);
@@ -244,6 +289,38 @@ async function runTests() {
   const pj1 = await p1.next();
   ok(pj1.type === 'peer-joined' && pj1.peerId === p2Id && pj1.name === 'Аня',
     'первый участник получил peer-joined с именем второго (Аня)');
+
+  // --- 4b. join-room с клиентским peerId (переподключение после обрыва сигналинга) ---
+  console.log('4b. join-room с клиентским peerId');
+  {
+    // Свободный валидный uuid -> сервер принимает его как есть.
+    const desiredId = genUuid();
+    const { peer: pCustom, joined: jCustom } = await join(roomId, 'Игорь', URL, desiredId);
+    ok(jCustom.peerId === desiredId, `свободный валидный peerId принят как есть (${jCustom.peerId})`);
+    await Promise.all([p1.next(), p2.next()]); // peer-joined остальным
+
+    // peerId уже занят (p1Id) -> сервер тихо генерирует новый, а не отказывает.
+    const { peer: pTaken, joined: jTaken } = await join(roomId, 'Занятой', URL, p1Id);
+    ok(jTaken.type === 'joined' && jTaken.peerId !== p1Id, `занятый peerId -> выдан другой (${jTaken.peerId} !== ${p1Id})`);
+    await Promise.all([p1.next(), p2.next(), pCustom.next()]); // peer-joined остальным
+
+    // Кривой peerId (не uuid) -> сервер тихо генерирует новый.
+    const { peer: pBad, joined: jBad } = await join(roomId, 'Кривой', URL, 'not-a-uuid');
+    ok(jBad.type === 'joined' && typeof jBad.peerId === 'string' && jBad.peerId !== 'not-a-uuid',
+      `невалидный (не-uuid) peerId -> выдан новый (${jBad.peerId})`);
+    await Promise.all([p1.next(), p2.next(), pCustom.next(), pTaken.next()]); // peer-joined остальным
+
+    // Прибираем троих за собой — порядок трёх peer-left относительно друг
+    // друга не важен, важно что p1/p2 получат ровно по три (не считаем, чей
+    // именно peerId в каком сообщении — уже проверено выше при входе).
+    pCustom.ws.close();
+    pTaken.ws.close();
+    pBad.ws.close();
+    for (let i = 0; i < 3; i++) {
+      const [m1, m2] = await Promise.all([p1.next(), p2.next()]);
+      ok(m1.type === 'peer-left' && m2.type === 'peer-left', 'peer-left дошёл p1 и p2 при уходе временного участника');
+    }
+  }
 
   // --- 5. Третий участник видит ОБОИХ предыдущих в peers ---
   console.log('5. третий участник видит всех предыдущих; оба получают peer-joined');

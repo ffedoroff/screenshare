@@ -378,7 +378,15 @@ async function main() {
         await waitForNoTile(olyaPage, 'Игорь', 15_000);
         await waitParticipantCount(olyaPage, 1, 15_000);
       });
-      await igorContext.setOffline(false);
+      // Роль Игоря в тесте окончена — закрываем его контекст, НЕ восстанавливая
+      // сеть (setOffline(false)). Иначе, раз страница Игоря так и осталась
+      // открытой, авто-reconnect (см. static/room.js) законно попытался бы
+      // переподключиться и заново войти в комнату, как только сеть вернётся —
+      // это корректное поведение само по себе (проверяется отдельно в
+      // сценарии (з) про рестарт сервера), но здесь только помешало бы
+      // последующим сценариям (д)/(е), которые рассчитывают, что Игорь
+      // окончательно ушёл.
+      try { await igorContext.close(); } catch { /* уже закрыт */ }
     } else {
       skip('(г) обрыв сети у Игоря', 'Игорь не подключился к комнате');
     }
@@ -523,6 +531,166 @@ async function main() {
       });
     } else {
       skip('(ж) rate-limit чата', 'Нина/Толя не подключились к новой комнате');
+    }
+
+    // Разгружаем ресурсы перед последним (самым тяжёлым, реальный рестарт
+    // сервера) сценарием: закрываем все контексты предыдущих сценариев — они
+    // здесь больше не нужны, а простаивающие вкладки (у части из них WebRTC
+    // ещё жив) иначе конкурируют за CPU с ICE-негоциацией трёх новых
+    // участников ниже и делают waitForMeshSettled эмпирически флейковым.
+    for (const ctx of allContexts) {
+      try { await ctx.close(); } catch { /* уже закрыт */ }
+    }
+    allContexts.length = 0;
+
+    // ============================================================
+    // (з) Рестарт сервера (деплой): звонок должен пережить его почти
+    // незаметно. Свежая комната — Вася/Петя/Оля заходят, у Васи микрофон,
+    // Петя шарит экран, есть переписка — затем сервер целиком останавливается
+    // (SIGTERM/SIGKILL, см. helpers.mjs::createServerController.stop) и
+    // поднимается заново на том же порту (server.start()) — ровно то, что
+    // происходит при выкатке новой версии (см. README.md, раздел «Живучесть
+    // звонка при деплое»). Мы НЕ трогаем static/* — только сервер-процесс.
+    // ============================================================
+    let vasya2Page = null;
+    let petya2Page = null;
+    let olya2Page = null;
+    const restartPrepOk = await step(
+      '(з, подготовка) новая комната — Вася/Петя/Оля заходят, Вася включает микрофон, Петя шарит экран, есть переписка',
+      async () => {
+        const restartRoomId = await createRoomViaApi(server.baseUrl);
+        const restartRoomUrl = `${server.baseUrl}/r/${restartRoomId}`;
+
+        const vasya2Context = await browser.newContext();
+        const petya2Context = await browser.newContext();
+        const olya2Context = await browser.newContext();
+        allContexts.push(vasya2Context, petya2Context, olya2Context);
+        await installMicAndCamStubs(vasya2Context);
+        await installCaptureOnly(petya2Context);
+        await installPcRegistry(vasya2Context);
+        await installPcRegistry(petya2Context);
+        await installPcRegistry(olya2Context);
+        await installSavedName(vasya2Context, 'Вася');
+        await installSavedName(petya2Context, 'Петя');
+        await installSavedName(olya2Context, 'Оля');
+        vasya2Page = await vasya2Context.newPage();
+        petya2Page = await petya2Context.newPage();
+        olya2Page = await olya2Context.newPage();
+
+        await vasya2Page.goto(restartRoomUrl);
+        await petya2Page.goto(restartRoomUrl);
+        await olya2Page.goto(restartRoomUrl);
+        await waitForOverlayHidden(vasya2Page);
+        await waitForOverlayHidden(petya2Page);
+        await waitForOverlayHidden(olya2Page);
+        await waitForMeshSettled([vasya2Page, petya2Page, olya2Page], { tileCount: 3, connectionsPerPage: 2 });
+
+        await vasya2Page.click('#camera-button');
+        await assertVideoPlaying(petya2Page, { selector: `${tileSelector('Вася')} video` });
+        await vasya2Page.click('#mic-button');
+        await waitForClassOnSelector(petya2Page, tileSelector('Вася'), 'tile--speaking', true, 8000);
+
+        await petya2Page.click('#screen-button');
+        await waitScreenButtonOn(petya2Page, true);
+        await assertVideoPlaying(olya2Page, { selector: '#screen-video' });
+
+        await openChatPanel(vasya2Page);
+        await openChatPanel(petya2Page);
+        await openChatPanel(olya2Page);
+        const msg1 = `до рестарта — раз — ${Date.now()}`;
+        const msg2 = `до рестарта — два — ${Date.now()}`;
+        await sendChatMessage(vasya2Page, msg1);
+        assert.ok(await messageTextsInclude(petya2Page, msg1), 'сообщение 1 не дошло до Пети');
+        assert.ok(await messageTextsInclude(olya2Page, msg1), 'сообщение 1 не дошло до Оли');
+        await sendChatMessage(petya2Page, msg2);
+        assert.ok(await messageTextsInclude(vasya2Page, msg2), 'сообщение 2 не дошло до Васи');
+        assert.ok(await messageTextsInclude(olya2Page, msg2), 'сообщение 2 не дошло до Оли');
+      }
+    );
+
+    if (restartPrepOk) {
+      await step(
+        '(з) сервер останавливается — у всех троих баннер «Переподключение…» появляется, тайлы/медиа/чат не разрушены',
+        async () => {
+          await server.stop();
+          for (const page of [vasya2Page, petya2Page, olya2Page]) {
+            await waitForClassOnSelector(page, '#reconnect-banner', 'hidden', false, 10_000);
+          }
+          // Сигналинг мёртв, но mesh (медиа/DataChannel-чат) от него физически
+          // не зависит (см. README.md) — тайлы никуда не делись прямо сейчас.
+          await waitForTileCount(vasya2Page, 3);
+          await waitForTileCount(petya2Page, 3);
+          await waitForTileCount(olya2Page, 3);
+        }
+      );
+
+      // Намеренная контролируемая пауза (не гонка с реальным даунтаймом
+      // деплоя): гарантирует, что окно «сервер лежит» не короче интервала
+      // поллинга баннера выше, даже на быстрой машине, где процесс успевает
+      // перезапуститься почти мгновенно.
+      await sleep(1500);
+
+      await step(
+        '(з) сервер поднимается заново на том же порту — авто-reconnect восстанавливает сигналинг, баннер исчезает',
+        async () => {
+          await server.start();
+          // Параллельно (не последовательно) и с запасом по времени: первые
+          // 1-2 попытки reconnect могут напороться на сервер, который ещё не
+          // до конца поднялся (порт слушается чуть раньше, чем приложение
+          // готово ответить) — бэкофф (1с→2с→4с→8с) в редком случае может
+          // унести реальный успех за пределы десятка секунд, это всё ещё
+          // далеко от продуктового бюджета в 2 минуты.
+          await Promise.all(
+            [vasya2Page, petya2Page, olya2Page].map((page) =>
+              waitForClassOnSelector(page, '#reconnect-banner', 'hidden', true, 45_000)
+            )
+          );
+        }
+      );
+
+      await step('(з.б) тайлы и счётчик участников восстановились (3 участника = "3 / 6")', async () => {
+        for (const page of [vasya2Page, petya2Page, olya2Page]) {
+          await waitForTileCount(page, 3, 15_000);
+          await waitParticipantCount(page, 3, 15_000);
+        }
+      });
+
+      let screenRestoredActually = false;
+      await step('(з.в) шаринг экрана Пети после реконнекта — фиксируем фактическое поведение', async () => {
+        try {
+          await waitScreenButtonOn(petya2Page, true, 15_000);
+          await waitScreenStageHidden(olya2Page, false, 15_000);
+          await assertVideoPlaying(olya2Page, { selector: '#screen-video' });
+          screenRestoredActually = true;
+        } catch (err) {
+          screenRestoredActually = false;
+          console.log(`[инфо] шаринг экрана Пети НЕ восстановился после реконнекта сервера: ${err.message}`);
+        }
+      });
+      console.log(
+        `# фактическое поведение (в): шаринг экрана после рестарта сервера ${
+          screenRestoredActually ? 'ВОССТАНОВЛЕН (share-start успешно переигран)' : 'НЕ восстановлен (сцена честно ушла)'
+        }`
+      );
+
+      await step('(з.г) P2P-чат работает и история на месте (клиентские буферы) после реконнекта', async () => {
+        for (const page of [vasya2Page, petya2Page, olya2Page]) {
+          await openChatPanel(page);
+          const chat = await getChatDom(page);
+          const texts = await chat.messages.allTextContents();
+          assert.ok(texts.some((t) => t.includes('до рестарта')), 'история чата не сохранилась в клиентском буфере после реконнекта');
+        }
+        const msg3 = `после рестарта — ${Date.now()}`;
+        await sendChatMessage(olya2Page, msg3);
+        assert.ok(await messageTextsInclude(vasya2Page, msg3), 'новое сообщение после рестарта не дошло до Васи');
+        assert.ok(await messageTextsInclude(petya2Page, msg3), 'новое сообщение после рестарта не дошло до Пети');
+      });
+
+      await step('(з.д) медиа живо: видео Васи у Пети продолжает идти (videoWidth растёт)', async () => {
+        await assertVideoPlaying(petya2Page, { selector: `${tileSelector('Вася')} video` });
+      });
+    } else {
+      skip('(з) рестарт сервера', 'подготовка не удалась');
     }
 
     for (const ctx of allContexts) {

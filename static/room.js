@@ -38,6 +38,9 @@ const sharePopupCloseEl = document.getElementById('share-popup-close');
 const sharePopupQrEl = document.getElementById('share-popup-qr');
 const sharePopupLinkEl = document.getElementById('share-popup-link');
 const sharePopupCopyButtonEl = document.getElementById('share-popup-copy-button');
+const reconnectBannerEl = document.getElementById('reconnect-banner');
+const versionBannerEl = document.getElementById('version-banner');
+const versionBannerReloadButtonEl = document.getElementById('version-banner-reload-button');
 
 // roomId — последний сегмент пути, например /r/abc123 -> "abc123".
 const roomId = location.pathname.split('/').filter(Boolean).pop();
@@ -63,6 +66,49 @@ let joinedOnce = false;
 // Как только показан «финальный» оверлей (ошибка/обрыв), больше не
 // перетираем его сообщениями о попутных проблемах.
 let terminalState = false;
+// ICE-серверы, полученные один раз при первой загрузке страницы — переиспользуются
+// при создании пиров как при обычных peer-joined, так и при реконнект-сверке.
+let iceServersCache = null;
+
+// --- Авто-reconnect сигналинга (переживает деплой/рестарт сервера) ---
+//
+// Ключевая идея: обрыв WS-сигналинга сам по себе НЕ должен рушить mesh
+// (медиа/DataChannel-чат) — они физически не зависят от сигналинга и живут,
+// пока живо само P2P-соединение (см. README.md, раздел про живучесть звонка
+// при деплое). Поэтому неожиданный обрыв (не «Покинуть», не room-not-found/
+// room-full — те уже терминальны сами по себе) запускает цикл
+// переподключения с экспоненциальным бэкоффом вместо немедленного
+// «Соединение потеряно».
+const RECONNECT_BACKOFF_MS = [1000, 2000, 4000, 8000]; // 1с→2с→4с→8с, дальше повторяется 8с (cap)
+const RECONNECT_TOTAL_BUDGET_MS = 120_000; // суммарный бюджет попыток — около 2 минут
+const RECONNECT_JOIN_TIMEOUT_MS = 8000; // сколько ждём ответ на join-room одной попытки
+// Сколько ждём отставшего пира/владельца экрана после успешного реконнекта,
+// прежде чем считать его окончательно ушедшим — остальные участники тоже
+// переподключаются вразнобой, им нужно время на собственный реконнект.
+const RECONNECT_PEER_GRACE_MS = 13_000;
+
+let reconnecting = false;
+let reconnectAttempt = 0;
+let reconnectDeadline = 0;
+let reconnectTimer = null;
+// Взводится перед намеренным закрытием сокета самим пользователем (кнопка
+// «Покинуть») — такое закрытие не должно триггерить авто-reconnect.
+let intentionalDisconnect = false;
+// Резолвер текущей попытки join-room в процессе реконнекта (см.
+// waitForJoinOutcome/sendJoinAndWait) — обычные обработчики joined/
+// room-not-found/room-full дополнительно репортят сюда исход, если он
+// взведён, вместо (или в дополнение к) обычной обработки.
+let pendingJoinResolve = null;
+// peerId -> id таймера отложенного удаления пира, который не нашёлся в
+// свежем joined.peers сразу после реконнекта (см. reconcileAfterReconnect).
+const pendingPeerRemovals = new Map();
+// Таймер грейс-периода для владельца экрана, который сам ещё не ре-джойнился
+// после реконнекта (см. reconcileScreenShareAfterReconnect).
+let screenOwnerGraceTimer = null;
+// Версия приложения (см. GET /version.json), с которой была загружена эта
+// страница — сверяется заново после каждого успешного реконнекта (стандарт
+// version-skew баннера, см. README.md).
+let lastKnownVersion = null;
 
 // peerId -> { rtc: RtcPeer, name, tile: {root, videoEl, placeholderEl, labelEl} }
 const peers = new Map();
@@ -143,6 +189,41 @@ function showRoomMessage(text) {
     roomMessageEl.classList.add('hidden');
   }, 4000);
 }
+
+// ---------- Баннер переподключения сигналинга ----------
+
+function showReconnectBanner() {
+  reconnectBannerEl.classList.remove('hidden');
+}
+
+function hideReconnectBanner() {
+  reconnectBannerEl.classList.add('hidden');
+}
+
+// ---------- Баннер version-skew ----------
+
+async function fetchVersion() {
+  try {
+    const res = await fetch('/version.json');
+    if (!res.ok) return null;
+    const data = await res.json();
+    return (data && data.version) || null;
+  } catch (err) {
+    return null;
+  }
+}
+
+/** Сравнить текущую серверную версию с той, с которой была загружена страница. Никогда не «забывает» уже показанное расхождение. */
+async function checkVersionSkew() {
+  const current = await fetchVersion();
+  if (current && lastKnownVersion && current !== lastKnownVersion) {
+    versionBannerEl.classList.remove('hidden');
+  }
+}
+
+versionBannerReloadButtonEl.addEventListener('click', () => {
+  location.reload();
+});
 
 // ---------- Воспроизведение с фоллбэком на mute при блокировке автовоспроизведения ----------
 
@@ -548,26 +629,81 @@ function removeRemotePeer(peerId) {
   }
 }
 
+// ---------- Реконнект: грейс-период для отставших пиров/владельца экрана ----------
+
+/**
+ * После успешного реконнекта пир может на время выпасть из свежего
+ * joined.peers (сервер после рестарта ничего не помнит, пока участник сам не
+ * переподключится) — вместо немедленного удаления даём ему
+ * RECONNECT_PEER_GRACE_MS на переподключение. Если за это время придёт
+ * peer-joined с тем же peerId — таймер снимается (см. cancelPendingPeerRemoval
+ * в обработчике peer-joined), mesh-пир и не удалялся.
+ */
+function schedulePeerRemoval(peerId) {
+  if (pendingPeerRemovals.has(peerId)) return;
+  const timer = setTimeout(() => {
+    pendingPeerRemovals.delete(peerId);
+    removeRemotePeer(peerId);
+    updateParticipantCount();
+  }, RECONNECT_PEER_GRACE_MS);
+  pendingPeerRemovals.set(peerId, timer);
+}
+
+function cancelPendingPeerRemoval(peerId) {
+  const timer = pendingPeerRemovals.get(peerId);
+  if (timer) {
+    clearTimeout(timer);
+    pendingPeerRemovals.delete(peerId);
+  }
+}
+
+/** Симметричный грейс для владельца экрана, который сам ещё не ре-джойнился (см. reconcileScreenShareAfterReconnect). */
+function scheduleScreenOwnerGrace(ownerPeerId) {
+  if (screenOwnerGraceTimer) return;
+  screenOwnerGraceTimer = setTimeout(() => {
+    screenOwnerGraceTimer = null;
+    if (currentScreenOwnerPeerId === ownerPeerId) {
+      // Владелец так и не ре-джойнился в отведённый срок — сцена честно уходит.
+      currentScreenOwnerPeerId = null;
+      hideScreenStage();
+      updateScreenButtonState();
+    }
+  }, RECONNECT_PEER_GRACE_MS);
+}
+
+function cancelScreenOwnerGrace() {
+  if (screenOwnerGraceTimer) {
+    clearTimeout(screenOwnerGraceTimer);
+    screenOwnerGraceTimer = null;
+  }
+}
+
 // ---------- Сигналинг ----------
 
 async function init() {
   showOverlay({ title: 'Подключение…', spinner: true });
 
-  const iceServers = await fetchIceServers();
+  iceServersCache = await fetchIceServers();
+  lastKnownVersion = await fetchVersion();
 
   signaling = new Signaling();
   signaling.onError = (event) => {
     console.error('Ошибка сигналинга:', event);
   };
   signaling.onClose = () => {
-    if (joinedOnce && !terminalState) {
-      terminalState = true;
-      showOverlay({
-        title: 'Соединение потеряно',
-        text: 'Связь с сервером сигналинга прервалась. Обновите страницу.',
-      });
-      if (chat) chat.disableInput('Соединение потеряно.');
-    }
+    // Уже переподключаемся (этот close — от неудавшейся попытки внутри
+    // самого цикла реконнекта) — цикл сам разберётся, повторно не запускаем.
+    if (reconnecting) return;
+    // Пользователь сам вышел, или уже показан терминальный оверлей
+    // (room-not-found/room-full до первого joined, либо разрыв ещё до
+    // первого joined) — реконнект тут неуместен.
+    if (intentionalDisconnect || terminalState || !joinedOnce) return;
+
+    // Неожиданный обрыв сигналинга после успешного входа — mesh (медиа,
+    // DataChannel-чат) при этом жив (см. README.md), поэтому НЕ рушим
+    // интерфейс сразу: тонкий баннер + авто-reconnect с бэкоффом, и только
+    // если он исчерпает бюджет — терминальный оверлей «Соединение потеряно».
+    startReconnectLoop();
   };
 
   try {
@@ -581,44 +717,65 @@ async function init() {
     return;
   }
 
-  registerSignalingHandlers(iceServers);
+  registerSignalingHandlers(iceServersCache);
   myName = ChatPanel.getSavedName();
   signaling.send('join-room', { roomId, ...(myName ? { name: myName } : {}) });
 }
 
 function registerSignalingHandlers(iceServers) {
   signaling.on('joined', ({ peerId, peers: otherPeers, screenOwner }) => {
-    joinedOnce = true;
+    // Реконнект ждёт именно этот ответ (см. sendJoinAndWait) — репортуем ему
+    // исход в дополнение к обычной обработке ниже (при первом входе
+    // pendingJoinResolve никогда не взведён).
+    if (pendingJoinResolve) pendingJoinResolve('joined');
+
+    if (!joinedOnce) {
+      // --- Первый вход в комнату (не реконнект) ---
+      joinedOnce = true;
+      myPeerId = peerId;
+      hideOverlay();
+
+      ownTile = createTile(peerId, myName, true);
+
+      for (const p of otherPeers) {
+        peerNames.set(p.peerId, p.name || null);
+        createRemotePeer(p.peerId, p.name, iceServers);
+      }
+
+      currentScreenOwnerPeerId = screenOwner || null;
+      if (currentScreenOwnerPeerId && currentScreenOwnerPeerId !== myPeerId) {
+        showRemoteScreenCaption(currentScreenOwnerPeerId);
+      }
+      updateScreenButtonState();
+      updateParticipantCount();
+
+      chat = ChatPanel.create({
+        signaling,
+        bus,
+        peerId,
+        name: myName,
+        variant: 'room',
+        toggleButton: chatButton,
+        getPeerIds: () => Array.from(peers.keys()),
+        initialPeerIds: otherPeers.map((p) => p.peerId),
+      });
+      return;
+    }
+
+    // --- Реконнект: сверяем состояние комнаты с тем, что у нас уже есть ---
+    // (mesh/медиа/чат уже жили всё это время, ничего из этого не пересоздаём
+    // — см. reconcileAfterReconnect). peerId сервер обычно возвращает тот же
+    // (см. src/ws.rs::JoinRoom { peer_id }), но подстрахуемся и на случай,
+    // если он всё же сменился.
     myPeerId = peerId;
-    hideOverlay();
-
-    ownTile = createTile(peerId, myName, true);
-
-    for (const p of otherPeers) {
-      peerNames.set(p.peerId, p.name || null);
-      createRemotePeer(p.peerId, p.name, iceServers);
-    }
-
-    currentScreenOwnerPeerId = screenOwner || null;
-    if (currentScreenOwnerPeerId && currentScreenOwnerPeerId !== myPeerId) {
-      showRemoteScreenCaption(currentScreenOwnerPeerId);
-    }
-    updateScreenButtonState();
-    updateParticipantCount();
-
-    chat = ChatPanel.create({
-      signaling,
-      bus,
-      peerId,
-      name: myName,
-      variant: 'room',
-      toggleButton: chatButton,
-      getPeerIds: () => Array.from(peers.keys()),
-      initialPeerIds: otherPeers.map((p) => p.peerId),
-    });
+    reconcileAfterReconnect(otherPeers, screenOwner);
   });
 
   signaling.on('room-not-found', () => {
+    if (pendingJoinResolve) {
+      pendingJoinResolve('room-not-found');
+      return;
+    }
     terminalState = true;
     showOverlay({
       title: 'Комната не найдена',
@@ -628,6 +785,10 @@ function registerSignalingHandlers(iceServers) {
   });
 
   signaling.on('room-full', () => {
+    if (pendingJoinResolve) {
+      pendingJoinResolve('room-full');
+      return;
+    }
     terminalState = true;
     showOverlay({
       title: 'Комната заполнена',
@@ -637,6 +798,13 @@ function registerSignalingHandlers(iceServers) {
 
   signaling.on('peer-joined', ({ peerId, name }) => {
     peerNames.set(peerId, name || null);
+    if (peers.has(peerId)) {
+      // Уже знаем этого пира — mesh пережил обрыв сигналинга (наш или его),
+      // это просто повторный peer-joined от его собственного реконнекта.
+      // Идемпотентно: существующий RtcPeer НЕ пересоздаём.
+      cancelPendingPeerRemoval(peerId);
+      return;
+    }
     createRemotePeer(peerId, name, iceServers);
     updateParticipantCount();
   });
@@ -687,6 +855,7 @@ function registerSignalingHandlers(iceServers) {
   });
 
   signaling.on('share-started', ({ peerId }) => {
+    cancelScreenOwnerGrace(); // владелец подтверждён сервером — грейс больше не нужен
     currentScreenOwnerPeerId = peerId;
     if (peerId === myPeerId) {
       showLocalScreenPreview();
@@ -701,6 +870,7 @@ function registerSignalingHandlers(iceServers) {
   });
 
   signaling.on('share-stopped', ({ peerId }) => {
+    cancelScreenOwnerGrace();
     if (currentScreenOwnerPeerId === peerId) {
       currentScreenOwnerPeerId = null;
     }
@@ -709,6 +879,15 @@ function registerSignalingHandlers(iceServers) {
   });
 
   signaling.on('share-rejected', ({ busyPeerId }) => {
+    cancelScreenOwnerGrace();
+    if (screenStream && currentScreenOwnerPeerId === myPeerId) {
+      // Мы шарили экран до обрыва сигналинга и после реконнекта попытались
+      // переиграть share-start (см. reconcileScreenShareAfterReconnect), но
+      // пока мы были офлайн, экран успел занять кто-то другой — корректно
+      // останавливаем свой локальный захват (чужая сцена уже живёт по mesh,
+      // ломать её не нужно).
+      forceStopLocalScreenCapture();
+    }
     currentScreenOwnerPeerId = busyPeerId;
     updateScreenButtonState();
     showRoomMessage(`Экран показывает ${peerNames.get(busyPeerId) || 'другой участник'}.`);
@@ -721,6 +900,192 @@ function registerSignalingHandlers(iceServers) {
   signaling.on('error', ({ message }) => {
     console.error('Сервер сигналинга сообщил об ошибке:', message);
   });
+}
+
+// ---------- Реконнект: цикл переподключения ----------
+
+/** Дождаться исхода ОДНОЙ попытки join-room: 'joined' | 'room-not-found' | 'room-full' | 'timeout'. */
+function waitForJoinOutcome(timeoutMs) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (status) => {
+      if (done) return;
+      done = true;
+      pendingJoinResolve = null;
+      resolve(status);
+    };
+    pendingJoinResolve = finish;
+    setTimeout(() => finish('timeout'), timeoutMs);
+  });
+}
+
+/** Отправить join-room со своим прежним peerId (см. src/protocol.rs) и дождаться исхода. */
+function sendJoinAndWait() {
+  const promise = waitForJoinOutcome(RECONNECT_JOIN_TIMEOUT_MS);
+  signaling.send('join-room', {
+    roomId,
+    ...(myName ? { name: myName } : {}),
+    ...(myPeerId ? { peerId: myPeerId } : {}),
+  });
+  return promise;
+}
+
+/** PUT /api/rooms/<roomId> — восстановить комнату, если реапер/рестарт её убрали (см. src/main.rs::restore_room). */
+async function restoreRoomViaPut() {
+  try {
+    const res = await fetch(`/api/rooms/${encodeURIComponent(roomId)}`, { method: 'PUT' });
+    return res.ok; // 200 (уже была) или 201 (создана) — оба ок
+  } catch (err) {
+    return false;
+  }
+}
+
+/** Одна попытка реконнекта целиком: открыть WS -> join-room -> (если room-not-found) PUT restore -> join-room ещё раз. */
+async function attemptReconnectOnce() {
+  try {
+    await signaling.connect();
+  } catch (err) {
+    return false;
+  }
+
+  const outcome = await sendJoinAndWait();
+  if (outcome === 'joined') return true;
+
+  if (outcome === 'room-not-found') {
+    const restored = await restoreRoomViaPut();
+    if (!restored) return false;
+    // Сервер сам закрывает сокет сразу после отказа room-not-found (см.
+    // src/ws.rs: «после отказа сервер сам закрывает сокет») — повторный
+    // join-room на ТОМ ЖЕ сокете уйдёт в никуда (см. Signaling.send: тихо
+    // не отправит на неоткрытом сокете), поэтому перед повторной попыткой
+    // открываем НОВОЕ соединение.
+    try {
+      await signaling.connect();
+    } catch (err) {
+      return false;
+    }
+    const outcome2 = await sendJoinAndWait();
+    return outcome2 === 'joined';
+  }
+
+  // 'room-full' (маловероятно — наше место освобождается почти сразу после
+  // обрыва) или 'timeout' — считаем попытку неудачной, цикл повторит с бэкоффом.
+  return false;
+}
+
+function startReconnectLoop() {
+  if (reconnecting) return;
+  reconnecting = true;
+  reconnectAttempt = 0;
+  reconnectDeadline = Date.now() + RECONNECT_TOTAL_BUDGET_MS;
+  showReconnectBanner();
+  scheduleNextReconnectAttempt(0);
+}
+
+function scheduleNextReconnectAttempt(delayMs) {
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(async () => {
+    const ok = await attemptReconnectOnce();
+    if (ok) {
+      finishReconnectSuccess();
+      return;
+    }
+    if (Date.now() >= reconnectDeadline) {
+      giveUpReconnect();
+      return;
+    }
+    const delay = RECONNECT_BACKOFF_MS[Math.min(reconnectAttempt, RECONNECT_BACKOFF_MS.length - 1)];
+    reconnectAttempt += 1;
+    scheduleNextReconnectAttempt(delay);
+  }, delayMs);
+}
+
+function finishReconnectSuccess() {
+  reconnecting = false;
+  hideReconnectBanner();
+  // Стандарт version-skew баннера: перечитать /version.json после каждого
+  // успешного реконнекта (см. README.md).
+  checkVersionSkew();
+}
+
+function giveUpReconnect() {
+  reconnecting = false;
+  hideReconnectBanner();
+  terminalState = true;
+  showOverlay({
+    title: 'Соединение потеряно',
+    text: 'Связь с сервером сигналинга прервалась. Обновите страницу.',
+  });
+  if (chat) chat.disableInput('Соединение потеряно.');
+}
+
+// ---------- Реконнект: сверка состояния комнаты после успешного join ----------
+
+/**
+ * После реконнекта сервер может знать о комнате МЕНЬШЕ, чем знаем мы сами
+ * (если он рестартовал — комната воссоздана пустой через PUT restore и
+ * заново наполняется по мере того, как остальные участники тоже
+ * переподключаются). НЕ пересоздаём то, что уже есть (mesh, тайлы, чат) —
+ * только сверяем: новые для нас peers — создаём, тех, кого больше нет в
+ * свежем списке — не удаляем сразу, а даём грейс-период (см.
+ * schedulePeerRemoval) на случай, что они просто ещё не успели ре-джойниться.
+ */
+function reconcileAfterReconnect(otherPeers, screenOwner) {
+  const freshIds = new Set(otherPeers.map((p) => p.peerId));
+
+  for (const p of otherPeers) {
+    peerNames.set(p.peerId, p.name || null);
+    if (peers.has(p.peerId)) {
+      cancelPendingPeerRemoval(p.peerId);
+    } else {
+      createRemotePeer(p.peerId, p.name, iceServersCache);
+    }
+  }
+
+  for (const peerId of Array.from(peers.keys())) {
+    if (!freshIds.has(peerId)) {
+      schedulePeerRemoval(peerId);
+    }
+  }
+
+  updateParticipantCount();
+  reconcileScreenShareAfterReconnect(screenOwner);
+}
+
+/**
+ * Сверка состояния шаринга экрана после реконнекта:
+ *   - если ДО обрыва шарили мы сами (и захват всё ещё жив локально —
+ *     mesh/getDisplayMedia не зависят от сигналинга) — переигрываем
+ *     share-start; сервер либо подтвердит (share-started), либо, если пока
+ *     мы были офлайн, экран успел занять кто-то другой — откажет
+ *     (share-rejected), тогда свой захват корректно останавливаем (см.
+ *     обработчик share-rejected выше);
+ *   - если шарил кто-то другой и сервер после рестарта его уже знает
+ *     (screenOwner пришёл) — просто синхронизируем метку;
+ *   - если шарил кто-то другой, но сервер о нём пока не знает (owner ещё не
+ *     ре-джойнился, screenOwner=null) — сцена и так жива по mesh, НЕ рушим
+ *     её немедленно, даём тот же грейс-период, что и пирам;
+ *   - если никто не шарил — просто снимаем метку.
+ */
+function reconcileScreenShareAfterReconnect(screenOwner) {
+  if (currentScreenOwnerPeerId === myPeerId && screenStream) {
+    pendingShareDecision = null; // на случай зависшего резолвера от старой попытки
+    signaling.send('share-start');
+    return;
+  }
+
+  if (screenOwner) {
+    currentScreenOwnerPeerId = screenOwner;
+    if (screenOwner !== myPeerId) {
+      showRemoteScreenCaption(screenOwner);
+    }
+    updateScreenButtonState();
+  } else if (currentScreenOwnerPeerId && currentScreenOwnerPeerId !== myPeerId) {
+    scheduleScreenOwnerGrace(currentScreenOwnerPeerId);
+  } else {
+    currentScreenOwnerPeerId = null;
+    updateScreenButtonState();
+  }
 }
 
 // ---------- Микрофон ----------
@@ -854,7 +1219,8 @@ screenButton.addEventListener('click', async () => {
   updateScreenButtonState();
 });
 
-function stopScreenShare() {
+/** Остановить локальный захват экрана (треки + отправку пирам), без share-stop серверу и без трогать UI сцены — используется и обычной остановкой (stopScreenShare), и реконнектом (см. обработчик share-rejected в registerSignalingHandlers). */
+function forceStopLocalScreenCapture() {
   if (!screenStream) return;
   removeLocalStreamFromAllPeers(screenStream);
   for (const track of screenStream.getTracks()) {
@@ -862,6 +1228,11 @@ function stopScreenShare() {
     track.stop();
   }
   screenStream = null;
+}
+
+function stopScreenShare() {
+  if (!screenStream) return;
+  forceStopLocalScreenCapture();
   signaling.send('share-stop');
   hideScreenStage();
   currentScreenOwnerPeerId = null;
@@ -932,7 +1303,21 @@ sharePopupCopyButtonEl.addEventListener('click', async () => {
 
 // ---------- Покинуть комнату ----------
 
+// Вкладка закрывается/уходит со страницы (крестик, навигация, reload) — WS
+// оборвётся сам собой через мгновение, но это НЕ обрыв сигналинга, который
+// нужно чинить: страница всё равно исчезает, реконнект-цикл (даже одна его
+// успевшая стартовать попытка) в этот момент только продлил бы жизнь
+// комнаты на сервере лишним повторным join-room от умирающей вкладки.
+// `pagehide` срабатывает раньше фактического разрыва соединения при
+// закрытии/навигации/reload — успеваем взвести флаг до onClose.
+window.addEventListener('pagehide', () => {
+  intentionalDisconnect = true;
+});
+
 leaveButton.addEventListener('click', () => {
+  // Намеренный выход — закрытие сокета, которое за этим последует, НЕ должно
+  // триггерить авто-reconnect (см. signaling.onClose в init()).
+  intentionalDisconnect = true;
   if (signaling) {
     signaling.send('leave');
   }

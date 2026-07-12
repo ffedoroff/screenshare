@@ -42,15 +42,56 @@ class Signaling {
 
   /** Открыть WebSocket-соединение с `/ws`. Промис резолвится после открытия. */
   connect() {
+    // Повторный вызов (авто-reconnect, см. static/room.js) НЕ должен оставлять
+    // предыдущий сокет висеть: если тот успел реально открыться и всё ещё
+    // жив на сервере (например, наша сторона просто устала ждать ответ и
+    // затеяла новую попытку) — сервер продолжал бы считать нас участником
+    // под СТАРЫМ peerId ещё и через старое соединение, и новый join-room с
+    // тем же peerId получил бы отказ («занят») там, где должен был просто
+    // переиспользовать его. Всегда явно закрываем прежний сокет перед тем,
+    // как открыть новый.
+    if (this.ws && this.ws.readyState !== WebSocket.CLOSED && this.ws.readyState !== WebSocket.CLOSING) {
+      this.ws.onopen = null;
+      this.ws.onmessage = null;
+      this.ws.onerror = null;
+      this.ws.onclose = null;
+      this.ws.close();
+    }
+
     return new Promise((resolve, reject) => {
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
       const url = `${proto}//${location.host}/ws`;
       const ws = new WebSocket(url);
       this.ws = ws;
+      // Промис должен settle'иться РОВНО один раз. Без этого флага
+      // повторный вызов connect() (авто-reconnect, см. static/room.js) мог
+      // зависнуть навсегда: если сокет закрывается ДО открытия (сервер ещё
+      // не поднялся/уже недоступен) и при этом браузер почему-то не прислал
+      // отдельного error-события — событие close без него не отклоняло
+      // промис вообще, и `await signaling.connect()` висел бесконечно,
+      // останавливая весь цикл переподключения (найдено эмпирически на
+      // e2e-сценарии рестарта сервера, см. tests/e2e/resilience.spec.mjs).
+      let settled = false;
 
-      ws.onopen = () => resolve();
+      // Событие от УЖЕ ЗАМЕНЁННОГО сокета (не текущего this.ws) — игнорируем
+      // целиком. Зачем: авто-reconnect (см. static/room.js) может дёрнуть
+      // connect() повторно ещё до того, как СТАРЫЙ (уже неудавшийся/
+      // подвисший) сокет пришлёт СВОЁ, отложенное браузером, close-событие —
+      // без этой проверки такое запоздавшее событие от давно брошенного
+      // сокета могло бы попасть в `this.onClose` уже ПОСЛЕ того, как новый
+      // сокет успешно переподключился, и ошибочно запустить ещё один цикл
+      // реконнекта поверх уже рабочего соединения (найдено эмпирически на
+      // e2e-сценарии рестарта сервера, см. tests/e2e/resilience.spec.mjs).
+      const isCurrent = () => this.ws === ws;
+
+      ws.onopen = () => {
+        if (!isCurrent()) return;
+        settled = true;
+        resolve();
+      };
 
       ws.onmessage = (event) => {
+        if (!isCurrent()) return;
         let msg;
         try {
           msg = JSON.parse(event.data);
@@ -62,13 +103,24 @@ class Signaling {
       };
 
       ws.onerror = (event) => {
+        if (!isCurrent()) return;
         console.error('Ошибка WebSocket-соединения:', event);
         if (this.onError) this.onError(event);
-        reject(event);
+        if (!settled) {
+          settled = true;
+          reject(event);
+        }
       };
 
       ws.onclose = (event) => {
+        if (!isCurrent()) return;
         console.log('WebSocket закрыт: код', event.code, 'причина', event.reason || '(нет)');
+        if (!settled) {
+          // Закрылся раньше, чем успел открыться — это неудача самого
+          // connect(), а не закрытие уже открытого соединения.
+          settled = true;
+          reject(event);
+        }
         if (this.onClose) this.onClose(event);
       };
     });

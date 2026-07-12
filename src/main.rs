@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Json, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::Router;
 use qrcode::render::svg;
 use qrcode::QrCode;
@@ -74,6 +74,7 @@ async fn main() {
         // Страница комнаты: roomId фронтенд читает из URL сам.
         .route("/r/{room_id}", get(|_: Path<String>| page("room.html")))
         .route("/api/rooms", post(create_room))
+        .route("/api/rooms/{room_id}", put(restore_room))
         .route("/config", get(ice_config))
         .route("/healthz", get(healthz))
         .route("/version.json", get(version_json))
@@ -151,6 +152,60 @@ async fn create_room(State(state): State<AppState>) -> Response {
     );
     drop(rooms_guard);
     info!(room = %room_id, "комната создана (пустая)");
+
+    (StatusCode::CREATED, Json(json!({ "roomId": room_id }))).into_response()
+}
+
+/// `PUT /api/rooms/{room_id}`: идемпотентное восстановление комнаты после
+/// рестарта сервера (см. «Живучесть звонка при деплое» в README.md) — вся
+/// память комнат целиком в процессе, поэтому рестарт стирает её без следа, а
+/// клиенты при авто-reconnect могут наткнуться на `room-not-found` для
+/// комнаты, в которой только что были. Вместо того чтобы это было тупиком,
+/// фронтенд (см. `static/room.js`) в ответ на `room-not-found` при
+/// переподключении сначала бьёт сюда с ЗАПОМНЕННЫМ `roomId`, а затем повторяет
+/// `join-room`.
+///
+/// Семантика идемпотентности:
+///   - `room_id` не соответствует формату (`^[a-z0-9]{8}$`, см.
+///     `is_valid_room_id`) — `400`;
+///   - комнаты с таким id нет — создаём пустую (как `POST /api/rooms`, но с
+///     заданным, а не случайным id) — `201`;
+///   - комната уже есть (не важно, пуста или с участниками) — ничего не
+///     трогаем, просто подтверждаем — `200`.
+///
+/// Про безопасность восстановления по известному id: комнаты в этом проекте
+/// эфемерны и не имеют отдельного контроля доступа — единственный секрет это
+/// сам `roomId` в ссылке (см. «Приватность» в README.md). Восстановление по
+/// уже известному клиенту id НИЧЕГО не расширяет по доступу — кто знал
+/// ссылку до рестарта, тот и после рестарта мог бы просто получить
+/// `room-not-found` и создать СВОЮ новую комнату с другим id; этот эндпоинт
+/// лишь избавляет знающего ссылку от необходимости создавать новую и
+/// рассылать её заново остальным участникам. Кто ссылку не знал — не может
+/// подобрать `room_id` (8 символов из ограниченного алфавита) практическим
+/// перебором ни через этот эндпоинт, ни через `POST /api/rooms`.
+async fn restore_room(
+    State(state): State<AppState>,
+    Path(room_id): Path<String>,
+) -> Response {
+    if !is_valid_room_id(&room_id) {
+        return (StatusCode::BAD_REQUEST, "invalid room id").into_response();
+    }
+
+    let mut rooms_guard = state.rooms.lock().unwrap();
+    if rooms_guard.contains_key(&room_id) {
+        drop(rooms_guard);
+        return (StatusCode::OK, Json(json!({ "roomId": room_id }))).into_response();
+    }
+    rooms_guard.insert(
+        room_id.clone(),
+        Room {
+            participants: HashMap::new(),
+            screen_owner: None,
+            emptied_at: Some(Instant::now()),
+        },
+    );
+    drop(rooms_guard);
+    info!(room = %room_id, "комната восстановлена после рестарта (PUT /api/rooms/{{id}})");
 
     (StatusCode::CREATED, Json(json!({ "roomId": room_id }))).into_response()
 }

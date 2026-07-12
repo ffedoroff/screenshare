@@ -438,6 +438,47 @@ body {
   background: var(--bg-elevated-2);
 }
 
+/* Тонкие ненавязчивые баннеры реконнекта сигналинга/version-skew (см.
+   static/room.js) — обычный поток документа (НЕ fixed, НЕ полноэкранный
+   оверлей), сразу под верхней панелью комнаты: mesh/медиа/чат продолжают
+   работать, баннер только информирует. */
+.top-banner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-4);
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  font-size: 0.85rem;
+}
+
+.top-banner-button {
+  border: none;
+  border-radius: var(--radius);
+  background: var(--accent);
+  color: #fff;
+  padding: 2px var(--space-3);
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.top-banner-button:hover {
+  background: var(--accent-hover);
+}
+
+.top-banner-spinner {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  animation: spin 0.9s linear infinite;
+}
+
 .room-message {
   position: fixed;
   bottom: 100px;

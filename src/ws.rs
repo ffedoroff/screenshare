@@ -10,6 +10,7 @@ use axum::response::Response;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 use crate::protocol::{ClientMessage, PeerInfo, ServerMessage};
 use crate::state::{
@@ -194,7 +195,7 @@ fn handle_message(
     chat_times: &mut VecDeque<Instant>,
 ) -> Flow {
     match msg {
-        ClientMessage::JoinRoom { room_id, name } => {
+        ClientMessage::JoinRoom { room_id, name, peer_id } => {
             if me.is_some() {
                 send_to(tx, err("already in a room"));
                 return Flow::Continue;
@@ -211,7 +212,13 @@ fn handle_message(
                 return Flow::Continue;
             }
 
-            let peer_id = generate_peer_id();
+            // Клиентский peerId (переподключение после обрыва сигналинга, см.
+            // ClientMessage::JoinRoom) — принимаем, только если валидный UUID
+            // и ещё свободен в этой комнате; иначе как раньше генерируем новый.
+            let peer_id = peer_id
+                .filter(|id| Uuid::parse_str(id).is_ok())
+                .filter(|id| !room.participants.contains_key(id))
+                .unwrap_or_else(generate_peer_id);
 
             // Другие уже подключённые участники — до вставки нового.
             let peers: Vec<PeerInfo> = room

@@ -22,6 +22,21 @@
       <span class="room-top-bar-spacer" aria-hidden="true"></span>
     </div>
 
+    <!-- Тонкий ненавязчивый баннер авто-reconnect'а сигналинга (НЕ
+         полноэкранный оверлей — mesh/медиа/чат продолжают работать во время
+         переподключения, см. static/room.js). -->
+    <div id="reconnect-banner" class="top-banner hidden">
+      <span class="top-banner-spinner" aria-hidden="true"></span>
+      <span>Переподключение…</span>
+    </div>
+
+    <!-- Баннер version-skew (стандарт Романа): задеплоена новая версия,
+         предлагаем обновить страницу. Крестика/дисмисса нет намеренно. -->
+    <div id="version-banner" class="top-banner hidden">
+      <span>Вышла новая версия — обновите страницу.</span>
+      <button id="version-banner-reload-button" class="top-banner-button" type="button">Обновить</button>
+    </div>
+
     <div class="room-stage">
       <!-- Главная зона: экран крупно, когда кто-то шарит. -->
       <div id="screen-stage" class="screen-stage hidden">
