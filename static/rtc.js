@@ -23,14 +23,36 @@
 // через setLocalDescription({type:'rollback'}) — современные браузеры делают
 // неявный rollback внутри setRemoteDescription(offer), если signalingState
 // был "have-local-offer".
+//
+// Ф0: шина комнаты (см. static/bus.js) поверх RTCDataChannel — обычный
+// (НЕ negotiated) канал: заводит его ТОЛЬКО impolite-сторона обычным
+// pc.createDataChannel('bus'), polite-сторона получает свою половину через
+// pc.ondatachannel. Симметричный negotiated-канал (обе стороны создают
+// одинаковый id=0 сразу в конструкторе) эмпирически оказался хрупок в
+// этой headless Chrome песочнице: при создании нескольких
+// RTCPeerConnection на одной странице почти одновременно браузер иногда
+// вовсе не вызывал onnegotiationneeded для одного из соединений (не баг
+// perfect negotiation — у остальных пар всё штатно доходило до
+// stable/connected, а для сломанной пары негоциация не начиналась вообще
+// ни с одной стороны). У обычного одностороннего createDataChannel('bus')
+// та же самая цепочка (createDataChannel -> onnegotiationneeded -> offer)
+// уже была многократно проверена штатной работой этого файла для
+// addTrack() (медиа) до Ф0 — воспроизвести ту же хрупкость с ней не
+// удалось, поэтому шина использует именно эту, уже проверенную схему.
+// Единственное отличие от медиа: канал создаётся сразу в конструкторе (а не
+// по клику пользователя), поэтому та же самая коллизия офферов, что раньше
+// возникала только при одновременном старте видео/аудио с двух сторон,
+// теперь возможна и от одного самого факта входа в комнату — perfect
+// negotiation ниже её штатно разруливает.
 
 'use strict';
 
 class RtcPeer {
-  constructor({ iceServers, polite, signaling, targetPeerId, onTrack, onStateChange }) {
+  constructor({ iceServers, polite, signaling, targetPeerId, onTrack, onStateChange, onBusMessage }) {
     this.signaling = signaling;
     this.targetPeerId = targetPeerId;
     this.polite = polite;
+    this.onBusMessage = onBusMessage || null;
 
     this.makingOffer = false;
     this.ignoreOffer = false;
@@ -42,8 +64,58 @@ class RtcPeer {
     this.remoteSet = false;
     this.candidateQueue = [];
 
+    // busChannel появляется не сразу: у impolite-стороны — синхронно здесь
+    // же (createDataChannel), у polite-стороны — асинхронно, когда придёт
+    // pc.ondatachannel. sendBus() должен уметь копить исходящее и до этого
+    // момента тоже, поэтому busQueue — это очередь СТРОК JSON, а не что-то
+    // завязанное на конкретный channel.
+    this.busChannel = null;
+    this.busQueue = [];
+
     const pc = new RTCPeerConnection({ iceServers });
     this.pc = pc;
+
+    const setupBusChannel = (channel) => {
+      this.busChannel = channel;
+
+      channel.onopen = () => {
+        const queue = this.busQueue;
+        this.busQueue = [];
+        for (const text of queue) {
+          try {
+            channel.send(text);
+          } catch (err) {
+            console.error(`[peer ${targetPeerId}] Ошибка отправки в шину (флаш очереди):`, err);
+          }
+        }
+      };
+
+      channel.onmessage = (event) => {
+        let obj;
+        try {
+          obj = JSON.parse(event.data);
+        } catch (err) {
+          console.error(`[peer ${targetPeerId}] Некорректный JSON в шине:`, event.data, err);
+          return;
+        }
+        if (this.onBusMessage) this.onBusMessage(obj);
+      };
+
+      channel.onerror = (event) => {
+        console.error(`[peer ${targetPeerId}] Ошибка DataChannel-шины:`, event);
+      };
+    };
+
+    if (!polite) {
+      // impolite создаёт канал — само создание триггерит onnegotiationneeded
+      // ниже (если для этой пары ещё не было ни одной SCTP-негоциации).
+      setupBusChannel(pc.createDataChannel('bus'));
+    } else {
+      // polite ничего не создаёт сама — ждёт канал от impolite-стороны.
+      pc.ondatachannel = (event) => {
+        if (event.channel.label === 'bus') setupBusChannel(event.channel);
+      };
+    }
 
     pc.onnegotiationneeded = async () => {
       try {
@@ -151,6 +223,34 @@ class RtcPeer {
         }
       });
     }
+  }
+
+  /**
+   * Отправить объект в шину этого пира: JSON.stringify + try/catch на сам
+   * send. Пока канал не создан/не открыт — копится в очереди (см.
+   * setupBusChannel/channel.onopen в конструкторе).
+   */
+  sendBus(obj) {
+    let text;
+    try {
+      text = JSON.stringify(obj);
+    } catch (err) {
+      console.error(`[peer ${this.targetPeerId}] Не удалось сериализовать сообщение шины:`, err);
+      return;
+    }
+    if (this.busChannel && this.busChannel.readyState === 'open') {
+      try {
+        this.busChannel.send(text);
+      } catch (err) {
+        console.error(`[peer ${this.targetPeerId}] Ошибка отправки в шину:`, err);
+      }
+    } else {
+      this.busQueue.push(text);
+    }
+  }
+
+  isBusOpen() {
+    return !!this.busChannel && this.busChannel.readyState === 'open';
   }
 
   close() {

@@ -7,22 +7,30 @@ use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::Response;
+use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::protocol::{ChatHistoryEntry, ClientMessage, PeerInfo, ServerMessage};
+use crate::protocol::{ClientMessage, PeerInfo, ServerMessage};
 use crate::state::{
-    generate_peer_id, now_ms, send_to, AppState, Participant, PeerTx, SharedRooms,
-    MAX_PARTICIPANTS,
+    generate_peer_id, send_to, AppState, Participant, PeerTx, SharedRooms, MAX_PARTICIPANTS,
 };
 
-/// Лимит на чат: не более `CHAT_RATE_LIMIT` сообщений за `CHAT_RATE_WINDOW`
-/// с одного соединения. Простой скользящий счётчик, без сторонних крейтов.
+/// Лимит на fallback-релей чата (см. `ClientMessage::Chat`): не более
+/// `CHAT_RATE_LIMIT` сообщений за `CHAT_RATE_WINDOW` с одного соединения.
+/// Основной путь чата (mesh RTCDataChannel) через сервер не идёт вообще и
+/// этому лимиту не подчиняется — см. `static/chat.js` (клиентский, мягкий
+/// rate-limit 10/10с там же, независимо от этого серверного). Простой
+/// скользящий счётчик, без сторонних крейтов.
 const CHAT_RATE_LIMIT: usize = 10;
 const CHAT_RATE_WINDOW: Duration = Duration::from_secs(10);
 
-/// Максимальная длина текста сообщения чата в символах (не байтах).
-const CHAT_TEXT_MAX_CHARS: usize = 2000;
+/// Максимальный размер сериализованного JSON конверта чата (`envelope`) в
+/// байтах — сервер не разбирает содержимое, но обязан ограничить размер,
+/// чтобы fallback-релей нельзя было использовать для перекачки произвольных
+/// объёмов данных через сервер.
+const CHAT_ENVELOPE_MAX_BYTES: usize = 8 * 1024;
+
 /// Максимальная длина отображаемого имени в символах.
 const CHAT_NAME_MAX_CHARS: usize = 32;
 
@@ -46,8 +54,6 @@ const MAX_MISSED_PONGS: u32 = 2;
 struct PeerCtx {
     room_id: String,
     peer_id: String,
-    /// Имя для чата, задаётся при join-room.
-    name: Option<String>,
 }
 
 /// Что делать с соединением после обработки сообщения.
@@ -59,13 +65,13 @@ enum Flow {
 }
 
 pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
-    ws.on_upgrade(move |socket| handle_socket(socket, state.rooms, state.chat_history_cap))
+    ws.on_upgrade(move |socket| handle_socket(socket, state.rooms))
 }
 
 /// Одно WS-соединение = одна задача tokio. Исходящие сообщения пиру идут
 /// через mpsc-канал: другие задачи кладут в канал, а писать в сокет может
 /// только эта задача (select ниже) — так исключаются гонки записи.
-async fn handle_socket(mut socket: WebSocket, rooms: SharedRooms, chat_history_cap: usize) {
+async fn handle_socket(mut socket: WebSocket, rooms: SharedRooms) {
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
     // Комната/пир этого соединения; None до join-room.
     let mut me: Option<PeerCtx> = None;
@@ -140,7 +146,7 @@ async fn handle_socket(mut socket: WebSocket, rooms: SharedRooms, chat_history_c
                         match serde_json::from_str::<ClientMessage>(&text) {
                             Ok(msg) => {
                                 let flow = handle_message(
-                                    msg, &mut me, &tx, &rooms, chat_history_cap, &mut chat_times,
+                                    msg, &mut me, &tx, &rooms, &mut chat_times,
                                 );
                                 if flow == Flow::Stop {
                                     // Не рвём сразу: даём писателю дослать очередь.
@@ -185,7 +191,6 @@ fn handle_message(
     me: &mut Option<PeerCtx>,
     tx: &PeerTx,
     rooms: &SharedRooms,
-    chat_history_cap: usize,
     chat_times: &mut VecDeque<Instant>,
 ) -> Flow {
     match msg {
@@ -238,14 +243,11 @@ fn handle_message(
             }
             send_to(tx, ServerMessage::Joined { peer_id: peer_id.clone(), peers, screen_owner });
 
-            // История чата — сразу после `joined`, из памяти комнаты (тот же
-            // мьютекс, что и запись — гонка «вошёл сразу после сообщения»
-            // невозможна в принципе).
-            let messages: Vec<ChatHistoryEntry> = room.chat_history.iter().cloned().collect();
-            send_to(tx, ServerMessage::ChatHistory { messages });
-
+            // Истории чата сервер новичку больше не шлёт: чат целиком на
+            // mesh RTCDataChannel, историю новичок запрашивает сам у
+            // соседей по шине (см. `static/chat.js`) — сервер её не хранит.
             drop(rooms_guard);
-            *me = Some(PeerCtx { room_id: room_id.clone(), peer_id, name });
+            *me = Some(PeerCtx { room_id: room_id.clone(), peer_id });
         }
 
         // Релей: содержимое не разбираем, только маршрутизируем внутри
@@ -275,8 +277,8 @@ fn handle_message(
             });
         }
 
-        ClientMessage::Chat { text } => {
-            handle_chat(text, me, tx, rooms, chat_history_cap, chat_times);
+        ClientMessage::Chat { target_peer_id, envelope } => {
+            handle_chat(target_peer_id, envelope, me, tx, rooms, chat_times);
         }
 
         ClientMessage::ShareStart => {
@@ -337,69 +339,41 @@ fn handle_share_stop(me: &Option<PeerCtx>, rooms: &SharedRooms) {
     }
 }
 
-/// Обработка `chat`: валидация, rate-limit, широковещательная рассылка
-/// участникам комнаты (включая отправителя) и запись в историю комнаты в
-/// памяти (`Room::chat_history`, с вытеснением старых при переполнении
-/// `chat_history_cap`). Рассылка и запись в историю — под одним и тем же
-/// мьютексом комнаты, поэтому гонка «участник вошёл сразу после отправки
-/// сообщения» невозможна в принципе (в отличие от прежней схемы с БД).
+/// Обработка `chat` (адресный fallback-релей, см. `ClientMessage::Chat`):
+/// rate-limit + проверка размера конверта, затем релей `target_peer_id`
+/// один-в-один как `offer`/`answer`/`stream-info` — сервер содержимое
+/// `envelope` не разбирает и нигде не хранит (ни в памяти комнаты, ни тем
+/// более на диске). Основной путь чата — mesh RTCDataChannel напрямую между
+/// участниками, сюда попадают только сообщения к пирам, у которых шина ещё
+/// не открыта.
 fn handle_chat(
-    text: String,
+    target_peer_id: String,
+    envelope: Value,
     me: &Option<PeerCtx>,
     tx: &PeerTx,
     rooms: &SharedRooms,
-    chat_history_cap: usize,
     chat_times: &mut VecDeque<Instant>,
 ) {
-    let Some(ctx) = me.as_ref() else {
+    if me.is_none() {
         send_to(tx, err("not in a room"));
         return;
-    };
+    }
 
     if !check_rate_limit(chat_times) {
         send_to(tx, err("too many chat messages, slow down"));
         return;
     }
 
-    let text = match validate_chat_text(&text) {
-        Ok(t) => t,
-        Err(message) => {
-            send_to(tx, err(message));
-            return;
-        }
-    };
-
-    let room_id = ctx.room_id.clone();
-    let from_peer_id = ctx.peer_id.clone();
-    let name = ctx.name.clone();
-    let ts = now_ms();
-
-    let chat_msg = ServerMessage::Chat {
-        from_peer_id: from_peer_id.clone(),
-        name: name.clone(),
-        text: text.clone(),
-        ts,
-    };
-
-    let mut rooms_guard = rooms.lock().unwrap();
-    let Some(room) = rooms_guard.get_mut(&room_id) else {
-        debug!(room = %room_id, "chat в уже закрытую комнату — игнорируем");
+    let size = serde_json::to_vec(&envelope).map(|v| v.len()).unwrap_or(usize::MAX);
+    if size > CHAT_ENVELOPE_MAX_BYTES {
+        send_to(tx, err("chat envelope too large (max 8KB)"));
         return;
-    };
-    for p in room.participants.values() {
-        send_to(&p.tx, chat_msg.clone());
     }
-    if chat_history_cap > 0 {
-        while room.chat_history.len() >= chat_history_cap {
-            room.chat_history.pop_front();
-        }
-        room.chat_history.push_back(ChatHistoryEntry {
-            from_peer_id,
-            name,
-            text,
-            ts,
-        });
-    }
+
+    relay(me, rooms, tx, &target_peer_id, |from| ServerMessage::Chat {
+        from_peer_id: from,
+        envelope,
+    });
 }
 
 /// Скользящий счётчик: не более `CHAT_RATE_LIMIT` сообщений за
@@ -419,20 +393,6 @@ fn check_rate_limit(chat_times: &mut VecDeque<Instant>) -> bool {
     }
     chat_times.push_back(now);
     true
-}
-
-/// `text` после trim должен быть непустым и не длиннее `CHAT_TEXT_MAX_CHARS`
-/// символов (считаем именно символы, не байты — иначе многобайтовый UTF-8
-/// обрезался бы слишком рано).
-fn validate_chat_text(text: &str) -> Result<String, &'static str> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return Err("chat message must not be empty");
-    }
-    if trimmed.chars().count() > CHAT_TEXT_MAX_CHARS {
-        return Err("chat message too long (max 2000 characters)");
-    }
-    Ok(trimmed.to_string())
 }
 
 /// `name`: trim, вырезать управляющие символы, обрезать до

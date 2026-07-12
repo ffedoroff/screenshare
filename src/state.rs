@@ -1,6 +1,8 @@
 //! Состояние комнат, целиком в памяти процесса. Никакого хранилища на диске:
-//! всё (участники, имена, история чата) живёт ровно до тех пор, пока жив
-//! процесс и жива сама комната — реапер или рестарт стирают всё без следа.
+//! всё (участники, имена) живёт ровно до тех пор, пока жив процесс и жива
+//! сама комната — реапер или рестарт стирают всё без следа. Чат (см.
+//! `static/chat.js`) сервер вообще не хранит — история живёт только в
+//! памяти вкладок участников, здесь для неё нет ни поля, ни буфера.
 //!
 //! Выбор синхронизации: `std::sync::Mutex` поверх `HashMap`, а не tokio-мьютекс
 //! и не акторная схема. Обоснование: все критические секции короткие и не
@@ -9,7 +11,7 @@
 //! над `HashMap`), поэтому обычный мьютекс проще и быстрее асинхронного, а
 //! contention при нашем масштабе (единицы комнат по ≤6 участников) пренебрежим.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -17,7 +19,7 @@ use tokio::sync::mpsc;
 use tracing::info;
 use uuid::Uuid;
 
-use crate::protocol::{ChatHistoryEntry, ServerMessage};
+use crate::protocol::ServerMessage;
 
 /// Максимум участников в комнате одновременно (протокол v2: симметричная
 /// комната, роли broadcaster/viewer больше не существует).
@@ -48,11 +50,6 @@ pub struct Room {
     pub participants: HashMap<String, Participant>,
     /// peerId участника, который сейчас шарит экран (если шарит хоть кто-то).
     pub screen_owner: Option<String>,
-    /// Последние сообщения чата комнаты, целиком в памяти — никакого
-    /// хранения на диске. Ограничена `AppState::chat_history_cap` записями
-    /// (вытеснение старых при переполнении); умирает вместе с комнатой
-    /// (реапер удалил / процесс перезапустился — истории как не бывало).
-    pub chat_history: VecDeque<ChatHistoryEntry>,
     /// Когда комната опустела (последний участник вышел), либо когда она
     /// была создана пустой через `POST /api/rooms`. `None`, пока в комнате
     /// есть хоть один участник. Реапер удаляет комнату, если она пуста
@@ -69,9 +66,6 @@ pub type SharedRooms = Arc<Mutex<HashMap<String, Room>>>;
 #[derive(Clone)]
 pub struct AppState {
     pub rooms: SharedRooms,
-    /// Сколько последних сообщений чата держать в памяти комнаты (env
-    /// `CHAT_HISTORY_CAP`, дефолт 50 — см. `main.rs`).
-    pub chat_history_cap: usize,
 }
 
 /// Отправить сообщение пиру; ошибка (пир уже отвалился) сознательно
@@ -83,14 +77,6 @@ pub fn send_to(tx: &PeerTx, msg: ServerMessage) {
 /// Внутренний идентификатор пира — обычный UUID.
 pub fn generate_peer_id() -> String {
     Uuid::new_v4().to_string()
-}
-
-/// Текущее время в unix-миллисекундах (для `ts` в сообщениях чата).
-pub fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 /// Короткий человекочитаемый roomId для URL: 8 символов из алфавита

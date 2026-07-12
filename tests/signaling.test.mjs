@@ -1,9 +1,10 @@
-// Интеграционный тест сигналинга + чата (протокол v2 — симметричная комната:
-// все участники равны, mesh, шаринг экрана — временное состояние комнаты).
-// Гоняет полный жизненный цикл комнаты против САМОСТОЯТЕЛЬНО поднятого
-// сервера (собирает cargo build, запускает ./target/debug/screenshare на
-// порту 3311 с временной SQLite-БД и гарантированно прибирает за собой).
-// Чистый Node >= 22, глобальный WebSocket/fetch, без npm.
+// Интеграционный тест сигналинга (протокол v3 — симметричная комната: все
+// участники равны, mesh, шаринг экрана — временное состояние комнаты; чат
+// на сервере — только адресный fallback-релей опакового конверта, см.
+// README.md/src/ws.rs). Гоняет полный жизненный цикл комнаты против
+// САМОСТОЯТЕЛЬНО поднятого сервера (собирает cargo build, запускает
+// ./target/debug/screenshare на порту 3311 и гарантированно прибирает за
+// собой). Чистый Node >= 22, глобальный WebSocket/fetch, без npm.
 //
 // Запуск: node tests/signaling.test.mjs
 
@@ -30,11 +31,10 @@ function ok(cond, name) {
 
 // --- Управление серверным процессом -------------------------------------
 //
-// Сервер полностью эфемерен (никакой БД/файлов на диске), поэтому здесь не
-// нужна временная SQLite и её уборка — только сам процесс(ы). Кроме
-// основного сервера на PORT, тест CHAT_HISTORY_CAP поднимает второй,
-// короткоживущий инстанс на отдельном порту — оба процесса трекаются в
-// `serverProcs` и гарантированно убиваются в `cleanup()`.
+// Сервер полностью эфемерен (никакой БД/файлов на диске, чат ничего не
+// хранит — см. README.md), поэтому здесь не нужна временная БД и её
+// уборка — только сам процесс. Трекается в `serverProcs` и гарантированно
+// убивается в `cleanup()`.
 
 let serverProc = null;
 const serverProcs = [];
@@ -63,8 +63,6 @@ function buildServer() {
 }
 
 // Поднять сервер на заданном порту с дополнительными переменными окружения.
-// Возвращает child process; вызывающий код сам решает, ждать ли готовности
-// и когда убивать (плюс подстраховка — все процессы убиваются в cleanup()).
 function spawnServer(port, extraEnv = {}) {
   const bin = path.join(PROJECT_DIR, 'target', 'debug', 'screenshare');
   if (!fs.existsSync(bin)) {
@@ -160,8 +158,7 @@ function connect(wsUrl = URL) {
   });
 }
 
-// Подключиться и войти в комнату одним шагом; возвращает { peer, joined }
-// (без ожидания chat-history — вызывающий код сам решает, ждать её или нет).
+// Подключиться и войти в комнату одним шагом; возвращает { peer, joined }.
 async function join(roomId, name, wsUrl = URL) {
   const peer = await connect(wsUrl);
   const msg = { type: 'join-room', roomId };
@@ -171,16 +168,33 @@ async function join(roomId, name, wsUrl = URL) {
   return { peer, joined };
 }
 
-// Отправить chat с одного пира и дождаться его широковещательной копии
-// у каждого из recipients (порядок результата соответствует порядку recipients).
-function sendChatAndDrain(sender, text, recipients) {
-  sender.send({ type: 'chat', text });
-  return Promise.all(recipients.map((r) => r.next()));
-}
-
 function isChatMsg(m) {
   return m && m.type === 'chat' && typeof m.fromPeerId === 'string'
-    && typeof m.text === 'string' && typeof m.ts === 'number';
+    && m.envelope !== undefined && m.envelope !== null && typeof m.envelope === 'object';
+}
+
+function sendChat(sender, targetPeerId, envelope) {
+  sender.send({ type: 'chat', targetPeerId, envelope });
+}
+
+// Сравнение по структуре, а не по строке: сервер гоняет envelope через
+// serde_json::Value, которое (без preserve_order) сортирует ключи объектов
+// алфавитно — порядок ключей меняется, но данные остаются теми же. Именно
+// это и значит "доставлено как есть" для опакового JSON.
+function deepEqual(a, b) {
+  if (a === b) return true;
+  if (typeof a !== typeof b) return false;
+  if (a === null || b === null) return a === b;
+  if (typeof a !== 'object') return a === b;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  if (Array.isArray(a)) {
+    if (a.length !== b.length) return false;
+    return a.every((v, i) => deepEqual(v, b[i]));
+  }
+  const aKeys = Object.keys(a).sort();
+  const bKeys = Object.keys(b).sort();
+  if (aKeys.length !== bKeys.length || aKeys.some((k, i) => k !== bKeys[i])) return false;
+  return aKeys.every((k) => deepEqual(a[k], b[k]));
 }
 
 // --- Сам прогон тестов -----------------------------------------------------
@@ -219,10 +233,6 @@ async function runTests() {
     'joined: peers=[], screenOwner=null для первого участника');
   const p1Id = j1.peerId;
 
-  const p1History0 = await p1.next();
-  ok(p1History0.type === 'chat-history' && Array.isArray(p1History0.messages) && p1History0.messages.length === 0,
-    'первый участник получил пустую chat-history сразу после joined');
-
   // --- 4. Второй участник (с именем) входит: видит первого в peers ---
   console.log('4. второй участник: peers содержит первого, peer-joined приходит первому');
   const { peer: p2, joined: j2 } = await join(roomId, 'Аня');
@@ -230,7 +240,6 @@ async function runTests() {
   ok(j2.type === 'joined' && j2.peers.length === 1 && j2.peers[0].peerId === p1Id && j2.peers[0].name === null,
     'joined: peers=[{peerId: первый, name: null}] для второго участника');
   ok(j2.screenOwner === null, 'screenOwner всё ещё null');
-  await p2.next(); // chat-history (пустая)
 
   const pj1 = await p1.next();
   ok(pj1.type === 'peer-joined' && pj1.peerId === p2Id && pj1.name === 'Аня',
@@ -243,7 +252,6 @@ async function runTests() {
   ok(j3.peers.length === 2, 'у третьего участника peers содержит двух предыдущих');
   ok(j3.peers.some((p) => p.peerId === p1Id && p.name === null), 'peers содержит первого (имя null)');
   ok(j3.peers.some((p) => p.peerId === p2Id && p.name === 'Аня'), 'peers содержит второго (имя Аня)');
-  await p3.next(); // chat-history
 
   const [pj2a, pj2b] = await Promise.all([p1.next(), p2.next()]);
   ok(pj2a.type === 'peer-joined' && pj2a.peerId === p3Id && pj2a.name === 'Боб', 'первый получил peer-joined (Боб)');
@@ -271,84 +279,97 @@ async function runTests() {
   const si = await p2.next();
   ok(si.type === 'stream-info' && si.fromPeerId === p3Id && si.info.s1.name === 'Боб', 'stream-info p3->p2');
 
-  // Релей на несуществующий peerId — тихо игнорируется, соединение живо.
+  // Релей на несуществующий peerId — тихо игнорируется, соединение живо
+  // (проверяем маячком через адресный чат — см. п.7 про формат конверта).
   p2.send({ type: 'ice-candidate', targetPeerId: 'ghost', candidate: {} });
   {
-    const results = await sendChatAndDrain(p2, 'маячок-после-ghost-релея', [p1, p2, p3]);
-    ok(results.every((m) => isChatMsg(m) && m.text === 'маячок-после-ghost-релея'),
-      'релей на неизвестный peerId не ломает сокет/чат');
-  }
-
-  // --- 7. Чат: базовая доставка всем участникам, включая отправителя ---
-  console.log('7. чат: базовая доставка и история');
-  {
-    const [selfMsg, p1Msg, p3Msg] = await sendChatAndDrain(p2, 'Привет от Ани', [p2, p1, p3]);
-    ok(isChatMsg(selfMsg) && selfMsg.fromPeerId === p2Id && selfMsg.name === 'Аня' && selfMsg.text === 'Привет от Ани',
-      'chat приходит самому отправителю (fromPeerId, name, ts)');
-    ok(isChatMsg(p1Msg) && p1Msg.fromPeerId === p2Id, 'chat приходит первому участнику');
-    ok(isChatMsg(p3Msg) && p3Msg.fromPeerId === p2Id, 'chat приходит третьему участнику');
-  }
-  {
-    const [p2Msg, selfMsg, p3Msg] = await sendChatAndDrain(p1, 'Привет от первого', [p2, p1, p3]);
-    ok(isChatMsg(p2Msg) && p2Msg.fromPeerId === p1Id && p2Msg.name === null, 'chat от первого доходит второму');
-    ok(isChatMsg(selfMsg) && selfMsg.fromPeerId === p1Id, 'chat доходит самому себе (единый путь рендера)');
-    ok(isChatMsg(p3Msg) && p3Msg.fromPeerId === p1Id, 'chat от первого доходит третьему');
-  }
-
-  // --- 7b. Невалидный чат: пустой текст и слишком длинный ---
-  console.log('7b. чат: валидация текста');
-  {
-    p1.send({ type: 'chat', text: '' });
+    sendChat(p2, p1Id, { kind: 'text', text: 'маячок-после-ghost-релея' });
     const m = await p1.next();
-    ok(m.type === 'error', `пустой text -> error (${m.message})`);
-  }
-  {
-    p1.send({ type: 'chat', text: 'a'.repeat(2001) });
-    const m = await p1.next();
-    ok(m.type === 'error', `текст 2001 символ -> error (${m.message})`);
+    ok(isChatMsg(m) && m.fromPeerId === p2Id && m.envelope.text === 'маячок-после-ghost-релея',
+      'релей на неизвестный peerId не ломает сокет — чат p2->p1 после него доходит');
   }
 
-  // --- 8. Новый участник получает накопленную историю в хронологическом порядке ---
-  console.log('8. четвёртый участник: chat-history с 2 сообщениями');
+  // --- 7. Чат: адресный relay опакового конверта (сервер конверт не разбирает) ---
+  console.log('7. чат: адресный relay envelope (опаковость)');
+  {
+    // Конверт — намеренно с полями, каких сервер никогда не видел (v/id/
+    // lamport/from/name/kind/text/replyTo из static/chat.js + пара
+    // совершенно произвольных полей) — сервер обязан доставить его КАК ЕСТЬ,
+    // не разбирая и не валидируя содержимое (кроме размера, см. п.7b).
+    const envelope = {
+      v: 1,
+      id: 'msg-1',
+      lamport: 3,
+      from: p2Id,
+      name: 'Аня',
+      kind: 'text',
+      text: 'Привет от Ани',
+      replyTo: null,
+      arbitraryField: { nested: [1, 2, 3] },
+      anotherOne: 'ромашки',
+    };
+    sendChat(p2, p1Id, envelope);
+    const m = await p1.next();
+    ok(m.type === 'chat' && m.fromPeerId === p2Id && deepEqual(m.envelope, envelope),
+      'адресату конверт доставлен побайтово как есть (опаковость), с fromPeerId отправителя');
+  }
+  {
+    // Доказываем, что это АДРЕСНЫЙ релей, а не broadcast: p2 шлёт p1
+    // envelope-A, затем сразу p3 envelope-B (маячок) — у p3 следующим
+    // сообщением должен прийти именно маячок B, а не просочившийся A.
+    const envelopeA = { kind: 'text', text: 'A — только для p1' };
+    const envelopeB = { kind: 'text', text: 'B — маячок для p3' };
+    sendChat(p2, p1Id, envelopeA);
+    sendChat(p2, p3Id, envelopeB);
+    const [mp1, mp3] = await Promise.all([p1.next(), p3.next()]);
+    ok(isChatMsg(mp1) && mp1.envelope.text === 'A — только для p1', 'p1 получил именно envelope A');
+    ok(isChatMsg(mp3) && mp3.envelope.text === 'B — маячок для p3', 'p3 получил именно маячок B, не A (адресный релей, не broadcast)');
+  }
+
+  // --- 7b. Чат: конверт больше 8КБ -> error, не доставляется ---
+  console.log('7b. чат: envelope больше 8КБ -> error');
+  {
+    const bigEnvelope = { kind: 'text', text: 'x'.repeat(9000) };
+    sendChat(p1, p2Id, bigEnvelope);
+    const m = await p1.next();
+    ok(m.type === 'error', `envelope >8КБ -> error отправителю (${m.message})`);
+
+    // Доказываем, что слишком большой конверт НЕ доставлен: следующим
+    // сообщением у p2 должен прийти явный маячок, а не просочившийся bigEnvelope.
+    sendChat(p1, p2Id, { kind: 'text', text: 'маячок-после-oversize' });
+    const m2 = await p2.next();
+    ok(isChatMsg(m2) && m2.envelope.text === 'маячок-после-oversize',
+      'слишком большой конверт не дошёл до адресата');
+  }
+
+  // --- 8. Четвёртый участник входит (без истории — сервер её не хранит) ---
+  console.log('8. четвёртый участник входит');
   const { peer: p4, joined: j4 } = await join(roomId, 'Вова');
   const p4Id = j4.peerId;
   ok(j4.peers.length === 3, 'у четвёртого участника peers содержит трёх предыдущих');
   await Promise.all([p1.next(), p2.next(), p3.next()]); // peer-joined всем троим
 
-  const hist4 = await p4.next();
-  // 3 сообщения: маячок из релей-теста (п.6) + два из п.7.
-  ok(hist4.type === 'chat-history' && hist4.messages.length === 3, 'четвёртый участник получил накопленную историю (3 сообщения)');
-  ok(
-    hist4.messages[0].text === 'маячок-после-ghost-релея'
-    && hist4.messages[1].fromPeerId === p2Id && hist4.messages[1].text === 'Привет от Ани'
-    && hist4.messages[2].fromPeerId === p1Id && hist4.messages[2].text === 'Привет от первого',
-    'chat-history в хронологическом порядке',
-  );
-
+  // --- 8b. Rate-limit: не более 10 сообщений за окно, 11-е -> error, не доставляется ---
+  console.log('8b. чат: rate-limit (серверный, на fallback-пути)');
   {
-    const [selfMsg, p1Msg, p2Msg, p3Msg] = await sendChatAndDrain(p4, 'Привет, я Вова', [p4, p1, p2, p3]);
-    ok(selfMsg.name === 'Вова' && p1Msg.name === 'Вова' && p2Msg.name === 'Вова' && p3Msg.name === 'Вова',
-      'name из join-room попадает в поле name чата');
-  }
-
-  // --- 8b. Rate-limit: не более 10 сообщений за окно, 11-е -> error, не доставляется другим ---
-  console.log('8b. чат: rate-limit');
-  {
-    // p4 уже отправил одно валидное сообщение выше — досылаем ещё 9, итого 10 в окне.
-    for (let i = 0; i < 9; i++) {
-      await sendChatAndDrain(p4, `сообщение ${i}`, [p4, p1, p2, p3]);
+    // 10 адресных сообщений подряд с одного соединения (p4) — все проходят.
+    for (let i = 0; i < 10; i++) {
+      sendChat(p4, p1Id, { kind: 'text', text: `сообщение ${i}` });
+      const m = await p1.next();
+      ok(isChatMsg(m) && m.fromPeerId === p4Id, `сообщение ${i} доставлено (в пределах лимита)`);
     }
     // 11-е сообщение в окне -> error самому отправителю.
-    p4.send({ type: 'chat', text: 'одиннадцатое' });
+    sendChat(p4, p1Id, { kind: 'text', text: 'одиннадцатое' });
     const errMsg = await p4.next();
     ok(errMsg.type === 'error', `11-е сообщение за окно -> error (${errMsg.message})`);
 
-    // Доказываем, что 11-е сообщение НЕ было разослано другим: следующим
-    // сообщением должен прийти заведомо другой "маячок", а не просочившееся 11-е.
-    const [p1Next, p2Next, p3Next, p4Next] = await sendChatAndDrain(p1, 'маячок-после-rate-limit', [p1, p2, p3, p4]);
-    ok(p1Next.text === 'маячок-после-rate-limit' && p2Next.text === 'маячок-после-rate-limit'
-      && p3Next.text === 'маячок-после-rate-limit' && p4Next.text === 'маячок-после-rate-limit',
-      'сообщение, срезанное rate-limit, не доставлено другим участникам');
+    // Доказываем, что 11-е сообщение НЕ было доставлено: следующим сообщением
+    // p1 должен прийти заведомо другой маячок от другого отправителя (p2), а
+    // не просочившееся 11-е от p4.
+    sendChat(p2, p1Id, { kind: 'text', text: 'маячок-после-rate-limit' });
+    const beacon = await p1.next();
+    ok(isChatMsg(beacon) && beacon.fromPeerId === p2Id && beacon.envelope.text === 'маячок-после-rate-limit',
+      'сообщение, срезанное rate-limit, не доставлено адресату');
   }
 
   // --- 9. Шаринг экрана: захват, отказ занятому, освобождение, перезахват ---
@@ -364,12 +385,12 @@ async function runTests() {
     const rej = await p2.next();
     ok(rej.type === 'share-rejected' && rej.busyPeerId === p1Id, 'share-rejected с busyPeerId занявшего экран участника');
 
-    // Доказываем, что share-rejected НЕ разослан остальным: следующим сообщением
-    // всем (включая самого p2 — chat всегда приходит и отправителю) должен
-    // прийти маячок, а не второй share-started/share-rejected.
+    // Доказываем, что share-rejected НЕ разослан остальным: следующим адресным
+    // сообщением p1 должен прийти маячок, а не второй share-started/share-rejected.
     {
-      const [b1, b2, b3, b4] = await sendChatAndDrain(p2, 'маячок-после-share-rejected', [p1, p2, p3, p4]);
-      ok([b1, b2, b3, b4].every((m) => isChatMsg(m) && m.text === 'маячок-после-share-rejected'),
+      sendChat(p2, p1Id, { kind: 'text', text: 'маячок-после-share-rejected' });
+      const b = await p1.next();
+      ok(isChatMsg(b) && b.envelope.text === 'маячок-после-share-rejected',
         'share-rejected доставлен только инициатору, остальные его не получили');
     }
 
@@ -396,7 +417,6 @@ async function runTests() {
     const { peer: p5, joined: j5 } = await join(roomId, 'Галя');
     ok(j5.screenOwner === p2Id, 'новый участник получает screenOwner активного шаринга в joined');
     await Promise.all([p1.next(), p2.next(), p3.next(), p4.next()]); // peer-joined всем
-    await p5.next(); // chat-history
 
     // Освобождаем перед следующим блоком (дисконнект-тест).
     p2.send({ type: 'share-stop' });
@@ -435,7 +455,6 @@ async function runTests() {
     for (let i = 0; i < 6; i++) {
       const { peer, joined: j } = await join(fullRoomId, `участник${i}`);
       ok(j.type === 'joined', `участник №${i + 1} вошёл`);
-      await peer.next(); // chat-history
       // peer-joined всем предыдущим участникам этой же комнаты.
       await Promise.all(members.map((m) => m.peer.next()));
       members.push({ peer, joined: j });
@@ -455,14 +474,12 @@ async function runTests() {
   {
     const { roomId: ttlRoomId } = await createRoom();
     const { peer } = await join(ttlRoomId);
-    await peer.next(); // chat-history
     peer.ws.close();
     await peer.closed;
 
     await sleep(500); // меньше TTL (2с)
     const { peer: reJoinPeer, joined: reJoined } = await join(ttlRoomId);
     ok(reJoined.type === 'joined', 'вход в опустевшую, но ещё живую комнату (< TTL) успешен');
-    await reJoinPeer.next(); // chat-history
     reJoinPeer.ws.close();
     await reJoinPeer.closed;
 
@@ -498,70 +515,8 @@ async function runTests() {
     ok(missing.status === 400, 'без параметра room -> 400');
   }
 
-  // --- 14. Чат-история: порядок сообщений для нового участника ---
-  console.log('14. chat-history: явный порядок для нескольких сообщений');
-  {
-    const { roomId: hRoom } = await createRoom();
-    const { peer: h1 } = await join(hRoom, 'H1');
-    await h1.next(); // chat-history пустая
-    const { peer: h2 } = await join(hRoom, 'H2');
-    await h1.next(); // peer-joined
-    await h2.next(); // chat-history пустая
-
-    await sendChatAndDrain(h1, 'первое', [h1, h2]);
-    await sendChatAndDrain(h2, 'второе', [h1, h2]);
-
-    const { peer: h3 } = await join(hRoom, 'H3');
-    await Promise.all([h1.next(), h2.next()]); // peer-joined обоим
-    const hist = await h3.next();
-    ok(
-      hist.type === 'chat-history' && hist.messages.length === 2
-      && hist.messages[0].text === 'первое' && hist.messages[1].text === 'второе',
-      'третий участник получил оба сообщения в порядке отправки',
-    );
-
-    h1.ws.close();
-    h2.ws.close();
-    h3.ws.close();
-  }
-
-  // --- 15. CHAT_HISTORY_CAP: кап истории вытесняет старые сообщения ---
-  console.log('15. CHAT_HISTORY_CAP: кап истории');
-  {
-    const capPort = PORT + 1;
-    const capConfigUrl = `http://localhost:${capPort}/config`;
-    const capRoomsUrl = `http://localhost:${capPort}/api/rooms`;
-    const capWsUrl = `ws://localhost:${capPort}/ws`;
-    const capProc = spawnServer(capPort, { CHAT_HISTORY_CAP: '3' });
-    try {
-      await waitForReady(capConfigUrl, capProc);
-      const { roomId: capRoom } = await createRoom(undefined, capRoomsUrl);
-      const { peer: c1 } = await join(capRoom, 'C1', capWsUrl);
-      await c1.next(); // chat-history пустая
-
-      for (let i = 0; i < 5; i++) {
-        await sendChatAndDrain(c1, `msg${i}`, [c1]);
-      }
-
-      const { peer: c2 } = await join(capRoom, 'C2', capWsUrl);
-      await c1.next(); // peer-joined
-      const hist = await c2.next();
-      ok(hist.type === 'chat-history' && hist.messages.length === 3,
-        `история капнута до CHAT_HISTORY_CAP=3 (получено ${hist.messages.length})`);
-      ok(hist.messages.map((m) => m.text).join(',') === 'msg2,msg3,msg4',
-        'в истории именно последние 3 сообщения по порядку отправки');
-
-      c1.ws.close();
-      c2.ws.close();
-    } finally {
-      if (capProc.exitCode === null && !capProc.killed) {
-        try { capProc.kill('SIGKILL'); } catch { /* уже мёртв */ }
-      }
-    }
-  }
-
-  // --- 16. Эфемерность: сервер не оставил файлов БД в CWD ---
-  console.log('16. эфемерность: нет файлов БД');
+  // --- 14. Эфемерность: сервер не оставил файлов БД в CWD ---
+  console.log('14. эфемерность: нет файлов БД');
   {
     const dbFiles = fs.readdirSync(PROJECT_DIR).filter((f) => f.endsWith('.db') || f.includes('.db-'));
     ok(dbFiles.length === 0,

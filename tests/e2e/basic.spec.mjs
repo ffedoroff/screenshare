@@ -40,6 +40,8 @@ import {
   installMicStub,
   installCamStub,
   installSavedName,
+  installPcRegistry,
+  waitForMeshSettled,
   waitForOverlayHidden,
   assertVideoPlaying,
   openChatPanel,
@@ -88,6 +90,43 @@ async function waitForClassOnSelector(page, selector, className, present, timeou
   );
 }
 
+// --- Шпион на WebSocket: перехватывает КАЖДЫЙ send() страницы и запоминает
+// фреймы с type === 'chat' (см. src/protocol.rs::ClientMessage::Chat —
+// адресный fallback-релей). Ф1: чат теперь целиком на mesh RTCDataChannel
+// (см. static/chat.js/bus.js) — fallback через сервер срабатывает, только
+// если DataChannel-шина до конкретного пира не открыта. При живом
+// установившемся mesh (как в этом тесте — WebRTC уже давно поднят к
+// моменту отправки чата) фреймов 'chat' в серверном сокете быть не должно
+// вообще ни у одного из участников. Ставится ДО первой навигации
+// (addInitScript выполняется при каждой загрузке страницы контекста).
+function installChatWsSpy(context) {
+  return context.addInitScript(() => {
+    window.__e2eChatFramesSent = [];
+    const RealWebSocket = window.WebSocket;
+    window.WebSocket = class extends RealWebSocket {
+      constructor(...args) {
+        super(...args);
+        const realSend = this.send.bind(this);
+        this.send = (data) => {
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed && parsed.type === 'chat') {
+              window.__e2eChatFramesSent.push(parsed);
+            }
+          } catch {
+            // не строка/не JSON — точно не наш chat-фрейм
+          }
+          return realSend(data);
+        };
+      }
+    };
+  });
+}
+
+async function chatFramesSentOn(page) {
+  return page.evaluate(() => window.__e2eChatFramesSent || []);
+}
+
 async function main() {
   await buildServer();
   await server.start();
@@ -103,6 +142,8 @@ async function main() {
     // --- Вася: главная страница -> имя -> создать комнату ---
     const vasyaContext = await browser.newContext();
     await installMediaStubs(vasyaContext);
+    await installChatWsSpy(vasyaContext);
+    await installPcRegistry(vasyaContext);
     const vasyaPage = await vasyaContext.newPage();
 
     let roomId = null;
@@ -131,6 +172,10 @@ async function main() {
     const olyaContext = await browser.newContext();
     await installMediaStubs(petyaContext);
     await installMediaStubs(olyaContext);
+    await installChatWsSpy(petyaContext);
+    await installChatWsSpy(olyaContext);
+    await installPcRegistry(petyaContext);
+    await installPcRegistry(olyaContext);
     await installSavedName(petyaContext, 'Петя');
     await installSavedName(olyaContext, 'Оля');
     const petyaPage = await petyaContext.newPage();
@@ -142,9 +187,9 @@ async function main() {
       await waitForOverlayHidden(petyaPage);
       await waitForOverlayHidden(olyaPage);
 
-      for (const page of [vasyaPage, petyaPage, olyaPage]) {
-        await waitForTileCount(page, 3);
-      }
+      // waitForMeshSettled ждёт и тайлы, и что у всех троих обе mesh-связи
+      // (шина + сигналинг) реально дошли до connected — см. helpers.mjs.
+      await waitForMeshSettled([vasyaPage, petyaPage, olyaPage], { tileCount: 3, connectionsPerPage: 2 });
     });
 
     if (!everyoneJoinedOk) {
@@ -218,12 +263,41 @@ async function main() {
         }
 
         await openChatPanel(vasyaPage);
+        await openChatPanel(petyaPage);
+        await openChatPanel(olyaPage);
         const text = `Привет от Васи — ${Date.now()}`;
         await sendChatMessage(vasyaPage, text);
         assert.ok(await messageTextsInclude(vasyaPage, text), 'сообщение не появилось у самого отправителя (Вася)');
         assert.ok(await messageTextsInclude(petyaPage, text), 'сообщение не дошло до Пети');
         assert.ok(await messageTextsInclude(olyaPage, text), 'сообщение не дошло до Оли');
+
+        // И в обратную сторону — от Пети всем, чтобы шпион ниже видел трафик
+        // по каждой из трёх сторон, а не только от Васи.
+        const text2 = `Ответ от Пети — ${Date.now()}`;
+        await sendChatMessage(petyaPage, text2);
+        assert.ok(await messageTextsInclude(vasyaPage, text2), 'ответное сообщение не дошло до Васи');
+        assert.ok(await messageTextsInclude(petyaPage, text2), 'ответное сообщение не появилось у самого отправителя (Петя)');
+        assert.ok(await messageTextsInclude(olyaPage, text2), 'ответное сообщение не дошло до Оли');
       });
+    }
+
+    // --- Живой mesh: чат не должен был использовать серверный fallback ---
+    if (stopShareOk) {
+      await step(
+        'Ни один chat-фрейм не ушёл в серверный WebSocket ни у кого из троих (mesh давно установлен, DataChannel-шина открыта)',
+        async () => {
+          for (const [label, page] of [['Вася', vasyaPage], ['Петя', petyaPage], ['Оля', olyaPage]]) {
+            const frames = await chatFramesSentOn(page);
+            assert.equal(
+              frames.length,
+              0,
+              `у ${label} в серверный сокет ушли chat-фреймы (ожидали 0, DataChannel-шина должна была быть открыта): ${JSON.stringify(frames)}`
+            );
+          }
+        }
+      );
+    } else {
+      skip('проверка "чат не идёт через сервер"', 'обмен сообщениями в предыдущем шаге не выполнен');
     }
 
     // --- Оля теперь может начать шаринг ---
@@ -329,6 +403,81 @@ async function main() {
     await vasyaContext.close();
     await petyaContext.close();
     await olyaContext.close();
+
+    // --- История чата: третий участник входит ПОСЛЕ двух сообщений и видит
+    // их, получив по DataChannel от пира (не через серверную историю — её
+    // больше нет, см. src/ws.rs/README.md) ---
+    await step(
+      'История чата: третий участник входит после двух сообщений и видит их, получив по DataChannel',
+      async () => {
+        const res = await fetch(`${server.baseUrl}/api/rooms`, { method: 'POST' });
+        assert.ok(res.ok, `POST /api/rooms ответил статусом ${res.status}`);
+        const { roomId: histRoomId } = await res.json();
+        const histRoomUrl = `${server.baseUrl}/r/${histRoomId}`;
+
+        const igorContext = await browser.newContext();
+        const nastyaContext = await browser.newContext();
+        await installSavedName(igorContext, 'Игорь');
+        await installSavedName(nastyaContext, 'Настя');
+        const igorPage = await igorContext.newPage();
+        const nastyaPage = await nastyaContext.newPage();
+
+        try {
+          await igorPage.goto(histRoomUrl);
+          await nastyaPage.goto(histRoomUrl);
+          await waitForOverlayHidden(igorPage);
+          await waitForOverlayHidden(nastyaPage);
+          await waitForTileCount(igorPage, 2);
+          await waitForTileCount(nastyaPage, 2);
+
+          await openChatPanel(igorPage);
+          await openChatPanel(nastyaPage);
+
+          const msg1 = `История-1-${Date.now()}`;
+          await sendChatMessage(igorPage, msg1);
+          assert.ok(await messageTextsInclude(nastyaPage, msg1), 'первое сообщение не дошло до второго участника (до входа третьего)');
+
+          const msg2 = `История-2-${Date.now()}`;
+          await sendChatMessage(nastyaPage, msg2);
+          assert.ok(await messageTextsInclude(igorPage, msg2), 'второе сообщение не дошло до первого участника (до входа третьего)');
+
+          // Третий участник — со шпионом на WS: доказываем, что и сама
+          // история (history-request/history-response, см. static/chat.js)
+          // тоже целиком по DataChannel, без обращения к серверу.
+          const tretyContext = await browser.newContext();
+          await installChatWsSpy(tretyContext);
+          await installSavedName(tretyContext, 'Третий');
+          const tretyPage = await tretyContext.newPage();
+          try {
+            await tretyPage.goto(histRoomUrl);
+            await waitForOverlayHidden(tretyPage);
+            await waitForTileCount(tretyPage, 3);
+
+            await openChatPanel(tretyPage);
+            assert.ok(
+              await messageTextsInclude(tretyPage, msg1),
+              'третий участник не увидел историческое сообщение 1 (ожидали получение по DataChannel от пира)'
+            );
+            assert.ok(
+              await messageTextsInclude(tretyPage, msg2),
+              'третий участник не увидел историческое сообщение 2 (ожидали получение по DataChannel от пира)'
+            );
+
+            const frames = await chatFramesSentOn(tretyPage);
+            assert.equal(
+              frames.length,
+              0,
+              `история должна была прийти третьему участнику по DataChannel, а не через серверный fallback: ${JSON.stringify(frames)}`
+            );
+          } finally {
+            await tretyContext.close();
+          }
+        } finally {
+          await igorContext.close();
+          await nastyaContext.close();
+        }
+      }
+    );
 
     // --- Мобильный смоук: узкий вьюпорт, новая (отдельная) комната ---
     // Экран не проверяем намеренно: на реальных мобильных браузерах

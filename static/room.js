@@ -71,6 +71,12 @@ const peerNames = new Map();
 // Свой тайл (создаётся сразу после joined).
 let ownTile = null;
 
+// Ф0: шина комнаты поверх mesh RTCDataChannel (см. bus.js/rtc.js) — общая
+// для чата (chat.js) и будущих фич, живёт на протяжении всей сессии в
+// комнате (пира регистрируем/снимаем синхронно с peers, см.
+// createRemotePeer/removeRemotePeer).
+const bus = new Bus();
+
 // --- Локальные медиа ---
 let micStream = null;
 let micTrack = null;
@@ -498,7 +504,9 @@ function createRemotePeer(peerId, name, iceServers) {
     targetPeerId: peerId,
     onTrack: (event) => handleRemoteTrack(peerId, event),
     onStateChange: () => {},
+    onBusMessage: (obj) => bus._dispatch(peerId, obj),
   });
+  bus.addPeer(peerId, rtc);
 
   const tile = createTile(peerId, name, false);
   peers.set(peerId, { rtc, name, tile });
@@ -519,6 +527,7 @@ function removeRemotePeer(peerId) {
   entry.tile.root.remove();
   peers.delete(peerId);
   peerNames.delete(peerId);
+  bus.removePeer(peerId);
   cleanupMicAudio(peerId);
   for (const [streamId, ownerPeerId] of cameraStreamOwner) {
     if (ownerPeerId === peerId) cameraStreamOwner.delete(streamId);
@@ -589,7 +598,16 @@ function registerSignalingHandlers(iceServers) {
     updateScreenButtonState();
     updateParticipantCount();
 
-    chat = ChatPanel.create({ signaling, peerId, variant: 'room', toggleButton: chatButton });
+    chat = ChatPanel.create({
+      signaling,
+      bus,
+      peerId,
+      name: myName,
+      variant: 'room',
+      toggleButton: chatButton,
+      getPeerIds: () => Array.from(peers.keys()),
+      initialPeerIds: otherPeers.map((p) => p.peerId),
+    });
   });
 
   signaling.on('room-not-found', () => {

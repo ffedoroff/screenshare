@@ -349,6 +349,90 @@ export function installSavedName(context, name) {
   }, name);
 }
 
+// --- Реестр RTCPeerConnection для ожидания реального "соединения устаканились" ---
+//
+// Ф0 (см. static/rtc.js): каждая пара заводит DataChannel-шину сразу при
+// входе в комнату (createDataChannel у impolite-стороны, ondatachannel у
+// polite), а не по клику пользователя — то есть SDP-негоциация для КАЖДОЙ
+// пары стартует почти сразу после join, ещё до включения любой медиа. В
+// процессе расследования одной hang-флакиности (см. историю: симметричный
+// negotiated-канал с id=0 у обеих сторон иногда не триггерил
+// onnegotiationneeded вовсе у одного из нескольких RTCPeerConnection,
+// созданных на странице почти одновременно) был найден и устранён
+// продуктовый баг — static/rtc.js теперь использует классическую
+// одностороннюю схему (createDataChannel только у impolite,
+// ondatachannel у polite), ту же, что уже была проверена для медиа-треков
+// до Ф0. Реестр здесь и waitForAllConnectionsSettled/waitForMeshSettled
+// ниже оставлены как недорогая страховка теста (ждать реального
+// connectionState==='connected' надёжнее и быстрее, чем гадать с
+// таймерами) — тестам basic.spec.mjs/resilience.spec.mjs это ничего не
+// стоит, а вложенный ретрай на случай редкого ICE-затора (setOffline,
+// перегруженный CI-раннер и т.п.) не помешает.
+//
+// installPcRegistry не трогает static/*.js — только оборачивает
+// window.RTCPeerConnection в addInitScript, как и installChatWsSpy
+// оборачивает WebSocket в basic.spec.mjs.
+export function installPcRegistry(context) {
+  return context.addInitScript(() => {
+    window.__e2ePcs = [];
+    const RealPC = window.RTCPeerConnection;
+    window.RTCPeerConnection = class extends RealPC {
+      constructor(...args) {
+        super(...args);
+        window.__e2ePcs.push(this);
+      }
+    };
+  });
+}
+
+// Дождаться, пока на странице появится минимум `expectedCount` учтённых
+// RTCPeerConnection и у ВСЕХ них connectionState === 'connected'. Требует
+// installPcRegistry(context) до навигации.
+export async function waitForAllConnectionsSettled(page, expectedCount, timeoutMs = 12000) {
+  await page.waitForFunction(
+    (n) => {
+      const pcs = window.__e2ePcs || [];
+      if (pcs.length < n) return false;
+      return pcs.every((pc) => pc.connectionState === 'connected');
+    },
+    expectedCount,
+    { polling: 100, timeout: timeoutMs }
+  );
+}
+
+// --- Ожидание "mesh устаканился", со страховочным ретраем через перезаход ---
+//
+// Ждём тайлы и connectionState==='connected' у всех mesh-связей страницы.
+// Обёрнуто в пару попыток с page.reload() между ними — недорогая страховка
+// на случай единичного реального ICE-затора в CI/песочнице (сеть,
+// перегруженный раннер), не связанная с конкретным багом протокола.
+export async function waitForMeshSettled(pages, { tileCount, connectionsPerPage, attempts = 2 } = {}) {
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      for (const page of pages) {
+        await page.waitForFunction(
+          (n) => document.querySelectorAll('.tile').length === n,
+          tileCount,
+          { polling: 100, timeout: 10_000 }
+        );
+      }
+      for (const page of pages) {
+        await waitForAllConnectionsSettled(page, connectionsPerPage);
+      }
+      return;
+    } catch (err) {
+      if (attempt === attempts) throw err;
+      console.log(
+        `[waitForMeshSettled] попытка ${attempt}/${attempts} не устаканилась (${err.message}) — перезаходим в комнату и пробуем снова`
+      );
+      for (const page of pages) {
+        await page.reload();
+        await waitForOverlayHidden(page);
+      }
+    }
+  }
+}
+
 // --- Вспомогательные функции для страниц ---
 
 // Дожидается реального просмотра потока у зрителя. Хром блокирует autoplay

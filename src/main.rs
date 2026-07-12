@@ -1,18 +1,21 @@
 //! Точка входа: HTTP-сервер на axum.
 //!
 //! Backend делает ровно три вещи (по спецификации):
-//!   1. Signaling-релей поверх WebSocket (`/ws`) — см. `ws.rs`. Сюда же
-//!      подмешан текстовый чат комнаты — история целиком в памяти комнаты
-//!      (`state::Room::chat_history`), никакого хранения на диске.
+//!   1. Signaling-релей поверх WebSocket (`/ws`) — см. `ws.rs`. Текстовый чат
+//!      комнаты сюда почти не попадает: он идёт напрямую между участниками
+//!      по mesh RTCDataChannel (см. `static/chat.js`), сервер лишь релеит
+//!      адресный fallback, если шина до конкретного пира ещё не открыта, и
+//!      не хранит ни байта из содержимого чата.
 //!   2. Раздача статики фронтенда (`/`, `/r/{id}`, `/static/...`).
 //!   3. `GET /qr.svg?room=<id>` — QR-код на короткую ссылку комнаты.
 //! Плюс крошечный `/config` с ICE-серверами из переменных окружения.
 //! Медиа через сервер по-прежнему не проходит.
 //!
 //! Приватность: на диске не остаётся ничего — ни IP/портов клиентов (в
-//! tracing-логах фигурируют только room/peer id), ни истории чата, ни какой
-//! бы то ни было информации о сессии. Комната умирает — умирает вся её
-//! память (участники, имена, история).
+//! tracing-логах фигурируют только room/peer id), ни содержимого чата
+//! (сервер его не видит и не хранит вовсе — см. выше), ни какой бы то ни
+//! было информации о сессии. Комната умирает — умирает вся её память
+//! (участники, имена).
 
 mod protocol;
 mod state;
@@ -63,15 +66,7 @@ async fn main() {
     let empty_room_ttl = Duration::from_secs(empty_room_ttl_secs);
     tokio::spawn(state::reap_empty_rooms(rooms.clone(), empty_room_ttl));
 
-    // Сколько последних сообщений чата держать в памяти комнаты (см.
-    // `state::Room::chat_history`). В тестах выставляется маленьким, чтобы
-    // проверить вытеснение старых сообщений без отправки полусотни сообщений.
-    let chat_history_cap: usize = std::env::var("CHAT_HISTORY_CAP")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(50);
-
-    let state = AppState { rooms, chat_history_cap };
+    let state = AppState { rooms };
 
     let app = Router::new()
         // Страница входа/лендинга.
@@ -149,7 +144,6 @@ async fn create_room(State(state): State<AppState>) -> Response {
         Room {
             participants: HashMap::new(),
             screen_owner: None,
-            chat_history: std::collections::VecDeque::new(),
             // Сразу помечена «пустой»: если никто не подключится за TTL,
             // реапер её удалит.
             emptied_at: Some(Instant::now()),

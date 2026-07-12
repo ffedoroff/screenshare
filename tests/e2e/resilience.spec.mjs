@@ -48,6 +48,8 @@ import {
   installMicStub,
   installCamStub,
   installSavedName,
+  installPcRegistry,
+  waitForMeshSettled,
   waitForOverlayHidden,
   assertVideoPlaying,
   openChatPanel,
@@ -194,6 +196,9 @@ async function main() {
     await installMicAndCamStubs(vasyaContext);
     await installCaptureOnly(petyaContext); // Петя шарит экран в сценарии (б)
     await installCaptureOnly(olyaContext); // Оля шарит экран в сценариях (б)/(в)
+    await installPcRegistry(vasyaContext);
+    await installPcRegistry(petyaContext);
+    await installPcRegistry(olyaContext);
     await installSavedName(vasyaContext, 'Вася');
     await installSavedName(petyaContext, 'Петя');
     await installSavedName(olyaContext, 'Оля');
@@ -208,9 +213,10 @@ async function main() {
       await waitForOverlayHidden(vasyaPage);
       await waitForOverlayHidden(petyaPage);
       await waitForOverlayHidden(olyaPage);
-      for (const page of [vasyaPage, petyaPage, olyaPage]) {
-        await waitForTileCount(page, 3);
-      }
+      // waitForMeshSettled ждёт и тайлы, и что у всех троих обе mesh-связи
+      // реально дошли до connected (см. helpers.mjs) — сценарий (а) ниже
+      // сразу кликает по камере/микрофону.
+      await waitForMeshSettled([vasyaPage, petyaPage, olyaPage], { tileCount: 3, connectionsPerPage: 2 });
     });
 
     if (!bothJoinedOk) {
@@ -298,14 +304,21 @@ async function main() {
     // (в) Оля перезагружает страницу посреди своего же шаринга
     // ============================================================
     if (scenarioBShareOk) {
-      await step('(в) Оля перезагружает страницу — снова в комнате, старый шаринг освобождён сервером, история чата пришла заново', async () => {
+      await step('(в) Оля перезагружает страницу — снова в комнате, старый шаринг освобождён сервером, история чата пуста (Ф1: сервер её не хранит, а к этому моменту Оля в комнате одна — спросить не у кого)', async () => {
         await olyaPage.reload();
         await waitForOverlayHidden(olyaPage);
 
-        // История чата: сообщение из сценария (а) должно прийти заново.
+        // Ф1: истории на сервере больше нет вообще (см. README.md/src/ws.rs) —
+        // новичок запрашивает последние сообщения у соседей по mesh
+        // DataChannel (см. static/chat.js). К этому моменту сценариев (а)/(б)
+        // и Вася, и Петя уже покинули комнату — Оля тут одна, спрашивать не у
+        // кого, поэтому у неё ЗАКОНОМЕРНО пустая лента (как и в пустой
+        // комнате при первом входе). Реальный кейс «история приходит от
+        // живого пира по DataChannel» уже покрыт отдельным сценарием в
+        // tests/e2e/basic.spec.mjs.
         await openChatPanel(olyaPage);
         const texts = await (await getChatDom(olyaPage)).messages.allTextContents();
-        assert.ok(texts.length >= 1, 'после переподключения история чата у Оли пуста');
+        assert.equal(texts.length, 0, 'у Оли (единственной в комнате после reload) лента чата должна быть пустой');
 
         // Старый шаринг реально освобождён сервером (дисконнект = share-stopped),
         // а не просто «выглядит» освобождённым из-за свежей загрузки страницы:

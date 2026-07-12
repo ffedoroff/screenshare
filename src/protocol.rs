@@ -6,6 +6,14 @@
 //! Протокол v2: симметричная комната — все участники равны (никакого
 //! broadcaster/viewer), соединяются mesh, шаринг экрана — временное
 //! состояние комнаты (максимум один шарящий одновременно).
+//!
+//! Протокол v3 (Ф0/Ф1): чат переехал на mesh RTCDataChannel напрямую между
+//! участниками (см. `static/rtc.js`/`static/bus.js`/`static/chat.js`) —
+//! сервер в этом пути не участвует вообще. `ClientMessage::Chat`/
+//! `ServerMessage::Chat` — только адресный fallback-релей на случай, если
+//! DataChannel-шина до конкретного пира ещё не открыта; `envelope` для
+//! сервера опаковый JSON (как `sdp`/`candidate`/`info`), не разбирается и
+//! нигде не хранится.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -32,8 +40,15 @@ pub enum ClientMessage {
     /// как offer/answer/ICE — используется фронтом для служебной информации
     /// между пирами (например, сопоставление аудиотреков с именами).
     StreamInfo { target_peer_id: String, info: Value },
-    /// Текстовое сообщение в чат комнаты — от любого участника.
-    Chat { text: String },
+    /// Адресный fallback-путь чата: используется клиентом, только когда
+    /// P2P DataChannel-шина до `target_peer_id` ещё не открыта (см.
+    /// `static/rtc.js`/`static/chat.js`). Основной путь чата — mesh
+    /// RTCDataChannel напрямую между участниками, этот сервер вообще не
+    /// видит. `envelope` — опаковый JSON конверт чата (v/id/lamport/from/
+    /// name/kind/text/...), сервер его не разбирает и не хранит, только
+    /// релеит адресату (как offer/answer/ICE) с валидацией размера и
+    /// rate-limit.
+    Chat { target_peer_id: String, envelope: Value },
     /// Заявка на шаринг экрана. Удовлетворяется, только если экран сейчас
     /// свободен (комната одновременно поддерживает не более одного шарящего).
     ShareStart,
@@ -82,17 +97,11 @@ pub enum ServerMessage {
     /// Участнику: комнаты нет (не создана, ещё не создана или уже удалена
     /// реапером после истечения TTL пустой комнаты).
     RoomNotFound,
-    /// Всем участникам комнаты (включая отправителя — единый путь рендера):
-    /// новое сообщение чата.
-    Chat {
-        from_peer_id: String,
-        name: Option<String>,
-        text: String,
-        ts: i64,
-    },
-    /// Участнику сразу после `joined`: последние сообщения чата комнаты
-    /// в хронологическом порядке.
-    ChatHistory { messages: Vec<ChatHistoryEntry> },
+    /// Целевому пиру: fallback-релей чата (см. `ClientMessage::Chat`) —
+    /// только когда P2P DataChannel-шина между этой парой не открыта.
+    /// `envelope` — тот же опаковый JSON конверт, сервер его не разбирает и
+    /// не хранит.
+    Chat { from_peer_id: String, envelope: Value },
     /// Отправителю: некорректный запрос.
     Error { message: String },
 }
@@ -103,14 +112,4 @@ pub enum ServerMessage {
 pub struct PeerInfo {
     pub peer_id: String,
     pub name: Option<String>,
-}
-
-/// Одно сообщение в списке `ChatHistory::messages`.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ChatHistoryEntry {
-    pub from_peer_id: String,
-    pub name: Option<String>,
-    pub text: String,
-    pub ts: i64,
 }
