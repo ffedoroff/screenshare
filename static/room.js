@@ -438,7 +438,9 @@ function hideReconnectBanner() {
 
 async function fetchVersion() {
   try {
-    const res = await fetch('/version.json');
+    // Ш2: через window.API_BASE (см. static/config.js) — /version.json живёт
+    // на API-хосте, не обязательно совпадающем с origin этой страницы.
+    const res = await fetch(`${window.API_BASE}/version.json`);
     if (!res.ok) return null;
     const data = await res.json();
     return (data && data.version) || null;
@@ -1921,7 +1923,8 @@ async function sendJoinAndWait() {
 /** PUT /api/rooms/<roomId> — восстановить комнату, если реапер/рестарт её убрали (см. src/main.rs::restore_room). */
 async function restoreRoomViaPut() {
   try {
-    const res = await fetch(`/api/rooms/${encodeURIComponent(roomId)}`, { method: 'PUT' });
+    // Ш2: через window.API_BASE — см. fetchVersion выше и static/config.js.
+    const res = await fetch(`${window.API_BASE}/api/rooms/${encodeURIComponent(roomId)}`, { method: 'PUT' });
     return res.ok; // 200 (уже была) или 201 (создана) — оба ок
   } catch (err) {
     return false;

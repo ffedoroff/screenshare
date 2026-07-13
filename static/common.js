@@ -9,10 +9,15 @@ const FALLBACK_ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }];
 /**
  * Получить список ICE-серверов с бэкенда (`GET /config`).
  * При любой ошибке (сеть, парсинг, пустой ответ) — тихий фоллбэк на STUN.
+ *
+ * Ш2: бьём в `window.API_BASE` (см. static/config.js), а не в same-origin
+ * `/config` напрямую — на Cloudflare Pages фронт и API живут на разных
+ * хостах (chat.fedorov.it / chat-api.fedorov.it), API_BASE — единственная
+ * точка, знающая актуальный адрес бэкенда.
  */
 async function fetchIceServers() {
   try {
-    const res = await fetch('/config');
+    const res = await fetch(`${window.API_BASE}/config`);
     if (!res.ok) throw new Error(`/config ответил статусом ${res.status}`);
     const data = await res.json();
     if (Array.isArray(data.iceServers) && data.iceServers.length > 0) {
@@ -62,7 +67,14 @@ class Signaling {
     this.onError = null;
   }
 
-  /** Открыть WebSocket-соединение с `/ws`. Промис резолвится после открытия. */
+  /**
+   * Открыть WebSocket-соединение с `/ws`. Промис резолвится после открытия.
+   *
+   * Ш2: адрес выводится из `window.API_BASE` (см. static/config.js), а не из
+   * `location.host` — на Cloudflare Pages фронт и API на разных хостах,
+   * `API_BASE.replace(/^http/, 'ws')` даёт `ws:`/`wss:` в зависимости от
+   * того, http или https там прописан (см. README.md «Топология Ш2»).
+   */
   connect() {
     // Повторный вызов (авто-reconnect, см. static/room.js) НЕ должен оставлять
     // предыдущий сокет висеть: если тот успел реально открыться и всё ещё
@@ -81,8 +93,7 @@ class Signaling {
     }
 
     return new Promise((resolve, reject) => {
-      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const url = `${proto}//${location.host}/ws`;
+      const url = `${window.API_BASE.replace(/^http/, 'ws')}/ws`;
       const ws = new WebSocket(url);
       this.ws = ws;
       // Промис должен settle'иться РОВНО один раз. Без этого флага

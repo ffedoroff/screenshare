@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
-use axum::response::Response;
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -79,7 +80,27 @@ enum Flow {
     Stop,
 }
 
-pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
+/// Ш2 (см. src/main.rs, "Топология Ш2"): WebSocket кросс-ориджн работает и
+/// БЕЗ единого заголовка CORS (браузеры не применяют same-origin policy к
+/// WS-хендшейку так, как к fetch) — но раз уж фронт и API теперь МОГУТ жить
+/// на разных хостах, лишним не будет опционально свериться с тем же
+/// allow-list `CORS_ORIGIN`, что и HTTP-эндпоинты (см. `crate::CORS_ORIGIN`,
+/// `crate::cors_middleware`). Если `CORS_ORIGIN` не задан (дефолт — локалка
+/// и нынешний прод, фронт и API ещё на одном хосте) — проверки нет вовсе,
+/// поведение как раньше. Если задан, а пришедший `Origin` с ним не совпал —
+/// `403`, апгрейда не будет.
+pub async fn ws_handler(
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> Response {
+    if let Some(allowed) = crate::CORS_ORIGIN.as_deref() {
+        let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
+        if origin != Some(allowed) {
+            warn!(?origin, allowed, "WS-хендшейк с несовпавшим Origin отклонён");
+            return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
+        }
+    }
     ws.on_upgrade(move |socket| handle_socket(socket, state.rooms))
 }
 

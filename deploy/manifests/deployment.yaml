@@ -33,6 +33,13 @@ spec:
         env:
         - { name: PORT, value: "8080" }
         - { name: STATIC_DIR, value: "/app/static" }
+        # Ш2 (разнесение доверия — см. README.md «Топология Ш2»): фронт уезжает
+        # на Cloudflare Pages (chat.fedorov.it), этот сервер отвечает и на
+        # chat.fedorov.it (пока статика ещё раздаётся отсюда же, до переключения
+        # DNS), и на chat-api.fedorov.it (см. ingress.yaml) — поэтому единственный
+        # разрешённый CORS-origin для кросс-хостовых запросов с Pages это
+        # chat.fedorov.it. Пусто -> CORS выключен целиком (см. src/main.rs::CORS_ORIGIN).
+        - { name: CORS_ORIGIN, value: "https://chat.fedorov.it" }
         # TURN-креды (turn.yaml + Secret turn-creds, создан админом руками):
         # приложение отдаёт их клиентам в /config. optional — без секрета
         # приложение живёт на одном STUN, как раньше.

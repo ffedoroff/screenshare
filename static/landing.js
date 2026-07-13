@@ -34,7 +34,10 @@ createButton.addEventListener('click', async () => {
   showMessage('');
 
   try {
-    const res = await fetch('/api/rooms', { method: 'POST' });
+    // Ш2: через window.API_BASE (см. static/config.js) — на Cloudflare Pages
+    // фронт и API живут на разных хостах, same-origin '/api/rooms' бил бы
+    // в сам Pages-хост, где такого пути нет.
+    const res = await fetch(`${window.API_BASE}/api/rooms`, { method: 'POST' });
     if (!res.ok) throw new Error(`сервер ответил статусом ${res.status}`);
     const data = await res.json();
     if (!data || typeof data.roomId !== 'string' || !data.roomId) {

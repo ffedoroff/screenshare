@@ -24,6 +24,16 @@
 //! (сервер его не видит и не хранит вовсе — см. выше), ни какой бы то ни
 //! было информации о сессии. Комната умирает — умирает вся её память
 //! (участники, имена).
+//!
+//! Ш2 (разнесение доверия, см. README.md «Топология Ш2»): статика фронтенда
+//! уезжает на Cloudflare Pages, этот сервер остаётся ТОЛЬКО API/WS на
+//! отдельном хосте (`chat-api.fedorov.it`) — фронт и бэкенд МОГУТ жить на
+//! разных origin. Отсюда: CORS на кросс-оригин HTTP-эндпоинтах (`cors_middleware`
+//! ниже, включается через env `CORS_ORIGIN`) и опциональная проверка `Origin`
+//! на `/ws` (см. `ws.rs::ws_handler`) — оба выключены (никаких заголовков,
+//! никакой проверки) по умолчанию, пока `CORS_ORIGIN` не задан, так что
+//! локалка и нынешний прод (статика и API ещё на одном хосте) ведут себя
+//! ровно как раньше.
 
 mod protocol;
 mod state;
@@ -33,8 +43,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::extract::{Path, State};
-use axum::http::{header, StatusCode};
+use axum::extract::{Path, Request, State};
+use axum::http::{header, HeaderValue, Method, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Json, Response};
 use axum::routing::{get, post, put};
 use axum::Router;
@@ -52,6 +63,76 @@ static STATIC_DIR: LazyLock<String> = LazyLock::new(|| {
     std::env::var("STATIC_DIR")
         .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/static").to_string())
 });
+
+/// Ш2 (разнесение доверия — статика уезжает на Cloudflare Pages, этот сервер
+/// остаётся только API/WS на отдельном хосте, см. README.md «Топология Ш2»):
+/// разрешённый кросс-оригин для CORS, из env `CORS_ORIGIN` (например
+/// `https://chat.fedorov.it`). Пусто/не задано (дефолт — локалка и нынешний
+/// прод, где фронт и API ещё на одном хосте) значит «CORS выключен целиком»:
+/// ни один Access-Control-* заголовок не шлётся (см. `cors_middleware`) — с
+/// точки зрения браузера ничего не изменилось по сравнению с тем, как сервер
+/// вёл себя раньше.
+pub(crate) static CORS_ORIGIN: LazyLock<Option<String>> = LazyLock::new(|| {
+    std::env::var("CORS_ORIGIN")
+        .ok()
+        .filter(|v| !v.is_empty())
+});
+
+/// CORS вручную, без tower-http: у нас всего три кросс-оригин HTTP-пути
+/// (`/api/rooms` (+`/api/rooms/{id}`), `/config`, `/version.json`) — тащить
+/// отдельный крейт (лишняя компиляция, лишняя поверхность) ради заголовков на
+/// три хендлера показалось overkill; сам протокол CORS здесь тривиален
+/// (никаких credentials/cookies, один статичный allow-list origin из env).
+/// Применяется точечно через `.route_layer()` только к этим маршрутам (см.
+/// main()) — остальные (статика, `/`, `/r/{id}`, `/ws`) не тратят на него
+/// ничего.
+///
+/// Preflight `OPTIONS` перехватывается и ЗДЕСЬ ЖЕ, до вызова хендлера маршрута
+/// (тем хендлерам метод OPTIONS не зарегистрирован вовсе) — отвечаем `204` с
+/// теми же заголовками. Если `CORS_ORIGIN` не задан, никакие Access-Control-*
+/// заголовки не добавляются вообще (см. `CORS_ORIGIN` выше) — но сам ответ
+/// `204` на OPTIONS сервер всё равно отдаст; практического значения это не
+/// имеет, т.к. same-origin запросы preflight не вызывают.
+async fn cors_middleware(req: Request, next: Next) -> Response {
+    let mut response = if req.method() == Method::OPTIONS {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        next.run(req).await
+    };
+
+    if let Some(origin) = CORS_ORIGIN.as_deref() {
+        let headers = response.headers_mut();
+        match HeaderValue::from_str(origin) {
+            Ok(v) => {
+                headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
+            }
+            Err(e) => warn!("CORS_ORIGIN={origin:?} не годится в заголовок: {e}"),
+        }
+        headers.insert(header::VARY, HeaderValue::from_static("Origin"));
+        headers.insert(
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("GET, POST, PUT, OPTIONS"),
+        );
+        headers.insert(
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            HeaderValue::from_static("Content-Type"),
+        );
+    }
+
+    response
+}
+
+/// Handler-заглушка для метода `OPTIONS` на CORS-маршрутах. Тело НИКОГДА не
+/// выполняется: `cors_middleware` перехватывает `OPTIONS` до вызова
+/// `next.run()` и отвечает сам. Он всё равно должен существовать: у axum
+/// `MethodRouter` без зарегистрированного `OPTIONS` коротит незнакомый метод
+/// сразу в `405 Method Not Allowed` — ДО того, как запрос вообще дойдёт до
+/// `route_layer`-мидлвари (её накат `.route_layer()` оборачивает только уже
+/// зарегистрированные на этом MethodRouter методы, а не 405-фоллбэк) — без
+/// этой заглушки preflight OPTIONS никогда бы не увидел CORS-заголовки.
+async fn options_stub() -> StatusCode {
+    StatusCode::NO_CONTENT
+}
 
 #[tokio::main]
 async fn main() {
@@ -76,16 +157,37 @@ async fn main() {
 
     let state = AppState { rooms };
 
+    // Ш2: CORS-мидлварь навешивается ТОЧЕЧНО только на кросс-оригин
+    // HTTP-эндпоинты (см. cors_middleware выше) — статика/страницы/`/ws` её
+    // не видят вовсе.
+    let cors = middleware::from_fn(cors_middleware);
+
     let app = Router::new()
         // Страница входа/лендинга.
         .route("/", get(|| page("index.html")))
         // Страница комнаты: roomId фронтенд читает из URL сам.
         .route("/r/{room_id}", get(|_: Path<String>| page("room.html")))
-        .route("/api/rooms", post(create_room))
-        .route("/api/rooms/{room_id}", put(restore_room))
-        .route("/config", get(ice_config))
+        .route(
+            "/api/rooms",
+            post(create_room)
+                .options(options_stub)
+                .route_layer(cors.clone()),
+        )
+        .route(
+            "/api/rooms/{room_id}",
+            put(restore_room)
+                .options(options_stub)
+                .route_layer(cors.clone()),
+        )
+        .route(
+            "/config",
+            get(ice_config).options(options_stub).route_layer(cors.clone()),
+        )
         .route("/healthz", get(healthz))
-        .route("/version.json", get(version_json))
+        .route(
+            "/version.json",
+            get(version_json).options(options_stub).route_layer(cors),
+        )
         .route("/ws", get(ws::ws_handler))
         .route("/static/{*path}", get(static_file))
         .with_state(state);

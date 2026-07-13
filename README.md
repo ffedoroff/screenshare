@@ -48,7 +48,7 @@
 - **Что шифруется:** поля `sdp`/`candidate`/`info` в `offer`/`answer`/`ice-candidate`/`stream-info` (сервер видит только `{v,iv,ct}` вместо настоящего SDP); отображаемое имя участника в `join-room` (шифрблоб-строка вместо открытого текста — не расшифровалось у получателя -> «Гость», а не ошибка); адресный fallback-конверт чата целиком (`{enc:{v,iv,ct}}`).
 - **Что НЕ шифруется этим слоем:** сама mesh-шина (`RTCDataChannel`, чат/`stream-info`-снапшоты по ней) и медиатреки — WebRTC обязан гнать их поверх DTLS, это уже полноценное E2E-шифрование между двумя конкретными браузерами; второй прикладной слой шифрования той же самой пары не добавил бы ни одного нового свойства безопасности, только тратил бы CPU.
 - **Что остаётся видно серверу (и не может быть скрыто в этой модели):** IP-адреса участников (хотя сервер их не логирует, см. ниже — но видит на транспортном уровне), `roomId`, `peerId` каждого участника, тайминги подключений/сообщений и сам факт, что кто-то с кем-то шарит комнату. Ничего из содержимого (кто что сказал, кого как зовут, что за видео идёт) серверу не доступно.
-- **Предел этой модели:** сервер по-прежнему раздаёт сам JS (`static/*.js`, включая `crypto.js`) — теоретически скомпрометированный/подменённый бэкенд мог бы отдать клиенту вредоносный код и обойти всю схему на корню. Вынос статики на независимый от бэкенда хостинг (чтобы один и тот же оператор не мог одновременно раздавать код и владеть сигналингом) — самостоятельная будущая фаза, не часть Ш1.
+- **Предел этой модели (снят в Ш2):** сервер раньше раздавал сам JS (`static/*.js`, включая `crypto.js`) — теоретически скомпрометированный/подменённый бэкенд мог бы отдать клиенту вредоносный код и обойти всю схему на корню. Ш2 (см. «Топология Ш2» ниже) выносит статику на независимый хостинг (Cloudflare Pages) — один и тот же оператор больше не раздаёт код и не владеет сигналингом одновременно.
 
 ### Остальное
 
@@ -76,6 +76,7 @@ cargo run
 | `TURN_URL` | нет | адрес TURN-сервера (например `turn:example.com:3478`) |
 | `TURN_USERNAME` | нет | логин для TURN |
 | `TURN_PASSWORD` | нет | пароль для TURN |
+| `CORS_ORIGIN` | нет (по умолчанию не задана — CORS выключен целиком) | Ш2: разрешённый origin фронтенда для CORS на `/api/rooms` (+`/api/rooms/{id}`), `/config`, `/version.json`, и опциональной проверки `Origin` на `/ws` (см. «Топология Ш2»); например `https://chat.fedorov.it` |
 
 Если `TURN_URL` не задан, клиент получает от `/config` только STUN-сервер Google. TURN нужен, если P2P-соединение не устанавливается напрямую (симметричный NAT и т.п.).
 
@@ -262,23 +263,87 @@ mesh (видео/аудио P2P, DataChannel-чат) физически не з�
   страницу» с кнопкой «Обновить» (без крестика). Протокол аддитивен, поэтому
   клиент со старым JS продолжает штатно работать и без перезагрузки.
 
+### Топология Ш2: фронт на Cloudflare Pages, backend — только API/WS
+
+Ш2 разносит доверие между статикой и сигналингом (продолжение мысли из
+«Приватность»/Ш1: один и тот же оператор не должен одновременно раздавать код
+и владеть сигналингом): фронтенд (весь `static/`) переезжает на **Cloudflare
+Pages** (проект `chat-web`, домен `chat.fedorov.it`), а этот backend
+(Rust/axum) остаётся ТОЛЬКО API/WS-хостом на отдельном домене
+**`chat-api.fedorov.it`**. До переключения DNS оба домена временно указывают
+на один и тот же backend (см. `deploy/manifests/ingress.yaml`) — раздача
+статики с backend'а не отключается сама по себе этой фазой, это отдельный шаг
+после того, как Pages-деплой подтверждён рабочим.
+
+- **`static/config.js`** — единственный НЕ-обычный файл статики: не билд-шаг
+  (у проекта его вообще нет — весь фронт classic-script'ы), а обычный
+  статический файл вида `window.API_BASE = window.API_BASE || location.origin;`,
+  подключаемый первым `<script>` на `index.html`/`room.html`. Все fetch
+  (`/api/rooms`, `/config`, `/version.json`) и WS (`/ws`) во фронтенде идут
+  через `window.API_BASE` (WS-адрес — `API_BASE.replace(/^http/, 'ws')`), а не
+  напрямую в `location.origin`/`location.host`. Дефолт — same-origin: локальная
+  разработка (`cargo run`) и нынешний прод (пока статика ещё раздаётся тем же
+  процессом) продолжают работать без единой лишней настройки. CI-сборка под
+  Pages (см. ниже) этот файл ПЕРЕЗАПИСЫВАЕТ строкой с `https://chat-api.fedorov.it`.
+- **CORS вручную, без tower-http.** Кросс-оригин HTTP-путей у backend'а всего
+  три (`/api/rooms` + `/api/rooms/{id}`, `/config`, `/version.json`) — решили,
+  что тащить отдельный крейт (tower-http, feature `cors`) ради заголовков на
+  три хендлера не оправдано (лишняя компиляция/поверхность на протокол, у
+  которого и так нет ни credentials, ни сложных правил — один статичный
+  allow-list origin из `CORS_ORIGIN`). Реализовано `route_layer`-мидлварью
+  (`src/main.rs::cors_middleware`), навешенной точечно только на эти маршруты;
+  preflight `OPTIONS` перехватывается той же мидлварью и отвечает `204` (с
+  теми же заголовками, если `CORS_ORIGIN` задан). Если `CORS_ORIGIN` не задан
+  (дефолт) — ни один `Access-Control-*` заголовок не шлётся вообще, поведение
+  как до Ш2.
+- **`/ws` без CORS, но с опциональной проверкой `Origin`.** WebSocket-хендшейк
+  не подчиняется той же same-origin policy, что `fetch` — браузер не блокирует
+  кросс-оригин WS сам по себе, поэтому формальный CORS ему не нужен. Раз фронт
+  и API теперь МОГУТ жить на разных хостах, `ws_handler` (см. `src/ws.rs`)
+  опционально сверяет заголовок `Origin` с тем же `CORS_ORIGIN`: не задан —
+  проверки нет вовсе (как раньше); задан и не совпал — `403`, апгрейда не
+  происходит.
+- **`deploy/manifests/ingress.yaml`**: второе правило `chat-api.fedorov.it`
+  добавлено РЯДОМ с `chat.fedorov.it` (оба на один Service `chat`) — заводит
+  DNS/туннель для нового хоста заранее, оба хоста живут параллельно до
+  переключения DNS координатором.
+- **`deploy/manifests/deployment.yaml`**: `CORS_ORIGIN=https://chat.fedorov.it`
+  — единственный разрешённый кросс-оригин для запросов с Pages.
+- **CI (`.github/workflows/deploy-prod.yml`, job `deploy-pages`)**: собирает
+  `pages-dist/` (копия `static/` + переписанный `config.js` на
+  `https://chat-api.fedorov.it` + файл `_headers` с `Cache-Control: no-cache`
+  — тот же принцип, что и `NO_CACHE` на origin, см. `src/main.rs`, чтобы
+  Pages-edge не закэшировал старую статику после деплоя), затем
+  `wrangler pages deploy pages-dist --project-name=chat-web`. Гейтится теми же
+  `test`/`e2e`, что и `deploy` job. **Мягкий гейт**: пока секрет
+  `CLOUDFLARE_API_TOKEN` не заведён (Pages-проект и токен создаёт координатор
+  вручную в Cloudflare) — шаг деплоя скипается (`echo` + `exit 0`), пайплайн
+  остаётся зелёным.
+- **Что осталось сделать координатору (не часть этой подготовки):**
+  1. создать Pages-проект `chat-web` в Cloudflare (dashboard или `wrangler pages project create`);
+  2. завести секреты репозитория `CLOUDFLARE_API_TOKEN`/`CLOUDFLARE_ACCOUNT_ID`;
+  3. один раз прогнать `deploy-pages` (push в `main` или `gh workflow run`) и проверить, что Pages реально отдаёт фронт и он ходит на `chat-api.fedorov.it`;
+  4. переключить DNS `chat.fedorov.it` на Pages, `chat-api.fedorov.it` оставить на текущем backend'е (через cloudflare-tunnel-ingress-controller, см. `ingress.yaml`);
+  5. после подтверждения — по желанию убрать раздачу статики (`/`, `/r/{id}`, `/static/*`) из backend'а и правило `chat.fedorov.it` из `ingress.yaml` (не входит в эту фазу).
+
 ## Структура репозитория
 
 ```
 Cargo.toml          — зависимости и метаданные крейта
 Cargo.lock           — зафиксированные версии зависимостей
 src/
-  main.rs            — маршруты axum (POST /api/rooms — теперь с leaderToken, PUT /api/rooms/{id} — восстановление после рестарта, /r/{id}, /config), раздача статики, старт сервера, запуск реапера
+  main.rs            — маршруты axum (POST /api/rooms — теперь с leaderToken, PUT /api/rooms/{id} — восстановление после рестарта, /r/{id}, /config), раздача статики, CORS (Ш2, см. «Топология Ш2»), старт сервера, запуск реапера
   protocol.rs         — типы сообщений сигналинга (ClientMessage/ServerMessage), RoomSettings; протокол v4 (чат — адресный fallback-релей опакового конверта, см. Ф1; лидер/лобби/права гостей, см. «Права и лидер»)
   state.rs            — состояние комнат целиком в памяти (Room с leader_id/leader_token/settings/pending, Participant с joined_at, PendingParticipant, SharedRooms, AppState, лимиты участников и лобби, реапер пустых комнат) — содержимого чата в нём нет вовсе
-  ws.rs               — обработчик WebSocket-соединений: вход в комнату (включая лидерство и лобби), релей между любой парой участников (включая адресный fallback-релей чата), шаринг экрана, смена настроек/лидера, enforcement прав гостей, жизненный цикл
+  ws.rs               — обработчик WebSocket-соединений: вход в комнату (включая лидерство и лобби), релей между любой парой участников (включая адресный fallback-релей чата), шаринг экрана, смена настроек/лидера, enforcement прав гостей, жизненный цикл, опциональная Origin-проверка (Ш2)
 static/
+  config.js           — Ш2: window.API_BASE (см. «Топология Ш2») — единственный файл, перезаписываемый CI-сборкой под Cloudflare Pages
   index.html          — страница входа/лендинга
   room.html            — единая страница комнаты (roomId читается из URL на фронте)
   style.css            — общие стили, тёмная тема
   crypto.js           — Ш1: RoomCrypto — вывод ключей комнаты (HKDF-SHA256) и AES-256-GCM шифрование/расшифровка (только WebCrypto, без сторонних библиотек)
   vendor/qrcode.js    — вендоренный qrcode-generator (kazuhikoarase, MIT) — локальный рендер QR в попапе «Поделиться», без похода на сервер
-  common.js            — /config (ICE) + обёртка Signaling над WebSocket (переживает повторные connect() при авто-reconnect), SpeakingDetection
+  common.js            — API_BASE + /config (ICE) + обёртка Signaling над WebSocket (переживает повторные connect() при авто-reconnect), SpeakingDetection
   bus.js              — API шины комнаты (Ф0): sendToPeer/broadcast/onMessage/isOpen поверх mesh RTCDataChannel (см. rtc.js)
   rtc.js              — RtcPeer: perfect negotiation + DataChannel-шина (createDataChannel/ondatachannel); Ш1: шифрует/расшифровывает offer/answer/ice-candidate под K_sig
   chat.js             — панель чата (Ф1): конверт сообщения, lamport-часы, дедуп, сортировка ленты, клиентский rate-limit, история по DataChannel; Ш1: шифрует fallback-конверт чата под K_chat
@@ -288,10 +353,10 @@ tests/
   e2e/                 — браузерный e2e на playwright-core + системный Chrome (см. «Тестирование»)
 Dockerfile           — образ для деплоя (distroless/cc), см. «Деплой»
 deploy/
-  manifests/           — k8s-манифесты KubeSolo (namespace/deployment/service/ingress/rbac; PVC нет — приложение эфемерно)
+  manifests/           — k8s-манифесты KubeSolo (namespace/deployment/service/ingress/rbac; PVC нет — приложение эфемерно; ingress — оба хоста chat.fedorov.it/chat-api.fedorov.it, см. «Топология Ш2»)
   README.md            — порядок применения и устройство CI-деплоя
 .github/workflows/
-  deploy-prod.yml      — автодеплой prod при push в main
+  deploy-prod.yml      — автодеплой prod при push в main (job deploy — backend, job deploy-pages — фронт на Cloudflare Pages, см. «Топология Ш2»)
 ```
 
 ## Протокол v4 (HTTP + WebSocket, JSON)
