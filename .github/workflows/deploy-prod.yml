@@ -84,12 +84,18 @@ jobs:
       - name: Собрать pages-dist/ (копия static/ + config.js под API-хост)
         run: |
           rm -rf pages-dist
-          cp -r static pages-dist
+          # Структура как у origin-сервера: ассеты под /static/*, страницы в
+          # корне (HTML ссылается на /static/foo.js — см. src/main.rs роуты).
+          mkdir pages-dist
+          cp -r static pages-dist/static
+          mv pages-dist/static/index.html pages-dist/static/room.html pages-dist/ 2>/dev/null || cp static/index.html static/room.html pages-dist/
+          # SPA-маршрут комнат: /r/<id> отдаёт room.html (rewrite, не redirect).
+          printf '/r/* /room.html 200\n' > pages-dist/_redirects
           # Ш2: Pages-сборка ходит на отдельный API-хост — same-origin дефолт
           # из репозитория (static/config.js: window.API_BASE = location.origin)
           # здесь не годится, фронт и API теперь на разных доменах (см.
           # deploy/manifests/ingress.yaml, src/main.rs::CORS_ORIGIN).
-          cat > pages-dist/config.js <<'EOF'
+          cat > pages-dist/static/config.js <<'EOF'
           'use strict';
           window.API_BASE = 'https://chat-api.fedorov.it';
           EOF
