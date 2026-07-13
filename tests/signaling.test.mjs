@@ -119,16 +119,35 @@ function sleep(ms) {
 
 // --- HTTP: создание комнаты ------------------------------------------------
 
-async function createRoom(body, roomsUrl = ROOMS_URL) {
-  const opts = { method: 'POST' };
+// `ip` (опционально) — см. раздел про per-IP лимит создания комнат (H2):
+// подставляется как заголовок `CF-Connecting-IP`, который сервер понимает в
+// первую очередь (см. src/state.rs::extract_client_ip). Без него запрос идёт
+// без заголовка — сервер сам фолбэкнется на адрес пира сокета (у всех
+// запросов теста без явного `ip` это будет один и тот же адрес localhost,
+// поэтому раздельные IP в тестах, где это важно, передаются явно).
+async function createRoom(body, roomsUrl = ROOMS_URL, ip = undefined) {
+  const opts = { method: 'POST', headers: {} };
+  if (ip !== undefined) opts.headers['CF-Connecting-IP'] = ip;
   if (body !== undefined) {
-    opts.headers = { 'Content-Type': 'application/json' };
+    opts.headers['Content-Type'] = 'application/json';
     opts.body = JSON.stringify(body);
   }
   const res = await fetch(roomsUrl, opts);
   let json = null;
   try { json = await res.json(); } catch { /* не JSON — ниже проверим статус */ }
   return { status: res.status, roomId: json && json.roomId, leaderToken: json && json.leaderToken };
+}
+
+// Остановить дополнительный серверный процесс (см. spawnServer) и дождаться
+// его выхода — используется тестами, которым нужен отдельный процесс с
+// нестандартным env (MAX_ROOMS/MAX_ROOM_LIFETIME_SECONDS), не тем же, что у
+// основного сервера на PORT.
+function stopServer(proc) {
+  return new Promise((resolve) => {
+    if (proc.exitCode !== null) return resolve();
+    proc.once('exit', () => resolve());
+    proc.kill('SIGKILL');
+  });
 }
 
 // PUT /api/rooms/<roomId> — идемпотентное восстановление (см. src/main.rs::restore_room).
@@ -305,6 +324,8 @@ async function runTests() {
     && j1.settings.guestAudio === true && j1.settings.guestVideo === true && j1.settings.guestScreen === true,
     'joined.settings — дефолты (всё разрешено, лобби выключено)');
   ok(Array.isArray(j1.pending) && j1.pending.length === 0, 'joined.pending — пустой список (заявок в лобби ещё нет)');
+  ok(typeof j1.expiresInSeconds === 'number' && j1.expiresInSeconds > 0,
+    `joined.expiresInSeconds присутствует и положителен, лимит длительности созвона (${j1.expiresInSeconds})`);
 
   // --- 4. Второй участник (с именем) входит: видит первого в peers ---
   console.log('4. второй участник: peers содержит первого, peer-joined приходит первому');
@@ -425,6 +446,68 @@ async function runTests() {
     const m = await p1.next();
     ok(isChatMsg(m) && m.fromPeerId === p2Id && m.envelope.text === 'маячок-после-ghost-релея',
       'релей на неизвестный peerId не ломает сокет — чат p2->p1 после него доходит');
+  }
+
+  // --- 6b. Релей: лимит размера payload offer/answer/ice/stream-info (H2) ---
+  console.log('6b. релей: лимит размера payload (H2, 16КБ)');
+  {
+    const bigSdp = { type: 'offer', sdp: 'x'.repeat(17 * 1024) }; // сериализованный payload заведомо > 16КБ
+    p2.send({ type: 'offer', targetPeerId: p3Id, sdp: bigSdp });
+    const errMsg = await p2.next();
+    ok(errMsg.type === 'error', `offer payload >16КБ -> error отправителю (${errMsg.message})`);
+
+    // Доказываем недоставку: следующим валидным offer'ом идёт маячок — p3
+    // должен получить именно его, а не просочившийся big offer.
+    const beaconSdp = { type: 'offer', sdp: 'маячок-после-oversize-offer' };
+    p2.send({ type: 'offer', targetPeerId: p3Id, sdp: beaconSdp });
+    const beacon = await p3.next();
+    ok(beacon.type === 'offer' && beacon.sdp.sdp === 'маячок-после-oversize-offer',
+      'offer >16КБ не доставлен; следующий валидный дошёл как есть');
+
+    // Payload чуть меньше лимита — проходит целиком.
+    const okSdp = { type: 'offer', sdp: 'y'.repeat(16 * 1024 - 200) };
+    p2.send({ type: 'offer', targetPeerId: p3Id, sdp: okSdp });
+    const okMsg = await p3.next();
+    ok(okMsg.type === 'offer' && okMsg.sdp.sdp.length === okSdp.sdp.length,
+      'offer размером чуть меньше 16КБ доставлен целиком');
+  }
+
+  // --- 6c. Релей: общий rate-limit на ВСЕ типы релея соединения суммарно (H2) ---
+  console.log('6c. релей: общий rate-limit (H2, RELAY_RATE_LIMIT=100/10с)');
+  {
+    // Два временных участника той же комнаты — не переиспользуем p1/p2/p3,
+    // чтобы не заранее расходовать их собственный бюджет для дальнейших
+    // разделов теста.
+    const { peer: pA, joined: jA } = await join(roomId, 'RateA');
+    await Promise.all([p1.next(), p2.next(), p3.next()]); // peer-joined всем текущим
+    const { peer: pB, joined: jB } = await join(roomId, 'RateB');
+    await Promise.all([p1.next(), p2.next(), p3.next(), pA.next()]); // peer-joined всем текущим
+
+    // 100 ice-candidate подряд с pA на pB — все в пределах общего лимита.
+    let allDelivered = true;
+    for (let i = 0; i < 100; i++) {
+      pA.send({ type: 'ice-candidate', targetPeerId: jB.peerId, candidate: { candidate: `c${i}` } });
+      const m = await pB.next();
+      if (!(m.type === 'ice-candidate' && m.candidate.candidate === `c${i}`)) allDelivered = false;
+    }
+    ok(allDelivered, '100 сообщений подряд (в пределах общего релей-лимита) доставлены все');
+
+    // 101-е сообщение за окно -> error самому отправителю, не доставлено.
+    pA.send({ type: 'ice-candidate', targetPeerId: jB.peerId, candidate: { candidate: 'over-limit' } });
+    const errMsg = await pA.next();
+    ok(errMsg.type === 'error', `101-е сообщение за 10с (суммарно по всем типам релея) -> error (${errMsg.message})`);
+
+    // Доказываем недоставку: маячок от ДРУГОГО отправителя (p1, свой чистый
+    // бюджет) должен дойти первым же сообщением у pB.
+    sendChat(p1, jB.peerId, { kind: 'text', text: 'маячок-после-relay-rate-limit' });
+    const beacon = await pB.next();
+    ok(isChatMsg(beacon) && beacon.envelope.text === 'маячок-после-relay-rate-limit',
+      '101-е сообщение, срезанное общим релей-лимитом, не доставлено получателю');
+
+    pA.ws.close();
+    await Promise.all([p1.next(), p2.next(), p3.next(), pB.next()]); // peer-left pA
+    pB.ws.close();
+    await Promise.all([p1.next(), p2.next(), p3.next()]); // peer-left pB
   }
 
   // --- 7. Чат: адресный relay опакового конверта (сервер конверт не разбирает) ---
@@ -839,6 +922,85 @@ async function runTests() {
     await guest4.closed;
 
     await Promise.all([leader.closed, guest1.closed]);
+  }
+
+  // === H2: потолок числа комнат, per-IP лимиты, 3ч-лимит созвона, заголовки ===
+
+  // --- 21. Потолок числа комнат (env MAX_ROOMS, отдельный серверный процесс) ---
+  console.log('21. потолок числа комнат (MAX_ROOMS)');
+  {
+    const port = 3312;
+    const proc = spawnServer(port, { MAX_ROOMS: '2' });
+    await waitForReady(`http://localhost:${port}/config`, proc);
+    const roomsUrl = `http://localhost:${port}/api/rooms`;
+
+    const r1 = await createRoom(undefined, roomsUrl);
+    ok(r1.status === 201, `первая комната создаётся при MAX_ROOMS=2 (status=${r1.status})`);
+    const r2 = await createRoom(undefined, roomsUrl);
+    ok(r2.status === 201, `вторая комната создаётся при MAX_ROOMS=2 (status=${r2.status})`);
+    const r3 = await createRoom(undefined, roomsUrl);
+    ok(r3.status === 503, `третья комната при исчерпанном MAX_ROOMS=2 -> 503 (status=${r3.status})`);
+
+    await stopServer(proc);
+  }
+
+  // --- 22. Per-IP лимит создания комнат (H2, 429) ---
+  console.log('22. per-IP лимит создания комнат (429)');
+  {
+    // Один и тот же CF-Connecting-IP на все запросы — свой собственный
+    // бюджет, отдельный от фолбэк-IP всех остальных createRoom() без
+    // заголовка в этом файле (см. комментарий у createRoom()).
+    const ip = '203.0.113.5';
+    let allCreated = true;
+    for (let i = 0; i < 10; i++) {
+      const r = await createRoom(undefined, ROOMS_URL, ip);
+      if (r.status !== 201) allCreated = false;
+    }
+    ok(allCreated, '10 создания комнат за окно с одного IP — все в пределах лимита (201)');
+
+    const eleventh = await createRoom(undefined, ROOMS_URL, ip);
+    ok(eleventh.status === 429, `11-е создание за окно с того же IP -> 429 (status=${eleventh.status})`);
+
+    // Другой IP — свой собственный, независимый бюджет.
+    const otherIp = '203.0.113.6';
+    const otherIpResult = await createRoom(undefined, ROOMS_URL, otherIp);
+    ok(otherIpResult.status === 201, `создание с ДРУГОГО IP не задето лимитом первого (status=${otherIpResult.status})`);
+  }
+
+  // --- 23. Лимит длительности созвона (MAX_ROOM_LIFETIME_SECONDS) ---
+  console.log('23. лимит длительности созвона (room-expired)');
+  {
+    const port = 3313;
+    const proc = spawnServer(port, { MAX_ROOM_LIFETIME_SECONDS: '3' });
+    await waitForReady(`http://localhost:${port}/config`, proc);
+    const roomsUrl = `http://localhost:${port}/api/rooms`;
+    const wsUrl = `ws://localhost:${port}/ws`;
+
+    const { roomId: lifeRoomId } = await createRoom(undefined, roomsUrl);
+    const { peer, joined } = await join(lifeRoomId, 'Жизнь', wsUrl);
+    ok(typeof joined.expiresInSeconds === 'number' && joined.expiresInSeconds >= 1 && joined.expiresInSeconds <= 3,
+      `joined.expiresInSeconds ~3 при MAX_ROOM_LIFETIME_SECONDS=3 (получено ${joined.expiresInSeconds})`);
+
+    const expired = await peer.next(6000); // реапер тикает раз в секунду, лимит 3с — 6с более чем достаточно
+    ok(expired.type === 'room-expired', `по истечении лимита длительности приходит room-expired (получено ${expired.type})`);
+    await peer.closed;
+    ok(true, 'сервер закрыл сокет вслед за room-expired');
+
+    // Комната удалена целиком реапером -> повторный join -> room-not-found.
+    const late = await connect(wsUrl);
+    late.send({ type: 'join-room', roomId: lifeRoomId });
+    const m = await late.next();
+    ok(m.type === 'room-not-found', 'комната удалена реапером после истечения лимита длительности созвона');
+
+    await stopServer(proc);
+  }
+
+  // --- 24. Security-заголовки на API-ответах (M2) ---
+  console.log('24. security-заголовки на /config');
+  {
+    const res = await fetch(CONFIG_URL);
+    ok(res.headers.get('x-content-type-options') === 'nosniff', 'X-Content-Type-Options: nosniff на /config');
+    ok(res.headers.get('referrer-policy') === 'no-referrer', 'Referrer-Policy: no-referrer на /config');
   }
 }
 

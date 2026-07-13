@@ -40,11 +40,12 @@ mod state;
 mod ws;
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::extract::{Path, Request, State};
-use axum::http::{header, HeaderValue, Method, StatusCode};
+use axum::extract::{ConnectInfo, Path, Request, State};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Json, Response};
 use axum::routing::{get, post, put};
@@ -54,7 +55,10 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::protocol::RoomSettings;
-use crate::state::{AppState, Room};
+use crate::state::{
+    check_ip_rate_limit, extract_client_ip, AppState, Room, DEFAULT_MAX_ROOMS,
+    DEFAULT_MAX_ROOM_LIFETIME_SECONDS, ROOM_CREATION_IP_LIMIT, ROOM_CREATION_IP_WINDOW,
+};
 
 /// Каталог со статикой фронтенда. Настраивается через env `STATIC_DIR` (в
 /// контейнере — например `/app/static`), а для `cargo run` без переменной
@@ -76,6 +80,22 @@ pub(crate) static CORS_ORIGIN: LazyLock<Option<String>> = LazyLock::new(|| {
     std::env::var("CORS_ORIGIN")
         .ok()
         .filter(|v| !v.is_empty())
+});
+
+/// Лимит длительности созвона (см. README.md, «Лимит длительности созвона»):
+/// комната старше этого возраста удаляется реапером (`state::reap_rooms`)
+/// целиком, даже если в ней есть живые участники — им перед этим рассылается
+/// `room-expired`. Env `MAX_ROOM_LIFETIME_SECONDS`, дефолт 3 часа
+/// (`DEFAULT_MAX_ROOM_LIFETIME_SECONDS`). `LazyLock` (как `CORS_ORIGIN` выше)
+/// читает env один раз при первом обращении — этого достаточно, значение не
+/// меняется на лету; используется и здесь при спауне реапера, и в `ws.rs`
+/// (`room_expires_in_seconds`) при подсчёте остатка для `Joined`.
+pub(crate) static MAX_ROOM_LIFETIME: LazyLock<Duration> = LazyLock::new(|| {
+    let secs: u64 = std::env::var("MAX_ROOM_LIFETIME_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_ROOM_LIFETIME_SECONDS);
+    Duration::from_secs(secs)
 });
 
 /// CORS вручную, без tower-http: у нас всего три кросс-оригин HTTP-пути
@@ -119,6 +139,17 @@ async fn cors_middleware(req: Request, next: Next) -> Response {
         );
     }
 
+    // M2 (security-заголовки на API-ответах): применяются на тех же
+    // маршрутах, что и CORS выше (`/api/rooms`, `/config`, `/version.json` —
+    // см. `.route_layer(cors...)` в `main()`), НЕЗАВИСИМО от того, задан ли
+    // `CORS_ORIGIN` — это чисто ответные заголовки, не про кросс-ориджин.
+    // Страницы (`page()`/`static_file()`) их не получают — эта мидлварь на
+    // них не навешана вовсе (см. main()), фронт-статика уезжает на Cloudflare
+    // Pages и заголовки страниц настраивает через `_headers` сама.
+    let headers = response.headers_mut();
+    headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+
     response
 }
 
@@ -153,9 +184,25 @@ async fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(120);
     let empty_room_ttl = Duration::from_secs(empty_room_ttl_secs);
-    tokio::spawn(state::reap_empty_rooms(rooms.clone(), empty_room_ttl));
+    // Лимит длительности созвона (H3/новое требование, см. README.md) —
+    // читаем сразу (форсируем LazyLock), чтобы значение зафиксировалось до
+    // спауна реапера и первого запроса.
+    let max_room_lifetime = *MAX_ROOM_LIFETIME;
+    tokio::spawn(state::reap_rooms(rooms.clone(), empty_room_ttl, max_room_lifetime));
 
-    let state = AppState { rooms };
+    // H2 (DoS-защита): потолок числа комнат одновременно — env `MAX_ROOMS`,
+    // дефолт `DEFAULT_MAX_ROOMS`.
+    let max_rooms: usize = std::env::var("MAX_ROOMS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_ROOMS);
+
+    let state = AppState {
+        rooms,
+        max_rooms,
+        room_creation_ips: Arc::new(Mutex::new(HashMap::new())),
+        pending_join_ips: Arc::new(Mutex::new(HashMap::new())),
+    };
 
     // Ш2: CORS-мидлварь навешивается ТОЧЕЧНО только на кросс-оригин
     // HTTP-эндпоинты (см. cors_middleware выше) — статика/страницы/`/ws` её
@@ -201,7 +248,11 @@ async fn main() {
         .await
         .unwrap_or_else(|e| panic!("не удалось занять {addr}: {e}"));
     info!("сервер слушает http://localhost:{port}");
-    axum::serve(listener, app)
+    // `with_connect_info`: нужен для `ConnectInfo<SocketAddr>` в
+    // `ws::ws_handler`/`create_room` — фолбэк-источник IP клиента для
+    // per-IP лимитов (H2/M3), когда ни `CF-Connecting-IP`, ни
+    // `X-Forwarded-For` не пришли (прямое подключение без proxy).
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())
         .await
         .expect("серверу конец");
@@ -235,7 +286,7 @@ async fn shutdown_signal() {
 /// парсится вовсе.
 ///
 /// Комната без единого участника живёт `EMPTY_ROOM_TTL_SECONDS` — если за
-/// это время никто не подключится, реапер (`state::reap_empty_rooms`) её
+/// это время никто не подключится, реапер (`state::reap_rooms`) её
 /// удалит.
 ///
 /// Возвращает вместе с `roomId` одноразовый `leaderToken` (см. README.md,
@@ -243,11 +294,32 @@ async fn shutdown_signal() {
 /// стать лидером комнаты — токен сгорает при первом же успешном предъявлении
 /// (совпавшем с хранимым). Если никто не предъявит токен, лидером станет
 /// первый вошедший как обычно.
-async fn create_room(State(state): State<AppState>) -> Response {
+async fn create_room(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    // H2 (DoS-защита): per-IP лимит — не больше ROOM_CREATION_IP_LIMIT
+    // запросов за ROOM_CREATION_IP_WINDOW с одного IP (см. её комментарий в
+    // state.rs про то, почему бюджет отдельный от лобби).
+    let ip = extract_client_ip(&headers, Some(peer_addr));
+    if !check_ip_rate_limit(&state.room_creation_ips, &ip, ROOM_CREATION_IP_LIMIT, ROOM_CREATION_IP_WINDOW) {
+        warn!(%ip, "превышен per-IP лимит создания комнат — 429");
+        return (StatusCode::TOO_MANY_REQUESTS, "too many rooms created, slow down").into_response();
+    }
+
     let room_id = state::generate_room_id();
     let leader_token = Uuid::new_v4().to_string();
 
     let mut rooms_guard = state.rooms.lock().unwrap();
+    // H2 (DoS-защита): глобальный потолок числа комнат — проверяем ПОД ТЕМ
+    // ЖЕ локом, что и вставку ниже, иначе гонка двух одновременных create_room
+    // могла бы обе пройти проверку и вместе превысить потолок.
+    if rooms_guard.len() >= state.max_rooms {
+        drop(rooms_guard);
+        warn!(max_rooms = state.max_rooms, "потолок числа комнат достигнут — 503");
+        return (StatusCode::SERVICE_UNAVAILABLE, "server busy").into_response();
+    }
     // Коллизия 8-символьного id астрономически маловероятна (32^8 вариантов);
     // в теоретическом проигрышном случае просто отказываем — клиент повторит
     // запрос.
@@ -268,6 +340,7 @@ async fn create_room(State(state): State<AppState>) -> Response {
             leader_token: Some(leader_token.clone()),
             settings: RoomSettings::default(),
             pending: HashMap::new(),
+            created_at: Instant::now(),
         },
     );
     drop(rooms_guard);
@@ -320,6 +393,13 @@ async fn restore_room(
         drop(rooms_guard);
         return (StatusCode::OK, Json(json!({ "roomId": room_id }))).into_response();
     }
+    // H2 (DoS-защита): тот же глобальный потолок, что в create_room, под тем
+    // же локом — восстановление НЕсуществующей комнаты тоже создаёт запись.
+    if rooms_guard.len() >= state.max_rooms {
+        drop(rooms_guard);
+        warn!(max_rooms = state.max_rooms, "потолок числа комнат достигнут — 503 (restore)");
+        return (StatusCode::SERVICE_UNAVAILABLE, "server busy").into_response();
+    }
     rooms_guard.insert(
         room_id.clone(),
         Room {
@@ -332,6 +412,10 @@ async fn restore_room(
             leader_token: None,
             settings: RoomSettings::default(),
             pending: HashMap::new(),
+            // Отсчёт лимита длительности созвона — с момента восстановления,
+            // а не какого-то исходного создания (память о нём не переживает
+            // рестарт сервера) — см. комментарий у Room::created_at.
+            created_at: Instant::now(),
         },
     );
     drop(rooms_guard);

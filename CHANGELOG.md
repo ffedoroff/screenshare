@@ -6,6 +6,21 @@
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-07-13
+
+### Added
+- Жёсткий лимит длительности созвона: комната живёт максимум
+  MAX_ROOM_LIFETIME_SECONDS (по умолчанию 3 часа) с момента создания —
+  по истечении сервер шлёт всем room-expired и удаляет комнату; joined
+  несёт expiresInSeconds для обратного отсчёта на клиенте.
+
+### Security
+- Защита от DoS: cap размера релея (16КБ) и WS-кадра (64КБ), общий
+  rate-limit на все релеи (100/10с), потолок числа комнат (MAX_ROOMS=500)
+  и per-IP лимит создания комнат/заявок в лобби (10/60с по CF-Connecting-IP).
+- Security-заголовки на API-ответах: X-Content-Type-Options: nosniff,
+  Referrer-Policy: no-referrer.
+
 ## [0.12.0] — 2026-07-13
 
 ### Changed

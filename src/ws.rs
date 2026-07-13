@@ -1,11 +1,12 @@
 //! Обработка WebSocket-соединений: сигналинг-релей, чат и жизненный цикл комнат.
 
 use std::collections::VecDeque;
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
@@ -15,8 +16,9 @@ use uuid::Uuid;
 
 use crate::protocol::{ClientMessage, PeerInfo, PendingInfo, RoomSettings, ServerMessage};
 use crate::state::{
-    generate_peer_id, send_to, AppState, PendingParticipant, Participant, PeerTx, Room,
-    SharedRooms, MAX_PARTICIPANTS, MAX_PENDING,
+    check_ip_rate_limit, extract_client_ip, generate_peer_id, send_to, AppState, IpRateLimitMap,
+    PendingParticipant, Participant, PeerTx, Room, SharedRooms, MAX_PARTICIPANTS, MAX_PENDING,
+    PENDING_JOIN_IP_LIMIT, PENDING_JOIN_IP_WINDOW,
 };
 
 /// Лимит на fallback-релей чата (см. `ClientMessage::Chat`): не более
@@ -50,6 +52,38 @@ const CHAT_ENVELOPE_MAX_BYTES: usize = 8 * 1024;
 /// у верхней границы `maxlength` инпута (см. static/room.html).
 const CHAT_NAME_MAX_CHARS: usize = 512;
 
+/// H2 (DoS-защита): максимальный размер сериализованного payload одного
+/// релея offer/answer/ice-candidate/stream-info (`sdp`/`candidate`/`info`
+/// соответственно) в байтах. Сервер эти поля не разбирает (опаковый JSON),
+/// но обязан ограничить размер — иначе релей превращается в бесплатный канал
+/// перекачки произвольных объёмов данных через сервер под видом сигналинга.
+/// Отдельно от `CHAT_ENVELOPE_MAX_BYTES` (8КБ) — легитимный offer с
+/// несколькими медиалиниями крупнее заведомо крошечного чат-конверта.
+const RELAY_MAX_BYTES: usize = 16 * 1024;
+
+/// H2 (DoS-защита): скользящее окно rate-limit НА ВСЕ релеи одного
+/// соединения суммарно — offer/answer/ice-candidate/stream-info И chat
+/// (адресный fallback) вместе, единым счётчиком. Обоснование объединения (а
+/// не отдельного счётчика на каждый тип): вектор атаки один и тот же
+/// (флудить сообщениями с одного соединения) независимо от того, какой
+/// именно тип релея используется — раздельные счётчики позволили бы
+/// обойти лимит одного типа, просто чередуя типы сообщений. `chat` у себя
+/// ДОПОЛНИТЕЛЬНО подчиняется более строгому специфическому лимиту
+/// (`CHAT_RATE_LIMIT`, 10/10с) — этот общий лимит (100/10с) шире и в первую
+/// очередь защищает от флуда ICE-кандидатами (их бывает много легитимно при
+/// установке соединения — 100 за 10с должно перекрывать нормальный
+/// trickle-ICE с запасом).
+const RELAY_RATE_LIMIT: usize = 100;
+const RELAY_RATE_WINDOW: Duration = Duration::from_secs(10);
+
+/// H2 (DoS-защита): лимиты на сам WS-кадр/сообщение — независимо от
+/// прикладных лимитов выше, на уровне протокола. Наш крупнейший легитимный
+/// кадр — offer с несколькими медиалиниями, укладывается на порядок меньше
+/// этого лимита; всё, что крупнее, рассматриваем как атаку и axum сам
+/// разрывает соединение, не пропуская кадр в приложение.
+const WS_MAX_MESSAGE_SIZE: usize = 64 * 1024;
+const WS_MAX_FRAME_SIZE: usize = 64 * 1024;
+
 /// Серверный ping/pong-хартбит: как часто сами пингуем клиента.
 ///
 /// Зачем: TCP-соединение может оборваться тихо, без FIN/RST (у клиента сдох
@@ -72,6 +106,16 @@ struct PeerCtx {
     peer_id: String,
 }
 
+/// Оба скользящих окна rate-limit одного соединения — чат-специфичное
+/// (`CHAT_RATE_LIMIT`) и общее на все релеи суммарно (`RELAY_RATE_LIMIT`) —
+/// сгруппированы в одну структуру, а не переданы в `handle_message` двумя
+/// отдельными параметрами, просто чтобы не раздувать её сигнатуру дальше.
+#[derive(Default)]
+struct RateLimits {
+    chat_times: VecDeque<Instant>,
+    relay_times: VecDeque<Instant>,
+}
+
 /// Что делать с соединением после обработки сообщения.
 #[derive(PartialEq)]
 enum Flow {
@@ -91,6 +135,7 @@ enum Flow {
 /// `403`, апгрейда не будет.
 pub async fn ws_handler(
     headers: HeaderMap,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
 ) -> Response {
@@ -101,21 +146,27 @@ pub async fn ws_handler(
             return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
         }
     }
-    ws.on_upgrade(move |socket| handle_socket(socket, state.rooms))
+    let ip = extract_client_ip(&headers, Some(peer_addr));
+    // H2 (DoS-защита): кап на размер WS-сообщения/кадра — см. WS_MAX_MESSAGE_SIZE
+    // выше. Проверено на актуальном API axum 0.8 (`WebSocketUpgrade::max_message_size`/
+    // `max_frame_size`, src/extract/ws.rs) — не выдумано.
+    ws.max_message_size(WS_MAX_MESSAGE_SIZE)
+        .max_frame_size(WS_MAX_FRAME_SIZE)
+        .on_upgrade(move |socket| handle_socket(socket, state, ip))
 }
 
 /// Одно WS-соединение = одна задача tokio. Исходящие сообщения пиру идут
 /// через mpsc-канал: другие задачи кладут в канал, а писать в сокет может
 /// только эта задача (select ниже) — так исключаются гонки записи.
-async fn handle_socket(mut socket: WebSocket, rooms: SharedRooms) {
+async fn handle_socket(mut socket: WebSocket, state: AppState, ip: String) {
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
     // Комната/пир этого соединения; None до join-room.
     let mut me: Option<PeerCtx> = None;
     // Взводится, когда очередь исходящих надо дослать и закрыть сокет.
     let mut closing = false;
-    // Метки времени последних отправленных чат-сообщений этого соединения
-    // (скользящее окно для rate-limit).
-    let mut chat_times: VecDeque<Instant> = VecDeque::new();
+    // Оба скользящих окна rate-limit этого соединения (чат-специфичное и
+    // общее на все релеи) сгруппированы в одну структуру — см. `RateLimits`.
+    let mut rate_limits = RateLimits::default();
 
     // Хартбит: тикает каждые PING_INTERVAL, шлёт Message::Ping. axum сам
     // отвечает Pong'ом на ВХОДЯЩИЕ Ping (нам ничего для этого делать не нужно),
@@ -155,6 +206,7 @@ async fn handle_socket(mut socket: WebSocket, rooms: SharedRooms) {
                     ServerMessage::RoomFull
                         | ServerMessage::RoomNotFound
                         | ServerMessage::JoinRejected {}
+                        | ServerMessage::RoomExpired {}
                 );
                 let text = match serde_json::to_string(&msg) {
                     Ok(t) => t,
@@ -188,7 +240,8 @@ async fn handle_socket(mut socket: WebSocket, rooms: SharedRooms) {
                         match serde_json::from_str::<ClientMessage>(&text) {
                             Ok(msg) => {
                                 let flow = handle_message(
-                                    msg, &mut me, &tx, &rooms, &mut chat_times,
+                                    msg, &mut me, &tx, &state.rooms, &mut rate_limits,
+                                    &ip, &state.pending_join_ips,
                                 );
                                 if flow == Flow::Stop {
                                     // Не рвём сразу: даём писателю дослать очередь.
@@ -221,7 +274,7 @@ async fn handle_socket(mut socket: WebSocket, rooms: SharedRooms) {
 
     // Чистка при любом исходе: leave, close, обрыв.
     if let Some(ctx) = me {
-        cleanup_peer(&ctx, &rooms);
+        cleanup_peer(&ctx, &state.rooms);
     }
 }
 
@@ -233,7 +286,9 @@ fn handle_message(
     me: &mut Option<PeerCtx>,
     tx: &PeerTx,
     rooms: &SharedRooms,
-    chat_times: &mut VecDeque<Instant>,
+    rate_limits: &mut RateLimits,
+    ip: &str,
+    pending_join_ips: &IpRateLimitMap,
 ) -> Flow {
     match msg {
         ClientMessage::JoinRoom { room_id, name, peer_id, leader_token } => {
@@ -281,6 +336,16 @@ fn handle_message(
                     drop(rooms_guard);
                     return Flow::Stop;
                 }
+                // M3 (лобби не забить): per-IP лимит на попадание в pending,
+                // отдельный бюджет от лимита создания комнат (см.
+                // `PENDING_JOIN_IP_LIMIT`) — не даёт одному IP забить лобби
+                // разом множеством соединений, даже если MAX_PENDING этой
+                // конкретной комнаты формально не исчерпан.
+                if !check_ip_rate_limit(pending_join_ips, ip, PENDING_JOIN_IP_LIMIT, PENDING_JOIN_IP_WINDOW) {
+                    send_to(tx, err("too many join attempts from your network, try again later"));
+                    drop(rooms_guard);
+                    return Flow::Stop;
+                }
                 room.pending.insert(
                     peer_id.clone(),
                     PendingParticipant { tx: tx.clone(), name: name.clone(), joined_at: Instant::now() },
@@ -312,34 +377,64 @@ fn handle_message(
         }
 
         // Релей: содержимое не разбираем, только маршрутизируем внутри
-        // комнаты отправителя (любому другому участнику), подставляя fromPeerId.
+        // комнаты отправителя (любому другому участнику), подставляя
+        // fromPeerId. H2 (DoS-защита): каждый релей сначала проходит общий
+        // счётчик частоты (RELAY_RATE_LIMIT, суммарный на все типы релеев
+        // этого соединения — см. её комментарий), затем кап на размер payload
+        // (RELAY_MAX_BYTES) — в этом порядке, чтобы попытка протащить
+        // огромный payload тоже расходовала бюджет частоты, а не обходила
+        // rate-limit бесплатно.
         ClientMessage::Offer { target_peer_id, sdp } => {
-            relay(me, rooms, tx, &target_peer_id, |from| ServerMessage::Offer {
-                from_peer_id: from,
-                sdp,
-            });
+            if !check_relay_rate_limit(&mut rate_limits.relay_times) {
+                send_to(tx, err("too many messages, slow down"));
+            } else if relay_payload_too_large(&sdp) {
+                send_to(tx, err("payload too large (max 16KB)"));
+            } else {
+                relay(me, rooms, tx, &target_peer_id, |from| ServerMessage::Offer {
+                    from_peer_id: from,
+                    sdp,
+                });
+            }
         }
         ClientMessage::Answer { target_peer_id, sdp } => {
-            relay(me, rooms, tx, &target_peer_id, |from| ServerMessage::Answer {
-                from_peer_id: from,
-                sdp,
-            });
+            if !check_relay_rate_limit(&mut rate_limits.relay_times) {
+                send_to(tx, err("too many messages, slow down"));
+            } else if relay_payload_too_large(&sdp) {
+                send_to(tx, err("payload too large (max 16KB)"));
+            } else {
+                relay(me, rooms, tx, &target_peer_id, |from| ServerMessage::Answer {
+                    from_peer_id: from,
+                    sdp,
+                });
+            }
         }
         ClientMessage::IceCandidate { target_peer_id, candidate } => {
-            relay(me, rooms, tx, &target_peer_id, |from| ServerMessage::IceCandidate {
-                from_peer_id: from,
-                candidate,
-            });
+            if !check_relay_rate_limit(&mut rate_limits.relay_times) {
+                send_to(tx, err("too many messages, slow down"));
+            } else if relay_payload_too_large(&candidate) {
+                send_to(tx, err("payload too large (max 16KB)"));
+            } else {
+                relay(me, rooms, tx, &target_peer_id, |from| ServerMessage::IceCandidate {
+                    from_peer_id: from,
+                    candidate,
+                });
+            }
         }
         ClientMessage::StreamInfo { target_peer_id, info } => {
-            relay(me, rooms, tx, &target_peer_id, |from| ServerMessage::StreamInfo {
-                from_peer_id: from,
-                info,
-            });
+            if !check_relay_rate_limit(&mut rate_limits.relay_times) {
+                send_to(tx, err("too many messages, slow down"));
+            } else if relay_payload_too_large(&info) {
+                send_to(tx, err("payload too large (max 16KB)"));
+            } else {
+                relay(me, rooms, tx, &target_peer_id, |from| ServerMessage::StreamInfo {
+                    from_peer_id: from,
+                    info,
+                });
+            }
         }
 
         ClientMessage::Chat { target_peer_id, envelope } => {
-            handle_chat(target_peer_id, envelope, me, tx, rooms, chat_times);
+            handle_chat(target_peer_id, envelope, me, tx, rooms, rate_limits);
         }
 
         ClientMessage::ShareStart => {
@@ -427,6 +522,7 @@ fn admit_participant(
         leader_id,
         settings: room.settings.clone(),
         pending,
+        expires_in_seconds: room_expires_in_seconds(room),
     });
 
     // Истории чата сервер новичку больше не шлёт: чат целиком на mesh
@@ -617,7 +713,7 @@ fn handle_chat(
     me: &Option<PeerCtx>,
     tx: &PeerTx,
     rooms: &SharedRooms,
-    chat_times: &mut VecDeque<Instant>,
+    rate_limits: &mut RateLimits,
 ) {
     let Some(ctx) = me else {
         send_to(tx, err("not in a room"));
@@ -638,7 +734,16 @@ fn handle_chat(
         }
     }
 
-    if !check_rate_limit(chat_times) {
+    // H2 (DoS-защита): общий релей-лимит (все типы релеев суммарно) — раньше
+    // специфичного чат-лимита ниже и раньше проверки размера, тем же
+    // порядком, что и в offer/answer/ice/stream-info (см. их комментарий):
+    // расходует бюджет частоты даже для сообщений, отклонённых позже.
+    if !check_relay_rate_limit(&mut rate_limits.relay_times) {
+        send_to(tx, err("too many messages, slow down"));
+        return;
+    }
+
+    if !check_rate_limit(&mut rate_limits.chat_times) {
         send_to(tx, err("too many chat messages, slow down"));
         return;
     }
@@ -655,23 +760,58 @@ fn handle_chat(
     });
 }
 
-/// Скользящий счётчик: не более `CHAT_RATE_LIMIT` сообщений за
-/// `CHAT_RATE_WINDOW` с одного соединения. Возвращает `true`, если сообщение
-/// разрешено (и тогда регистрирует его метку времени).
-fn check_rate_limit(chat_times: &mut VecDeque<Instant>) -> bool {
+/// Скользящее окно, общее для чат-лимита и релей-лимита (см.
+/// `check_rate_limit`/`check_relay_rate_limit`): не более `limit` меток за
+/// `window`. Возвращает `true`, если ещё одна метка разрешена (и тогда
+/// регистрирует её).
+fn sliding_window_ok(times: &mut VecDeque<Instant>, limit: usize, window: Duration) -> bool {
     let now = Instant::now();
-    while let Some(&oldest) = chat_times.front() {
-        if now.duration_since(oldest) > CHAT_RATE_WINDOW {
-            chat_times.pop_front();
+    while let Some(&oldest) = times.front() {
+        if now.duration_since(oldest) > window {
+            times.pop_front();
         } else {
             break;
         }
     }
-    if chat_times.len() >= CHAT_RATE_LIMIT {
+    if times.len() >= limit {
         return false;
     }
-    chat_times.push_back(now);
+    times.push_back(now);
     true
+}
+
+/// Скользящий счётчик: не более `CHAT_RATE_LIMIT` сообщений за
+/// `CHAT_RATE_WINDOW` с одного соединения. Возвращает `true`, если сообщение
+/// разрешено (и тогда регистрирует его метку времени). Специфичный для
+/// адресного fallback-чата лимит — строже общего релей-лимита ниже.
+fn check_rate_limit(chat_times: &mut VecDeque<Instant>) -> bool {
+    sliding_window_ok(chat_times, CHAT_RATE_LIMIT, CHAT_RATE_WINDOW)
+}
+
+/// H2 (DoS-защита): общий скользящий счётчик на ВСЕ релеи соединения
+/// суммарно (offer/answer/ice-candidate/stream-info/chat) — см.
+/// `RELAY_RATE_LIMIT`.
+fn check_relay_rate_limit(relay_times: &mut VecDeque<Instant>) -> bool {
+    sliding_window_ok(relay_times, RELAY_RATE_LIMIT, RELAY_RATE_WINDOW)
+}
+
+/// H2 (DoS-защита): сериализованный размер payload релея (`sdp`/`candidate`/
+/// `info`) превышает `RELAY_MAX_BYTES`? Сервер эти значения не разбирает, но
+/// должен ограничить их размер — см. `RELAY_MAX_BYTES`.
+fn relay_payload_too_large(value: &Value) -> bool {
+    let size = serde_json::to_string(value).map(|s| s.len()).unwrap_or(usize::MAX);
+    size > RELAY_MAX_BYTES
+}
+
+/// Остаток жизни комнаты в секундах на текущий момент (лимит длительности
+/// созвона, см. README.md «Лимит длительности созвона») — `MAX_ROOM_LIFETIME`
+/// минус возраст комнаты, зажатый снизу в 0. Используется в `Joined`, чтобы
+/// клиент мог сам показать обратный отсчёт/предупреждение.
+fn room_expires_in_seconds(room: &Room) -> u64 {
+    crate::MAX_ROOM_LIFETIME
+        .checked_sub(room.created_at.elapsed())
+        .unwrap_or(Duration::ZERO)
+        .as_secs()
 }
 
 /// `name`: trim, вырезать управляющие символы, обрезать до
@@ -732,7 +872,7 @@ where
 /// заново (`join-request` за каждую); затем (если кто-то остался)
 /// `peer-left`. Если комната опустела — не удаляем её сразу, а помечаем
 /// момент опустошения: реапер удалит её позже, если никто не подключится до
-/// истечения TTL (см. `state::reap_empty_rooms`); все ещё живые заявки
+/// истечения TTL (см. `state::reap_rooms`); все ещё живые заявки
 /// лобби в этот момент отклоняются (`join-rejected` + закрытие сокета) —
 /// одобрять их больше некому.
 ///
