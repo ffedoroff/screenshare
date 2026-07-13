@@ -53,6 +53,7 @@ const overlayTitleEl = document.getElementById('overlay-title');
 const overlayTextEl = document.getElementById('overlay-text');
 const overlayActionButtonEl = document.getElementById('overlay-action-button');
 const participantCountEl = document.getElementById('participant-count');
+const roomTimerEl = document.getElementById('room-timer');
 const screenStageEl = document.getElementById('screen-stage');
 const screenVideoEl = document.getElementById('screen-video');
 const screenCaptionEl = document.getElementById('screen-caption');
@@ -199,6 +200,60 @@ let screenOwnerGraceTimer = null;
 // страница — сверяется заново после каждого успешного реконнекта (стандарт
 // version-skew баннера, см. README.md).
 let lastKnownVersion = null;
+
+// --- Лимит длительности созвона (3 часа, см. README.md) ---
+//
+// Сервер сам считает и присылает остаток жизни комнаты в `joined.expiresInSeconds`
+// (см. src/ws.rs::room_expires_in_seconds) — на КАЖДОМ joined, и при первом
+// входе, и при реконнекте (после реконнекта остаток мог заметно измениться,
+// если реконнект был долгим, поэтому дедлайн всегда пересчитывается заново из
+// свежего значения, а не переживает реконнект как есть, см. startRoomTimer).
+// Когда время истекает, сервер сам рассылает `room-expired` всем участникам
+// (и ожидающим в лобби) и закрывает сокет — см. signaling.on('room-expired')
+// в registerSignalingHandlers ниже.
+const ROOM_TIMER_WARNING_MS = 10 * 60 * 1000; // последние 10 минут — жёлтый
+const ROOM_TIMER_CRITICAL_MS = 60 * 1000; // последняя минута — красный
+let roomExpiresAtMs = null; // Date.now() на момент joined + expiresInSeconds*1000, null до первого joined
+let roomTimerInterval = null;
+
+/** Ч:ММ:СС из миллисекунд (не может быть отрицательным — вызывающая сторона зажимает снизу в 0). */
+function formatRoomTimer(remainingMs) {
+  const totalSeconds = Math.max(0, Math.floor(remainingMs / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
+/** Раз в секунду — пересчитать остаток и перекрасить пилюлю таймера по порогам (см. ROOM_TIMER_*_MS). */
+function updateRoomTimerDisplay() {
+  if (roomExpiresAtMs === null) return;
+  const remainingMs = roomExpiresAtMs - Date.now();
+  roomTimerEl.textContent = formatRoomTimer(remainingMs);
+  roomTimerEl.classList.toggle('room-timer--warning', remainingMs <= ROOM_TIMER_WARNING_MS && remainingMs > ROOM_TIMER_CRITICAL_MS);
+  roomTimerEl.classList.toggle('room-timer--critical', remainingMs <= ROOM_TIMER_CRITICAL_MS);
+  roomTimerEl.classList.remove('hidden');
+}
+
+/** Вызывается на КАЖДОМ joined (первый вход и реконнект) — пересчитывает дедлайн из свежего expiresInSeconds. */
+function startRoomTimer(expiresInSeconds) {
+  if (typeof expiresInSeconds !== 'number' || !Number.isFinite(expiresInSeconds)) return;
+  roomExpiresAtMs = Date.now() + expiresInSeconds * 1000;
+  updateRoomTimerDisplay();
+  if (!roomTimerInterval) {
+    roomTimerInterval = setInterval(updateRoomTimerDisplay, 1000);
+  }
+}
+
+/** Комната истекла (room-expired) — таймер больше не идёт, дальше показывать нечего. */
+function stopRoomTimer() {
+  if (roomTimerInterval) {
+    clearInterval(roomTimerInterval);
+    roomTimerInterval = null;
+  }
+  roomExpiresAtMs = null;
+  roomTimerEl.classList.add('hidden');
+}
 
 // peerId -> { rtc: RtcPeer, name, tile: {root, videoEl, placeholderEl, labelEl, crownEl} }
 const peers = new Map();
@@ -1473,6 +1528,31 @@ function removeRemotePeer(peerId) {
   }
 }
 
+/**
+ * Полный локальный teardown mesh/медиа/чата — используется терминальными
+ * состояниями, после которых восстанавливать соединение бессмысленно (см.
+ * signaling.on('room-expired') в registerSignalingHandlers: комната на
+ * сервере уже удалена). В отличие от giveUpReconnect (там сокет сигналинга
+ * умер, но mesh/DataChannel-чат физически могут пережить это и оставлены как
+ * есть — см. README.md про живучесть звонка при деплое), здесь причина
+ * терминальна ПО СУТИ (не «сервер моргнул», а «время вышло») — оставлять
+ * висеть P2P-соединения и захваченные mic/camera/screen треки браузера
+ * незачем, останавливаем их сразу.
+ */
+function teardownMeshMediaChat(reason) {
+  for (const peerId of Array.from(peers.keys())) {
+    removeRemotePeer(peerId);
+  }
+  if (micTrack) micTrack.stop();
+  micStream = null;
+  micTrack = null;
+  if (camTrack) camTrack.stop();
+  camStream = null;
+  camTrack = null;
+  forceStopLocalScreenCapture();
+  if (chat) chat.disableInput(reason);
+}
+
 // ---------- Реконнект: грейс-период для отставших пиров/владельца экрана ----------
 
 /**
@@ -1627,11 +1707,16 @@ async function connectAndJoin() {
 }
 
 function registerSignalingHandlers(iceServers) {
-  signaling.on('joined', async ({ peerId, peers: otherPeers, screenOwner, leaderId: joinedLeaderId, settings, pending }) => {
+  signaling.on('joined', async ({ peerId, peers: otherPeers, screenOwner, leaderId: joinedLeaderId, settings, pending, expiresInSeconds }) => {
     // Реконнект ждёт именно этот ответ (см. sendJoinAndWait) — репортуем ему
     // исход в дополнение к обычной обработке ниже (при первом входе
     // pendingJoinResolve никогда не взведён).
     if (pendingJoinResolve) pendingJoinResolve('joined');
+
+    // Лимит длительности созвона: пересчитываем дедлайн из свежего
+    // expiresInSeconds на КАЖДОМ joined — и при первом входе, и при
+    // реконнекте (см. startRoomTimer выше и README.md).
+    startRoomTimer(expiresInSeconds);
 
     if (!joinedOnce) {
       // --- Первый вход в комнату (не реконнект) ---
@@ -1780,6 +1865,32 @@ function registerSignalingHandlers(iceServers) {
       title: 'Комната заполнена',
       text: 'В этой комнате уже максимум участников (6). Попробуйте позже.',
     });
+  });
+
+  // Лимит длительности созвона (3 часа, см. README.md и startRoomTimer выше):
+  // сервер сам решает, что время вышло — рассылает это всем участникам И
+  // ожидающим в лобби, и сам закрывает сокет сразу следом (см. src/ws.rs::
+  // reap_rooms, src/state.rs). terminalState=true ставим СИНХРОННО здесь же
+  // (до того, как придёт сам close) — это тот же приём, что и у
+  // room-not-found/room-full/join-rejected выше: signaling.onClose проверяет
+  // terminalState и не запускает авто-reconnect, не перетирает этот оверлей
+  // «Соединением потеряно» (см. connectAndJoin: signaling.onClose). Терминально
+  // и безвозвратно — комната на сервере уже удалена, реконнект в неё
+  // технически ничего не восстановит (в отличие от рестарта сервера, см.
+  // restoreRoomViaPut — здесь восстанавливать нечего, лимит истёк осознанно).
+  signaling.on('room-expired', () => {
+    if (pendingJoinResolve) {
+      pendingJoinResolve('room-expired');
+    }
+    if (terminalState) return; // оверлей уже показан (двойная доставка/гонка) — не перетираем
+    terminalState = true;
+    stopRoomTimer();
+    showOverlay({
+      title: 'Время созвона истекло (3 часа)',
+      text: 'Комната закрыта — превышен лимит длительности созвона.',
+      actionLabel: 'Создать новую',
+    });
+    teardownMeshMediaChat('Время созвона истекло.');
   });
 
   signaling.on('peer-joined', async ({ peerId, name }) => {

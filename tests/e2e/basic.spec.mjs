@@ -28,6 +28,10 @@
 
 import { chromium } from 'playwright-core';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import {
   REAL_CAPTURE_TIMEOUT_MS,
   REAL_MIC_TIMEOUT_MS,
@@ -62,7 +66,37 @@ import {
   framesOfTypeSentOn,
   waitInvalidLinkOverlay,
   waitForBusOpenToAllPeers,
+  REPO_ROOT,
 } from './helpers.mjs';
+
+/**
+ * Извлечь тело `run: |` YAML-шага по подстроке в его `name:` — без тяжёлой
+ * зависимости от YAML-парсера (в tests/e2e/package.json его нет и заводить
+ * ради одного теста не хочется, см. M2-тест ниже). Работает для block-scalar
+ * (`|`) с постоянным отступом (наш случай, см. .github/workflows/deploy-prod.yml)
+ * — блок кончается на первой строке с отступом МЕНЬШЕ отступа первой
+ * содержательной строки тела (следующий `- name:`/ключ шага того же уровня).
+ */
+function extractYamlRunStepScript(workflowText, stepNameSubstring) {
+  const nameIdx = workflowText.indexOf(stepNameSubstring);
+  assert.ok(nameIdx >= 0, `не нашёл шаг "${stepNameSubstring}" в workflow`);
+  const runIdx = workflowText.indexOf('run: |', nameIdx);
+  assert.ok(runIdx >= 0, `не нашёл "run: |" после шага "${stepNameSubstring}"`);
+  const afterRunLine = workflowText.slice(runIdx).split('\n').slice(1); // без самой строки "run: |"
+  const bodyLines = [];
+  let baseIndent = null;
+  for (const line of afterRunLine) {
+    if (line.trim() === '') {
+      bodyLines.push('');
+      continue;
+    }
+    const indent = line.match(/^ */)[0].length;
+    if (baseIndent === null) baseIndent = indent;
+    if (indent < baseIndent) break; // дедент — блок этого run кончился
+    bodyLines.push(line.slice(baseIndent));
+  }
+  return bodyLines.join('\n');
+}
 
 const PORT = 3322;
 const { step, skip, printSummary, bumpFailedForUnexpectedError, counts } = createRunner();
@@ -234,6 +268,12 @@ async function main() {
   await server.start();
 
   let browser = null;
+  // Комната, переданная из шага «Ш1: неверный k» шагу «Лимит длительности
+  // созвона» — см. комментарий у roomIdForTimerTestReuse = wrongKeyRoomId
+  // ниже: экономим один POST /api/rooms (H2: ROOM_CREATION_IP_LIMIT — 10 за
+  // 60с с одного IP, а этот файл создаёт много комнат за один прогон).
+  let roomIdForTimerTestReuse = null;
+
   try {
     browser = await chromium.launch({
       channel: 'chrome',
@@ -1242,6 +1282,141 @@ async function main() {
             !(await messageTextsInclude(pPage, 'ВЗЛОМАНО', 300)),
             'подделанный текст «ВЗЛОМАНО» не должен появиться в ленте у Паши'
           );
+
+          // --- (д) H3: identity binding — envelope.from не сходится с ИСТИННЫМ
+          // транспортным отправителем ---
+          //
+          // В отличие от (г) (выдуманный peerId, никому не принадлежащий),
+          // здесь оба id — НАСТОЯЩИЕ peerId реальных участников комнаты:
+          // имитируем скомпрометированного Пашу, который прислал бы конверт с
+          // envelope.from = РЕАЛЬНЫЙ peerId Инны, пытаясь выдать себя за неё
+          // (украсть авторство её сообщения) — bus._dispatch(pPeerId, {from:
+          // iPeerId, ...}), вызванный НА СТРАНИЦЕ ИННЫ, воспроизводит именно
+          // то, что сделал бы её собственный RtcPeer.onBusMessage, получив
+          // такой конверт от настоящего DataChannel с Пашей (см. bus.js:
+          // _dispatch(peerId, obj) — peerId там всегда транспортный, не из
+          // содержимого сообщения). До фикса dispatchEnvelope брал
+          // envelope.from доверчиво — при таком совпадении (envelope.from ===
+          // РЕАЛЬНЫЙ id автора оригинала) правка/удаление проходили бы;
+          // теперь envelope.from принудительно нормализуется на истинный
+          // fromPeerId ДО проверки авторства (см. static/chat.js), поэтому
+          // подмена отклоняется.
+          const iPeerId = await iPage.evaluate(() => document.querySelector('.tile--own')?.dataset.peerId);
+          const pPeerId = await pPage.evaluate(() => document.querySelector('.tile--own')?.dataset.peerId);
+          assert.ok(iPeerId, 'не удалось прочитать настоящий peerId Инны');
+          assert.ok(pPeerId, 'не удалось прочитать настоящий peerId Паши');
+          assert.notEqual(iPeerId, pPeerId, 'peerId Инны и Паши должны различаться, иначе тест не имеет смысла');
+
+          // Новое сообщение Инны — независимое от М1/М2 выше, чтобы негативные
+          // проверки ниже не зависели от их уже изменённого состояния.
+          const original3 = `Оригинал-3-${Date.now()}`;
+          const msg3Id = await sendChatMessageAndGetId(iPage, original3);
+          assert.ok(msg3Id, 'не удалось получить id сообщения М3 у Инны');
+          assert.ok(await messageTextsInclude(pPage, original3), 'М3 не дошло до Паши');
+          const msg3Sel = `.chat-message[data-msg-id="${msg3Id}"]`;
+
+          // (д.1) чужой текст с ПОДМЕНЁННЫМ from не отрисовывается как СВОЁ
+          // сообщение получателя, если истинный транспортный отправитель —
+          // другой пир (нормализация envelope.from переатрибутирует его на
+          // Пашу, а не на Инну, за которую он назвался).
+          const forgedTextOwnClass = await iPage.evaluate(
+            ({ pashaId, innaId }) => {
+              bus._dispatch(pashaId, {
+                v: 1,
+                id: 'forged-text-impersonation',
+                lamport: 999999,
+                from: innaId, // ПОДМЕНА: настоящий отправитель — Паша (pashaId), выдаёт себя за Инну
+                name: 'Инна',
+                kind: 'text',
+                text: 'ПАША-ВЫДАЛ-СЕБЯ-ЗА-ИННУ',
+                ts: Date.now(),
+              });
+              const el = document.querySelector('.chat-message[data-msg-id="forged-text-impersonation"]');
+              return el ? el.classList.contains('chat-message--own') : null;
+            },
+            { pashaId: pPeerId, innaId: iPeerId }
+          );
+          assert.equal(
+            forgedTextOwnClass,
+            false,
+            'конверт с чужим (но настоящим) from должен быть переатрибутирован на истинного транспортного отправителя, а не отрисован как СВОЁ сообщение получателя'
+          );
+
+          // (д.2) подделанный edit (from=Инна, но истинный транспорт — Паша)
+          // на сообщение М3 (реальный автор — Инна) должен быть отклонён.
+          const forgedEditText = await iPage.evaluate(
+            ({ pashaId, innaId, targetId }) => {
+              bus._dispatch(pashaId, {
+                v: 1,
+                id: 'forged-edit-impersonation',
+                lamport: 999999,
+                from: innaId,
+                name: 'Инна',
+                kind: 'edit',
+                target: targetId,
+                text: 'ПАША-ПОДМЕНИЛ-ЭДИТ',
+                ts: Date.now(),
+              });
+              const el = document.querySelector(`.chat-message[data-msg-id="${targetId}"] .chat-message-text`);
+              return el ? el.textContent : null;
+            },
+            { pashaId: pPeerId, innaId: iPeerId, targetId: msg3Id }
+          );
+          assert.equal(
+            forgedEditText,
+            original3,
+            `подделанный edit с чужим (настоящим) from должен быть отклонён — текст М3 должен остаться «${original3}», получено: ${forgedEditText}`
+          );
+          assert.ok(
+            !(await messageTextsInclude(iPage, 'ПАША-ПОДМЕНИЛ-ЭДИТ', 300)),
+            'подделанный текст правки не должен появиться в ленте у Инны'
+          );
+
+          // (д.3) подделанный delete (from=Инна, истинный транспорт — Паша)
+          // на то же М3 — тоже отклоняется, сообщение остаётся на месте.
+          const forgedDeleteApplied = await iPage.evaluate(
+            ({ pashaId, innaId, targetId }) => {
+              bus._dispatch(pashaId, {
+                v: 1,
+                id: 'forged-delete-impersonation',
+                lamport: 1000000,
+                from: innaId,
+                name: 'Инна',
+                kind: 'delete',
+                target: targetId,
+                ts: Date.now(),
+              });
+              return document.querySelector(`.chat-message[data-msg-id="${targetId}"]`)?.classList.contains('chat-message--deleted');
+            },
+            { pashaId: pPeerId, innaId: iPeerId, targetId: msg3Id }
+          );
+          assert.equal(
+            forgedDeleteApplied,
+            false,
+            'подделанный delete с чужим (настоящим) from не должен удалить сообщение Инны'
+          );
+          assert.ok(
+            await messageTextsInclude(iPage, original3),
+            'М3 должно остаться видимым у Инны после отклонённой подделки delete'
+          );
+
+          // (д.4) контроль: легитимная правка (настоящий Паша правит СВОЁ
+          // сообщение, transport и from совпадают) — как в (а) выше, но здесь
+          // — что нормализация envelope.from не мешает нормальной работе.
+          const pOriginal = `Паша-оригинал-${Date.now()}`;
+          const pMsgId = await sendChatMessageAndGetId(pPage, pOriginal);
+          assert.ok(await messageTextsInclude(iPage, pOriginal), 'сообщение Паши не дошло до Инны');
+          const pEdited = `Паша-правка-${Date.now()}`;
+          const pMsgSel = `.chat-message[data-msg-id="${pMsgId}"]`;
+          await pPage.locator(pMsgSel).hover();
+          await pPage.locator(pMsgSel).locator('.chat-message-action--edit').click();
+          await pPage.locator('.chat-edit-bar:not(.hidden)').waitFor({ state: 'visible', timeout: 3000 });
+          await pPage.locator('.chat-text-input').fill(pEdited);
+          await pPage.locator('.chat-send-button').click();
+          assert.ok(
+            await messageTextsInclude(iPage, pEdited),
+            'легитимная правка настоящего автора должна дойти и примениться у Инны — нормализация from не должна ломать легитимный путь'
+          );
         } finally {
           await iContext.close();
           await pContext.close();
@@ -1827,6 +2002,13 @@ async function main() {
         const res = await fetch(`${server.baseUrl}/api/rooms`, { method: 'POST' });
         assert.ok(res.ok, `POST /api/rooms ответил статусом ${res.status}`);
         const { roomId: wrongKeyRoomId } = await res.json();
+        // Переиспользуется следующим шагом (лимит длительности созвона) —
+        // без лишнего POST /api/rooms: за один прогон файла их и так набегает
+        // много (см. H2: ROOM_CREATION_IP_LIMIT — 10 за 60с с одного IP, а
+        // Node-фетчи и клик «Создать комнату» в браузере считаются с ОДНОГО
+        // IP, localhost), новая комната этому шагу не нужна — участник там
+        // solo, ключ комнаты ни с кем не должен совпадать.
+        roomIdForTimerTestReuse = wrongKeyRoomId;
         const keyA = generateRoomKeyBase64url();
         const keyB = generateRoomKeyBase64url(); // независимый случайный ключ той же формы — валиден, но не тот же
         assert.notEqual(keyA, keyB, 'сгенерированные ключи должны отличаться, иначе тест не имеет смысла');
@@ -1869,6 +2051,160 @@ async function main() {
           await waitInvalidLinkOverlay(soloPage, 5000);
         } finally {
           await soloContext.close();
+        }
+      }
+    );
+
+    // --- Лимит длительности созвона (3 часа, см. README.md и static/room.js:
+    //     startRoomTimer/stopRoomTimer) ---
+    //
+    // Контракт с бэкендом: `joined.expiresInSeconds` — остаток жизни комнаты
+    // на момент входа (реальный дефолт — 3 часа, см. src/state.rs::
+    // DEFAULT_MAX_ROOM_LIFETIME_SECONDS); `room-expired {}` рассылается всем,
+    // когда лимит истёк, сервер сам закрывает сокет следом (см. src/ws.rs).
+    // Гонять реальный тайм-лимит в 3 часа непрактично — вместо этого:
+    //   (а)/(б)/(в) подменяем состояние таймера прямым вызовом top-level
+    //       startRoomTimer(N) (room.js — классический script, функция видна
+    //       из page.evaluate ровно как bus/ChatPanel в других тестах этого
+    //       файла) под разные N — норма/жёлтый (<=10 мин)/красный (<=60с);
+    //   (г) эмулируем сам сервер: signaling._dispatch({type:'room-expired'})
+    //       — тот же приём прямой инъекции, что и у stream-info/invalid-link
+    //       выше — и проверяем финальный оверлей + отключение чата;
+    //   (д) последующее закрытие сокета (как это сделал бы сам сервер сразу
+    //       после room-expired, см. src/ws.rs: reject=true) не должно
+    //       перетереть этот оверлей «Соединением потеряно» — terminalState
+    //       уже взведён (тот же приём, что у room-not-found/room-full/
+    //       join-rejected, см. static/room.js: signaling.onClose).
+    await step(
+      'Лимит длительности созвона: таймер в баре (норма/жёлтый/красный) + оверлей «Время истекло» по room-expired, не перетирается последующим закрытием сокета',
+      async () => {
+        // Переиспользуем комнату из шага «Ш1: неверный k» выше (см.
+        // roomIdForTimerTestReuse) — экономим POST /api/rooms (H2-лимит на
+        // создание, см. комментарий там же); участник здесь solo, комната
+        // уже существует на сервере, свой ключ ни с кем совпадать не должен.
+        assert.ok(roomIdForTimerTestReuse, 'нет комнаты, переданной предыдущим шагом для переиспользования');
+        const timerRoomKey = generateRoomKeyBase64url();
+        const timerRoomUrl = roomUrlWithKey(server.baseUrl, roomIdForTimerTestReuse, timerRoomKey);
+
+        const timerContext = await browser.newContext();
+        try {
+          const timerPage = await timerContext.newPage();
+          await timerPage.goto(timerRoomUrl);
+          await joinRoom(timerPage, 'Настя');
+          await waitForOverlayHidden(timerPage);
+          await openChatPanel(timerPage);
+
+          // Сразу после joined (реальный expiresInSeconds ~3ч) таймер уже
+          // должен быть виден и не в предупредительном состоянии.
+          await timerPage.waitForFunction(
+            () => !document.getElementById('room-timer')?.classList.contains('hidden'),
+            undefined,
+            { polling: 100, timeout: 3000 }
+          );
+          const initialState = await timerPage.evaluate(() => ({
+            text: document.getElementById('room-timer').textContent,
+            warning: document.getElementById('room-timer').classList.contains('room-timer--warning'),
+            critical: document.getElementById('room-timer').classList.contains('room-timer--critical'),
+          }));
+          assert.match(initialState.text, /^\d+:\d{2}:\d{2}$/, `формат таймера должен быть Ч:ММ:СС, получено: ${initialState.text}`);
+          assert.equal(initialState.warning, false, 'сразу после входа (лимит ~3ч) таймер не должен быть жёлтым');
+          assert.equal(initialState.critical, false, 'сразу после входа (лимит ~3ч) таймер не должен быть красным');
+
+          // (а) норма: час с лишним — ни жёлтого, ни красного.
+          await timerPage.evaluate(() => startRoomTimer(3700));
+          const normalState = await timerPage.evaluate(() => ({
+            text: document.getElementById('room-timer').textContent,
+            warning: document.getElementById('room-timer').classList.contains('room-timer--warning'),
+            critical: document.getElementById('room-timer').classList.contains('room-timer--critical'),
+          }));
+          assert.equal(normalState.text, '1:01:40', `таймер должен показывать 1:01:40, получено: ${normalState.text}`);
+          assert.equal(normalState.warning, false);
+          assert.equal(normalState.critical, false);
+
+          // (б) последние 10 минут — жёлтый.
+          await timerPage.evaluate(() => startRoomTimer(300));
+          const warningState = await timerPage.evaluate(() => ({
+            warning: document.getElementById('room-timer').classList.contains('room-timer--warning'),
+            critical: document.getElementById('room-timer').classList.contains('room-timer--critical'),
+          }));
+          assert.equal(warningState.warning, true, 'при остатке 5 минут таймер должен быть жёлтым (room-timer--warning)');
+          assert.equal(warningState.critical, false, 'при остатке 5 минут таймер НЕ должен быть красным');
+
+          // (в) последняя минута — красный.
+          await timerPage.evaluate(() => startRoomTimer(30));
+          const criticalState = await timerPage.evaluate(() => ({
+            warning: document.getElementById('room-timer').classList.contains('room-timer--warning'),
+            critical: document.getElementById('room-timer').classList.contains('room-timer--critical'),
+          }));
+          assert.equal(criticalState.critical, true, 'при остатке 30с таймер должен быть красным (room-timer--critical)');
+
+          // (г) сервер решил, что время вышло — room-expired: финальный
+          // оверлей, таймер прячется, чат отключается.
+          await timerPage.evaluate(() => {
+            signaling._dispatch({ type: 'room-expired' });
+          });
+          await waitOverlayTitle(timerPage, 'Время созвона истекло (3 часа)');
+          const afterExpiry = await timerPage.evaluate(() => ({
+            actionLabel: document.getElementById('overlay-action-button')?.textContent,
+            timerHidden: document.getElementById('room-timer')?.classList.contains('hidden'),
+            chatDisabled: document.querySelector('.chat-text-input')?.disabled,
+          }));
+          assert.equal(afterExpiry.actionLabel, 'Создать новую', `кнопка оверлея должна вести на создание новой комнаты: ${afterExpiry.actionLabel}`);
+          assert.equal(afterExpiry.timerHidden, true, 'таймер должен скрыться после room-expired (stopRoomTimer)');
+          assert.equal(afterExpiry.chatDisabled, true, 'инпут чата должен быть задизейблен после room-expired (teardownMeshMediaChat)');
+
+          // (д) терминальность: последующее закрытие сокета (как сделал бы
+          // сам сервер сразу за room-expired) не должно перетереть этот
+          // оверлей баннером «Соединение потеряно».
+          await timerPage.evaluate(() => signaling.ws.close());
+          await timerPage.waitForTimeout(500);
+          const titleAfterClose = await timerPage.evaluate(() => document.getElementById('overlay-title')?.textContent);
+          assert.equal(
+            titleAfterClose,
+            'Время созвона истекло (3 часа)',
+            `оверлей «Время истекло» не должен перетираться закрытием сокета: ${titleAfterClose}`
+          );
+        } finally {
+          await timerContext.close();
+        }
+      }
+    );
+
+    // --- M2: заголовки Cloudflare Pages (_headers) ---
+    //
+    // Прогонять реальный wrangler/Pages в e2e непрактично (координатор ещё
+    // не завёл прод-проект, см. .github/workflows/deploy-prod.yml: job
+    // deploy-pages гейтится секретом CLOUDFLARE_API_TOKEN) — вместо похода на
+    // pages.dev выполняем РОВНО ТОТ ЖЕ шаг сборки, что описан в workflow
+    // (шаг "Собрать pages-dist/…", секция генерации _headers), извлечённый
+    // прямо из самого workflow-файла (не переписанный вручную — так тест не
+    // может разойтись с тем, что реально катится в CI), и проверяем
+    // результат на диске. Это не браузерный тест (CSP энфорсится браузером
+    // при реальной раздаче с Pages, а не на этом origin-сервере) — здесь
+    // фиксируется контракт самого файла _headers.
+    await step(
+      'M2: сгенерированный _headers для Cloudflare Pages содержит строгий CSP (frame-ancestors \'none\') и сопутствующие security-заголовки',
+      async () => {
+        const workflowPath = path.join(REPO_ROOT, '.github/workflows/deploy-prod.yml');
+        const workflowText = fs.readFileSync(workflowPath, 'utf8');
+        const pagesStepScript = extractYamlRunStepScript(workflowText, 'Собрать pages-dist');
+
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pages-dist-headers-test-'));
+        try {
+          fs.cpSync(path.join(REPO_ROOT, 'static'), path.join(tmpDir, 'static'), { recursive: true });
+          execFileSync('bash', ['-c', pagesStepScript], { cwd: tmpDir, stdio: 'pipe' });
+
+          const headersPath = path.join(tmpDir, 'pages-dist', '_headers');
+          assert.ok(fs.existsSync(headersPath), '_headers не был создан шагом сборки pages-dist');
+          const headersText = fs.readFileSync(headersPath, 'utf8');
+
+          assert.match(headersText, /Content-Security-Policy:.*frame-ancestors 'none'/, `_headers должен содержать CSP с frame-ancestors 'none': ${headersText}`);
+          assert.match(headersText, /Content-Security-Policy:.*default-src 'self'/, `_headers должен содержать default-src 'self': ${headersText}`);
+          assert.match(headersText, /X-Frame-Options:\s*DENY/, `_headers должен содержать X-Frame-Options: DENY: ${headersText}`);
+          assert.match(headersText, /X-Content-Type-Options:\s*nosniff/, `_headers должен содержать X-Content-Type-Options: nosniff: ${headersText}`);
+          assert.match(headersText, /Cache-Control:\s*no-cache/, `_headers должен сохранить существующий Cache-Control: no-cache: ${headersText}`);
+        } finally {
+          fs.rmSync(tmpDir, { recursive: true, force: true });
         }
       }
     );

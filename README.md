@@ -95,8 +95,9 @@ cargo run
 | `EMPTY_ROOM_TTL_SECONDS` | нет (по умолчанию `120`) | сколько секунд живёт пустая комната (никто не подключился или все вышли), прежде чем фоновый реапер её удалит |
 | `STATIC_DIR` | нет (по умолчанию каталог `static/` рядом с `Cargo.toml`) | откуда раздавать статику фронтенда; в контейнере — например `/app/static` |
 | `TURN_URL` | нет | адрес TURN-сервера (например `turn:example.com:3478`) |
-| `TURN_USERNAME` | нет | логин для TURN |
-| `TURN_PASSWORD` | нет | пароль для TURN |
+| `TURN_STATIC_SECRET` | нет (рекомендуется) | H1: общий секрет для эфемерных TURN-кредов (TTL, HMAC-SHA1) — см. «TURN-сервер» ниже; если задан, `TURN_USERNAME`/`TURN_PASSWORD` игнорируются |
+| `TURN_USERNAME` | нет (устаревает) | статический логин для TURN — фоллбэк ТОЛЬКО пока `TURN_STATIC_SECRET` не задан (см. «TURN-сервер») |
+| `TURN_PASSWORD` | нет (устаревает) | статический пароль для TURN — тот же фоллбэк |
 | `CORS_ORIGIN` | нет (по умолчанию не задана — CORS выключен целиком) | Ш2: разрешённый origin фронтенда для CORS на `/api/rooms` (+`/api/rooms/{id}`), `/config`, `/version.json`, и опциональной проверки `Origin` на `/ws` (см. «Топология Ш2»); например `https://chat.fedorov.it` |
 | `MAX_ROOMS` | нет (по умолчанию `500`) | потолок числа комнат одновременно — `POST`/`PUT`-восстановление при достижении отвечают `503` (см. «Лимиты и защита от DoS») |
 | `MAX_ROOM_LIFETIME_SECONDS` | нет (по умолчанию `10800` = 3 часа) | лимит длительности созвона — комната старше этого возраста удаляется целиком, все в ней получают `room-expired` (см. «Лимит длительности созвона») |
@@ -206,23 +207,82 @@ cd tests/e2e && node resilience.spec.mjs
 
 ## TURN-сервер (turn-rs) рядом, кратко
 
-Если STUN недостаточно (P2P не устанавливается за NAT), рядом поднимается `turn-rs`.
+Если STUN недостаточно (P2P не устанавливается за NAT), рядом поднимается
+`turn-rs` (ghcr.io/mycrl/turn-server, см. `deploy/manifests/turn.yaml`).
 
-Docker:
+### H1: эфемерные TURN-креды вместо статического общего логина/пароля
+
+До 2026-07-13 `/config` отдавал ЛЮБОМУ вызвавшему СТАТИЧЕСКУЮ пару
+`TURN_USERNAME`/`TURN_PASSWORD` — валидную бессрочно, пока админ не поменяет
+её руками сразу в двух местах (Secret turn-rs и Secret этого сервера) и не
+перезапустит оба. Кто угодно, взяв её один раз (например, просто открыв
+сайт и посмотрев `/config` в devtools), мог гонять свой собственный трафик
+через наш TURN сколько угодно — открытый релей, кража bandwidth хостера.
+
+Начиная с 2026-07-13, если задан `TURN_STATIC_SECRET`, каждый вызов
+`/config` вычисляет СВОЮ пару username/credential (см.
+`src/main.rs::ice_config`/`turn_hmac_credential`):
+
+- `username = "<unix-время-истечения>:chat"` (TTL — час,
+  `TURN_CRED_TTL_SECONDS`);
+- `credential = base64(HMAC-SHA1(TURN_STATIC_SECRET, username))`.
+
+Это ровно схема **TURN REST API** (coturn-style long-term credentials,
+`draft-uberti-behave-turn-rest-00` §2.2), которую `turn-rs` понимает через
+`auth.static-auth-secret` в `config.toml` — проверено по исходникам
+turn-rs (`codec::crypto::static_auth_secret`, [mycrl/turn-rs][turn-rs-src]):
+он считает буквально то же самое, `base64(HMAC_SHA1(secret, username))`, и
+уже из этого выводит долгоживущий STUN-ключ
+`MD5(username:realm:password)`.
+
+**Известное ограничение (честно, не притворяемся, что это полностью
+закрывает проблему):** сам `turn-rs`, по этим же исходникам, НЕ проверяет
+встроенную в `username` метку времени — комментарий в его коде прямо
+говорит, что RFC-черновик не обязывает к такой проверке и что за
+актуальность строки отвечает внешний сервис. Значит:
+
+- протухшая по TTL пара username/credential всё равно ПРОЙДЁТ
+  HMAC-проверку у turn-rs — TTL в username не энфорсится сервером;
+- реальная граница жизни утёкшей пары — это **ротация
+  `TURN_STATIC_SECRET`**: как только секрет меняется (и в Secret turn-rs, и
+  в Secret backend'а — это одно и то же значение), ВСЕ ранее выданные пары
+  сразу перестают проходить HMAC-проверку, независимо от их `username`;
+- если нужна настоящая серверная проверка срока по каждому запросу — у
+  turn-rs есть `auth.enable-hooks-auth` + `hooks.endpoint` (вызов НАШЕГО
+  вебхука на каждый `get_password`, где мы сами могли бы отклонять
+  просроченные `username`) — отдельная, не сделанная здесь фаза.
+
+Даже с этим ограничением H1 — заметное улучшение: раньше утечка ОДНОЙ пары
+означала бессрочный доступ без каких-либо действий со стороны админа;
+теперь единственный рычаг для обесценивания всех выданных кредов —
+однократная ротация одного секрета (а не синхронная смена логина И пароля
+в двух местах), и в логах turn-rs видна метка времени, для которой
+credential был выпущен (сигнал для мониторинга аномального переиспользования).
+
+[turn-rs-src]: https://github.com/mycrl/turn-rs/blob/main/src/codec/crypto.rs
+
+### Запуск turn-rs (пример, Docker)
+
 ```
-docker run -d --network=host ghcr.io/webrtc-rs/turn-server \
-  --public-ip <внешний-IP> --listening-port 3478 \
-  --realm example.com --users "user=pass"
+docker run -d --network=host ghcr.io/mycrl/turn-server \
+  --config /etc/turn-server/config.toml
 ```
 
-Или `cargo install turn-server` и запуск с теми же флагами (см. `--help`).
+В `config.toml`:
+```toml
+[auth]
+static-auth-secret = "<TURN_STATIC_SECRET>"
+```
 
 Приложению после этого выставить:
 ```
 TURN_URL=turn:<внешний-IP>:3478
-TURN_USERNAME=user
-TURN_PASSWORD=pass
+TURN_STATIC_SECRET=<тот же секрет, что в config.toml turn-rs>
 ```
+
+Если `TURN_STATIC_SECRET` не задан, но заданы старые `TURN_USERNAME`/
+`TURN_PASSWORD` — сервер отдаёт их как раньше (фоллбэк на время миграции,
+тот же статический риск, описанный выше).
 
 ## Деплой
 

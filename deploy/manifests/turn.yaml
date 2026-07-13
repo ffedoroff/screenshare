@@ -7,11 +7,29 @@
 # Порты открыты в ОБЛАЧНОМ firewall Contabo (панель хостера, 2026-07-12):
 # UDP 3478 + 49160-49999 (см. registry, карточка хоста).
 #
-# Секреты (НЕ в git, созданы админом руками):
+# H1 (эфемерные TURN-креды, см. README.md «TURN-сервер» и
+# src/main.rs::ice_config, 2026-07-13): раньше `config.toml` держал
+# `[auth.static-credentials]` (одна пара логин/пароль, валидная бессрочно
+# для КОГО УГОДНО, кто дошёл до `/config`) — теперь вместо неё
+# `auth.static-auth-secret = "<TURN_STATIC_SECRET>"` — long-term credential
+# по схеме TURN REST API (coturn-style HMAC-SHA1, подтверждено по исходникам
+# turn-rs, `codec::crypto::static_auth_secret`), backend вычисляет
+# username/credential на каждый вызов `/config` заново (TTL метки в
+# username, см. подробный комментарий в `ice_config` — сам turn-rs эту метку
+# НЕ проверяет, реальная граница жизни утёкшей пары — периодическая ротация
+# этого секрета, не срок в username).
+#
+# Секреты (НЕ в git, заводит/ротирует админ руками):
 #   - Secret turn/turn-config: config.toml целиком (realm, port-range,
-#     external=<публичный IP>:3478, static-credentials chat=<пароль>).
-#   - Secret chat-prod/turn-creds: TURN_URL/TURN_USERNAME/TURN_PASSWORD —
-#     их подхватывает Deployment chat (envFrom) и раздаёт клиентам в /config.
+#     external=<публичный IP>:3478, `auth.static-auth-secret=<TURN_STATIC_SECRET>`
+#     — то же значение, что и в Secret ниже, БЕЗ отдельной пары логин/пароль).
+#   - Secret chat-prod/turn-creds: TURN_URL/TURN_STATIC_SECRET (ключ
+#     TURN_STATIC_SECRET — то самое значение из turn/turn-config выше) —
+#     их подхватывает Deployment chat (envFrom) и по ним раздаёт клиентам
+#     СВЕЖИЕ TURN-креды в `/config`, а не общую пару. TURN_USERNAME/
+#     TURN_PASSWORD можно оставить в том же Secret как fallback на время
+#     миграции (см. `ice_config`) — как только `TURN_STATIC_SECRET` заведён,
+#     backend их больше не читает.
 apiVersion: v1
 kind: Namespace
 metadata: { name: turn }

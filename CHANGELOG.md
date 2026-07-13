@@ -6,6 +6,25 @@
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-07-13
+
+### Security
+- H1: эфемерные TURN-креды. Вместо вечного общего логина/пароля /config
+  выдаёт на каждый запрос свежие HMAC-SHA1 креды (TURN REST API,
+  static-auth-secret); секрет только на сервере. Закрывает использование
+  нашего TURN как открытого релея.
+- H3: привязка личности в чате. Входящий конверт нормализуется по
+  транспортному отправителю (envelope.from := fromPeerId) — участник больше
+  не может слать/редактировать/удалять сообщения от чужого имени.
+- M2: строгие security-заголовки на фронте (Cloudflare Pages _headers):
+  CSP (script/style 'self', frame-ancestors 'none'), X-Frame-Options: DENY,
+  Permissions-Policy на camera/microphone/display-capture=self.
+
+### Added
+- UI лимита созвона: таймер оставшегося времени у счётчика участников
+  (жёлтый ≤10 мин, красный ≤60 с), оверлей «Время созвона истекло» с
+  корректным teardown при room-expired.
+
 ## [0.13.0] — 2026-07-13
 
 ### Added

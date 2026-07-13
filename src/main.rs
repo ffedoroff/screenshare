@@ -42,7 +42,7 @@ mod ws;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use axum::extract::{ConnectInfo, Path, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
@@ -50,7 +50,10 @@ use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Json, Response};
 use axum::routing::{get, post, put};
 use axum::Router;
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use hmac::{Hmac, KeyInit, Mac};
 use serde_json::json;
+use sha1::Sha1;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -481,18 +484,98 @@ async fn static_file(Path(path): Path<String>) -> Response {
     }
 }
 
-/// ICE-конфигурация для клиента: STUN всегда, TURN — если задан в окружении
-/// (TURN_URL / TURN_USERNAME / TURN_PASSWORD; сервер turn-rs поднимается отдельно).
+/// H1 (эфемерные TURN-креды, см. README.md «TURN-сервер»): срок жизни
+/// каждой выданной `/config` пары username/credential — час достаточно на
+/// звонок (см. `MAX_ROOM_LIFETIME` — комнаты и так живут не дольше 3ч по
+/// умолчанию, а сам созвон переустанавливать ICE каждый час не должен: раз
+/// установленное TURN-allocation клиент продолжает рефрешить тем же
+/// credential, полученным при входе). НЕ энфорсится сервером turn-rs (см.
+/// предупреждение в `ice_config` ниже) — реальная граница жизни утёкшей
+/// пары задаётся ротацией `TURN_STATIC_SECRET`, а не этим числом.
+const TURN_CRED_TTL_SECONDS: u64 = 3600;
+
+/// Текущее unix-время в секундах. `unwrap_or_default()` на случай часов
+/// раньше эпохи (не должно происходить на реальном сервере) — деградирует
+/// в `0`, что для TTL-расчёта означает «уже истекло», а не панику.
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// `credential = base64(HMAC-SHA1(secret, username))` — ровно та схема TURN
+/// REST API (coturn-style long-term credentials,
+/// draft-uberti-behave-turn-rest-00 §2.2), которую понимает turn-rs через
+/// `auth.static-auth-secret` (проверено по его исходникам,
+/// `codec::crypto::static_auth_secret` в mycrl/turn-rs, считает буквально
+/// то же самое перед тем, как вывести из результата долгоживущий ключ
+/// `MD5(username:realm:password)`).
+fn turn_hmac_credential(secret: &str, username: &str) -> String {
+    let mut mac = Hmac::<Sha1>::new_from_slice(secret.as_bytes())
+        .expect("HMAC-SHA1 принимает ключ произвольной длины");
+    mac.update(username.as_bytes());
+    BASE64_STANDARD.encode(mac.finalize().into_bytes())
+}
+
+/// ICE-конфигурация для клиента: STUN всегда, TURN — если задан `TURN_URL`
+/// (сервер turn-rs поднимается отдельно, см. `deploy/manifests/turn.yaml`).
+///
+/// H1 (было — открытый релей): раньше сервер отдавал СТАТИЧЕСКИЙ
+/// `TURN_USERNAME`/`TURN_PASSWORD` любому, кто вызвал `/config` — пара
+/// валидна бессрочно, пока админ не поменяет её руками сразу в двух местах
+/// (Secret turn-rs и Secret этого сервера) и не перезапустит оба — кто
+/// угодно, взяв её один раз, мог гонять свой трафик через наш TURN сколько
+/// угодно (кража bandwidth чужого хостера).
+///
+/// Теперь, если задан `TURN_STATIC_SECRET`, каждый вызов `/config` получает
+/// СВОЮ, отдельно вычисленную пару:
+///   - `username = "<unix-время-истечения>:chat"`;
+///   - `credential = base64(HMAC-SHA1(TURN_STATIC_SECRET, username))`
+///     (см. `turn_hmac_credential`).
+///
+/// ВАЖНО, честно: сам turn-rs эту встроенную в `username` метку времени НЕ
+/// проверяет — по его исходникам (`codec::crypto::static_auth_secret`),
+/// комментарий там прямо говорит, что RFC не обязывает к проверке
+/// временной метки и что за её актуальность отвечает внешний сервис.
+/// Значит, TTL здесь — это НЕ жёсткая граница на стороне TURN-сервера
+/// (протухшая по времени пара всё равно пройдёт HMAC-проверку и позволит
+/// и дальше рефрешить существующее allocation, и даже создать новое): это
+/// (а) метка для аудита в логах turn-rs (`get_password: username=...`), и
+/// (б) единица, синхронная с ПЕРИОДИЧЕСКОЙ РОТАЦИЕЙ `TURN_STATIC_SECRET` —
+/// именно ротация секрета (не встроенная метка) одним действием обесценивает
+/// вообще все ранее выданные пары сразу, и теперь для этого достаточно
+/// поменять ОДНО значение в ОДНОМ Secret'е, а не логин и пароль в двух
+/// разных местах синхронно. Настоящая серверная проверка срока (turn-rs
+/// умеет и её — `auth.enable-hooks-auth` + `hooks.endpoint`, вызов НАШЕГО
+/// вебхука на каждый `get_password`) — отдельная фаза, здесь не сделана.
+///
+/// Обратная совместимость: если `TURN_STATIC_SECRET` не задан, но заданы
+/// старые `TURN_USERNAME`/`TURN_PASSWORD` — отдаём их как раньше (тот же
+/// статический риск, просто ещё не смигрировали на секрет). Если не задано
+/// вообще ничего — клиент получает только STUN, как и было.
 async fn ice_config() -> Json<serde_json::Value> {
     let mut servers = vec![json!({ "urls": "stun:stun.l.google.com:19302" })];
     if let Ok(url) = std::env::var("TURN_URL") {
         if !url.is_empty() {
             let mut turn = json!({ "urls": url });
-            if let Ok(user) = std::env::var("TURN_USERNAME") {
-                turn["username"] = json!(user);
-            }
-            if let Ok(pass) = std::env::var("TURN_PASSWORD") {
-                turn["credential"] = json!(pass);
+            let static_secret = std::env::var("TURN_STATIC_SECRET")
+                .ok()
+                .filter(|s| !s.is_empty());
+            if let Some(secret) = static_secret {
+                let expiry = unix_now_secs() + TURN_CRED_TTL_SECONDS;
+                let username = format!("{expiry}:chat");
+                let credential = turn_hmac_credential(&secret, &username);
+                turn["username"] = json!(username);
+                turn["credential"] = json!(credential);
+            } else {
+                // Фоллбэк обратной совместимости — старая статическая пара.
+                if let Ok(user) = std::env::var("TURN_USERNAME") {
+                    turn["username"] = json!(user);
+                }
+                if let Ok(pass) = std::env::var("TURN_PASSWORD") {
+                    turn["credential"] = json!(pass);
+                }
             }
             servers.push(turn);
         }
@@ -505,4 +588,58 @@ async fn ice_config() -> Json<serde_json::Value> {
 /// но которые не вредно принять во входной валидации).
 fn is_valid_room_id(room: &str) -> bool {
     room.len() == 8 && room.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+/// H1 (эфемерные TURN-креды): юнит-проверка `turn_hmac_credential` и
+/// формата `username`, без подъёма сервера/turn-rs (для end-to-end
+/// проверки формата ответа `/config` см. README.md/отчёт задачи — curl
+/// локально поднятого сервера с тестовым `TURN_STATIC_SECRET`).
+#[cfg(test)]
+mod turn_credential_tests {
+    use super::*;
+
+    #[test]
+    fn hmac_credential_is_deterministic_valid_base64_and_input_sensitive() {
+        let secret = "test-secret";
+        let username = "1234567890:chat";
+
+        let cred1 = turn_hmac_credential(secret, username);
+        let cred2 = turn_hmac_credential(secret, username);
+        assert_eq!(cred1, cred2, "тот же вход должен давать тот же credential");
+        assert!(!cred1.is_empty());
+        assert!(
+            BASE64_STANDARD.decode(&cred1).is_ok(),
+            "credential должен быть валидным base64: {cred1:?}"
+        );
+
+        let cred_other_username = turn_hmac_credential(secret, "1234567891:chat");
+        assert_ne!(
+            cred1, cred_other_username,
+            "другой username должен давать другой credential"
+        );
+
+        let cred_other_secret = turn_hmac_credential("другой-секрет", username);
+        assert_ne!(
+            cred1, cred_other_secret,
+            "другой secret должен давать другой credential"
+        );
+    }
+
+    #[test]
+    fn username_format_is_expiry_colon_label_and_expiry_is_in_the_future() {
+        let now = unix_now_secs();
+        let expiry = now + TURN_CRED_TTL_SECONDS;
+        let username = format!("{expiry}:chat");
+
+        let (ts_part, label) = username
+            .split_once(':')
+            .expect("username должен быть вида '<unix_ts>:label'");
+        let ts: u64 = ts_part
+            .parse()
+            .expect("часть до ':' должна парситься как unix-timestamp");
+
+        assert_eq!(label, "chat");
+        assert!(ts > now, "expiry должен быть в будущем относительно момента генерации");
+        assert_eq!(ts - now, TURN_CRED_TTL_SECONDS);
+    }
 }

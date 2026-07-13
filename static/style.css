@@ -14,6 +14,7 @@
   --danger: #e5484d;
   --danger-hover: #ff5d61;
   --success: #33b56c;
+  --warning: #e0a92b;
   --radius: 12px;
   --radius-lg: 16px;
   --shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
@@ -236,8 +237,22 @@ body {
      оставался ровно по центру бара независимо от ширины логотипа. */
 }
 
+/* Центральная колонка бара — счётчик участников + таймер лимита созвона
+   (см. static/room.js: startRoomTimer) вместе, одним grid-элементом (auto),
+   чтобы .room-top-bar не потерял центрирование (3 явные колонки:
+   1fr auto 1fr — 4-й прямой ребёнок сломал бы раскладку, см. #room-timer в
+   room.html). flex-wrap — на случай узкого экрана таймер уходит на вторую
+   строку, а не толкает счётчик участников или выходит за пределы бара. */
+.room-top-bar-center {
+  grid-column: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
 .participant-count {
-  justify-self: center;
   font-size: 0.78rem;
   font-weight: 600;
   color: var(--text-muted);
@@ -246,6 +261,32 @@ body {
   border-radius: 999px;
   padding: var(--space-1) var(--space-3);
   white-space: nowrap;
+}
+
+/* Лимит длительности созвона (3 часа, см. README.md) — тот же стиль пилюли,
+   что и .participant-count, но с явной сменой цвета по мере приближения к
+   концу: обычный (text-muted) -> жёлтый (последние 10 минут) -> красный
+   (последняя минута), см. static/room.js: updateRoomTimerDisplay. */
+.room-timer {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: var(--space-1) var(--space-3);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums; /* цифры не "прыгают" по ширине на каждом тике */
+}
+
+.room-timer--warning {
+  color: var(--warning);
+  border-color: var(--warning);
+}
+
+.room-timer--critical {
+  color: var(--danger-hover);
+  border-color: var(--danger);
 }
 
 /* ---------- Комната: сцена и тайлы ---------- */
@@ -1452,6 +1493,20 @@ body {
 @media (max-width: 640px) {
   .room-top-bar {
     padding: var(--space-2) var(--space-3);
+  }
+
+  /* Узкий экран: логотип слева ужимается визуально малозначим, а центральная
+     колонка (счётчик + таймер) — самая широкая часть бара. Уменьшаем зазор и
+     сам текст чуть-чуть, чтобы "Участников: 3 / 6" + "2:59:47" гарантированно
+     не выталкивали друг друга на 390px (см. проверку скриншотами). */
+  .room-top-bar-center {
+    gap: var(--space-1);
+  }
+
+  .participant-count,
+  .room-timer {
+    font-size: 0.72rem;
+    padding: var(--space-1) var(--space-2);
   }
 
   .room-stage {

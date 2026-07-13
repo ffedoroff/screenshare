@@ -104,7 +104,42 @@ jobs:
           # no-cache», чтобы после деплоя не залипала старая статика (ровно
           # та проблема, из-за которой на origin завели NO_CACHE, см. там же).
           # Кэш-бастер ?v=N в HTML — не трогаем, разметка копируется как есть.
-          printf '/*\n  Cache-Control: no-cache\n' > pages-dist/_headers
+          #
+          # M2 — строгие security-заголовки (см. tests/e2e/basic.spec.mjs,
+          # проверка на CSP/frame-ancestors в сгенерированном _headers):
+          #   - script-src/style-src 'self', БЕЗ 'unsafe-inline' — во всём
+          #     static/ нет ни одного инлайн <script>/<style>/style="..."
+          #     (все скрипты — внешние файлы, см. static/*.html), а точечные
+          #     JS-мутации через CSSOM (element.style.foo = ...; см.
+          #     static/room.js/chat.js — градиенты тайлов, полосы прогресса
+          #     файлов, позиционирование попапа реакций) CSP style-src не
+          #     затрагивает — это подтверждено локальной проверкой (Chromium
+          #     + securitypolicyviolation, см. историю решений): такие
+          #     мутации не идут через парсинг атрибута style, только через
+          #     него ходит инлайн-разметка/markup, которой в проекте нет;
+          #   - connect-src 'self' + сам API/WS-хост (Ш2, см. static/config.js
+          #     на Pages-сборке выше) — WebRTC/getUserMedia/getDisplayMedia
+          #     не идут через fetch/XHR/WebSocket, CSP их не касается вовсе
+          #     (SDP/ICE и есть сам P2P-транспорт, не подпадающий под connect-src),
+          #     STUN/TURN тоже не проходят через connect-src;
+          #   - img-src/media-src разрешают data:/blob: — инлайн-превью файлов
+          #     чата и objectURL у скачанных/полученных файлов и картинок
+          #     (см. static/chat.js: URL.createObjectURL) без них не отрисуются;
+          #   - frame-ancestors 'none' — комнату нельзя встроить во внешний
+          #     фрейм (кликджекинг), дублируется X-Frame-Options: DENY для
+          #     браузеров без поддержки CSP уровня 2;
+          #   - Permissions-Policy разрешает camera/microphone/display-capture
+          #     ТОЛЬКО self (сам фрейм, без вложенных чужих origin) — иначе
+          #     они были бы доступны потенциальным сторонним фреймам.
+          cat > pages-dist/_headers <<'HEADERS'
+          /*
+            Cache-Control: no-cache
+            Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' https://chat-api.fedorov.it wss://chat-api.fedorov.it; frame-ancestors 'none'; base-uri 'none'; form-action 'none'
+            X-Frame-Options: DENY
+            X-Content-Type-Options: nosniff
+            Referrer-Policy: no-referrer
+            Permissions-Policy: camera=(self), microphone=(self), display-capture=(self), geolocation=(), interest-cohort=()
+          HEADERS
       - name: Проверка секрета CLOUDFLARE_API_TOKEN (гейт — Pages-проект/токен заводит координатор)
         id: gate
         env:

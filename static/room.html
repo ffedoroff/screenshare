@@ -45,7 +45,13 @@
 
     <div class="room-top-bar">
       <span class="room-logo">Созвон</span>
-      <span id="participant-count" class="participant-count">Участников: 1 / 6</span>
+      <div class="room-top-bar-center">
+        <span id="participant-count" class="participant-count">Участников: 1 / 6</span>
+        <!-- Лимит длительности созвона (см. static/room.js: startRoomTimer) —
+             обратный отсчёт Ч:ММ:СС до expiresInSeconds из joined; скрыт до
+             первого joined (см. static/style.css: .room-timer). -->
+        <span id="room-timer" class="room-timer hidden"></span>
+      </div>
       <span class="room-top-bar-spacer" aria-hidden="true"></span>
     </div>
 
