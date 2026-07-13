@@ -65,6 +65,33 @@
 // Создание дополнительного DataChannel на уже установленном соединении не
 // требует новой SDP-негоциации (SCTP-ассоциация уже есть) — onnegotiationneeded
 // в норме не срабатывает повторно.
+//
+// Ф3 (повторные offer/answer/ice по шине): ПЕРВОЕ рукопожатие пары (когда
+// шина ещё не существует — курица-яйцо, см. Ш1 выше) и ICE-restart/реконнект
+// ВСЕГДА идут через серверный релей с шифрованием, как и раньше. Но КАЖДАЯ
+// ПОСЛЕДУЮЩАЯ ренегоциация той же пары (добавление/снятие трека, смена
+// камеры с реальной ренегоциацией и т.п.) — уже после того, как шина к этому
+// пиру открылась — гоняется прямо по ней: kind: 'rtc-signal', payload
+// {type: 'offer'|'answer'|'ice', data}, БЕЗ шифрования этим слоем (DataChannel
+// уже идёт поверх DTLS — это и есть E2E между этими двумя конкретными
+// пирами, второй прикладной слой шифрования той же пары ничего не добавил
+// бы, см. рассуждение про P2P-шину/медиатреки в комментарии Ш1 выше).
+// sigCrypto остаётся нужен ТОЛЬКО для серверного пути.
+//
+// ТОНКОЕ МЕСТО: сама шина живёт на том же RTCPeerConnection, который сейчас
+// ренегоциируется — если именно ЭТА ренегоциация сломает pc (редко, но
+// возможно — ICE не сойдётся заново, DTLS отвалится и т.п.), шина умрёт
+// вместе с ним, и offer/answer/ice, отправленные по ней, просто не доедут
+// (никакого отдельного failure-сигнала от DataChannel.send() при этом может
+// и не быть — сообщение либо ушло в буфер SCTP, либо канал уже закрылся
+// синхронно, см. try/catch ниже). Никаких подтверждений/ретраев здесь
+// сознательно не заводим (усложнение несоразмерно риску) — вместо этого
+// простое и дешёвое правило проверяется НЕПОСРЕДСТВЕННО перед каждой
+// отправкой: канал открыт И pc.connectionState === 'connected' -> шина;
+// иначе (в частности — весь путь ICE-restart/реконнекта, где connectionState
+// заведомо не 'connected') -> сервер, как и раньше. Проверка и сам
+// channel.send() — синхронный код без await между ними, гонка «состояние
+// изменилось между проверкой и отправкой» исключена.
 
 'use strict';
 
@@ -184,15 +211,17 @@ class RtcPeer {
       try {
         this.makingOffer = true;
         await pc.setLocalDescription();
-        // Шифруем ЦЕЛИКОМ {type, sdp} под K_sig — сервер видит только
-        // непрозрачный {v,iv,ct} вместо настоящего SDP (и его
-        // DTLS-отпечатков, см. заголовок static/crypto.js).
-        const encSdp = await this.sigCrypto.encrypt({
-          type: pc.localDescription.type,
-          sdp: pc.localDescription.sdp,
-        });
-        signaling.send('offer', { targetPeerId, sdp: encSdp });
-        ConnStats.incSignalingRelay();
+        const offer = { type: pc.localDescription.type, sdp: pc.localDescription.sdp };
+        // Ф3: шина к этому пиру уже открыта и pc в порядке -> гоним offer по
+        // ней напрямую (см. заголовок файла); иначе — прежний серверный путь
+        // с шифрованием под K_sig (сервер видит только непрозрачный
+        // {v,iv,ct} вместо настоящего SDP и его DTLS-отпечатков, см.
+        // заголовок static/crypto.js).
+        if (!this._trySendBusSignal('offer', offer)) {
+          const encSdp = await this.sigCrypto.encrypt(offer);
+          signaling.send('offer', { targetPeerId, sdp: encSdp });
+          ConnStats.incSignalingRelay();
+        }
       } catch (err) {
         console.error(`[peer ${targetPeerId}] Ошибка onnegotiationneeded:`, err);
       } finally {
@@ -201,15 +230,17 @@ class RtcPeer {
     };
 
     pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        this.sigCrypto.encrypt(event.candidate.toJSON()).then((encCandidate) => {
-          signaling.send('ice-candidate', {
-            targetPeerId,
-            candidate: encCandidate,
-          });
-          ConnStats.incSignalingRelay();
+      if (!event.candidate) return;
+      const candidateJson = event.candidate.toJSON();
+      // Ф3: тот же выбор пути, что и у offer/answer выше — см. _trySendBusSignal.
+      if (this._trySendBusSignal('ice', candidateJson)) return;
+      this.sigCrypto.encrypt(candidateJson).then((encCandidate) => {
+        signaling.send('ice-candidate', {
+          targetPeerId,
+          candidate: encCandidate,
         });
-      }
+        ConnStats.incSignalingRelay();
+      });
     };
 
     pc.ontrack = (event) => {
@@ -227,12 +258,13 @@ class RtcPeer {
   }
 
   /**
-   * Приём SDP-описания от удалённого пира — offer ИЛИ answer, разбираются по
-   * description.type. Реализует детект и разрешение коллизии офферов.
-   * `encryptedDescription` — зашифрованный блоб {v,iv,ct} (см. K_sig в
-   * static/crypto.js) — расшифровывается ПЕРВЫМ делом, до какой-либо иной
-   * обработки; отказ расшифровки почти всегда значит, что у одной из сторон
-   * неверный ключ комнаты (см. onCryptoFailure).
+   * Приём SDP-описания от удалённого пира ЧЕРЕЗ СЕРВЕРНЫЙ РЕЛЕЙ — offer ИЛИ
+   * answer, разбираются по description.type. `encryptedDescription` —
+   * зашифрованный блоб {v,iv,ct} (см. K_sig в static/crypto.js) —
+   * расшифровывается ПЕРВЫМ делом, до какой-либо иной обработки; отказ
+   * расшифровки почти всегда значит, что у одной из сторон неверный ключ
+   * комнаты (см. onCryptoFailure). Сама обработка (perfect negotiation) —
+   * в _applyRemoteDescription, общей с приёмом по шине (см. handleBusSignal).
    */
   async handleDescription(encryptedDescription) {
     let description;
@@ -243,7 +275,42 @@ class RtcPeer {
       if (this.onCryptoFailure) this.onCryptoFailure(err);
       return;
     }
+    await this._applyRemoteDescription(description);
+  }
 
+  /** Приём ICE-кандидата от удалённого пира ЧЕРЕЗ СЕРВЕРНЫЙ РЕЛЕЙ (trickle). `encryptedCandidate` — блоб {v,iv,ct}, расшифровывается первым делом (см. handleDescription про onCryptoFailure). */
+  async handleCandidate(encryptedCandidate) {
+    let candidate;
+    try {
+      candidate = await this.sigCrypto.decrypt(encryptedCandidate);
+    } catch (err) {
+      console.error(`[peer ${this.targetPeerId}] Не удалось расшифровать ICE-кандидат (неверный ключ комнаты?):`, err);
+      if (this.onCryptoFailure) this.onCryptoFailure(err);
+      return;
+    }
+    await this._applyRemoteCandidate(candidate);
+  }
+
+  /**
+   * Ф3: приём rtc-signal с P2P-шины (см. room.js: bus.onMessage — уже
+   * маршрутизирует по kind и зовёт это для соответствующего RtcPeer).
+   * `payload` — {type: 'offer'|'answer'|'ice', data} — данные УЖЕ в чистом
+   * виде (не зашифрованы этим слоем, см. заголовок файла), поэтому просто
+   * заводятся в те же _applyRemoteDescription/_applyRemoteCandidate, что и
+   * серверный путь — вся логика perfect negotiation/очереди кандидатов не
+   * дублируется.
+   */
+  async handleBusSignal(payload) {
+    if (!payload || typeof payload !== 'object') return;
+    if (payload.type === 'ice') {
+      await this._applyRemoteCandidate(payload.data);
+    } else {
+      await this._applyRemoteDescription(payload.data);
+    }
+  }
+
+  /** Общая обработка удалённого SDP-описания (offer/answer) — детект и разрешение коллизии офферов, применение remoteDescription, ответный answer при offer. Не завязана на транспорт (сервер/шина) — см. handleDescription/handleBusSignal. */
+  async _applyRemoteDescription(description) {
     const pc = this.pc;
     const isOffer = description.type === 'offer';
 
@@ -273,32 +340,26 @@ class RtcPeer {
     if (isOffer) {
       try {
         await pc.setLocalDescription();
-        const encAnswer = await this.sigCrypto.encrypt({
-          type: pc.localDescription.type,
-          sdp: pc.localDescription.sdp,
-        });
-        this.signaling.send('answer', {
-          targetPeerId: this.targetPeerId,
-          sdp: encAnswer,
-        });
-        ConnStats.incSignalingRelay();
+        const answer = { type: pc.localDescription.type, sdp: pc.localDescription.sdp };
+        // Ф3: тот же выбор пути (шина/сервер), что и у offer/ice — см.
+        // _trySendBusSignal и заголовок файла про ТОНКОЕ МЕСТО ренегоциации
+        // поверх той же самой шины.
+        if (!this._trySendBusSignal('answer', answer)) {
+          const encAnswer = await this.sigCrypto.encrypt(answer);
+          this.signaling.send('answer', {
+            targetPeerId: this.targetPeerId,
+            sdp: encAnswer,
+          });
+          ConnStats.incSignalingRelay();
+        }
       } catch (err) {
         console.error(`[peer ${this.targetPeerId}] Ошибка setLocalDescription (answer):`, err);
       }
     }
   }
 
-  /** Приём ICE-кандидата от удалённого пира (trickle). `encryptedCandidate` — блоб {v,iv,ct}, расшифровывается первым делом (см. handleDescription про onCryptoFailure). */
-  async handleCandidate(encryptedCandidate) {
-    let candidate;
-    try {
-      candidate = await this.sigCrypto.decrypt(encryptedCandidate);
-    } catch (err) {
-      console.error(`[peer ${this.targetPeerId}] Не удалось расшифровать ICE-кандидат (неверный ключ комнаты?):`, err);
-      if (this.onCryptoFailure) this.onCryptoFailure(err);
-      return;
-    }
-
+  /** Общая обработка удалённого ICE-кандидата (trickle, очередь до remoteDescription) — не завязана на транспорт, см. handleCandidate/handleBusSignal. */
+  async _applyRemoteCandidate(candidate) {
     if (!this.remoteSet) {
       this.candidateQueue.push(candidate);
       return;
@@ -352,6 +413,45 @@ class RtcPeer {
 
   isBusOpen() {
     return !!this.busChannel && this.busChannel.readyState === 'open';
+  }
+
+  /**
+   * Ф3: можно ли прямо СЕЙЧАС гонять offer/answer/ice по шине этой пары —
+   * простое правило без подтверждений/ретраев (см. заголовок файла,
+   * «ТОНКОЕ МЕСТО»): канал открыт И pc уже 'connected'. Если пара ещё
+   * устанавливается (bootstrap, шина не открылась) или разваливается/
+   * переустанавливается (ICE-restart, реконнект после падения канала —
+   * connectionState тогда не 'connected') — сигналы обязаны идти сервером.
+   */
+  _canUseBus() {
+    return this.isBusOpen() && this.pc.connectionState === 'connected';
+  }
+
+  /**
+   * Попытаться отправить один сигнал ('offer'|'answer'|'ice') по шине этой
+   * пары. Возвращает true, если реально ушло по шине (вызывающая сторона
+   * тогда НЕ шлёт тем же сигналом ещё и через сервер и НЕ инкрементирует
+   * ConnStats.incSignalingRelay — см. static/room.js, п.4 задания), false —
+   * если бус недоступен или send() синхронно отказал (тогда вызывающая
+   * сторона обязана откатиться на серверный путь сама).
+   *
+   * Намеренно НЕ используется sendBus() (тот копит недоставленное в очередь
+   * до следующего открытия канала) — если именно эта ренегоциация сломала
+   * pc, канал, скорее всего, никогда больше не откроется, и offer застрял бы
+   * в очереди навсегда вместо честного немедленного отката на сервер.
+   * Проверка _canUseBus() и сам channel.send() — синхронный код без await
+   * между ними, поэтому гонка «состояние изменилось между проверкой и
+   * отправкой» здесь исключена.
+   */
+  _trySendBusSignal(type, data) {
+    if (!this._canUseBus()) return false;
+    try {
+      this.busChannel.send(JSON.stringify({ kind: 'rtc-signal', payload: { type, data } }));
+      return true;
+    } catch (err) {
+      console.warn(`[peer ${this.targetPeerId}] Не удалось отправить ${type} по шине — откат на серверный релей:`, err);
+      return false;
+    }
   }
 
   /**

@@ -61,6 +61,7 @@ import {
   allFramesSentOn,
   framesOfTypeSentOn,
   waitInvalidLinkOverlay,
+  waitForBusOpenToAllPeers,
 } from './helpers.mjs';
 
 const PORT = 3322;
@@ -176,6 +177,18 @@ async function streamInfoFramesSentOn(page) {
   return page.evaluate(() => window.__e2eStreamInfoFramesSent || []);
 }
 
+// Ф3 (повторные offer/answer/ice по шине, см. static/rtc.js): суммарное
+// число offer+answer+ice-candidate фреймов, ушедших этой страницей в
+// серверный WS (требует installSignalingFrameSpy на контексте — см. main()
+// ниже, установлен на vasyaContext/petyaContext/olyaContext). Используется
+// парой «до/после» вокруг ренегоциаций после установления mesh (камера/
+// микрофон/шаринг экрана) — по протоколу счёт не должен расти вообще, раз
+// шина к этому моменту уже открыта (см. waitForBusOpenToAllPeers выше).
+async function signalRelayFramesCount(page) {
+  const frames = await allFramesSentOn(page);
+  return frames.filter((f) => f && (f.type === 'offer' || f.type === 'answer' || f.type === 'ice-candidate')).length;
+}
+
 // Сколько миллисекунд после установления mesh-пары (connectionState
 // 'connected' у обоих RTCPeerConnection, см. waitForMeshSettled) серверный
 // релей stream-info ещё считается штатным bootstrap-путём (шина открывается
@@ -233,6 +246,12 @@ async function main() {
     await installMediaStubs(vasyaContext);
     await installChatWsSpy(vasyaContext);
     await installPcRegistry(vasyaContext);
+    // Ф3: шпион на ВСЕ фреймы серверного WS (не только chat/stream-info, см.
+    // installChatWsSpy выше) — нужен ниже, чтобы доказать, что offer/answer/
+    // ice-candidate повторных ренегоциаций (камера/микрофон/шаринг экрана
+    // ПОСЛЕ установления mesh) не растут через сервер (см. проверку в конце
+    // основного сценария).
+    await installSignalingFrameSpy(vasyaContext);
     const vasyaPage = await vasyaContext.newPage();
 
     let roomId = null;
@@ -284,6 +303,8 @@ async function main() {
     await installChatWsSpy(olyaContext);
     await installPcRegistry(petyaContext);
     await installPcRegistry(olyaContext);
+    await installSignalingFrameSpy(petyaContext);
+    await installSignalingFrameSpy(olyaContext);
     const petyaPage = await petyaContext.newPage();
     const olyaPage = await olyaContext.newPage();
 
@@ -291,6 +312,13 @@ async function main() {
     // когда mesh у неё стал 'connected' — см. assertNoLateStreamInfoOverServer
     // ниже (bootstrap-окно stream-info отсчитывается от этого момента).
     const meshSettledAtByLabel = new Map();
+
+    // Ф3: peerId-метка -> число offer+answer+ice-candidate фреймов через
+    // сервер В МОМЕНТ, когда mesh+шина уже устаканились (см.
+    // signalRelayFramesCount/waitForBusOpenToAllPeers выше) — базовая линия
+    // для сравнения «до/после» вокруг всех последующих ренегоциаций
+    // (камера/микрофон/шаринг экрана), см. проверку в конце сценария.
+    const signalRelayCountAtMeshSettledByLabel = new Map();
 
     const everyoneJoinedOk = await step('Петя и Оля открывают ссылку комнаты (модалка входа), у всех троих по 3 тайла, корона только у Васи', async () => {
       await petyaPage.goto(guestRoomUrl);
@@ -304,8 +332,21 @@ async function main() {
       // (шина + сигналинг) реально дошли до connected — см. helpers.mjs.
       await waitForMeshSettled([vasyaPage, petyaPage, olyaPage], { tileCount: 3, connectionsPerPage: 2 });
 
+      // Ф3: connectionState==='connected' у RTCPeerConnection не гарантирует
+      // МГНОВЕННО открытую DataChannel-шину (её собственный SCTP-хендшейк —
+      // отдельная, чуть более поздняя договорённость) — явно дожидаемся
+      // bus.isOpen() с обеими парами на каждой странице, прежде чем ниже по
+      // сценарию намеренно спровоцировать ренегоциации (камера/микрофон/
+      // экран) и проверить, что они идут по шине, а не через сервер (см.
+      // waitForBusOpenToAllPeers/сравнение счётчиков сигналинга в конце
+      // сценария).
+      for (const page of [vasyaPage, petyaPage, olyaPage]) {
+        await waitForBusOpenToAllPeers(page);
+      }
+
       for (const [label, page] of [['Вася', vasyaPage], ['Петя', petyaPage], ['Оля', olyaPage]]) {
         meshSettledAtByLabel.set(label, await page.evaluate(() => Date.now()));
+        signalRelayCountAtMeshSettledByLabel.set(label, await signalRelayFramesCount(page));
       }
 
       // (а) Вася — лидер (корона на его тайле у остальных), у Пети/Оли короны нет.
@@ -685,6 +726,42 @@ async function main() {
       );
     } else {
       skip('проверка "новый stream-info не идёт через сервер после bootstrap-окна"', 'mesh не установился');
+    }
+
+    // --- Ф3: повторные offer/answer/ice ПОСЛЕ установления mesh идут по шине,
+    // не по серверу ---
+    //
+    // Со времени mesh+шина устаканились (см. signalRelayCountAtMeshSettledByLabel
+    // выше) сценарий уже успел спровоцировать НЕСКОЛЬКО настоящих ренегоциаций
+    // (addTrack -> onnegotiationneeded, а не просто track.enabled toggle):
+    // Вася включил камеру и микрофон, Петя и Оля по очереди пошарили экран,
+    // Вася сменил устройство камеры. Каждая из них — новый offer/answer (и
+    // сопутствующий trickle ICE) между соответствующей парой. С учётом Ф3
+    // ВСЕ они обязаны были уйти по DataChannel-шине (bus уже открыт, pc уже
+    // 'connected' — см. static/rtc.js: _canUseBus/_trySendBusSignal), поэтому
+    // счётчик offer+answer+ice-candidate через сервер у КАЖДОГО из троих не
+    // должен был вырасти ни на единицу с момента базовой линии. Заодно —
+    // само по себе то, что все эти шаги (видео/спикинг/шаринг у остальных)
+    // уже прошли (assertVideoPlaying/waitForClassOnSelector выше) — и есть
+    // подтверждение, что функционально всё отработало, а не просто «тихо
+    // сломалось само по себе».
+    if (everyoneJoinedOk) {
+      await step(
+        'Ренегоциации ПОСЛЕ установления mesh (вкл. камеры/микрофона Васи, шаринг экрана Пети/Оли) не добавили ни одного offer/answer/ice-candidate фрейма в серверный WebSocket ни у кого из троих',
+        async () => {
+          for (const [label, page] of [['Вася', vasyaPage], ['Петя', petyaPage], ['Оля', olyaPage]]) {
+            const before = signalRelayCountAtMeshSettledByLabel.get(label);
+            const after = await signalRelayFramesCount(page);
+            assert.equal(
+              after,
+              before,
+              `у ${label} счётчик offer/answer/ice-candidate через сервер вырос с ${before} до ${after} после установления mesh — ожидали, что ренегоциации пойдут по шине`
+            );
+          }
+        }
+      );
+    } else {
+      skip('проверка "ренегоциации после mesh идут по шине, не по серверу"', 'mesh не установился');
     }
 
     await vasyaContext.close();

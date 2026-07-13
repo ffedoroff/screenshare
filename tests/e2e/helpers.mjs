@@ -443,6 +443,31 @@ export async function framesOfTypeSentOn(page, type) {
   return frames.filter((f) => f && f.type === type);
 }
 
+/**
+ * Ф3 (повторные offer/answer/ice по шине, см. static/rtc.js): дождаться, что
+ * DataChannel-шина (static/bus.js: bus.isOpen) открыта СО ВСЕМИ прочими
+ * участниками на этой странице. `bus` — обычный top-level `const` в room.js
+ * (классический скрипт, не module — тот же приём, что и с ChatPanel/leaderId
+ * в других хелперах этого файла), поэтому виден из page.evaluate() напрямую.
+ *
+ * Нужно, чтобы исключить гонку «pc.connectionState уже 'connected'
+ * (см. waitForAllConnectionsSettled выше), а SCTP-хендшейк самой шины ещё не
+ * успел завершиться» перед тем, как тест намеренно спровоцирует ренегоциацию
+ * (addTrack при включении камеры/микрофона/шаринга экрана) и проверит, что
+ * offer/answer/ice в этот момент уходят по шине, а не через сервер.
+ */
+export async function waitForBusOpenToAllPeers(page, timeoutMs = 8000) {
+  await page.waitForFunction(
+    () => {
+      const tiles = Array.from(document.querySelectorAll('.tile:not(.tile--own)'));
+      if (tiles.length === 0) return false;
+      return tiles.every((t) => typeof bus !== 'undefined' && bus.isOpen(t.dataset.peerId));
+    },
+    undefined,
+    { polling: 100, timeout: timeoutMs }
+  );
+}
+
 /** Оверлей «Ссылка неполная» (Ш1: нет валидного `k`, либо ключ неверен — см. static/room.js: showInvalidLinkOverlay). */
 export async function waitInvalidLinkOverlay(page, timeoutMs = 10_000) {
   await page.waitForFunction(

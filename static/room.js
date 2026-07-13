@@ -1231,6 +1231,20 @@ bus.onMessage((_fromPeerId, obj) => {
   if (obj && obj.kind === 'stream-info') handleStreamInfo(obj.info);
 });
 
+// Ф3: приём повторных offer/answer/ice ПО ШИНЕ (см. static/rtc.js —
+// RtcPeer._trySendBusSignal на стороне отправителя, sigCrypto там уже не
+// участвует, payload приходит в чистом виде). Маршрутизируется в ТОТ ЖЕ
+// RtcPeer, что и прислал сообщение (bus._dispatch зовёт обработчики с
+// fromPeerId — см. bus.js/rtc.js: onBusMessage), поэтому здесь просто нужен
+// сам RtcPeer конкретного пира — bus.getPeer(fromPeerId), а не полноценный
+// bus-транспорт (rtc-signal — не сообщение чата/фичи, ему нужен доступ к
+// handleBusSignal, которого у Bus API нет и не должно быть).
+bus.onMessage((fromPeerId, obj) => {
+  if (!obj || obj.kind !== 'rtc-signal') return;
+  const rtc = bus.getPeer(fromPeerId);
+  if (rtc) rtc.handleBusSignal(obj.payload);
+});
+
 function handleRemoteTrack(peerId, event) {
   const track = event.track;
   const stream = event.streams[0] || new MediaStream([track]);
