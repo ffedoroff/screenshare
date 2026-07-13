@@ -90,7 +90,7 @@ jobs:
           cp -r static pages-dist/static
           mv pages-dist/static/index.html pages-dist/static/room.html pages-dist/ 2>/dev/null || cp static/index.html static/room.html pages-dist/
           # SPA-маршрут комнат: /r/<id> отдаёт room.html (rewrite, не redirect).
-          printf '/r/* /room.html 200\n' > pages-dist/_redirects
+          printf '/r/* /room 200\n' > pages-dist/_redirects   # цель без .html: Pages со своими pretty-URL иначе даёт 308 и теряет путь
           # Ш2: Pages-сборка ходит на отдельный API-хост — same-origin дефолт
           # из репозитория (static/config.js: window.API_BASE = location.origin)
           # здесь не годится, фронт и API теперь на разных доменах (см.
