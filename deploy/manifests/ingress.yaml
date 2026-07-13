@@ -5,26 +5,17 @@
 #
 # Ш2 (разнесение доверия — см. README.md «Топология Ш2»): статика фронтенда
 # переезжает на Cloudflare Pages (проект «chat-web»), а этот backend остаётся
-# API/WS-хостом. Второе правило (chat-api.fedorov.it) заводит DNS/туннель для
-# нового хоста заранее — оба хоста намеренно указывают на ОДИН И ТОТ ЖЕ Service
-# (`chat`) и живут ПАРАЛЛЕЛЬНО: chat.fedorov.it продолжает отдавать и статику,
-# и API до того момента, когда координатор создаст Pages-проект и переключит
-# DNS `chat.fedorov.it` на Pages — после этого можно (отдельным шагом,
-# НЕ входящим в эту подготовку) убрать раздачу статики из backend и/или это
-# правило под chat.fedorov.it.
+# API/WS-хостом chat-api.fedorov.it. Переключение выполнено 2026-07-13:
+# chat.fedorov.it указывает CNAME'ом на Pages (chat-web-7ev.pages.dev),
+# правило для него из Ingress убрано (иначе туннель-контроллер боролся бы
+# за DNS-запись). Backend всё ещё умеет раздавать статику (безвредно,
+# доступна на chat-api) — вычистку можно сделать позже отдельным шагом.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata: { name: chat, namespace: chat-prod }
 spec:
   ingressClassName: cloudflare-tunnel
   rules:
-  - host: chat.fedorov.it
-    http:
-      paths:
-      - path: /
-        pathType: Prefix
-        backend:
-          service: { name: chat, port: { number: 80 } }
   - host: chat-api.fedorov.it
     http:
       paths:
