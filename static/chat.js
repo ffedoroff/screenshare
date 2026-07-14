@@ -1,34 +1,15 @@
 // chat.js — панель текстового чата комнаты (Ф1: чат на mesh RTCDataChannel;
 // Ф2: форматирование текста, реплаи и реакции — см. ниже).
 //
-// Транспорт:
-//   основной путь — шина (см. bus.js/rtc.js): broadcast конверта всем пирам
-//   с открытым DataChannel;
-//   fallback — пирам БЕЗ открытого канала конверт уходит через сервер
-//   адресно: signaling.send('chat', { targetPeerId, envelope }), сервер
-//   релеит как 'chat' { fromPeerId, envelope } и содержимое не разбирает и
-//   не хранит (см. src/ws.rs).
+// Транспорт: ТОЛЬКО P2P-шина (см. bus.js/rtc.js) — broadcast конверта всем
+// пирам с открытым DataChannel. Серверного релея чата НЕТ: пирам без ещё
+// открытого канала конверт ждёт в локальной очереди и уходит по шине при её
+// открытии (см. sendEnvelopeToPeer/notifyBusOpen). См. docs/chat.md §12.
 //
-// Ш1 (E2E-шифрование, см. static/crypto.js): по шине конверт уходит КАК ЕСТЬ
-// (P2P DataChannel уже E2E за счёт DTLS) — а вот в fallback-пути через
-// сервер конверт целиком шифруется под K_chat, выведенный из ключа комнаты
-// (см. static/room.js): на проводе вместо открытого конверта уходит
-// {enc:{v,iv,ct}, epoch} (см. sendEnvelopeToPeer/attach ниже) — сервер видит
-// только непрозрачный блоб + номер эпохи, как и остальной сигналинг-релей.
-//
-// Ш3 (forward secrecy контента при смене состава, см.
-// docs/e2e-encryption.md §7): K_chat не один статичный ключ на всю сессию —
-// лидер комнаты может выпустить НОВУЮ эпоху (при уходе участника/отказе в
-// лобби), после чего этот fallback-путь шифрует ИСХОДЯЩЕЕ под новой эпохой, а
-// ВХОДЯЩЕЕ расшифровывает ключом ТОЙ эпохи, что указана в самом конверте
-// (`epoch`, открытым текстом рядом с `enc` — иначе получателю нечем было бы
-// выбрать нужный ключ ДО расшифровки). Участник, уже покинувший комнату (или
-// отклонённый в лобби), никогда не получает ключ новой эпохи (раздача —
-// строго по P2P-шине, см. static/room.js: rotateContentKeysIfLeader) — вот
-// он, весь выигрыш: то, что отправлено в fallback-путь ПОСЛЕ его ухода, он
-// прочитать не может, даже если бы каким-то образом снова слушал трафик
-// сервера. P2P-путь по шине этим слоем не защищается и не нуждается в этом —
-// см. заголовок выше про DTLS.
+// Шифрование: конверт по шине уходит КАК ЕСТЬ — P2P DataChannel уже E2E за
+// счёт DTLS (см. static/crypto.js, docs/e2e-encryption.md §3.2). Прикладного
+// слоя шифрования у чата нет и не нужно; K_chat и контентные эпохи (Ш3) были
+// нужны только прежнему серверному fallback-пути и удалены вместе с ним.
 //
 // Конверт сообщения (РАСШИРЯЕМЫЙ — расширения будущих волн должны лечь без
 // ломки формата):
@@ -40,9 +21,8 @@
 // его не трогает, это чисто клиентское расширение внутри уже опакового для
 // сервера конверта.
 //
-// Реакции (Ф2) — отдельный kind, тот же транспорт (broadcast по шине +
-// fallback через сервер), тот же общий буфер истории, что и текстовые
-// сообщения:
+// Реакции (Ф2) — отдельный kind, тот же транспорт (broadcast по шине),
+// тот же общий буфер истории, что и текстовые сообщения:
 //   { v: 1, id, lamport, from, name, kind: 'reaction', target, emoji, op, ts }
 // `target` — id сообщения, к которому относится реакция; `emoji` — один из
 // фиксированного набора (см. REACTION_EMOJIS); `op` — 'add'|'remove'
@@ -83,8 +63,8 @@
 // Передача файлов (Ф3) — строго P2P, сервер байты файла никогда не видит:
 //   { v: 1, id, lamport, from, name, kind: 'file-offer', fileId, fileName,
 //     size, mime, ts }
-// Оффер — обычный конверт по тому же транспорту (broadcast по шине +
-// fallback через сервер) и в том же общем буфере истории, что text/reaction
+// Оффер — обычный конверт по тому же транспорту (broadcast по шине)
+// и в том же общем буфере истории, что text/reaction
 // — опоздавший видит карточку файла из реплея истории точно так же, как
 // историческое текстовое сообщение (см. mergeHistory). Сам файл (File-объект)
 // живёт только у отправителя, в памяти вкладки (fileSendMap: fileId -> File)
@@ -102,9 +82,9 @@
 // канала идёт JSON-мета { fileId, size, mime, name }, дальше — бинарные чанки
 // по FILE_CHUNK_SIZE байт (ArrayBuffer), с backpressure по bufferedAmount;
 // отправитель закрывает канал по завершении, получатель собирает Blob и
-// сверяет итоговый размер. Оффер без P2P-канала до отправителя (fallback-пара
-// или отправитель уже вышел) — карточка честно показывает недоступность
-// вместо попытки скачивания через сервер (сервер байты файла не гоняет
+// сверяет итоговый размер. Оффер без P2P-канала до отправителя (канал не
+// открылся или отправитель уже вышел) — карточка честно показывает
+// недоступность вместо попытки скачивания через сервер (сервер байты файла не гоняет
 // НИКОГДА — см. handleFileRequest/requestFileDownload/beginSendingFile/
 // beginReceivingFile ниже).
 //
@@ -122,9 +102,9 @@
 // (никого в joined.peers) — пустая история, спрашивать не у кого.
 //
 // Rate-limit — клиентский, мягкий: не чаще 10 сообщений за 10с, блокирует
-// отправку с сообщением в панели (серверный rate-limit — отдельно, только
-// для fallback-пути, см. src/ws.rs). Реакции этим лимитом не ограничены —
-// это лёгкие toggle-события, не полноценные сообщения.
+// отправку с сообщением в панели. Серверного rate-limit у чата нет — чат
+// сервер не видит. Реакции этим лимитом не ограничены — это лёгкие
+// toggle-события, не полноценные сообщения.
 //
 // Форматирование текста (kind=text) — см. renderMessageBody/appendInlineNodes
 // ниже (Ф4, Telegram-подобный синтаксис, двойные маркеры): **жирный**,
@@ -182,26 +162,21 @@
 // сюда параметром `name` в ChatPanel.create()/attach(). Никакого
 // localStorage/sessionStorage здесь и во всём файле нет.
 //
-// Права гостей (см. docs/permissions-and-leader.md, «Chat — Partially
-// Server-Enforced»): при `guestChat=false` инпут дизейблится (см. room.js:
+// Права гостей (см. docs/permissions-and-leader.md, «Chat — Cooperative
+// Only»): при `guestChat=false` инпут дизейблится (см. room.js:
 // ChatPanel.setChatForbidden) и получатели игнорируют входящие
-// 'text'/'file-offer' конверты от НЕ-лидеров (см. dispatchEnvelope ниже) —
-// и по шине, и по серверному fallback, единая точка входа. Это кооперативная
-// защита: модифицированный клиент получателя может её игнорировать и
-// отрендерить конверт всё равно (сервер P2P-трафик не видит и проверить не
-// может) — так и задумано, см. docs/permissions-and-leader.md.
+// 'text'/'file-offer' конверты от НЕ-лидеров (см. dispatchEnvelope ниже).
+// Это КООПЕРАТИВНАЯ защита (чат сервер не видит вовсе): модифицированный
+// клиент получателя может её игнорировать и отрендерить конверт всё равно —
+// так и задумано, см. docs/permissions-and-leader.md.
 //
 // H3 — привязка личности (identity binding): envelope.from — САМОЗАЯВЛЕННОЕ
 // поле, отправитель волен вписать туда что угодно (в т.ч. чужой peerId).
-// Транспорт (и шина, и серверный fallback-релей) при этом ЗНАЕТ истинного
-// отправителя независимо от содержимого конверта: по шине это peerId той
-// самой пары RtcPeer, чей DataChannel принёс сообщение (см. bus.js:
-// _dispatch(peerId, obj), room.js: onBusMessage), по fallback — peerId,
-// который сервер сам проставляет из идентичности WS-соединения (см.
-// src/ws.rs: relay(), поле `from` в ServerMessage::Chat строится из
-// `ctx.peer_id` контекста подключения, а не из чего-либо, присланного
-// клиентом) — в обоих случаях `fromPeerId`, приходящий в dispatchEnvelope
-// НИЖЕ, подделать нельзя (не самозаявленный, а транспортный факт).
+// Транспорт (шина) при этом ЗНАЕТ истинного отправителя независимо от
+// содержимого конверта: это peerId той самой пары RtcPeer, чей DataChannel
+// принёс сообщение (см. bus.js: _dispatch(peerId, obj), room.js:
+// onBusMessage) — `fromPeerId`, приходящий в dispatchEnvelope НИЖЕ, подделать
+// нельзя (не самозаявленный, а транспортный факт).
 // Без сверки этих двух источников правды ЛЮБОЙ участник мог бы прислать
 // text/reaction/edit/delete/file-offer с envelope.from = чужой peerId и
 // отрендериться (или отредактировать/удалить чужое сообщение — см.
@@ -339,7 +314,7 @@ const ChatPanel = (() => {
   function displayName(msg) {
     if (msg.name) return msg.name;
     const suffix = (msg.from || '').slice(-4);
-    return `Гость-${suffix}`;
+    return `Guest-${suffix}`;
   }
 
   function truncateText(text, maxLen) {
@@ -370,7 +345,7 @@ const ChatPanel = (() => {
       .map((line) => (line.startsWith('> ') ? line.slice(2) : line))
       .join(' ');
     return result
-      .replace(/\|\|(?!\s)([^|]+?)(?<!\s)\|\|/g, 'спойлер')
+      .replace(/\|\|(?!\s)([^|]+?)(?<!\s)\|\|/g, 'spoiler')
       .replace(/`([^`]+?)`/g, '$1')
       .replace(/\*\*(?!\s)([^*]+?)(?<!\s)\*\*/g, '$1')
       .replace(/__(?!\s)([^_]+?)(?<!\s)__/g, '$1')
@@ -387,8 +362,8 @@ const ChatPanel = (() => {
   /** Человекочитаемый размер файла: "512 Б", "12.3 КБ", "1.4 МБ" и т.п. */
   function humanFileSize(bytes) {
     const n = Number(bytes) || 0;
-    if (n < 1024) return `${n} Б`;
-    const units = ['КБ', 'МБ', 'ГБ'];
+    if (n < 1024) return `${n} B`;
+    const units = ['KB', 'MB', 'GB'];
     let value = n / 1024;
     let unitIndex = 0;
     while (value >= 1024 && unitIndex < units.length - 1) {
@@ -552,7 +527,7 @@ const ChatPanel = (() => {
     span.className = 'chat-md-spoiler';
     span.setAttribute('role', 'button');
     span.setAttribute('tabindex', '0');
-    span.setAttribute('aria-label', 'Спойлер, нажмите, чтобы показать');
+    span.setAttribute('aria-label', 'Spoiler, click to reveal');
     appendInlineNodes(span, content);
     const reveal = () => span.classList.add('revealed');
     span.addEventListener('click', reveal);
@@ -587,7 +562,7 @@ const ChatPanel = (() => {
     const showCopied = () => {
       const prevText = buttonEl.textContent;
       buttonEl.classList.add('chat-code-block-copy--done');
-      buttonEl.textContent = 'Скопировано';
+      buttonEl.textContent = 'Copied';
       setTimeout(() => {
         buttonEl.classList.remove('chat-code-block-copy--done');
         buttonEl.textContent = prevText;
@@ -613,7 +588,7 @@ const ChatPanel = (() => {
     try {
       document.execCommand('copy');
     } catch (err) {
-      console.warn('Не удалось скопировать код блока (ни Clipboard API, ни execCommand):', err);
+      console.warn('Failed to copy code block (neither Clipboard API nor execCommand worked):', err);
     }
     document.body.removeChild(textarea);
     onDone();
@@ -640,7 +615,7 @@ const ChatPanel = (() => {
     const copyBtn = document.createElement('button');
     copyBtn.type = 'button';
     copyBtn.className = 'chat-code-block-copy';
-    copyBtn.textContent = 'Копировать';
+    copyBtn.textContent = 'Copy';
     copyBtn.addEventListener('click', () => copyCodeToClipboard(code, copyBtn));
     header.appendChild(copyBtn);
 
@@ -729,39 +704,53 @@ const ChatPanel = (() => {
     panel.className = `chat-panel chat-panel--${variant} hidden`;
     panel.innerHTML = `
       <div class="chat-header">
-        <span class="chat-title">Чат</span>
-        <button type="button" class="chat-collapse-button" aria-label="Свернуть чат" title="Свернуть чат">
+        <span class="chat-title">Chat</span>
+        <!-- SAS «отпечаток комнаты» (см. room.js: renderRoomSas, crypto.js:
+             deriveSas) — человекоудобная проверка ключа против активного MITM.
+             Скрыт, пока не установлен хотя бы один пир (нечего и не с кем
+             сверять). Тап открывает пояснение (chat-sas-note). -->
+        <button type="button" class="chat-sas hidden" aria-label="Room verification code" title="Room verification code — read it aloud and check it matches for everyone">
+          <span class="chat-sas-emoji"></span>
+        </button>
+        <button type="button" class="chat-collapse-button" aria-label="Collapse chat" title="Collapse chat">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <line x1="5" y1="5" x2="19" y2="19"></line>
             <line x1="19" y1="5" x2="5" y2="19"></line>
           </svg>
         </button>
       </div>
+      <div class="chat-sas-note hidden">
+        These emoji are a fingerprint of this call's encryption key. Compare
+        them out loud <strong>before</strong> discussing anything sensitive: if
+        everyone sees the same emoji, no one is intercepting the call. If they
+        differ, someone may have handed you a tampered link.
+        <span class="chat-sas-hex"></span>
+      </div>
       <div class="chat-messages"></div>
       <div class="chat-error-banner hidden"></div>
       <div class="chat-reply-bar hidden">
         <span class="chat-reply-bar-text"></span>
-        <button type="button" class="chat-reply-bar-close" aria-label="Отменить ответ" title="Отменить ответ">×</button>
+        <button type="button" class="chat-reply-bar-close" aria-label="Cancel reply" title="Cancel reply">×</button>
       </div>
       <div class="chat-edit-bar hidden">
-        <span class="chat-edit-bar-label">Редактирование</span>
-        <button type="button" class="chat-edit-bar-close" aria-label="Отменить редактирование" title="Отменить редактирование">×</button>
+        <span class="chat-edit-bar-label">Editing</span>
+        <button type="button" class="chat-edit-bar-close" aria-label="Cancel editing" title="Cancel editing">×</button>
       </div>
       <div class="chat-format-toolbar hidden">
-        <button type="button" class="chat-format-btn chat-format-btn--bold" data-format="bold" aria-label="Жирный" title="Жирный">Ж</button>
-        <button type="button" class="chat-format-btn chat-format-btn--italic" data-format="italic" aria-label="Курсив" title="Курсив">К</button>
-        <button type="button" class="chat-format-btn chat-format-btn--strike" data-format="strike" aria-label="Зачёркнутый" title="Зачёркнутый">З</button>
-        <button type="button" class="chat-format-btn chat-format-btn--spoiler" data-format="spoiler" aria-label="Спойлер" title="Спойлер">🙈</button>
-        <button type="button" class="chat-format-btn chat-format-btn--code" data-format="code" aria-label="Код" title="Код">&lt;/&gt;</button>
-        <button type="button" class="chat-format-btn chat-format-btn--link" data-format="link" aria-label="Ссылка" title="Ссылка">🔗</button>
+        <button type="button" class="chat-format-btn chat-format-btn--bold" data-format="bold" aria-label="Bold" title="Bold">B</button>
+        <button type="button" class="chat-format-btn chat-format-btn--italic" data-format="italic" aria-label="Italic" title="Italic">I</button>
+        <button type="button" class="chat-format-btn chat-format-btn--strike" data-format="strike" aria-label="Strikethrough" title="Strikethrough">S</button>
+        <button type="button" class="chat-format-btn chat-format-btn--spoiler" data-format="spoiler" aria-label="Spoiler" title="Spoiler">🙈</button>
+        <button type="button" class="chat-format-btn chat-format-btn--code" data-format="code" aria-label="Code" title="Code">&lt;/&gt;</button>
+        <button type="button" class="chat-format-btn chat-format-btn--link" data-format="link" aria-label="Link" title="Link">🔗</button>
       </div>
       <div class="chat-input-row">
-        <textarea class="chat-text-input" rows="1" placeholder="Сообщение…" maxlength="2000"></textarea>
+        <textarea class="chat-text-input" rows="1" placeholder="Message…" maxlength="2000"></textarea>
         <div class="chat-input-actions">
-          <button type="button" class="chat-attach-button" aria-label="Прикрепить файл" title="Прикрепить файл"></button>
+          <button type="button" class="chat-attach-button" aria-label="Attach file" title="Attach file"></button>
           <input type="file" class="chat-file-input" multiple hidden />
-          <button type="button" class="chat-format-toggle-button" aria-label="Форматирование текста" title="Форматирование текста" aria-pressed="false">Aa</button>
-          <button type="button" class="chat-send-button" aria-label="Отправить" title="Отправить">
+          <button type="button" class="chat-format-toggle-button" aria-label="Text formatting" title="Text formatting" aria-pressed="false">Aa</button>
+          <button type="button" class="chat-send-button" aria-label="Send" title="Send">
             <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <line x1="22" y1="2" x2="11" y2="13"></line>
               <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
@@ -788,10 +777,10 @@ const ChatPanel = (() => {
       <div class="chat-message-popover-backdrop"></div>
       <div class="chat-message-popover-card" role="dialog" aria-modal="true">
         <div class="chat-message-popover-handle" aria-hidden="true"></div>
-        <button type="button" class="chat-message-popover-close" aria-label="Закрыть" title="Закрыть">×</button>
+        <button type="button" class="chat-message-popover-close" aria-label="Close" title="Close">×</button>
         <div class="chat-message-popover-emojis"></div>
         <div class="chat-message-popover-reactions hidden">
-          <div class="chat-message-popover-reactions-title">Реакции</div>
+          <div class="chat-message-popover-reactions-title">Reactions</div>
           <div class="chat-message-popover-reactions-list"></div>
         </div>
         <div class="chat-message-popover-actions"></div>
@@ -814,6 +803,10 @@ const ChatPanel = (() => {
       toggleButton,
       panel,
       unreadBadge: toggleButton.querySelector('.chat-unread-badge'),
+      sasButton: panel.querySelector('.chat-sas'),
+      sasEmojiEl: panel.querySelector('.chat-sas-emoji'),
+      sasNote: panel.querySelector('.chat-sas-note'),
+      sasHexEl: panel.querySelector('.chat-sas-hex'),
       collapseButton: panel.querySelector('.chat-collapse-button'),
       messagesEl: panel.querySelector('.chat-messages'),
       errorBanner: panel.querySelector('.chat-error-banner'),
@@ -842,8 +835,8 @@ const ChatPanel = (() => {
 
   /**
    * @param {object} opts
-   * @param {object} opts.signaling — Signaling (см. common.js), для fallback-релея и приёма его.
-   * @param {object} opts.bus — Bus (см. bus.js), основной P2P-транспорт.
+   * @param {object} opts.signaling — Signaling (см. common.js), для приёма серверных ошибок ('error').
+   * @param {object} opts.bus — Bus (см. bus.js), единственный транспорт чата (P2P).
    * @param {string} opts.peerId — свой peerId.
    * @param {?string} opts.name — своё отображаемое имя (фиксируется на сессию, как раньше).
    * @param {string} opts.variant
@@ -862,9 +855,6 @@ const ChatPanel = (() => {
     initialPeerIds,
     getLeaderId,
     getGuestChatAllowed,
-    getChatKeyForEpoch,
-    getCurrentContentEpoch,
-    isContentEpochReady,
   }) {
     if (!singleton) {
       const dom = buildDom(variant, toggleButton);
@@ -879,9 +869,6 @@ const ChatPanel = (() => {
       initialPeerIds,
       getLeaderId,
       getGuestChatAllowed,
-      getChatKeyForEpoch,
-      getCurrentContentEpoch,
-      isContentEpochReady,
     });
     return singleton.publicApi;
   }
@@ -891,6 +878,10 @@ const ChatPanel = (() => {
       toggleButton,
       panel,
       unreadBadge,
+      sasButton,
+      sasEmojiEl,
+      sasNote,
+      sasHexEl,
       collapseButton,
       messagesEl,
       errorBanner,
@@ -920,30 +911,12 @@ const ChatPanel = (() => {
     let bus = null;
     let peerId = null;
     let myName = null;
-    // Ш1/Ш3 (E2E-шифрование + forward secrecy контента, см.
-    // static/crypto.js/room.js): K_chat используется ТОЛЬКО для серверного
-    // fallback-релея (см. sendEnvelopeToPeer/attach ниже) — по шине конверт
-    // не шифруется этим слоем вовсе. Ключ больше не статичен на всю сессию
-    // (см. docs/e2e-encryption.md §7): комната может пережить смену эпохи
-    // (лидер ротирует K_chat/K_meta при уходе участника), поэтому вместо
-    // одного сохранённого CryptoKey здесь — колбэки room.js, читающие ЖИВОЕ
-    // состояние contentEpochs на момент вызова:
-    //   - getChatKeyForEpoch(epoch) -> CryptoKey чата этой эпохи, или null,
-    //     если эпоха нам неизвестна (не должно случаться при корректной
-    //     раздаче — см. заголовок файла и signaling.on('chat', ...) ниже);
-    //   - getCurrentContentEpoch() -> номер эпохи, которой шифруем ИСХОДЯЩИЙ
-    //     fallback-конверт прямо сейчас;
-    //   - isContentEpochReady() -> false у новичка, пока текущая эпоха ещё
-    //     не подтверждена по шине (см. room.js: contentEpochReady) — пока
-    //     false, исходящий fallback-конверт СТАВИТСЯ В ОЧЕРЕДЬ
-    //     (pendingFallbackSends), а не шифруется устаревшей эпохой 0.
-    let getChatKeyForEpoch = () => null;
-    let getCurrentContentEpoch = () => 0;
-    let isContentEpochReady = () => true;
-    // Очередь исходящих fallback-отправок, накопленная, пока
-    // isContentEpochReady() возвращал false — сливается разом в
-    // notifyContentEpochReady() (room.js зовёт её из markContentEpochReady).
-    let pendingFallbackSends = [];
+    // Очередь исходящего чата, накопленная, пока P2P-шина к адресату ещё не
+    // открыта — сливается в notifyBusOpen() (room.js зовёт её из onBusOpen).
+    // Пришла на смену серверному fallback-релею чата: чат ходит только по шине
+    // (DTLS-E2E), а до её открытия конверт ждёт локально, а не уходит через
+    // сервер (см. docs/chat.md).
+    let pendingBusSends = [];
     let getPeerIds = () => [];
     // Права гостей (см. docs/permissions-and-leader.md, «Chat — Partially
     // Server-Enforced»): getLeaderId/getGuestChatAllowed
@@ -1111,7 +1084,7 @@ const ChatPanel = (() => {
       const original = findEditableOriginalById(targetId);
       if (!original) {
         quote.classList.add('chat-reply-quote--missing');
-        quote.textContent = 'сообщение недоступно';
+        quote.textContent = 'message unavailable';
         return quote;
       }
       const overlay = messageOverlays.get(targetId);
@@ -1121,7 +1094,7 @@ const ChatPanel = (() => {
       const textEl = document.createElement('span');
       textEl.className = 'chat-reply-quote-text';
       if (overlay && overlay.deleted) {
-        textEl.textContent = 'Сообщение удалено';
+        textEl.textContent = 'Message deleted';
       } else {
         const bodyText =
           overlay && typeof overlay.editText === 'string' ? overlay.editText : replyPreviewBodyText(original);
@@ -1147,7 +1120,7 @@ const ChatPanel = (() => {
         chip.type = 'button';
         chip.className = 'chat-reaction-chip' + (peersSet.has(peerId) ? ' chat-reaction-chip--own' : '');
         chip.textContent = `${emoji} ${peersSet.size}`;
-        chip.title = peersSet.has(peerId) ? 'Убрать реакцию' : 'Поставить реакцию';
+        chip.title = peersSet.has(peerId) ? 'Remove reaction' : 'Add reaction';
         chip.addEventListener('click', () => sendReactionToggle(msgId, emoji));
         row.appendChild(chip);
       }
@@ -1179,7 +1152,7 @@ const ChatPanel = (() => {
       if (overlay && !overlay.deleted && typeof overlay.editText === 'string') {
         const editedSpan = document.createElement('span');
         editedSpan.className = 'chat-message-meta-edited';
-        editedSpan.textContent = '(изменено)';
+        editedSpan.textContent = '(edited)';
         meta.appendChild(editedSpan);
       }
       return meta;
@@ -1208,7 +1181,7 @@ const ChatPanel = (() => {
       text.className = 'chat-message-text';
       if (isDeleted) {
         text.classList.add('chat-message-text--deleted');
-        text.textContent = 'Сообщение удалено';
+        text.textContent = 'Message deleted';
       } else {
         const bodyText = overlay && typeof overlay.editText === 'string' ? overlay.editText : msg.text;
         renderMessageBody(text, bodyText);
@@ -1240,10 +1213,10 @@ const ChatPanel = (() => {
 
     /** Карандаш — только на СВОИХ text-сообщениях (см. populatePopoverActions); file-offer редактировать нельзя. */
     function buildEditButton(msg) {
-      const { btn } = buildPopoverActionRow(EDIT_ICON_SVG, 'Редактировать');
+      const { btn } = buildPopoverActionRow(EDIT_ICON_SVG, 'Edit');
       btn.className = 'chat-message-action chat-message-action--edit';
-      btn.setAttribute('aria-label', 'Редактировать');
-      btn.title = 'Редактировать';
+      btn.setAttribute('aria-label', 'Edit');
+      btn.title = 'Edit';
       btn.addEventListener('click', () => startEdit(msg));
       return btn;
     }
@@ -1255,10 +1228,10 @@ const ChatPanel = (() => {
      * второго клика — откат в исходную подпись без отправки чего-либо.
      */
     function buildDeleteButton(msg) {
-      const { btn, labelEl } = buildPopoverActionRow(DELETE_ICON_SVG, 'Удалить');
+      const { btn, labelEl } = buildPopoverActionRow(DELETE_ICON_SVG, 'Delete');
       btn.className = 'chat-message-action chat-message-action--delete';
-      btn.setAttribute('aria-label', 'Удалить');
-      btn.title = 'Удалить';
+      btn.setAttribute('aria-label', 'Delete');
+      btn.title = 'Delete';
       let confirmTimer = null;
 
       function resetToIdle() {
@@ -1267,9 +1240,9 @@ const ChatPanel = (() => {
           confirmTimer = null;
         }
         btn.classList.remove('chat-message-action--confirm');
-        labelEl.textContent = 'Удалить';
-        btn.setAttribute('aria-label', 'Удалить');
-        btn.title = 'Удалить';
+        labelEl.textContent = 'Delete';
+        btn.setAttribute('aria-label', 'Delete');
+        btn.title = 'Delete';
       }
 
       btn.addEventListener('click', () => {
@@ -1281,9 +1254,9 @@ const ChatPanel = (() => {
           return;
         }
         btn.classList.add('chat-message-action--confirm');
-        labelEl.textContent = 'Точно удалить?';
-        btn.setAttribute('aria-label', 'Подтвердите удаление');
-        btn.title = 'Нажмите ещё раз, чтобы подтвердить удаление';
+        labelEl.textContent = 'Confirm delete?';
+        btn.setAttribute('aria-label', 'Confirm deletion');
+        btn.title = 'Click again to confirm deletion';
         confirmTimer = setTimeout(resetToIdle, DELETE_CONFIRM_MS);
       });
 
@@ -1324,7 +1297,7 @@ const ChatPanel = (() => {
         // нечего, см. заголовок файла про Ф3).
         const text = document.createElement('div');
         text.className = 'chat-message-text chat-message-text--deleted';
-        text.textContent = 'Сообщение удалено';
+        text.textContent = 'Message deleted';
         item.appendChild(text);
         messagesEl.appendChild(item);
         return;
@@ -1402,7 +1375,7 @@ const ChatPanel = (() => {
       if (state.status === 'unavailable') {
         const note = document.createElement('div');
         note.className = 'chat-file-note';
-        note.textContent = 'Отправитель недоступен';
+        note.textContent = 'Sender unavailable';
         card.appendChild(note);
         return;
       }
@@ -1410,13 +1383,13 @@ const ChatPanel = (() => {
       if (state.status === 'failed') {
         const note = document.createElement('div');
         note.className = 'chat-file-note';
-        note.textContent = 'Не удалось получить файл';
+        note.textContent = 'Failed to receive file';
         card.appendChild(note);
         if (!own) {
           const retryButton = document.createElement('button');
           retryButton.type = 'button';
           retryButton.className = 'chat-file-download-button';
-          retryButton.textContent = 'Повторить';
+          retryButton.textContent = 'Retry';
           retryButton.addEventListener('click', () => requestFileDownload(msg));
           card.appendChild(retryButton);
         }
@@ -1431,7 +1404,7 @@ const ChatPanel = (() => {
       if (!getPeerIds().includes(msg.from)) {
         const note = document.createElement('div');
         note.className = 'chat-file-note';
-        note.textContent = 'Отправитель недоступен';
+        note.textContent = 'Sender unavailable';
         card.appendChild(note);
         return;
       }
@@ -1439,8 +1412,8 @@ const ChatPanel = (() => {
       if (!bus.isOpen(msg.from)) {
         const note = document.createElement('div');
         note.className = 'chat-file-download-button chat-file-download-button--disabled';
-        note.textContent = 'Недоступно: нет прямого соединения';
-        note.title = 'Между вами и отправителем нет прямого P2P-соединения — передача файлов работает только напрямую, через сервер файлы не передаются.';
+        note.textContent = 'Unavailable: no direct connection';
+        note.title = 'There is no direct P2P connection between you and the sender — file transfer only works directly, files are not relayed through the server.';
         card.appendChild(note);
         return;
       }
@@ -1448,7 +1421,7 @@ const ChatPanel = (() => {
       const downloadButton = document.createElement('button');
       downloadButton.type = 'button';
       downloadButton.className = 'chat-file-download-button';
-      downloadButton.textContent = 'Скачать';
+      downloadButton.textContent = 'Download';
       downloadButton.addEventListener('click', () => requestFileDownload(msg));
       card.appendChild(downloadButton);
     }
@@ -1492,7 +1465,7 @@ const ChatPanel = (() => {
       link.className = 'chat-file-download-link chat-file-download-link--compact';
       link.href = state.objectUrl;
       link.download = msg.fileName;
-      link.textContent = 'Скачать';
+      link.textContent = 'Download';
       return link;
     }
 
@@ -1587,7 +1560,7 @@ const ChatPanel = (() => {
       link.className = 'chat-file-download-link';
       link.href = state.objectUrl;
       link.download = msg.fileName;
-      link.textContent = 'Скачать';
+      link.textContent = 'Download';
       card.appendChild(link);
     }
 
@@ -1653,7 +1626,7 @@ const ChatPanel = (() => {
       fileSendMap = new Map();
       fileStates = new Map();
       pendingFileRequests = new Map();
-      pendingFallbackSends = [];
+      pendingBusSends = [];
       cancelReply();
       cancelEditAndClear();
       closeMessagePopover();
@@ -1770,7 +1743,7 @@ const ChatPanel = (() => {
     function startReply(msg) {
       cancelEditAndClear(); // реплай и редактирование взаимоисключаются (см. заголовок файла)
       replyTarget = msg;
-      replyBarText.textContent = `Ответ ${displayName(msg)}: ${truncateText(stripMarkdownForPreview(replyPreviewBodyText(msg)), REPLY_PREVIEW_MAX_LEN)}`;
+      replyBarText.textContent = `Reply to ${displayName(msg)}: ${truncateText(stripMarkdownForPreview(replyPreviewBodyText(msg)), REPLY_PREVIEW_MAX_LEN)}`;
       replyBar.classList.remove('hidden');
       closeMessagePopover();
       textInput.focus();
@@ -1894,14 +1867,14 @@ const ChatPanel = (() => {
 
     /** Скопировать ТЕКУЩИЙ (с учётом правки) текст сообщения в буфер обмена — действие «Копировать» в попапе. */
     function buildCopyButton(msg, overlay) {
-      const { btn, labelEl } = buildPopoverActionRow(COPY_ICON_SVG, 'Копировать текст');
+      const { btn, labelEl } = buildPopoverActionRow(COPY_ICON_SVG, 'Copy text');
       btn.className = 'chat-message-action chat-message-action--copy';
       btn.addEventListener('click', () => {
         const bodyText = overlay && typeof overlay.editText === 'string' ? overlay.editText : msg.text;
         copyTextToClipboard(String(bodyText || ''), () => {
-          labelEl.textContent = 'Скопировано';
+          labelEl.textContent = 'Copied';
           setTimeout(() => {
-            labelEl.textContent = 'Копировать текст';
+            labelEl.textContent = 'Copy text';
           }, 1200);
         });
       });
@@ -1909,7 +1882,7 @@ const ChatPanel = (() => {
     }
 
     function buildReplyActionButton(msg) {
-      const { btn } = buildPopoverActionRow(REPLY_ICON_SVG, 'Ответить');
+      const { btn } = buildPopoverActionRow(REPLY_ICON_SVG, 'Reply');
       btn.className = 'chat-message-action chat-message-action--reply';
       btn.addEventListener('click', () => {
         closeMessagePopover();
@@ -2099,69 +2072,38 @@ const ChatPanel = (() => {
     }
 
     /**
-     * Отправить конверт ОДНОМУ конкретному пиру (адресно) — та же логика
-     * шина/фоллбэк, что и в broadcastEnvelope, но для одного адресата
-     * (используется file-request). Ш1 (E2E-шифрование, см. static/crypto.js):
-     * по шине конверт уходит КАК ЕСТЬ (P2P DataChannel уже E2E за счёт DTLS,
-     * см. static/rtc.js) — а вот серверный fallback шифрует конверт ЦЕЛИКОМ
-     * под K_chat ТЕКУЩЕЙ эпохи, сервер видит только {enc:{v,iv,ct}, epoch}
-     * вместо содержимого.
-     *
-     * Ш3 (forward secrecy, см. docs/e2e-encryption.md §7): эпоха проставляется
-     * ТОЛЬКО на fallback-пути (по шине конверт и так не шифрован этим слоем —
-     * ему эпоха ни для чего не нужна, см. static/room.js: bus уже DTLS-E2E).
-     * Пока isContentEpochReady() ложно (новичок ещё ждёт key-rotate от
-     * лидера, см. room.js: contentEpochReady) — отправку ЭТОГО конкретного
-     * конверта в fallback-путь НЕЛЬЗЯ шифровать устаревшей эпохой 0 (именно
-     * так ушедший участник мог бы её прочитать, раз уже держит K_chat_0) —
-     * поэтому конверт копится в pendingFallbackSends и уходит позже, разом,
-     * через notifyContentEpochReady().
+     * Отправить конверт ОДНОМУ конкретному пиру (адресно) — исключительно по
+     * P2P-шине (DataChannel уже E2E за счёт DTLS, см. static/rtc.js). Если шина
+     * к адресату ещё не открыта, конверт КОПИТСЯ ЛОКАЛЬНО (pendingBusSends) и
+     * уходит при её открытии (см. notifyBusOpen) — серверного fallback-релея
+     * чата больше нет (см. docs/chat.md: чат работает только при P2P/TURN,
+     * медиа без него всё равно не существует). Никакого прикладного шифрования
+     * поверх DTLS чат не требует.
      */
     function sendEnvelopeToPeer(targetPeerId, envelope) {
       if (bus.isOpen(targetPeerId)) {
         bus.sendToPeer(targetPeerId, envelope);
         return;
       }
-      if (!isContentEpochReady()) {
-        pendingFallbackSends.push({ targetPeerId, envelope });
-        return;
-      }
-      const epoch = getCurrentContentEpoch();
-      const key = getChatKeyForEpoch(epoch);
-      if (!key) {
-        // Не должно случаться при корректной раздаче (см. заголовок файла) —
-        // своя ЖЕ текущая эпоха всегда должна быть у нас в карте контентных
-        // ключей. Молча не отправляем, а не шифруем под чем попало.
-        console.error(`Ш3: нет ключа для собственной текущей эпохи ${epoch} — fallback-конверт не отправлен`);
-        return;
-      }
-      RoomCrypto.encrypt(key, envelope).then((enc) => {
-        signaling.send('chat', { targetPeerId, envelope: { enc, epoch } });
-        ConnStats.incFallbackChat();
-      });
+      pendingBusSends.push({ targetPeerId, envelope });
     }
 
-    /** Слить очередь fallback-отправок, накопленную, пока эпоха не была подтверждена (см. sendEnvelopeToPeer/isContentEpochReady) — вызывается room.js через publicApi.notifyContentEpochReady, как только эпоха наконец известна. */
-    function flushPendingFallbackSends() {
-      if (pendingFallbackSends.length === 0) return;
-      const queued = pendingFallbackSends;
-      pendingFallbackSends = [];
+    /** Слить локальную очередь исходящего, накопленную, пока шина к адресатам не открылась (см. sendEnvelopeToPeer) — вызывается из room.js (onBusOpen) через publicApi.notifyBusOpen, когда шина к кому-то открылась. Пробуем всё; что ещё не открылось — снова уходит в очередь. */
+    function notifyBusOpen() {
+      if (pendingBusSends.length === 0) return;
+      const queued = pendingBusSends;
+      pendingBusSends = [];
       for (const { targetPeerId, envelope } of queued) {
         sendEnvelopeToPeer(targetPeerId, envelope);
       }
     }
 
-    /** Вызывается room.js (см. markContentEpochReady), когда текущая эпоха контентных ключей наконец точно известна — отпускает очередь исходящего fallback-чата. */
-    function notifyContentEpochReady() {
-      flushPendingFallbackSends();
-    }
-
     /**
      * Права гостей на стороне ПОЛУЧАТЕЛЯ (см. docs/permissions-and-leader.md,
-     * «Chat — Partially Server-Enforced», и заголовок файла): при
+     * «Chat — Cooperative Only», и заголовок файла): при
      * `guestChat=false` входящие 'text'/'file-offer' от
-     * кого угодно, кроме текущего лидера, молча игнорируются — и по шине, и
-     * по fallback-релею сервера (единая точка входа — dispatchEnvelope).
+     * кого угодно, кроме текущего лидера, молча игнорируются (единая точка
+     * входа — dispatchEnvelope).
      * Остальные kind (reaction/edit/delete/history-*) этим ограничением не
      * затрагиваются: это лёгкие производные операции над уже показанными
      * сообщениями, не самостоятельный текст.
@@ -2169,7 +2111,7 @@ const ChatPanel = (() => {
      * Кооперативная защита: модифицированный клиент получателя может этот
      * фильтр не применять и отрендерить конверт всё равно — сервер P2P-байты
      * не видит и запретить их доставку физически не может (см.
-     * docs/permissions-and-leader.md, «Chat — Partially Server-Enforced»).
+     * docs/permissions-and-leader.md, «Chat — Cooperative Only»).
      */
     function isIncomingEnvelopeAllowed(fromPeerId, envelope) {
       if (envelope.kind !== 'text' && envelope.kind !== 'file-offer') return true;
@@ -2184,7 +2126,7 @@ const ChatPanel = (() => {
     // канал — подмена envelope.from там ничего не даёт злоумышленнику.
     const SELF_ASSERTED_FROM_KINDS = new Set(['text', 'reaction', 'edit', 'delete', 'file-offer']);
 
-    // --- Приём: единая точка для сообщений с шины И с fallback-релея сервера ---
+    // --- Приём: единая точка для сообщений с шины ---
     function dispatchEnvelope(fromPeerId, envelope) {
       if (!envelope || typeof envelope !== 'object' || typeof envelope.kind !== 'string') return;
       // H3: нельзя доверять самозаявленному envelope.from — транспорт знает
@@ -2498,7 +2440,7 @@ const ChatPanel = (() => {
       const files = Array.from(fileList || []);
       for (const file of files) {
         if (file.size > FILE_SIZE_LIMIT_BYTES) {
-          showError(`Файл «${file.name}» больше 25МБ — не отправлен.`);
+          showError(`File "${file.name}" is larger than 25MB — not sent.`);
           continue;
         }
 
@@ -2630,7 +2572,7 @@ const ChatPanel = (() => {
       if (!signaling || !bus) return;
 
       if (!checkClientRateLimit()) {
-        showError('Слишком много сообщений подряд — подождите немного.');
+        showError('Too many messages in a row — please wait a moment.');
         return;
       }
 
@@ -2849,12 +2791,12 @@ const ChatPanel = (() => {
       const end = textInput.selectionEnd;
       const value = textInput.value;
       const selected = value.slice(start, end);
-      const url = window.prompt('Ссылка (URL):', 'https://');
+      const url = window.prompt('Link (URL):', 'https://');
       if (!url) {
         textInput.focus();
         return;
       }
-      const inserted = `[${selected || 'ссылка'}](${url})`;
+      const inserted = `[${selected || 'link'}](${url})`;
       textInput.value = value.slice(0, start) + inserted + value.slice(end);
       const cursor = start + inserted.length;
       textInput.setSelectionRange(cursor, cursor);
@@ -3024,20 +2966,20 @@ const ChatPanel = (() => {
         textInput.disabled = true;
         sendButton.disabled = true;
         attachButton.disabled = true;
-        textInput.placeholder = 'Соединение потеряно.';
+        textInput.placeholder = 'Connection lost.';
         return;
       }
       if (forbiddenByLeader) {
         textInput.disabled = true;
         sendButton.disabled = true;
         attachButton.disabled = true;
-        textInput.placeholder = 'Чат запрещён лидером';
+        textInput.placeholder = 'Chat disabled by the leader';
         return;
       }
       textInput.disabled = false;
       sendButton.disabled = false;
       attachButton.disabled = false;
-      textInput.placeholder = 'Сообщение…';
+      textInput.placeholder = 'Message…';
     }
 
     function enableInput() {
@@ -3056,17 +2998,67 @@ const ChatPanel = (() => {
       applyInputState();
     }
 
+    // Тап по SAS-плашке раскрывает/сворачивает пояснение под шапкой.
+    if (sasButton) {
+      sasButton.addEventListener('click', () => {
+        if (sasNote) sasNote.classList.toggle('hidden');
+      });
+    }
+
+    /**
+     * Обновить SAS «отпечаток комнаты» в шапке чата (см. room.js:
+     * renderRoomSas). `emojis` — массив строк-эмодзи или null/пустой (скрыть).
+     * Разделяем эмодзи узкими пробелами для читаемости при сверке вслух.
+     */
+    function setRoomSas(state, result) {
+      if (!sasButton || !sasEmojiEl) return;
+      sasButton.classList.remove(
+        'chat-sas--ok',
+        'chat-sas--verifying',
+        'chat-sas--mismatch',
+        'chat-sas--unavailable'
+      );
+      if (sasHexEl) sasHexEl.textContent = '';
+
+      if (!state || state === 'hidden') {
+        sasButton.classList.add('hidden');
+        if (sasNote) sasNote.classList.add('hidden');
+        sasEmojiEl.textContent = '';
+        return;
+      }
+      sasButton.classList.remove('hidden');
+
+      if (state === 'ok' && result && Array.isArray(result.emoji)) {
+        sasButton.classList.add('chat-sas--ok');
+        sasEmojiEl.textContent = result.emoji.join(' ');
+        sasButton.setAttribute('aria-label', `Room verification code: ${result.emoji.join(' ')}`);
+        if (sasHexEl && result.hex) sasHexEl.textContent = `Text code: ${result.hex}`;
+      } else if (state === 'mismatch') {
+        sasButton.classList.add('chat-sas--mismatch');
+        sasEmojiEl.textContent = 'verification failed';
+        sasButton.setAttribute('aria-label', 'Room verification failed — codes do not match');
+      } else if (state === 'unavailable') {
+        sasButton.classList.add('chat-sas--unavailable');
+        sasEmojiEl.textContent = 'not verified';
+        sasButton.setAttribute('aria-label', 'Verification unavailable — no direct connection');
+      } else {
+        sasButton.classList.add('chat-sas--verifying');
+        sasEmojiEl.textContent = 'verifying…';
+        sasButton.setAttribute('aria-label', 'Verifying room…');
+      }
+    }
+
     const publicApi = {
       disableInput,
       enableInput,
       setChatForbidden,
+      setRoomSas,
       handleIncomingFileChannel,
-      notifyContentEpochReady,
+      notifyBusOpen,
     };
 
     function handleServerError({ message }) {
-      // Ошибки fallback-релея сервера (envelope > 8KB, серверный rate-limit
-      // на fallback-пути) — тоже показываем в панели, тем же баннером.
+      // Серверные ошибки (напр. rate-limit) — показываем в панели тем же баннером.
       if (message) showError(message);
     }
 
@@ -3079,9 +3071,6 @@ const ChatPanel = (() => {
       initialPeerIds,
       getLeaderId: newGetLeaderId,
       getGuestChatAllowed: newGetGuestChatAllowed,
-      getChatKeyForEpoch: newGetChatKeyForEpoch,
-      getCurrentContentEpoch: newGetCurrentContentEpoch,
-      isContentEpochReady: newIsContentEpochReady,
     }) {
       signaling = newSignaling;
       bus = newBus;
@@ -3090,9 +3079,6 @@ const ChatPanel = (() => {
       getPeerIds = typeof newGetPeerIds === 'function' ? newGetPeerIds : () => [];
       getLeaderId = typeof newGetLeaderId === 'function' ? newGetLeaderId : () => null;
       getGuestChatAllowed = typeof newGetGuestChatAllowed === 'function' ? newGetGuestChatAllowed : () => true;
-      getChatKeyForEpoch = typeof newGetChatKeyForEpoch === 'function' ? newGetChatKeyForEpoch : () => null;
-      getCurrentContentEpoch = typeof newGetCurrentContentEpoch === 'function' ? newGetCurrentContentEpoch : () => 0;
-      isContentEpochReady = typeof newIsContentEpochReady === 'function' ? newIsContentEpochReady : () => true;
 
       clearMessages();
       unreadCount = 0;
@@ -3103,38 +3089,11 @@ const ChatPanel = (() => {
       applyInputState();
       setCollapsed(true);
 
+      // Чат ходит ИСКЛЮЧИТЕЛЬНО по P2P-шине (DataChannel, E2E за счёт DTLS).
+      // Серверного fallback-релея чата больше нет (см. docs/chat.md): если
+      // шина к адресату ещё не открыта, конверт копится локально и уходит при
+      // её открытии (см. sendEnvelopeToPeer/notifyBusOpen), а не через сервер.
       bus.onMessage(dispatchEnvelope);
-      // Ш1/Ш3 (E2E-шифрование + forward secrecy, см. static/crypto.js/room.js):
-      // фоллбэк-релей сервера несёт конверт как {enc:{v,iv,ct}, epoch} (см.
-      // sendEnvelopeToPeer выше) — расшифровываем ключом ИМЕННО той эпохи,
-      // под которой конверт был зашифрован (не обязательно текущей — история/
-      // запоздавшие сообщения могут быть под более старой), ПЕРЕД
-      // dispatchEnvelope; по шине конверт приходит как обычно (не завёрнут,
-      // эпоха ему не нужна — см. заголовок файла). Отсутствующее поле epoch
-      // трактуется как эпоха 0 (обратная совместимость формата, хотя вживую
-      // после этой волны такого конверта прийти уже не должно). Неверный
-      // ключ/эпоха нам неизвестна/повреждённый блоб — тихо логируем и
-      // игнорируем это одно сообщение (не валим всю панель чата — соседние
-      // конверты по шине продолжают работать как ни в чём не бывало).
-      signaling.on('chat', ({ fromPeerId, envelope }) => {
-        if (envelope && typeof envelope === 'object' && envelope.enc) {
-          const epoch = typeof envelope.epoch === 'number' ? envelope.epoch : 0;
-          const key = getChatKeyForEpoch(epoch);
-          if (!key) {
-            console.warn(
-              `Ш3: неизвестная эпоха ${epoch} контентного ключа — fallback-конверт чата проигнорирован (не должно случаться при корректной раздаче, см. docs/e2e-encryption.md)`
-            );
-            return;
-          }
-          RoomCrypto.decrypt(key, envelope.enc)
-            .then((plain) => dispatchEnvelope(fromPeerId, plain))
-            .catch((err) => {
-              console.warn('Не удалось расшифровать fallback-конверт чата (неверный ключ комнаты?):', err);
-            });
-        } else {
-          dispatchEnvelope(fromPeerId, envelope);
-        }
-      });
       signaling.on('error', handleServerError);
 
       const candidates = Array.isArray(initialPeerIds) ? initialPeerIds.slice() : [];

@@ -30,10 +30,10 @@ terms, the server never has access to:
 
 - Video or audio content — media never touches the server at all; it flows
   directly between browsers (see [`webrtc-mesh.md`](webrtc-mesh.md)).
-- Chat content — messages travel over the peer-to-peer data-channel bus;
-  the server is not in that path. The one exception, the addressed fallback
-  relay for a peer whose channel isn't open yet, carries only ciphertext
-  (see [`chat.md` §12](chat.md#12-fallback-through-the-server)).
+- Chat content — messages travel **only** over the peer-to-peer data-channel
+  bus; the server is never in that path in any form. There is no server relay
+  for chat — the earlier ciphertext fallback was removed
+  (see [`chat.md` §12](chat.md#12-no-server-fallback)).
 - File contents, images, or audio clips shared in chat — transferred over a
   dedicated peer-to-peer data channel; never proxied through the server
   under any circumstance, including when a direct connection can't be
@@ -130,14 +130,14 @@ participants to trust a document:
   rather than hard-coded text — so the label can never silently drift out
   of sync with what's actually running.
 - The live connection mode to each other participant — direct
-  peer-to-peer, via a TURN relay, or via the server-side fallback — computed
+  peer-to-peer or via a TURN relay — computed
   from real connection statistics (see
   [`webrtc-mesh.md` §7](webrtc-mesh.md#7-connection-mode-detection)), not
   assumed.
 - A plain-language list of exactly what the server can see (matching
-  [§2](#2-what-the-server-does-see) above), plus **live session counters**
+  [§2](#2-what-the-server-does-see) above), plus a **live session counter**
   for how many messages actually went through the server-relayed signaling
-  path and through the chat fallback path — a running, honest tally rather
-  than a one-time claim, since some server involvement (the bootstrap window
-  before a pair's bus opens) is normal and is shown as such rather than
-  hidden.
+  path — a running, honest tally rather than a one-time claim, since some
+  server involvement (the bootstrap signaling before a pair's bus opens) is
+  normal and is shown as such rather than hidden. (Chat has no server path at
+  all, so there is no chat counter.)

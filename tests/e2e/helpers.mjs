@@ -550,7 +550,7 @@ export async function waitForBusOpenToAllPeers(page, timeoutMs = 8000) {
 /** Оверлей «Ссылка неполная» (Ш1: нет валидного `k`, либо ключ неверен — см. static/room.js: showInvalidLinkOverlay). */
 export async function waitInvalidLinkOverlay(page, timeoutMs = 10_000) {
   await page.waitForFunction(
-    () => document.getElementById('overlay-title')?.textContent === 'Ссылка неполная',
+    () => document.getElementById('overlay-title')?.textContent === 'Link is invalid',
     undefined,
     { polling: 100, timeout: timeoutMs }
   );

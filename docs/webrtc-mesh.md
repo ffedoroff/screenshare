@@ -188,8 +188,10 @@ shows, per peer, one of four states, computed from `pc.getStats()`:
    determine the mode: `p2p` if neither side is a `relay` candidate, `turn`
    otherwise.
 2. If there's no selected pair yet and the bus to that peer isn't open
-   either, the mode is `fallback` — every message to that peer is currently
-   going through the server-relayed signaling path.
+   either, the mode is `fallback` — connection **setup** (offer/answer/ICE/
+   `stream-info`) is currently going through the server-relayed signaling
+   path. Chat does **not** use this path: it waits in a local queue until the
+   bus opens (see [`chat.md` §12](chat.md#12-no-server-fallback)).
 3. Otherwise (no pair yet, but the bus is somehow already open — a race that
    shouldn't normally be reachable), the mode shown is `connecting`.
 

@@ -422,6 +422,28 @@ async function main() {
       return;
     }
 
+    // --- SAS: человекоудобная проверка ключа (commit-reveal, см. docs/sas-verification.md) ---
+    await step('SAS: у всех троих в шапке чата один и тот же непустой код верификации (6 эмодзи), собранный commit-reveal раундом', async () => {
+      const pages = [['Вася', vasyaPage], ['Петя', petyaPage], ['Оля', olyaPage]];
+      // Ждём завершения раунда (state 'ok') у всех — таймер 3с + триггер на bus-open.
+      for (const [, page] of pages) {
+        await waitForClassOnSelector(page, '.chat-sas', 'chat-sas--ok', true, 20000);
+      }
+      const codes = [];
+      for (const [label, page] of pages) {
+        const code = await page.evaluate(() => document.querySelector('.chat-sas-emoji')?.textContent || '');
+        codes.push([label, code]);
+      }
+      const first = codes[0][1];
+      assert.ok(
+        first && first.split(' ').filter(Boolean).length === 6,
+        `код SAS должен быть из 6 эмодзи, получено у Васи: "${first}"`
+      );
+      for (const [label, code] of codes) {
+        assert.equal(code, first, `у ${label} код SAS должен совпадать с остальными ("${code}" != "${first}")`);
+      }
+    });
+
     // --- Вася включает камеру ---
     const vasyaTileSel = await tileSelector('Вася');
     const camOk = await step('Вася включает камеру — у Пети и Оли живое видео в его тайле', async () => {
@@ -474,7 +496,7 @@ async function main() {
         await vasyaPage.waitForFunction(
           () => {
             const rows = Array.from(document.querySelectorAll('#settings-peers-list .settings-peer-row'));
-            return rows.some((row) => row.textContent.includes('напрямую (P2P)'));
+            return rows.some((row) => row.textContent.includes('direct (P2P)'));
           },
           undefined,
           { polling: 200, timeout: 10_000 }
@@ -1083,7 +1105,7 @@ async function main() {
 
           const copyButton = codeBlockEl.locator('.chat-code-block-copy');
           await copyButton.click();
-          await waitUntil(async () => (await copyButton.textContent()) === 'Скопировано', {
+          await waitUntil(async () => (await copyButton.textContent()) === 'Copied', {
             timeoutMs: 2000,
             message: 'кнопка «копировать» должна показать «Скопировано» после клика',
           });
@@ -1339,7 +1361,7 @@ async function main() {
           // У автора: тумбстоун вместо текста, реакции пропали, попап на тумбстоуне больше не открывается.
           await iPage.locator(`${iMsg2Sel} .chat-message-text--deleted`).waitFor({ timeout: 5000 });
           const iTombstoneText = await iPage.locator(`${iMsg2Sel} .chat-message-text`).textContent();
-          assert.equal(iTombstoneText, 'Сообщение удалено', `тумбстоун у автора должен показывать «Сообщение удалено»: ${iTombstoneText}`);
+          assert.equal(iTombstoneText, 'Message deleted', `тумбстоун у автора должен показывать «Message deleted»: ${iTombstoneText}`);
           assert.equal(await iPage.locator(`${iMsg2Sel} .chat-reaction-chip`).count(), 0, 'у автора чипы реакций должны исчезнуть у удалённого сообщения');
           await iPage.locator(iMsg2Sel).locator('.chat-message-meta').click();
           await new Promise((r) => setTimeout(r, 300));
@@ -1352,7 +1374,7 @@ async function main() {
           // У Паши: то же самое — тумбстоун, чипы реакций пропали.
           await pPage.locator(`${pMsg2Sel} .chat-message-text--deleted`).waitFor({ timeout: 5000 });
           const pTombstoneText = await pPage.locator(`${pMsg2Sel} .chat-message-text`).textContent();
-          assert.equal(pTombstoneText, 'Сообщение удалено', `тумбстоун у Паши должен показывать «Сообщение удалено»: ${pTombstoneText}`);
+          assert.equal(pTombstoneText, 'Message deleted', `тумбстоун у Паши должен показывать «Message deleted»: ${pTombstoneText}`);
           await waitUntil(async () => (await pPage.locator(`${pMsg2Sel} .chat-reaction-chip`).count()) === 0, {
             timeoutMs: 5000,
             message: 'у Паши чипы реакций должны исчезнуть у удалённого сообщения',
@@ -1388,7 +1410,7 @@ async function main() {
             const sTombstoneText = await sPage.locator(`${sMsg2Sel} .chat-message-text`).textContent();
             assert.equal(
               sTombstoneText,
-              'Сообщение удалено',
+              'Message deleted',
               `опоздавший должен увидеть тумбстоун вместо оригинала М2: ${sTombstoneText}`
             );
             assert.ok(
@@ -1761,7 +1783,7 @@ async function main() {
 
           const fAudioSizeText = await fAudioCard.locator('.chat-file-meta-size').textContent();
           assert.ok(
-            fAudioSizeText && /Б|КБ|МБ/.test(fAudioSizeText),
+            fAudioSizeText && /B|KB|MB/.test(fAudioSizeText),
             `у аудио должен быть виден человекочитаемый размер: ${fAudioSizeText}`
           );
 
@@ -1819,7 +1841,7 @@ async function main() {
 
           const fVideoSizeText = await fVideoCard.locator('.chat-file-meta-size').textContent();
           assert.ok(
-            fVideoSizeText && /Б|КБ|МБ/.test(fVideoSizeText),
+            fVideoSizeText && /B|KB|MB/.test(fVideoSizeText),
             `у видео должен быть виден человекочитаемый размер: ${fVideoSizeText}`
           );
 
@@ -1953,7 +1975,7 @@ async function main() {
           const tonyaPage = await tonyaContext.newPage();
           await tonyaPage.goto(permRoomUrl);
           await joinRoom(tonyaPage, 'Тоня');
-          await waitOverlayTitle(tonyaPage, 'Ожидание одобрения…');
+          await waitOverlayTitle(tonyaPage, 'Waiting for approval…');
 
           const tonyaRequestCard = lidaPage.locator('.join-request-card', { hasText: 'Тоня' });
           await tonyaRequestCard.waitFor({ state: 'visible', timeout: 8000 });
@@ -1975,12 +1997,12 @@ async function main() {
           try {
             await yuraPage.goto(permRoomUrl);
             await joinRoom(yuraPage, 'Юра');
-            await waitOverlayTitle(yuraPage, 'Ожидание одобрения…');
+            await waitOverlayTitle(yuraPage, 'Waiting for approval…');
 
             const yuraRequestCard = lidaPage.locator('.join-request-card', { hasText: 'Юра' });
             await yuraRequestCard.waitFor({ state: 'visible', timeout: 8000 });
             await yuraRequestCard.locator('.join-request-button--reject').click();
-            await waitOverlayTitle(yuraPage, 'Вход отклонён');
+            await waitOverlayTitle(yuraPage, 'Access denied');
           } finally {
             await yuraContext.close();
           }
@@ -2003,7 +2025,7 @@ async function main() {
           assert.equal(goshaChatState.disabled, true, 'у Гоши инпут чата должен быть задизейблен при guestChat=false');
           assert.equal(
             goshaChatState.placeholder,
-            'Чат запрещён лидером',
+            'Chat disabled by the leader',
             `плейсхолдер должен объяснять запрет: ${goshaChatState.placeholder}`
           );
 
@@ -2053,7 +2075,7 @@ async function main() {
           assert.equal(goshaScreenState.disabled, true, 'кнопка «Экран» у Гоши должна быть задизейблена при guestScreen=false');
           assert.equal(
             goshaScreenState.title,
-            'Запрещено лидером',
+            'Disabled by the leader',
             `title кнопки «Экран» должен объяснять запрет: ${goshaScreenState.title}`
           );
 
@@ -2062,7 +2084,7 @@ async function main() {
           await lidaPage.click('#leave-button');
 
           await goshaPage.waitForFunction(
-            () => document.getElementById('toast')?.textContent === 'Вы стали лидером' && !document.getElementById('toast')?.classList.contains('hidden'),
+            () => document.getElementById('toast')?.textContent === 'You are now the leader' && !document.getElementById('toast')?.classList.contains('hidden'),
             undefined,
             { polling: 50, timeout: 8000 }
           );
@@ -2369,7 +2391,7 @@ async function main() {
             await openMessagePopoverFor(mobilePage, mobilePage.locator(`.chat-message[data-msg-id="${msg3Id}"]`));
             const copyBtn = mobilePage.locator('.chat-message-popover .chat-message-action--copy');
             await copyBtn.click();
-            await waitUntil(async () => (await copyBtn.textContent())?.includes('Скопировано'), {
+            await waitUntil(async () => (await copyBtn.textContent())?.includes('Copied'), {
               timeoutMs: 2000,
               message: 'кнопка «Копировать текст» должна показать «Скопировано» после клика',
             });
@@ -2780,13 +2802,13 @@ async function main() {
           await timerPage.evaluate(() => {
             signaling._dispatch({ type: 'room-expired' });
           });
-          await waitOverlayTitle(timerPage, 'Время созвона истекло (3 часа)');
+          await waitOverlayTitle(timerPage, 'Meeting time is up (3 hours)');
           const afterExpiry = await timerPage.evaluate(() => ({
             actionLabel: document.getElementById('overlay-action-button')?.textContent,
             timerHidden: document.getElementById('room-timer')?.classList.contains('hidden'),
             chatDisabled: document.querySelector('.chat-text-input')?.disabled,
           }));
-          assert.equal(afterExpiry.actionLabel, 'Создать новую', `кнопка оверлея должна вести на создание новой комнаты: ${afterExpiry.actionLabel}`);
+          assert.equal(afterExpiry.actionLabel, 'Create a new one', `кнопка оверлея должна вести на создание новой комнаты: ${afterExpiry.actionLabel}`);
           assert.equal(afterExpiry.timerHidden, true, 'таймер должен скрыться после room-expired (stopRoomTimer)');
           assert.equal(afterExpiry.chatDisabled, true, 'инпут чата должен быть задизейблен после room-expired (teardownMeshMediaChat)');
 
@@ -2798,7 +2820,7 @@ async function main() {
           const titleAfterClose = await timerPage.evaluate(() => document.getElementById('overlay-title')?.textContent);
           assert.equal(
             titleAfterClose,
-            'Время созвона истекло (3 часа)',
+            'Meeting time is up (3 hours)',
             `оверлей «Время истекло» не должен перетираться закрытием сокета: ${titleAfterClose}`
           );
         } finally {
@@ -2807,297 +2829,6 @@ async function main() {
       }
     );
 
-    // --- Ш3: forward secrecy контента при смене состава (см.
-    //     docs/e2e-encryption.md §7) ---
-    //
-    // Ротируются ТОЛЬКО K_chat/K_meta (НЕ K_sig), и только лидером, при
-    // уходе участника (peer-left). Раздача — строго по P2P-шине (bus),
-    // никогда через сервер. `contentEpochs`/`currentContentEpoch` — обычные
-    // top-level `let`/`const` в room.js (классический скрипт, не module —
-    // тот же приём, что и с `bus`/`roomSettings` в других тестах этого
-    // файла), поэтому видны из page.evaluate() напрямую, без всякого
-    // window.__debug-моста.
-    //
-    // Собственный блок ({ ... }), а не отдельная функция — тесту нужны свои
-    // vasyaContext/vasyaPage и т.п., те же имена уже заняты (const) самым
-    // первым сценарием этого файла; блочная область видимости даёт завести
-    // их заново без конфликта, не переименовывая персонажей.
-    //
-    // Комната — через PUT /api/rooms/<id> (см. static/room.js:
-    // restoreRoomViaPut), а не POST: к этому месту файла счёт POST-запросов
-    // (H2: ROOM_CREATION_IP_LIMIT — 10 за 60с с одного IP, см.
-    // src/state.rs) уже насчитывает 10 других шагов этого файла — ещё один
-    // POST здесь мог бы упереться в лимит (не время создания растянуто
-    // равномерно: несколько «лёгких» Ш1-шагов подряд перед этим местом
-    // укладываются в куда меньше 60с). PUT восстановления комнаты, в
-    // отличие от POST её создания, НЕ проверяет этот лимит вовсе (см.
-    // src/main.rs::restore_room) — комната создаётся пустой, БЕЗ лидера:
-    // первый вошедший (Вася) станет лидером автоматически (см.
-    // src/ws.rs::JoinRoom: `!becomes_leader && room.leader_id.is_none()`),
-    // никакого leaderToken не нужно.
-    {
-      const epochRoomId = Array.from({ length: 8 }, () => 'abcdefghijklmnopqrstuvwxyz0123456789'[Math.floor(Math.random() * 36)]).join('');
-      const epochRoomKey = generateRoomKeyBase64url(); // Ш1: см. комментарий у histRoomKey выше
-      const epochRoomUrl = roomUrlWithKey(server.baseUrl, epochRoomId, epochRoomKey);
-
-      const vasyaContext = await browser.newContext();
-      const petyaContext = await browser.newContext();
-      const olyaContext = await browser.newContext();
-      // Нужен, чтобы поймать реальный fallback-фрейм 'chat' на проводе и
-      // проверить его поле `epoch` (см. шаг «fallback-конверт» ниже).
-      await installChatWsSpy(vasyaContext);
-
-      let vasyaPage, petyaPage, olyaPage;
-      let petyaPeerId = null;
-      let olyaEpoch0Raw = null;
-      let preRotationMsg = null;
-      let capturedFallbackEnc = null;
-
-      try {
-        const sceneReadyOk = await step(
-          'Ш3: Вася (лидер), Петя и Оля устанавливают mesh; Петя шлёт сообщение под эпохой 0 (для будущей проверки истории у новичка)',
-          async () => {
-            const putRes = await fetch(`${server.baseUrl}/api/rooms/${epochRoomId}`, { method: 'PUT' });
-            assert.ok(putRes.ok, `PUT /api/rooms/${epochRoomId} ответил статусом ${putRes.status}`);
-
-            vasyaPage = await vasyaContext.newPage();
-            petyaPage = await petyaContext.newPage();
-            olyaPage = await olyaContext.newPage();
-
-            // Вася входит ПЕРВОЙ и ОТДЕЛЬНО от Пети/Оли (не параллельно) —
-            // комната только что создана PUT'ом пустой, без лидера: лидером
-            // становится первый, чьё join-room сервер обработает (см.
-            // src/ws.rs выше). joinRoom() лишь кликает кнопку модалки и не
-            // дожидается ответа сервера — если бы все трое стартовали
-            // join-room без барьера, порядок обработки на сервере не был бы
-            // гарантирован. Дожидаемся короны на тайле Васи — это и есть
-            // подтверждение, что лидерство уже закреплено сервером за ней,
-            // прежде чем впускать остальных.
-            await vasyaPage.goto(epochRoomUrl);
-            await joinRoom(vasyaPage, 'Вася');
-            await waitForOverlayHidden(vasyaPage);
-            await vasyaPage.waitForFunction(
-              () => !document.querySelector('.tile--own .tile-crown')?.classList.contains('hidden'),
-              undefined,
-              { polling: 100, timeout: 5000 }
-            );
-
-            await petyaPage.goto(epochRoomUrl);
-            await olyaPage.goto(epochRoomUrl);
-            await joinRoom(petyaPage, 'Петя');
-            await joinRoom(olyaPage, 'Оля');
-            await waitForOverlayHidden(petyaPage);
-            await waitForOverlayHidden(olyaPage);
-            await waitForTileCount(vasyaPage, 3, 10_000);
-            await waitForTileCount(petyaPage, 3, 10_000);
-            await waitForTileCount(olyaPage, 3, 10_000);
-            // Шина должна быть открыта до ВСЕХ, прежде чем Оля уйдёт —
-            // иначе key-rotate от Васи к Пете лёг бы в очередь RtcPeer
-            // (доставился бы всё равно, но смазал бы тайминг проверки ниже).
-            await waitForBusOpenToAllPeers(vasyaPage);
-            await waitForBusOpenToAllPeers(petyaPage);
-            await waitForBusOpenToAllPeers(olyaPage);
-
-            petyaPeerId = await vasyaPage.evaluate(
-              () => document.querySelector('.tile[data-name="Петя"]').dataset.peerId
-            );
-            // Улика forward secrecy: сырой ключ эпохи 0, который держит Оля
-            // ДО своего ухода — ровно то, чем бы располагал настоящий
-            // ушедший участник (см. проверку «FS» ниже).
-            olyaEpoch0Raw = await olyaPage.evaluate(() => Array.from(contentEpochs.get(0).raw));
-
-            await openChatPanel(vasyaPage);
-            await openChatPanel(petyaPage);
-            await openChatPanel(olyaPage);
-            preRotationMsg = `Ш3-до-ротации-эпоха0-${Date.now()}`;
-            await sendChatMessage(petyaPage, preRotationMsg);
-            assert.ok(
-              await messageTextsInclude(vasyaPage, preRotationMsg),
-              'Вася должен был увидеть сообщение Пети до ротации (эпоха 0, живой mesh)'
-            );
-          }
-        );
-
-        const rotatedOk =
-          sceneReadyOk &&
-          (await step(
-            'Ш3: Оля уходит (peer-left) — Вася (лидер) ротирует контентные ключи; эпоха инкрементнулась и разошлась по шине Пете',
-            async () => {
-              await olyaPage.click('#leave-button');
-              // olyaContext закрывается один раз, в общем finally этого
-              // блока ниже — не здесь, чтобы не рисковать двойным close(),
-              // если этот шаг вообще не выполнится (sceneReadyOk === false).
-
-              await waitForTileCount(vasyaPage, 2, 8000);
-              await waitForTileCount(petyaPage, 2, 8000);
-
-              await waitUntil(async () => (await vasyaPage.evaluate(() => currentContentEpoch === 1)), {
-                timeoutMs: 5000,
-                message: 'у Васи (лидера) currentContentEpoch не стал 1 после ухода Оли',
-              });
-              await waitUntil(async () => (await petyaPage.evaluate(() => currentContentEpoch === 1)), {
-                timeoutMs: 5000,
-                message: 'у Пети currentContentEpoch не стал 1 — не дошёл key-rotate от лидера по шине?',
-              });
-
-              const vasyaEpochCount = await vasyaPage.evaluate(() => contentEpochs.size);
-              const petyaEpochCount = await petyaPage.evaluate(() => contentEpochs.size);
-              assert.equal(vasyaEpochCount, 2, `у Васи должно быть известно 2 эпохи (0 и 1), получено ${vasyaEpochCount}`);
-              assert.equal(petyaEpochCount, 2, `у Пети должно быть известно 2 эпохи (0 и 1), получено ${petyaEpochCount}`);
-
-              // K_sig НЕ ротируется (см. docs/e2e-encryption.md §7.1) —
-              // sigKey остаётся тем же самым объектом на всю жизнь комнаты.
-              const sigUnchanged = await vasyaPage.evaluate(() => typeof sigKey === 'object' && sigKey !== null);
-              assert.equal(sigUnchanged, true, 'sigKey должен остаться валидным CryptoKey (K_sig не ротируется)');
-            }
-          ));
-
-        const fallbackEpochOk =
-          rotatedOk &&
-          (await step(
-            'Ш3: fallback-конверт чата после ротации несёт epoch:1 и Петя корректно его расшифровывает новой эпохой',
-            async () => {
-              // Шина между Васей и Петей и так открыта — форсируем именно
-              // серверный fallback-путь, временно "притворяясь", что канал
-              // к Пете закрыт (единственный воспроизводимый способ проверить
-              // реальный fallback у уже устоявшегося mesh, не разрывая его
-              // по-настоящему).
-              await vasyaPage.evaluate((pid) => {
-                window.__e2eRealBusIsOpen = bus.isOpen.bind(bus);
-                bus.isOpen = (id) => (id === pid ? false : window.__e2eRealBusIsOpen(id));
-              }, petyaPeerId);
-
-              const fallbackMsg = `Ш3-fallback-эпоха1-${Date.now()}`;
-              try {
-                await sendChatMessage(vasyaPage, fallbackMsg);
-                assert.ok(
-                  await messageTextsInclude(petyaPage, fallbackMsg),
-                  'Петя должен был получить и расшифровать fallback-сообщение под новой эпохой'
-                );
-              } finally {
-                await vasyaPage.evaluate(() => {
-                  bus.isOpen = window.__e2eRealBusIsOpen;
-                  delete window.__e2eRealBusIsOpen;
-                });
-              }
-
-              const chatFrames = await chatFramesSentOn(vasyaPage);
-              const targeted = chatFrames.filter(
-                (f) => f.targetPeerId === petyaPeerId && f.envelope && f.envelope.enc
-              );
-              assert.ok(
-                targeted.length > 0,
-                `не нашли ни одного fallback-фрейма 'chat' к Пете: ${JSON.stringify(chatFrames)}`
-              );
-              const lastFrame = targeted[targeted.length - 1];
-              assert.equal(
-                lastFrame.envelope.epoch,
-                1,
-                `fallback-конверт должен нести epoch:1 (текущая эпоха после ротации), получено: ${JSON.stringify(lastFrame.envelope)}`
-              );
-              capturedFallbackEnc = lastFrame.envelope.enc;
-            }
-          ));
-
-        if (fallbackEpochOk) {
-          await step(
-            'Ш3 (forward secrecy): ушедшая Оля (держит только ключ эпохи 0) НЕ может расшифровать конверт новой эпохи',
-            async () => {
-              assert.ok(capturedFallbackEnc, 'нет захваченного зашифрованного конверта новой эпохи из предыдущего шага');
-              const olyaCanStillDecrypt = await vasyaPage.evaluate(async ({ rawArr, enc }) => {
-                const raw = new Uint8Array(rawArr);
-                const keys = await RoomCrypto.deriveContentKeys(raw);
-                try {
-                  await RoomCrypto.decrypt(keys.chat, enc);
-                  return true; // расшифровалось бы — это и была бы поломанная FS
-                } catch (err) {
-                  return false;
-                }
-              }, { rawArr: olyaEpoch0Raw, enc: capturedFallbackEnc });
-              assert.equal(
-                olyaCanStillDecrypt,
-                false,
-                'ушедшая Оля (только ключ эпохи 0) смогла расшифровать конверт новой эпохи — forward secrecy нарушена'
-              );
-            }
-          );
-        } else {
-          skip('Ш3 (forward secrecy): ушедшая Оля не может расшифровать конверт новой эпохи', 'предыдущий шаг (fallback-конверт) не прошёл');
-        }
-
-        if (rotatedOk) {
-          const igorContext = await browser.newContext();
-          let igorPage;
-          try {
-            const igorReadyOk = await step(
-              'Ш3: новичок Игорь входит ПОСЛЕ ротации — запрашивает и получает текущую эпоху у лидера по шине (key-request/key-rotate)',
-              async () => {
-                igorPage = await igorContext.newPage();
-                await igorPage.goto(epochRoomUrl);
-                await joinRoom(igorPage, 'Игорь');
-                await waitForOverlayHidden(igorPage);
-                await waitForTileCount(igorPage, 3, 10_000);
-
-                await waitUntil(async () => (await igorPage.evaluate(() => currentContentEpoch === 1)), {
-                  timeoutMs: 8000,
-                  message: 'Игорь не получил текущую эпоху (1) от лидера по key-request/key-rotate',
-                });
-              }
-            );
-
-            if (igorReadyOk) {
-              await step('Ш3: Игорь видит историю чата под эпохой 0 (сообщение, отправленное до ротации)', async () => {
-                await openChatPanel(igorPage);
-                assert.ok(
-                  await messageTextsInclude(igorPage, preRotationMsg, 8000),
-                  'Игорь должен был увидеть историческое сообщение (эпоха 0), полученное по DataChannel'
-                );
-              });
-
-              await step(
-                'Ш3: Игорь получает и корректно расшифровывает НОВЫЙ fallback-конверт под текущей (уже не нулевой) эпохой',
-                async () => {
-                  const igorPeerId = await vasyaPage.evaluate(
-                    () => document.querySelector('.tile[data-name="Игорь"]')?.dataset.peerId
-                  );
-                  assert.ok(igorPeerId, 'у Васи не нашёлся тайл Игоря');
-
-                  await vasyaPage.evaluate((pid) => {
-                    window.__e2eRealBusIsOpen = bus.isOpen.bind(bus);
-                    bus.isOpen = (id) => (id === pid ? false : window.__e2eRealBusIsOpen(id));
-                  }, igorPeerId);
-
-                  const msgToIgor = `Ш3-новичку-эпоха1-${Date.now()}`;
-                  try {
-                    await sendChatMessage(vasyaPage, msgToIgor);
-                    assert.ok(
-                      await messageTextsInclude(igorPage, msgToIgor),
-                      'Игорь должен был расшифровать fallback-сообщение под текущей эпохой сразу после входа'
-                    );
-                  } finally {
-                    await vasyaPage.evaluate(() => {
-                      bus.isOpen = window.__e2eRealBusIsOpen;
-                      delete window.__e2eRealBusIsOpen;
-                    });
-                  }
-                }
-              );
-            } else {
-              skip('Ш3: Игорь видит историю чата под эпохой 0', 'новичок не получил текущую эпоху');
-              skip('Ш3: Игорь получает новый fallback-конверт под текущей эпохой', 'новичок не получил текущую эпоху');
-            }
-          } finally {
-            await igorContext.close();
-          }
-        } else {
-          skip('Ш3: новичок входит после ротации и получает текущую эпоху', 'ротация ключей не удалась на предыдущем шаге');
-        }
-      } finally {
-        await vasyaContext.close();
-        await petyaContext.close();
-        await olyaContext.close();
-      }
-    }
 
     // --- Build-хэш опубликованной статики (форензический якорь, см.
     // docs/security.md, «Published Build Hash») ---

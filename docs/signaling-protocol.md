@@ -37,9 +37,10 @@ empty (see [`state.rs`](../src/state.rs)).
 
 Since protocol v3, chat travels over the mesh `RTCDataChannel` bus, not this
 WebSocket connection (see [`chat.md`](chat.md)) — the WebSocket protocol
-below carries only: signaling (offer/answer/ICE/`stream-info`), an addressed
-fallback relay for chat envelopes when the data-channel bus to a given peer
-isn't open yet, and (since v4) permission/lobby control. The protocol is
+below carries only: signaling (offer/answer/ICE/`stream-info`) and (since v4)
+permission/lobby control. There is **no** server relay for chat: the earlier
+addressed `chat`/`envelope` fallback was removed (see
+[`chat.md` §12](chat.md#12-no-server-fallback)). The protocol is
 **additive**: an older client that doesn't know a newer field or message type
 keeps working (see [§8](#8-versioning--backward-compatibility)).
 
@@ -132,7 +133,6 @@ default).
 | `answer` | `targetPeerId`, `sdp` | An SDP answer to any other participant; same cap. |
 | `ice-candidate` | `targetPeerId`, `candidate` | A trickled ICE candidate to any peer; same cap. |
 | `stream-info` | `targetPeerId`, `info` (opaque JSON) | Out-of-band info relayed exactly like offer/answer/ICE — used by the frontend to associate incoming tracks with peers/labels (see [`webrtc-mesh.md`](webrtc-mesh.md)). |
-| `chat` | `targetPeerId`, `envelope` (opaque JSON, ≤8KB) | The addressed **fallback** relay for one chat envelope — used only when the mesh data-channel bus to `targetPeerId` isn't open yet. The primary chat path never touches this message (see [`chat.md`](chat.md)). |
 | `share-start` | — | Request to start screen sharing; granted only if no one else currently holds it. |
 | `share-stop` | — | Release screen sharing; a no-op unless sent by the current holder. |
 | `update-settings` | `settings: RoomSettings` | Replace the room's settings wholesale (guest chat/audio/video/screen permissions, waiting-room toggle). Leader only. |
@@ -161,7 +161,6 @@ for the full model):
 | `share-started` | `peerId` | Everyone in the room, including the initiator (one render path for all) |
 | `share-rejected` | `busyPeerId?` (who holds it, on a busy conflict), `reason?` (`"forbidden"` on a permission denial — `busyPeerId` absent in that case) | Only the requester of `share-start` |
 | `share-stopped` | `peerId` | Everyone in the room — on explicit stop, on the holder disconnecting, or when the leader revokes `guestScreen` mid-share |
-| `chat` | `fromPeerId`, `envelope` | The addressed target peer — fallback relay, mirrors client `chat` |
 | `waiting` | — | A new arrival, instead of `joined`, while they're in the waiting room |
 | `join-request` | `peerId`, `name?` | The leader — a new (or re-delivered, after a leader change) pending arrival |
 | `join-request-cancelled` | `peerId` | The leader — a waiting arrival disconnected before a decision |
@@ -179,15 +178,13 @@ for the full model):
   are routed from sender to `targetPeerId` (any other participant in the
   sender's room) without the server interpreting their payload.
 - **Size caps.** Signaling relay payloads (`sdp`/`candidate`/`info`) are
-  capped at 16KB serialized; the chat envelope fallback path is capped
-  separately at 8KB. Oversized payloads are rejected with `error` and never
-  relayed. The WebSocket frame/message itself is additionally capped at 64KB
-  at the transport level — see [`security.md`](security.md) for the full
+  capped at 16KB serialized. Oversized payloads are rejected with `error` and
+  never relayed. The WebSocket frame/message itself is additionally capped at
+  64KB at the transport level — see [`security.md`](security.md) for the full
   rationale.
 - **Rate limits.** One shared sliding-window counter covers all relay types
-  on a connection combined (offer/answer/ICE/`stream-info`/chat) so an
-  attacker can't dodge a per-type limit by alternating message types; chat
-  additionally has its own, stricter limit on top. See
+  on a connection combined (offer/answer/ICE/`stream-info`) so an attacker
+  can't dodge a per-type limit by alternating message types. See
   [`security.md`](security.md) for the exact numbers and reasoning.
 - **Unknown targets are silently dropped.** A `targetPeerId` that has already
   left is a normal race, not an error — the message is simply not relayed
@@ -195,9 +192,11 @@ for the full model):
 - **Waiting arrivals cannot relay.** A peer sitting in the waiting room is
   not a participant and cannot send or receive relayed messages until
   admitted.
-- **Permission-gated message types.** `chat` and `share-start` are checked
-  against the room's current `RoomSettings` for non-leader senders before
-  being processed (see [`permissions-and-leader.md`](permissions-and-leader.md)).
+- **Permission-gated message types.** `share-start` is checked against the
+  room's current `RoomSettings` for non-leader senders before being processed.
+  Chat is no longer server-gated — it never reaches the server, so its
+  `guestChat` permission is cooperative only (see
+  [`permissions-and-leader.md`](permissions-and-leader.md)).
 
 ## 6. Heartbeat (Ping/Pong)
 

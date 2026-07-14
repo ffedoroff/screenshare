@@ -12,6 +12,7 @@
 - [8. Meeting Duration Ceiling](#8-meeting-duration-ceiling)
 - [9. Known Boundaries](#9-known-boundaries)
 - [10. Published Build Hash — Verifying Served Static](#10-published-build-hash--verifying-served-static)
+- [11. SAS Verification — Human-Checkable MITM Protection](#11-sas-verification--human-checkable-mitm-protection)
   - [10.1 What Gets Published, and Where](#101-what-gets-published-and-where)
   - [10.2 Recomputing the Hash Yourself](#102-recomputing-the-hash-yourself)
   - [10.3 Not in the Link, Not in the QR](#103-not-in-the-link-not-in-the-qr)
@@ -49,9 +50,10 @@ and states known gaps plainly rather than implying full coverage.
 | A hostile origin reading camera/microphone/screen through an embedded frame | Mitigated | `Permissions-Policy` restricts capture APIs to `self` (M2, [§6](#6-m2--security-headers--csp)) |
 | A meeting running indefinitely, accumulating state forever | Mitigated | Hard maximum meeting lifetime, enforced by a background reaper regardless of live participants ([§8](#8-meeting-duration-ceiling)) |
 | A guest bypassing a chat/audio/video restriction via a modified client | **Not fully mitigated — cooperative only** | See [`permissions-and-leader.md` §7](permissions-and-leader.md#7-guest-permissions--how-theyre-actually-enforced) and [§9](#9-known-boundaries) below |
-| Recovering plaintext of a past meeting after the room key leaks | **Not mitigated** (signaling); **Partially mitigated** (fallback chat content/names, going forward from a membership change) | No forward secrecy for `K_sig`/signaling — see [`e2e-encryption.md` §6](e2e-encryption.md#6-known-limitations). Content keys (`K_chat`/`K_meta`) rotate when a participant leaves or is rejected at the lobby — see [`e2e-encryption.md` §7](e2e-encryption.md#7-forward-secrecy-for-content-on-membership-change-ш3) |
+| Recovering plaintext of a past meeting after the room key leaks | **Not mitigated** | No forward secrecy — `K_sig`/`K_meta` are derived from `k` once and never rotated (see [`e2e-encryption.md` §6](e2e-encryption.md#6-known-limitations)). Chat/media never touch the server (P2P, DTLS-E2E — nothing server-side to recover); the former content-key epoch rotation was removed with the chat fallback (see [`chat.md` §12](chat.md#12-no-server-fallback)) |
 | A leaked/guessed room id or link granting access | Inherent to the model, mitigated by entropy | The link itself is the only credential; room ids are drawn from a large enough space that guessing one is impractical (see [`privacy.md`](privacy.md)) |
 | A compromised/malicious static-file host (Ш2 split-origin, [`self-hosting.md` §1.2](self-hosting.md#12-split-origin-frontend--signaling-separated)) silently serving tampered frontend JS | **Forensic checkpoint only, not preventive** | Reproducible SHA-256 of the deployed bundle, published to an independent channel (GitHub Release) the static host doesn't control (§10, [§10.4](#104-what-this-doesnt-protect-against) for exactly what this doesn't cover) |
+| An active MITM (malicious relay, or an attacker controlling link delivery) handing different room keys to different participants and bridging the halves | **Detected by human out-of-band comparison** | Commit-before-reveal SAS: six emoji per room that agree across honest participants unless bridged; residual attack is a `2^-36` blind guess (§11, [`sas-verification.md`](sas-verification.md)) |
 
 ## 3. H1 — Ephemeral TURN Credentials
 
@@ -150,9 +152,9 @@ mitigation, a participant could set it to another participant's peer id and
 have a message (or an edit/delete of someone else's message) render, or be
 authorized, as if it came from that other person. The fix normalizes
 `envelope.from` to the message's true transport-level sender — the peer id
-that actually delivered the data-channel message, or the peer id the server
-itself attaches on the fallback path — before any rendering or authorship
-check happens, for every envelope kind that carries authorship.
+that actually delivered the data-channel message (chat only ever travels over
+the P2P bus now; there is no server relay path for it) — before any rendering
+or authorship check happens, for every envelope kind that carries authorship.
 
 ## 6. M2 — Security Headers & CSP
 
@@ -214,14 +216,11 @@ Stated plainly, not buried:
   mechanism, even in principle, for the server to detect or prevent that
   without becoming a media/data relay itself — which would contradict the
   product's core privacy property (see [`PRD.md` §6.1](PRD.md#61-nfr-inclusions)).
-- **No forward secrecy for signaling** (`K_sig` is never rotated — see
-  [`e2e-encryption.md` §7.7](e2e-encryption.md#77-what-this-does-and-doesnt-fix--stated-plainly)),
-  and forward secrecy for content (`K_chat`/`K_meta`, rotated on membership
-  change) is **partial**, not a general ratchet — see
-  [`e2e-encryption.md` §7](e2e-encryption.md#7-forward-secrecy-for-content-on-membership-change-ш3)
-  for exactly what it covers (fallback-relayed chat content and names, going
-  forward from a departure/lobby rejection) and what it plainly doesn't
-  (signaling, a newcomer's own name, post-compromise security).
+- **No forward secrecy.** `K_sig`/`K_meta` are derived from `k` once and never
+  rotated (see [`e2e-encryption.md` §6](e2e-encryption.md#6-known-limitations)).
+  The former content-key epoch rotation only ever protected the server-relayed
+  chat fallback and was removed with it (chat is P2P/DTLS only now) — see
+  [`chat.md` §12](chat.md#12-no-server-fallback).
 - **Per-IP rate limiting is not attacker-proof.** Client IP is inferred from
   proxy headers with a direct-connection fallback; a sufficiently motivated
   attacker behind a spoofable or absent proxy chain could evade it. The goal
@@ -375,3 +374,33 @@ Stated plainly, not buried:
   [`self-hosting.md` §1.2](self-hosting.md#12-split-origin-frontend--signaling-separated),
   where the operator has intentionally chosen not to run their own static
   hosting.
+
+## 11. SAS Verification — Human-Checkable MITM Protection
+
+The end-to-end signaling encryption ([`e2e-encryption.md`](e2e-encryption.md))
+contains a passive server, and an active server that only relays: neither can
+read or forge what it carries without the room key `k`, and the browser refuses
+any DTLS connection whose certificate doesn't match the (authenticated) SDP.
+The one scenario that chain cannot cover is an active man-in-the-middle who
+**poisons the trust anchor itself** — the link. An attacker who controls link
+delivery, or who fully controls the relay and is willing to run an active
+bridge, can hand *different* room keys to different participants and stitch the
+two encrypted halves together. Every ciphertext still decrypts cleanly, because
+each half is internally consistent; the cryptography worked, but against a key
+the attacker chose.
+
+Because the product deliberately has no identity/PKI layer (see
+[`e2e-encryption.md` §6](e2e-encryption.md#6-known-limitations) on trust between
+participants), it closes this gap the way secure phone systems do: a **Short
+Authentication String** — six emoji derived from a **commit-before-reveal**
+round bound to the DTLS fingerprints — that participants compare out-of-band. A
+naive `HKDF(k, fingerprints)` SAS would be worthless here (a birthday grind
+forces a collision in ~0.35 s); the commitment removes the grind, leaving only
+a `2^-36` blind guess per call. The full attack analysis, protocol, wire
+format, and threat model are in **[`sas-verification.md`](sas-verification.md)**.
+
+**Boundary, stated plainly:** this only works if humans *actually compare* the
+emoji over a channel where they recognize each other (voice/face). It
+authenticates "one un-bridged session over the same media path," not identity,
+and it detects rather than prevents — on a mismatch the UI warns, and hanging
+up is the human's call.

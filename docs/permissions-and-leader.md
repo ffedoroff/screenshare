@@ -10,7 +10,7 @@
 - [6. The Waiting Room (Lobby)](#6-the-waiting-room-lobby)
 - [7. Guest Permissions & How They're Actually Enforced](#7-guest-permissions--how-theyre-actually-enforced)
   - [7.1 Screen Sharing — Server-Enforced](#71-screen-sharing--server-enforced)
-  - [7.2 Chat — Partially Server-Enforced](#72-chat--partially-server-enforced)
+  - [7.2 Chat — Cooperative Only](#72-chat--cooperative-only)
   - [7.3 Audio & Video — Receiver-Enforced Only](#73-audio--video--receiver-enforced-only)
 
 <!-- /toc -->
@@ -130,19 +130,19 @@ guest screen sharing is revoked **while** a guest is actively presenting,
 the server itself ends the share (`share-stopped` to everyone) without
 waiting for the guest's client to cooperate.
 
-### 7.2 Chat — Partially Server-Enforced
+### 7.2 Chat — Cooperative Only
 
-The server only controls its own addressed **fallback relay** (see
-[`chat.md` §12](chat.md#12-fallback-through-the-server)): with
-`guestChat=false`, a guest's `chat` message over that path gets `error`
-instead of being relayed; the leader can always use it. The **primary** chat
-path — the mesh `RTCDataChannel` bus directly between browsers — is
-something the server physically never sees, so a modified/non-cooperative
-guest client could, in principle, keep sending chat messages over the bus in
-spite of this setting; the server has no way to detect or block that,
-because it has no visibility into that channel at all (see
-[`privacy.md`](privacy.md) — the server neither stores nor can gate a
-peer-to-peer channel it has no access to).
+Chat travels **only** over the mesh `RTCDataChannel` bus directly between
+browsers — the server physically never sees it, and there is no server relay
+for chat any more (the earlier addressed fallback was removed, see
+[`chat.md` §12](chat.md#12-no-server-fallback)). So `guestChat` is enforced
+**cooperatively, on the client only**: a well-behaved guest client disables
+its own input and honours the setting, but a modified/non-cooperative client
+could keep sending over the bus, and the server has no way to detect or block
+that — it has no visibility into that channel at all. This is the same
+cooperative model as audio/video/screen below. (Previously the server could
+gate chat on its fallback relay path; with that path gone, that partial
+server enforcement is gone too.)
 
 ### 7.3 Audio & Video — Receiver-Enforced Only
 

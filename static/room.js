@@ -25,12 +25,8 @@
 //
 // Ключ комнаты (Ш1, E2E-шифрование, см. static/crypto.js): `k` парсится ЗДЕСЬ
 // ЖЕ — до того, как страница успела показать что-либо, и до какого-либо
-// обращения к сигналингу; от него позже выводятся sigKey/metaKey и эпоха 0
-// контентных ключей (см. deriveRoomKeys). Ш3 (forward secrecy контента при
-// смене состава, см. docs/e2e-encryption.md §7): лидер может выпустить
-// НОВУЮ эпоху K_chat/K_meta поверх этой — см. contentEpochs/
-// rotateContentKeysIfLeader ниже; sigKey остаётся неизменным на всю жизнь
-// комнаты.
+// обращения к сигналингу; от него выводятся sigKey (сигналинг) и metaKey
+// (имя участника) — см. deriveRoomKeys. Оба неизменны на всю жизнь комнаты.
 const { initialLeaderToken, roomKeyBase64url } = (() => {
   const hash = location.hash;
   const ltMatch = hash.match(/(?:^|[&#])lt=([^&]+)/);
@@ -101,7 +97,6 @@ const settingsCryptoRowEl = document.getElementById('settings-crypto-row');
 const settingsCryptoTextEl = document.getElementById('settings-crypto-text');
 const settingsPeersListEl = document.getElementById('settings-peers-list');
 const settingsSignalingCountEl = document.getElementById('settings-signaling-count');
-const settingsFallbackCountEl = document.getElementById('settings-fallback-count');
 const settingsBuildRowEl = document.getElementById('settings-build-row');
 const settingsBuildTextEl = document.getElementById('settings-build-text');
 
@@ -146,38 +141,14 @@ if (!screenShareSupported) {
 // --- Ш1: криптографические ключи комнаты (см. static/crypto.js) ---
 // Выводятся один раз при старте страницы из roomKeyBase64url (см. init/
 // deriveRoomKeys ниже) — null, пока вывод не завершился (или не начинался).
-let sigKey = null; // K_sig — sdp/candidate/info в серверном релее (НЕ ротируется, см. Ш3 ниже)
-let metaKey = null; // K_meta эпохи 0 — отображаемое имя участника в join-room (см. Ш3: имя новичка ВСЕГДА эпохи 0)
+let sigKey = null; // K_sig — sdp/candidate/info в серверном релее
+let metaKey = null; // K_meta — отображаемое имя участника в join-room
 // Взводится один раз на первую же неудачную расшифровку входящего
 // (SDP/ICE/stream-info с серверного релея) — почти всегда значит, что ключ
 // комнаты неверный (см. handleCryptoFailureOnce). Отдельно от terminalState,
 // чтобы не показать оверлей дважды при параллельных отказах нескольких
 // пиров сразу.
 let cryptoFailureHandled = false;
-
-// --- Ш3: forward secrecy контента при смене состава (см.
-// docs/e2e-encryption.md §7) ---
-//
-// Ротируются ТОЛЬКО контентные ключи (K_chat/K_meta) — K_sig выше НЕ
-// ротируется никогда. Map<epoch:number, {raw:Uint8Array, chat:CryptoKey,
-// meta:CryptoKey}> — эпоха 0 заполняется в deriveRoomKeys() тем же
-// материалом, что и `k`. Старые эпохи НЕ выбрасываются (нужны для истории/
-// запоздавших fallback-конвертов под прежней эпохой) — память ничтожна
-// (несколько эпох за ≤3ч жизни комнаты). `raw` (сырые байты, не только
-// производные CryptoKey) хранится специально — лидеру нужно уметь заново
-// переслать его новичку по key-request (CryptoKey из deriveKey создаётся
-// неэкспортируемым, см. static/crypto.js: deriveContextKey).
-const contentEpochs = new Map();
-let currentContentEpoch = 0;
-// false у новичка сразу после входа, ЕСЛИ в комнате уже кто-то есть и это не
-// он сам лидер — до тех пор, пока не получен ответ на key-request (см.
-// createRemotePeer: onBusOpen) или не истёк CONTENT_EPOCH_REQUEST_TIMEOUT_MS
-// (после которого сдаёмся и шлём под тем, что знаем — доступность важнее).
-// Пока false — исходящий fallback-чат ставится в очередь (см.
-// static/chat.js: isContentEpochReady/notifyContentEpochReady).
-let contentEpochReady = true;
-let contentEpochRequestSent = false;
-const CONTENT_EPOCH_REQUEST_TIMEOUT_MS = 3000;
 
 // --- Общее состояние комнаты/сигналинга ---
 let signaling = null;
@@ -190,6 +161,34 @@ let terminalState = false;
 // ICE-серверы, полученные один раз при первой загрузке страницы — переиспользуются
 // при создании пиров как при обычных peer-joined, так и при реконнект-сверке.
 let iceServersCache = null;
+
+// --- SAS: человекоудобная проверка ключа (см. static/crypto.js: deriveSas,
+// docs/security.md «SAS / MITM») ---
+//
+// ОДИН DTLS-сертификат на всю сессию, переиспользуемый во всех
+// RTCPeerConnection этого участника (передаётся в RtcPeer через certificate)
+// — чтобы у нас был единственный стабильный фингерпринт, одинаково видимый
+// всеми пирами. Иначе браузер сгенерировал бы новый сертификат на каждое
+// соединение и «отпечаток комнаты» не сошёлся бы. Генерируется один раз в
+// connectAndJoin (ensureSessionCertificate) и переживает reconnect.
+let sessionCertificate = null;
+let ownCertFingerprint = null; // фингерпринт нашего sessionCertificate (нормализуется в crypto.js)
+
+// --- SAS v2: commit-before-reveal раунд (см. docs/sas-verification.md) ---
+//
+// Раунд идентифицируется roundId = hash(состав по peerId ‖ их фингерпринты).
+// Смена состава ИЛИ любого фингерпринта -> новый roundId -> свежий раунд с
+// новыми нонсами (это и закрывает грайнд сертификата после ревила, §7.2).
+let sasCurrentRoundId = null; // roundId текущего раунда, либо null
+let sasRoundMembers = null; // снапшот [{peerId, fingerprint}] на старте раунда (фиксированный ожидаемый состав)
+let sasMyNonce = null; // наш нонс текущего раунда (Uint8Array 32)
+let sasCommits = new Map(); // peerId -> commitHex (свой + принятые с шины)
+let sasReveals = new Map(); // peerId -> nonce (Uint8Array), свой + принятые и (позже) проверяемые
+let sasRevealed = false; // раскрыли ли мы уже свой нонс в этом раунде (гейт: только после всех коммитов)
+let sasState = 'hidden'; // hidden | unavailable | verifying | ok | mismatch
+let sasResult = null; // { emoji:[...], hex } когда state==='ok'
+let sasRefreshTimer = null;
+const SAS_REFRESH_MS = 3000;
 
 // --- Авто-reconnect сигналинга (переживает деплой/рестарт сервера) ---
 //
@@ -421,12 +420,6 @@ async function deriveRoomKeys() {
     const keys = await RoomCrypto.deriveKeys(rawKey);
     sigKey = keys.sig;
     metaKey = keys.meta;
-    // Ш3: `k` — это и есть материал эпохи 0 контентных ключей (chat/meta);
-    // хранится в contentEpochs как ЛЮБАЯ другая эпоха (см. заголовок раздела
-    // выше), чтобы вся остальная логика (chatKeyForEpoch/applyContentEpoch)
-    // не различала эпоху 0 как особый случай.
-    contentEpochs.set(0, { raw: rawKey, chat: keys.chat, meta: keys.meta });
-    currentContentEpoch = 0;
     return true;
   } catch (err) {
     console.error('Не удалось вывести криптографические ключи комнаты:', err);
@@ -445,9 +438,9 @@ function showInvalidLinkOverlay() {
   // когда showJoinModal() вообще не успел выполниться.
   hideJoinModal();
   showOverlay({
-    title: 'Ссылка неполная',
-    text: 'Попросите новую ссылку у участника комнаты.',
-    actionLabel: 'На главную',
+    title: 'Link is invalid',
+    text: 'Ask a room participant for a new link.',
+    actionLabel: 'Go home',
   });
 }
 
@@ -493,111 +486,25 @@ async function decryptPeerName(cipherName) {
   }
 }
 
-// ---------- Ш3: forward secrecy — ротация контентных ключей по эпохам ----------
-//
-// См. docs/e2e-encryption.md §7 для полной модели; здесь только механика.
-// Инвариант: K_sig НИКОГДА не ротируется (см. sigKey выше) — эпохи касаются
-// исключительно K_chat/K_meta, и раздаются ИСКЛЮЧИТЕЛЬНО по P2P-шине
-// (bus.sendToPeer/bus.onMessage) — сырой ключ эпохи никогда не проходит
-// через сервер ни в каком виде, даже зашифрованным.
-
-/** CryptoKey чата нужной эпохи (или null, если эта эпоха нам ещё/уже неизвестна) — см. static/chat.js: getChatKeyForEpoch. */
-function chatKeyForEpoch(epoch) {
-  const entry = contentEpochs.get(epoch);
-  return entry ? entry.chat : null;
-}
-
-/** Взводится, когда текущая эпоха наконец точно известна (сразу у большинства, у новичка — после key-request/таймаута) — снимает очередь исходящего fallback-чата, см. static/chat.js: notifyContentEpochReady. Идемпотентно. */
-function markContentEpochReady() {
-  if (contentEpochReady) return;
-  contentEpochReady = true;
-  if (chat) chat.notifyContentEpochReady();
-}
-
-/**
- * Применить входящий `{epoch, key}` из key-rotate (см. bus.onMessage ниже) —
- * и чужая ротация от лидера, и адресный ответ на наш собственный key-request
- * приходят в одном и том же формате. Идемпотентно: повторная доставка уже
- * известной эпохи не пересчитывает ключ заново (HKDF — не бесплатная
- * операция, а бывает как минимум двойная доставка — бродкаст лидера мог
- * застать нас уже знающими эту эпоху из ответа на key-request, и наоборот).
- */
-async function applyContentEpoch(epoch, keyBase64url) {
-  if (typeof epoch !== 'number' || !Number.isInteger(epoch) || epoch < 0) return;
-  if (typeof keyBase64url !== 'string' || !keyBase64url) return;
-  if (contentEpochs.has(epoch)) {
-    if (epoch > currentContentEpoch) currentContentEpoch = epoch;
-    markContentEpochReady();
-    return;
-  }
-  let raw;
-  try {
-    raw = RoomCrypto.base64urlToBytes(keyBase64url);
-  } catch (err) {
-    console.error('Ш3: не удалось декодировать ключ эпохи из key-rotate:', err);
-    return;
-  }
-  try {
-    const keys = await RoomCrypto.deriveContentKeys(raw);
-    contentEpochs.set(epoch, { raw, chat: keys.chat, meta: keys.meta });
-    if (epoch > currentContentEpoch) currentContentEpoch = epoch;
-    markContentEpochReady();
-  } catch (err) {
-    console.error('Ш3: не удалось вывести контентные ключи новой эпохи:', err);
-  }
-}
-
-/**
- * Только ЛИДЕР и только при реальной смене состава — участник ушёл
- * (peer-left) или отклонён в лобби (reject) — см. вызовы в
- * registerSignalingHandlers/buildJoinRequestCardEl. Генерирует новый
- * случайный 32-байтный ключ, инкрементит эпоху и рассылает её ТЕКУЩИМ пирам
- * ИСКЛЮЧИТЕЛЬНО по шине (см. заголовок раздела). Пустая комната после ухода
- * (peers.size===0) — рассылать некому, ротацию пропускаем: лишняя эпоха без
- * единого получателя не даёт никакого выигрыша в forward secrecy, только
- * шум.
- */
-async function rotateContentKeysIfLeader() {
-  if (!isLeader || peers.size === 0) return;
-  const raw = RoomCrypto.generateRoomKey();
-  let keys;
-  try {
-    keys = await RoomCrypto.deriveContentKeys(raw);
-  } catch (err) {
-    console.error('Ш3: не удалось сгенерировать новую эпоху контентных ключей:', err);
-    return;
-  }
-  currentContentEpoch += 1;
-  contentEpochs.set(currentContentEpoch, { raw, chat: keys.chat, meta: keys.meta });
-  const payload = { kind: 'key-rotate', epoch: currentContentEpoch, key: RoomCrypto.bytesToBase64url(raw) };
-  for (const peerId of peers.keys()) {
-    // bus.sendToPeer очередит отправку внутри RtcPeer, если канал конкретно
-    // к этому пиру почему-то ещё не открыт (редкий край) — не теряется.
-    bus.sendToPeer(peerId, payload);
-  }
-}
-
-// Приём с шины: чужая ротация (от лидера) ИЛИ адресный ответ на наш
-// key-request — оба несут одинаковый {kind:'key-rotate', epoch, key}.
-bus.onMessage((_fromPeerId, obj) => {
-  if (!obj || obj.kind !== 'key-rotate') return;
-  applyContentEpoch(obj.epoch, obj.key).catch((err) =>
-    console.error('Ш3: обработка key-rotate завершилась с ошибкой:', err)
-  );
-});
-
-// Приём с шины: key-request — отвечает ТОЛЬКО текущий лидер, ТОЛЬКО
-// запросившему (адресно), текущей эпохой целиком (не историей всех эпох —
-// новичку живые сообщения важнее, а эпоху 0 он и так уже знает из #k).
+// SAS v2 (см. docs/sas-verification.md, стейт-машина ниже). fromPeerId —
+// АУТЕНТИФИЦИРОВАННЫЙ транспортный отправитель (bus зовёт обработчики с ним,
+// см. H3 в docs/security.md): сообщения не несут self-declared id, подмена
+// автора невозможна. Сообщения не своего раунда игнорируются.
 bus.onMessage((fromPeerId, obj) => {
-  if (!obj || obj.kind !== 'key-request' || !isLeader) return;
-  const entry = contentEpochs.get(currentContentEpoch);
-  if (!entry) return;
-  bus.sendToPeer(fromPeerId, {
-    kind: 'key-rotate',
-    epoch: currentContentEpoch,
-    key: RoomCrypto.bytesToBase64url(entry.raw),
-  });
+  if (!obj || obj.kind !== 'sas-commit') return;
+  if (obj.round !== sasCurrentRoundId || typeof obj.commit !== 'string') return;
+  if (!sasCommits.has(fromPeerId)) sasCommits.set(fromPeerId, obj.commit);
+  sasTryComplete().catch((err) => console.warn('SAS: обработка sas-commit не удалась:', err));
+});
+bus.onMessage((fromPeerId, obj) => {
+  if (!obj || obj.kind !== 'sas-reveal') return;
+  if (obj.round !== sasCurrentRoundId || typeof obj.nonce !== 'string') return;
+  try {
+    sasReveals.set(fromPeerId, RoomCrypto.base64urlToBytes(obj.nonce));
+  } catch {
+    return;
+  }
+  sasTryComplete().catch((err) => console.warn('SAS: обработка sas-reveal не удалась:', err));
 });
 
 // ---------- Ненавязчивые сообщения ----------
@@ -785,7 +692,7 @@ function createTile(peerId, name, isOwn) {
 
   const label = document.createElement('div');
   label.className = 'tile-name';
-  label.textContent = isOwn ? `Вы${trimmedName ? ` (${trimmedName})` : ''}` : (trimmedName || 'Гость');
+  label.textContent = isOwn ? `You${trimmedName ? ` (${trimmedName})` : ''}` : (trimmedName || 'Guest');
 
   // Корона лидера (см. docs/permissions-and-leader.md) — скрыта по умолчанию,
   // показывается/прячется через setLeaderIndicator() при смене leaderId.
@@ -826,7 +733,7 @@ function setTileMicOffIndicator(tile, micOff) {
 
 function updateParticipantCount() {
   const total = 1 + peers.size;
-  participantCountEl.textContent = `Участников: ${total} / 6`;
+  participantCountEl.textContent = `Participants: ${total} / 6`;
   updateSoloState();
 }
 
@@ -862,8 +769,8 @@ function setLeaderIndicator(newLeaderId) {
 function updateOwnTileLabel() {
   if (!ownTile) return;
   const trimmedName = (myName || '').trim();
-  let text = `Вы${trimmedName ? ` (${trimmedName})` : ''}`;
-  if (isLeader) text += ' (лидер)';
+  let text = `You${trimmedName ? ` (${trimmedName})` : ''}`;
+  if (isLeader) text += ' (Leader)';
   ownTile.labelEl.textContent = text;
 }
 
@@ -904,7 +811,7 @@ function updateScreenButtonState() {
   // текущего состояния владения экраном. Лидера это ограничение не касается.
   if (!isLeader && roomSettings && !roomSettings.guestScreen) {
     screenButton.disabled = true;
-    screenButton.title = 'Запрещено лидером';
+    screenButton.title = 'Disabled by the leader';
     screenButton.classList.remove('control-button--on');
     screenButton.setAttribute('aria-pressed', 'false');
     return;
@@ -920,9 +827,9 @@ function updateScreenButtonState() {
     screenButton.classList.add('control-button--on');
     screenButton.setAttribute('aria-pressed', 'true');
   } else {
-    const name = peerNames.get(currentScreenOwnerPeerId) || 'другой участник';
+    const name = peerNames.get(currentScreenOwnerPeerId) || 'another participant';
     screenButton.disabled = true;
-    screenButton.title = `Экран показывает ${name}`;
+    screenButton.title = `${name} is sharing their screen`;
     screenButton.classList.remove('control-button--on');
     screenButton.setAttribute('aria-pressed', 'false');
   }
@@ -947,12 +854,12 @@ function showLocalScreenPreview() {
   screenVideoEl.srcObject = screenStream;
   screenVideoEl.muted = true; // не отдаём эхо собственного звука вкладки/системы
   safePlay(screenVideoEl);
-  screenCaptionEl.textContent = `Экран: Вы${myName ? ` (${myName})` : ''}`;
+  screenCaptionEl.textContent = `Screen: You${myName ? ` (${myName})` : ''}`;
 }
 
 function showRemoteScreenCaption(peerId) {
   showScreenStageContainer();
-  screenCaptionEl.textContent = `Экран: ${peerNames.get(peerId) || 'Гость'}`;
+  screenCaptionEl.textContent = `Screen: ${peerNames.get(peerId) || 'Guest'}`;
 }
 
 // ---------- Права гостей: применение на своей стороне (отправитель) ----------
@@ -971,7 +878,7 @@ function applyGuestEnforcement() {
   const restrictChat = !isLeader && !roomSettings.guestChat;
 
   micButton.disabled = restrictAudio;
-  micButton.title = restrictAudio ? 'Запрещено лидером' : '';
+  micButton.title = restrictAudio ? 'Disabled by the leader' : '';
   if (restrictAudio && micTrack && micTrack.enabled) {
     micTrack.enabled = false;
     setMicButtonOn(false);
@@ -980,7 +887,7 @@ function applyGuestEnforcement() {
   }
 
   cameraButton.disabled = restrictVideo;
-  cameraButton.title = restrictVideo ? 'Запрещено лидером' : '';
+  cameraButton.title = restrictVideo ? 'Disabled by the leader' : '';
   if (restrictVideo && camTrack && camTrack.enabled) {
     camTrack.enabled = false;
     setCameraButtonOn(false);
@@ -1064,7 +971,7 @@ function buildJoinRequestCardEl(req) {
 
   const name = document.createElement('span');
   name.className = 'join-request-name';
-  name.textContent = req.name || 'Гость';
+  name.textContent = req.name || 'Guest';
 
   const actions = document.createElement('div');
   actions.className = 'join-request-actions';
@@ -1072,7 +979,7 @@ function buildJoinRequestCardEl(req) {
   const acceptButton = document.createElement('button');
   acceptButton.type = 'button';
   acceptButton.className = 'join-request-button join-request-button--accept';
-  acceptButton.textContent = 'Принять';
+  acceptButton.textContent = 'Accept';
   acceptButton.addEventListener('click', () => {
     signaling.send('approve', { peerId: req.peerId });
     removePendingRequest(req.peerId);
@@ -1081,19 +988,10 @@ function buildJoinRequestCardEl(req) {
   const rejectButton = document.createElement('button');
   rejectButton.type = 'button';
   rejectButton.className = 'join-request-button join-request-button--reject';
-  rejectButton.textContent = 'Отклонить';
+  rejectButton.textContent = 'Decline';
   rejectButton.addEventListener('click', () => {
     signaling.send('reject', { peerId: req.peerId });
     removePendingRequest(req.peerId);
-    // Ш3: смена состава — заявка отклонена лидером (см. docs/e2e-encryption.md
-    // §7). Сам отклонённый ничего не выигрывает от этой ротации (он никогда
-    // не был в `peers` и не получал ни одной эпохи контентных ключей — не от
-    // чего его отрезать), но событие формально попадает под «смена состава»,
-    // и ротация здесь дёшева, поэтому проще выполнять её единообразно, чем
-    // отдельно объяснять, почему в этом случае её нет.
-    rotateContentKeysIfLeader().catch((err) =>
-      console.error('Ш3: ротация ключей после отказа в лобби не удалась:', err)
-    );
   });
 
   actions.appendChild(acceptButton);
@@ -1166,10 +1064,10 @@ const CONNECTION_SECTION_REFRESH_MS = 5000;
 let connectionSectionTimer = null;
 
 const PEER_MODE_LABELS = {
-  p2p: 'напрямую (P2P)',
-  turn: 'через TURN-релей',
-  fallback: 'через сервер (fallback)',
-  connecting: 'устанавливается…',
+  p2p: 'direct (P2P)',
+  turn: 'via TURN relay',
+  fallback: 'via server (fallback)',
+  connecting: 'connecting…',
 };
 
 /** Отрисовать строку шифрования из getCryptoInfo() — текст алгоритма НЕ хардкодится, кроме шаблона фразы. */
@@ -1177,12 +1075,12 @@ function renderCryptoInfo() {
   const info = RoomCrypto.getCryptoInfo();
   if (!info.active) {
     settingsCryptoRowEl.classList.add('settings-crypto-row--off');
-    settingsCryptoTextEl.textContent = 'E2E-шифрование выключено — сервер может видеть содержимое';
+    settingsCryptoTextEl.textContent = 'E2E encryption is off — the server can see the content';
     return;
   }
   settingsCryptoRowEl.classList.remove('settings-crypto-row--off');
   settingsCryptoTextEl.textContent =
-    `E2E-шифрование: ${info.algorithm} · ключ ${info.keyBits} бит · ${info.kdf}`;
+    `E2E encryption: ${info.algorithm} · ${info.keyBits}-bit key · ${info.kdf}`;
 }
 
 /**
@@ -1246,7 +1144,7 @@ async function renderPeerConnectionsList() {
     settingsPeersListEl.textContent = '';
     const li = document.createElement('li');
     li.className = 'settings-peer-row settings-peer-row--empty';
-    li.textContent = 'Пока никого — вы одни в комнате.';
+    li.textContent = 'No one else here yet — you are alone in the room.';
     settingsPeersListEl.appendChild(li);
     return;
   }
@@ -1267,7 +1165,7 @@ async function renderPeerConnectionsList() {
 
     const label = document.createElement('span');
     label.className = 'settings-peer-label';
-    label.textContent = `${peerNames.get(peerId) || 'Гость'} — ${PEER_MODE_LABELS[mode]}`;
+    label.textContent = `${peerNames.get(peerId) || 'Guest'} — ${PEER_MODE_LABELS[mode]}`;
 
     li.appendChild(dot);
     li.appendChild(label);
@@ -1278,7 +1176,180 @@ async function renderPeerConnectionsList() {
 /** Динамические счётчики «что видит сервер» — см. static/common.js: ConnStats. */
 function renderServerCounters() {
   settingsSignalingCountEl.textContent = String(ConnStats.signalingRelayCount);
-  settingsFallbackCountEl.textContent = String(ConnStats.fallbackChatCount);
+}
+
+/**
+ * Один раз за сессию сгенерировать сессионный DTLS-сертификат для SAS (см.
+ * блок объявления sessionCertificate выше). Идемпотентна и не бросает: при
+ * отказе просто оставляет sessionCertificate=null (звонок работает, SAS не
+ * показывается). ECDSA P-256 — тот же дефолт, что браузер выбирает сам, так
+ * что на совместимость соединений влияния нет.
+ */
+async function ensureSessionCertificate() {
+  if (sessionCertificate) return;
+  try {
+    sessionCertificate = await RTCPeerConnection.generateCertificate({
+      name: 'ECDSA',
+      namedCurve: 'P-256',
+    });
+    const fps = sessionCertificate.getFingerprints ? sessionCertificate.getFingerprints() : [];
+    const sha256 = fps.find((f) => f.algorithm === 'sha-256') || fps[0];
+    ownCertFingerprint = sha256 ? sha256.value : null;
+  } catch (err) {
+    console.warn('Не удалось сгенерировать сессионный сертификат для SAS:', err);
+    sessionCertificate = null;
+    ownCertFingerprint = null;
+  }
+}
+
+// ---------- SAS v2: стейт-машина commit-before-reveal ----------
+//
+// Полная спецификация — docs/sas-verification.md. Управляется таймером
+// (sasRefresh) плюс входящими sas-commit/sas-reveal (обработчики выше).
+// Инвариант: раунд определяется снапшотом sasRoundMembers, зафиксированным на
+// старте; сообщения не своего roundId игнорируются; showing 'ok' только когда
+// от ВСЕХ ожидаемых участников пришли и проверены reveal'ы.
+
+/** Отрисовать текущее состояние SAS в шапке чата (см. static/chat.js: setRoomSas). Идемпотентна, безопасна до создания ChatPanel. */
+function renderRoomSas() {
+  if (chat && typeof chat.setRoomSas === 'function') chat.setRoomSas(sasState, sasResult);
+}
+
+function sasSetState(state) {
+  if (state !== 'ok') sasResult = null;
+  sasState = state;
+  renderRoomSas();
+}
+
+/** Сбросить состояние раунда (уходим в hidden/unavailable — сверять не с кем). */
+function sasResetRound(state) {
+  sasCurrentRoundId = null;
+  sasRoundMembers = null;
+  sasMyNonce = null;
+  sasCommits = new Map();
+  sasReveals = new Map();
+  sasRevealed = false;
+  sasSetState(state);
+}
+
+/** Начать новый раунд над снапшотом состава `members` ([{peerId, fingerprint}]) с идентификатором `rid`. */
+function sasStartRound(rid, members) {
+  sasCurrentRoundId = rid;
+  sasRoundMembers = members;
+  sasMyNonce = RoomCrypto.generateSasNonce();
+  sasCommits = new Map();
+  sasReveals = new Map([[myPeerId, sasMyNonce]]); // свой нонс сразу известен
+  sasRevealed = false;
+  sasSetState('verifying');
+  RoomCrypto.sasCommit(rid, myPeerId, sasMyNonce)
+    .then((commit) => {
+      if (rid !== sasCurrentRoundId) return; // раунд успел смениться
+      sasCommits.set(myPeerId, commit);
+      bus.broadcast({ kind: 'sas-commit', round: rid, commit });
+      return sasTryComplete();
+    })
+    .catch((err) => console.warn('SAS: старт раунда не удался:', err));
+}
+
+/** Повторно разослать свой commit (и reveal, если уже раскрылись) — покрывает пиров, чья шина открылась после первой рассылки. */
+function sasRebroadcast() {
+  const commit = sasCommits.get(myPeerId);
+  if (commit) bus.broadcast({ kind: 'sas-commit', round: sasCurrentRoundId, commit });
+  if (sasRevealed && sasMyNonce) {
+    bus.broadcast({
+      kind: 'sas-reveal',
+      round: sasCurrentRoundId,
+      nonce: RoomCrypto.bytesToBase64url(sasMyNonce),
+    });
+  }
+}
+
+/**
+ * Продвинуть текущий раунд: гейт ревила (раскрываемся только собрав ВСЕ
+ * коммиты), проверка reveal'ов против коммитов, вывод SAS. Идемпотентна;
+ * безопасна при параллельных вызовах (проверяет, не сменился ли раунд).
+ */
+async function sasTryComplete() {
+  const rid = sasCurrentRoundId;
+  if (!rid || !sasRoundMembers) return;
+  const expected = sasRoundMembers.map((m) => m.peerId);
+
+  // 1. Ждём коммиты от всех ожидаемых участников.
+  if (!expected.every((p) => sasCommits.has(p))) {
+    sasSetState('verifying');
+    return;
+  }
+  // 2. Гейт: все коммиты собраны — можно раскрыть свой нонс.
+  if (!sasRevealed) {
+    sasRevealed = true;
+    bus.broadcast({ kind: 'sas-reveal', round: rid, nonce: RoomCrypto.bytesToBase64url(sasMyNonce) });
+  }
+  // 3. Ждём reveal'ы от всех.
+  if (!expected.every((p) => sasReveals.has(p))) {
+    sasSetState('verifying');
+    return;
+  }
+  // 4. Проверяем каждый чужой reveal против его коммита.
+  for (const m of sasRoundMembers) {
+    if (m.peerId === myPeerId) continue; // свой нонс доверяем
+    const commit = await RoomCrypto.sasCommit(rid, m.peerId, sasReveals.get(m.peerId));
+    if (rid !== sasCurrentRoundId) return; // раунд сменился во время await
+    if (commit !== sasCommits.get(m.peerId)) {
+      sasSetState('mismatch');
+      return;
+    }
+  }
+  // 5. Всё сошлось — выводим SAS.
+  const entries = sasRoundMembers.map((m) => ({
+    peerId: m.peerId,
+    fingerprint: m.fingerprint,
+    nonce: sasReveals.get(m.peerId),
+  }));
+  const result = await RoomCrypto.deriveSas(entries);
+  if (rid !== sasCurrentRoundId) return;
+  sasResult = result;
+  sasSetState('ok');
+}
+
+/**
+ * Периодический тик: собрать актуальный состав (свой + пиры с ОТКРЫТОЙ шиной и
+ * известным DTLS-фингерпринтом), вычислить roundId (включает фингерпринты) и
+ * при его смене — начать свежий раунд. Иначе — добить текущий. Состояния:
+ *  - один в комнате -> hidden (сверять не с кем);
+ *  - есть пиры, но ни к кому нет верифицируемого P2P-пути -> unavailable
+ *    (медиа-пути тоже нет — см. docs/sas-verification.md §8/§9).
+ */
+async function sasRefresh() {
+  if (!ownCertFingerprint || !myPeerId) return; // сертификат не готов — SAS недоступен молча
+  const peerEntries = Array.from(peers.entries());
+  if (peerEntries.length === 0) {
+    if (sasState !== 'hidden') sasResetRound('hidden');
+    return;
+  }
+  const members = [{ peerId: myPeerId, fingerprint: ownCertFingerprint }];
+  for (const [pid, entry] of peerEntries) {
+    if (!bus.isOpen(pid)) continue;
+    const fp = await entry.rtc.getRemoteCertificateFingerprint();
+    if (fp) members.push({ peerId: pid, fingerprint: fp });
+  }
+  if (members.length < 2) {
+    if (sasState !== 'unavailable') sasResetRound('unavailable');
+    return;
+  }
+  const rid = await RoomCrypto.sasRoundId(members);
+  if (rid !== sasCurrentRoundId) {
+    sasStartRound(rid, members);
+  } else {
+    sasRebroadcast();
+    await sasTryComplete();
+  }
+}
+
+/** Запустить периодический SAS-тик (идемпотентно, переживает reconnect). */
+function startSasUpdates() {
+  const tick = () => sasRefresh().catch((err) => console.warn('SAS-тик не удался:', err));
+  tick();
+  if (!sasRefreshTimer) sasRefreshTimer = setInterval(tick, SAS_REFRESH_MS);
 }
 
 function refreshConnectionSection() {
@@ -1312,12 +1383,12 @@ async function refreshDeviceLists() {
   fillDeviceSelect(
     settingMicDeviceSelect,
     devices.filter((d) => d.kind === 'audioinput'),
-    'Микрофон'
+    'Microphone'
   );
   fillDeviceSelect(
     settingCameraDeviceSelect,
     devices.filter((d) => d.kind === 'videoinput'),
-    'Камера'
+    'Camera'
   );
 }
 
@@ -1688,6 +1759,11 @@ function createRemotePeer(peerId, name, iceServers) {
     polite: myPeerId > peerId,
     signaling,
     targetPeerId: peerId,
+    // SAS: один сессионный сертификат на все соединения (см.
+    // ensureSessionCertificate, static/crypto.js: deriveSas). Может быть null,
+    // если генерация не удалась — тогда браузер сам выпустит сертификат, а SAS
+    // просто не покажется.
+    certificate: sessionCertificate,
     // Ш1 (E2E-шифрование): offer/answer/ice-candidate к ЭТОМУ пиру всегда
     // идут через серверный сигналинг-релей — RtcPeer шифрует/расшифровывает
     // их сам под K_sig (см. static/rtc.js), room.js только выдаёт функции.
@@ -1704,17 +1780,12 @@ function createRemotePeer(peerId, name, iceServers) {
     // sendAllActiveStreamInfoTo, там же почему это нужно ВТОРЫМ разом).
     onBusOpen: () => {
       sendAllActiveStreamInfoTo(peerId);
-      // Ш3: мы новичок (не лидер), эпоха контентных ключей ещё не
-      // подтверждена, и шина только что открылась ИМЕННО до лидера — самое
-      // время спросить у него текущую эпоху (см. bus.onMessage('key-request')
-      // выше). leaderId к этому моменту уже точно известен (onBusOpen —
-      // асинхронный колбэк много позже синхронной обработки joined, где
-      // leaderId выставляется, см. registerSignalingHandlers). Шлём не более
-      // одного запроса за сессию (contentEpochRequestSent).
-      if (!contentEpochReady && !isLeader && !contentEpochRequestSent && peerId === leaderId) {
-        contentEpochRequestSent = true;
-        bus.sendToPeer(peerId, { kind: 'key-request' });
-      }
+      // SAS: шина к пиру открылась — состав/фингерпринты могли измениться,
+      // пересобираем раунд не дожидаясь таймера (см. sasRefresh).
+      if (sasRefreshTimer) sasRefresh().catch(() => {});
+      // Чат: слить локальную очередь исходящего, ждавшего открытия шины (пришло
+      // на смену серверному fallback-релею, см. static/chat.js: notifyBusOpen).
+      if (chat && typeof chat.notifyBusOpen === 'function') chat.notifyBusOpen(peerId);
     },
     // Ф3: входящий файловый DataChannel — маршрутизируем в ChatPanel (там
     // живёт протокол передачи файлов, см. static/chat.js). `chat` в момент
@@ -1762,6 +1833,9 @@ function removeRemotePeer(peerId) {
     hideScreenStage();
     updateScreenButtonState();
   }
+
+  // SAS: состав изменился — пересобрать раунд (иначе останется старый roundId).
+  if (sasRefreshTimer) sasRefresh().catch(() => {});
 }
 
 /**
@@ -1894,10 +1968,11 @@ async function init() {
 }
 
 async function connectAndJoin() {
-  showOverlay({ title: 'Подключение…', spinner: true });
+  showOverlay({ title: 'Connecting…', spinner: true });
 
   iceServersCache = await fetchIceServers();
   lastKnownVersion = await fetchVersion();
+  await ensureSessionCertificate();
 
   signaling = new Signaling();
   signaling.onError = (event) => {
@@ -1925,8 +2000,8 @@ async function connectAndJoin() {
   } catch (err) {
     terminalState = true;
     showOverlay({
-      title: 'Не удалось подключиться',
-      text: 'Проверьте соединение с интернетом и обновите страницу.',
+      title: 'Could not connect',
+      text: 'Check your internet connection and refresh the page.',
     });
     return;
   }
@@ -1987,16 +2062,6 @@ function registerSignalingHandlers(iceServers) {
       renderJoinRequests();
       applyGuestEnforcement();
 
-      // Ш3: если в комнате уже кто-то есть и это не мы сами лидер — наша
-      // эпоха 0 (из #k) МОЖЕТ уже быть устаревшей (лидер мог поротировать её
-      // до нашего входа) — ждём key-request/key-rotate по шине (см.
-      // createRemotePeer: onBusOpen) прежде чем слать fallback-контент.
-      // Одни в комнате или мы сами лидер — эпоха 0 заведомо актуальна.
-      contentEpochReady = isLeader || otherPeers.length === 0;
-      if (!contentEpochReady) {
-        setTimeout(() => markContentEpochReady(), CONTENT_EPOCH_REQUEST_TIMEOUT_MS);
-      }
-
       updateScreenButtonState();
       updateParticipantCount();
 
@@ -2011,12 +2076,8 @@ function registerSignalingHandlers(iceServers) {
         initialPeerIds: otherPeers.map((p) => p.peerId),
         getLeaderId: () => leaderId,
         getGuestChatAllowed: () => (roomSettings ? roomSettings.guestChat : true),
-        // Ш3: чат больше не получает один статичный ключ — эпоха может
-        // смениться в любой момент сессии (см. rotateContentKeysIfLeader).
-        getChatKeyForEpoch: chatKeyForEpoch,
-        getCurrentContentEpoch: () => currentContentEpoch,
-        isContentEpochReady: () => contentEpochReady,
       });
+      startSasUpdates();
       return;
     }
 
@@ -2048,10 +2109,10 @@ function registerSignalingHandlers(iceServers) {
     // это — ждём решения лидера. «Отменить» = leave + на главную (тот же
     // приём, что и у leaveButton ниже — intentionalDisconnect до leave).
     showOverlay({
-      title: 'Ожидание одобрения…',
-      text: myName ? `Вы вошли как «${myName}»` : 'Ждём решения лидера комнаты.',
+      title: 'Waiting for approval…',
+      text: myName ? `You joined as "${myName}"` : 'Waiting for the room leader to respond.',
       spinner: true,
-      actionLabel: 'Отменить',
+      actionLabel: 'Cancel',
       onAction: () => {
         intentionalDisconnect = true;
         if (signaling) signaling.send('leave');
@@ -2071,9 +2132,9 @@ function registerSignalingHandlers(iceServers) {
   signaling.on('join-rejected', () => {
     terminalState = true;
     showOverlay({
-      title: 'Вход отклонён',
-      text: 'Лидер комнаты отклонил вашу заявку на вход.',
-      actionLabel: 'На главную',
+      title: 'Access denied',
+      text: 'The room leader declined your join request.',
+      actionLabel: 'Go home',
     });
   });
 
@@ -2090,9 +2151,9 @@ function registerSignalingHandlers(iceServers) {
     applyGuestEnforcement();
     refreshMediaRenderingForAllPeers();
     if (newLeaderId === myPeerId) {
-      showToast('Вы стали лидером');
+      showToast('You are now the leader');
     } else {
-      showToast(`Лидер теперь ${peerNames.get(newLeaderId) || 'Гость'}`);
+      showToast(`${peerNames.get(newLeaderId) || 'Guest'} is now the leader`);
     }
   });
 
@@ -2103,9 +2164,9 @@ function registerSignalingHandlers(iceServers) {
     }
     terminalState = true;
     showOverlay({
-      title: 'Комната не найдена',
-      text: 'Ссылка недействительна или комната уже удалена.',
-      actionLabel: 'Создать новую',
+      title: 'Room not found',
+      text: 'The link is invalid or the room has already been deleted.',
+      actionLabel: 'Create a new one',
     });
   });
 
@@ -2116,8 +2177,8 @@ function registerSignalingHandlers(iceServers) {
     }
     terminalState = true;
     showOverlay({
-      title: 'Комната заполнена',
-      text: 'В этой комнате уже максимум участников (6). Попробуйте позже.',
+      title: 'Room is full',
+      text: 'This room already has the maximum of 6 participants. Please try again later.',
     });
   });
 
@@ -2141,11 +2202,11 @@ function registerSignalingHandlers(iceServers) {
     terminalState = true;
     stopRoomTimer();
     showOverlay({
-      title: 'Время созвона истекло (3 часа)',
-      text: 'Комната закрыта — превышен лимит длительности созвона.',
-      actionLabel: 'Создать новую',
+      title: 'Meeting time is up (3 hours)',
+      text: 'The room is closed — the meeting duration limit was reached.',
+      actionLabel: 'Create a new one',
     });
-    teardownMeshMediaChat('Время созвона истекло.');
+    teardownMeshMediaChat('Meeting time is up.');
   });
 
   signaling.on('peer-joined', async ({ peerId, name }) => {
@@ -2163,13 +2224,8 @@ function registerSignalingHandlers(iceServers) {
   });
 
   signaling.on('peer-left', ({ peerId }) => {
-    removeRemotePeer(peerId); // peers больше не содержит peerId — rotateContentKeysIfLeader() ниже его уже не разошлёт
+    removeRemotePeer(peerId);
     updateParticipantCount();
-    // Ш3: смена состава — участник ушёл (см. docs/e2e-encryption.md §7). Нет
-    // эффекта, если мы не лидер (guard внутри) — только лидер рассылает.
-    rotateContentKeysIfLeader().catch((err) =>
-      console.error('Ш3: ротация ключей после ухода участника не удалась:', err)
-    );
   });
 
   signaling.on('offer', async ({ fromPeerId, sdp }) => {
@@ -2246,11 +2302,11 @@ function registerSignalingHandlers(iceServers) {
       // а не потому что экран занят — busyPeerId в этом случае не приходит.
       currentScreenOwnerPeerId = null;
       updateScreenButtonState();
-      showRoomMessage('Лидер запретил показ экрана.');
+      showRoomMessage('The leader has disabled screen sharing.');
     } else {
       currentScreenOwnerPeerId = busyPeerId;
       updateScreenButtonState();
-      showRoomMessage(`Экран показывает ${peerNames.get(busyPeerId) || 'другой участник'}.`);
+      showRoomMessage(`${peerNames.get(busyPeerId) || 'Another participant'} is already sharing their screen.`);
     }
     if (pendingShareDecision) {
       pendingShareDecision.resolve(false);
@@ -2376,10 +2432,10 @@ function giveUpReconnect() {
   hideReconnectBanner();
   terminalState = true;
   showOverlay({
-    title: 'Соединение потеряно',
-    text: 'Связь с сервером сигналинга прервалась. Обновите страницу.',
+    title: 'Connection lost',
+    text: 'Lost the connection to the signaling server. Please refresh the page.',
   });
-  if (chat) chat.disableInput('Соединение потеряно.');
+  if (chat) chat.disableInput('Connection lost.');
 }
 
 // ---------- Реконнект: сверка состояния комнаты после успешного join ----------
@@ -2483,7 +2539,7 @@ async function liveSwitchMicTrack(deviceId, enabledValue) {
     });
   } catch (err) {
     console.warn('Не удалось переключить микрофон:', err);
-    showRoomMessage('Не удалось переключить микрофон.');
+    showRoomMessage('Could not switch microphone.');
     return;
   }
   const newTrack = newStream.getAudioTracks()[0];
@@ -2530,7 +2586,7 @@ micButton.addEventListener('click', async () => {
       });
     } catch (err) {
       console.warn('Доступ к микрофону отклонён:', err);
-      showRoomMessage('Не удалось получить доступ к микрофону.');
+      showRoomMessage('Could not access the microphone.');
       micRequestInProgress = false;
       return;
     }
@@ -2585,7 +2641,7 @@ async function liveSwitchCamTrack(deviceId, enabledValue) {
     newStream = await navigator.mediaDevices.getUserMedia({ video: cameraConstraintsFor(deviceId) });
   } catch (err) {
     console.warn('Не удалось переключить камеру:', err);
-    showRoomMessage('Не удалось переключить камеру.');
+    showRoomMessage('Could not switch camera.');
     return;
   }
   const newTrack = newStream.getVideoTracks()[0];
@@ -2629,7 +2685,7 @@ cameraButton.addEventListener('click', async () => {
       stream = await navigator.mediaDevices.getUserMedia({ video: cameraConstraintsFor(selectedCamDeviceId) });
     } catch (err) {
       console.warn('Доступ к камере отклонён:', err);
-      showRoomMessage('Не удалось получить доступ к камере.');
+      showRoomMessage('Could not access the camera.');
       camRequestInProgress = false;
       return;
     }
@@ -2691,7 +2747,7 @@ screenButton.addEventListener('click', async () => {
   } catch (err) {
     console.warn('getDisplayMedia отменён/отклонён:', err);
     signaling.send('share-stop'); // отпускаем захваченный замок
-    showRoomMessage('Показ экрана отменён.');
+    showRoomMessage('Screen sharing was cancelled.');
     updateScreenButtonState();
     return;
   }
@@ -2740,7 +2796,7 @@ function stopScreenShare() {
 // как на iOS-фоллбэк. Тот же приём для exitFullscreen/fullscreenElement.
 function requestFullscreenCompat(el) {
   const fn = el.requestFullscreen || el.webkitRequestFullscreen;
-  if (!fn) return Promise.reject(new Error('Fullscreen API недоступен'));
+  if (!fn) return Promise.reject(new Error('Fullscreen API is not available'));
   return fn.call(el);
 }
 
@@ -2757,7 +2813,7 @@ function isFullscreenActive() {
 function updateFullscreenButtonState() {
   const active = isFullscreenActive();
   screenFullscreenButtonEl.setAttribute('aria-pressed', String(active));
-  screenFullscreenButtonEl.title = active ? 'Выйти из полноэкранного режима' : 'На весь экран';
+  screenFullscreenButtonEl.title = active ? 'Exit fullscreen' : 'Fullscreen';
   screenFullscreenButtonEl.setAttribute('aria-label', screenFullscreenButtonEl.title);
 }
 
@@ -2865,7 +2921,7 @@ sharePopupCopyButtonEl.addEventListener('click', async () => {
   const success = await copyTextToClipboard(buildShareLink());
   if (success) {
     const original = sharePopupCopyButtonEl.textContent;
-    sharePopupCopyButtonEl.textContent = 'Скопировано';
+    sharePopupCopyButtonEl.textContent = 'Copied';
     setTimeout(() => {
       sharePopupCopyButtonEl.textContent = original;
     }, 1500);

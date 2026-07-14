@@ -1,7 +1,7 @@
-// Интеграционный тест сигналинга (протокол v3 — симметричная комната: все
+// Интеграционный тест сигналинга (протокол v3+ — симметричная комната: все
 // участники равны, mesh, шаринг экрана — временное состояние комнаты; чат
-// на сервере — только адресный fallback-релей опакового конверта, см.
-// README.md/src/ws.rs). Гоняет полный жизненный цикл комнаты против
+// на сервере не проходит вообще — только P2P-шина, серверный fallback-релей
+// чата удалён, см. docs/chat.md/src/ws.rs). Гоняет полный жизненный цикл против
 // САМОСТОЯТЕЛЬНО поднятого сервера (собирает cargo build, запускает
 // ./target/debug/screenshare на порту 3311 и гарантированно прибирает за
 // собой). Чистый Node >= 22, глобальный WebSocket/fetch, без npm.
@@ -226,13 +226,16 @@ function defaultSettings(overrides = {}) {
   };
 }
 
-function isChatMsg(m) {
-  return m && m.type === 'chat' && typeof m.fromPeerId === 'string'
-    && m.envelope !== undefined && m.envelope !== null && typeof m.envelope === 'object';
+// Маячок для проверок "сокет жив / релей адресный / срезан rate-limit'ом":
+// серверного релея чата больше нет (чат только по P2P-шине), поэтому в роли
+// маячка — ещё существующий адресный релей stream-info (см. handle_stream_info).
+function isBeaconMsg(m) {
+  return m && m.type === 'stream-info' && typeof m.fromPeerId === 'string'
+    && m.info !== undefined && m.info !== null && typeof m.info === 'object';
 }
 
-function sendChat(sender, targetPeerId, envelope) {
-  sender.send({ type: 'chat', targetPeerId, envelope });
+function sendBeacon(sender, targetPeerId, payload) {
+  sender.send({ type: 'stream-info', targetPeerId, info: payload });
 }
 
 // Сравнение по структуре, а не по строке: сервер гоняет envelope через
@@ -439,12 +442,12 @@ async function runTests() {
   ok(si.type === 'stream-info' && si.fromPeerId === p3Id && si.info.s1.name === 'Боб', 'stream-info p3->p2');
 
   // Релей на несуществующий peerId — тихо игнорируется, соединение живо
-  // (проверяем маячком через адресный чат — см. п.7 про формат конверта).
+  // (проверяем маячком через адресный stream-info).
   p2.send({ type: 'ice-candidate', targetPeerId: 'ghost', candidate: {} });
   {
-    sendChat(p2, p1Id, { kind: 'text', text: 'маячок-после-ghost-релея' });
+    sendBeacon(p2, p1Id, { kind: 'text', text: 'маячок-после-ghost-релея' });
     const m = await p1.next();
-    ok(isChatMsg(m) && m.fromPeerId === p2Id && m.envelope.text === 'маячок-после-ghost-релея',
+    ok(isBeaconMsg(m) && m.fromPeerId === p2Id && m.info.text === 'маячок-после-ghost-релея',
       'релей на неизвестный peerId не ломает сокет — чат p2->p1 после него доходит');
   }
 
@@ -499,9 +502,9 @@ async function runTests() {
 
     // Доказываем недоставку: маячок от ДРУГОГО отправителя (p1, свой чистый
     // бюджет) должен дойти первым же сообщением у pB.
-    sendChat(p1, jB.peerId, { kind: 'text', text: 'маячок-после-relay-rate-limit' });
+    sendBeacon(p1, jB.peerId, { kind: 'text', text: 'маячок-после-relay-rate-limit' });
     const beacon = await pB.next();
-    ok(isChatMsg(beacon) && beacon.envelope.text === 'маячок-после-relay-rate-limit',
+    ok(isBeaconMsg(beacon) && beacon.info.text === 'маячок-после-relay-rate-limit',
       '101-е сообщение, срезанное общим релей-лимитом, не доставлено получателю');
 
     pA.ws.close();
@@ -510,88 +513,12 @@ async function runTests() {
     await Promise.all([p1.next(), p2.next(), p3.next()]); // peer-left pB
   }
 
-  // --- 7. Чат: адресный relay опакового конверта (сервер конверт не разбирает) ---
-  console.log('7. чат: адресный relay envelope (опаковость)');
-  {
-    // Конверт — намеренно с полями, каких сервер никогда не видел (v/id/
-    // lamport/from/name/kind/text/replyTo из static/chat.js + пара
-    // совершенно произвольных полей) — сервер обязан доставить его КАК ЕСТЬ,
-    // не разбирая и не валидируя содержимое (кроме размера, см. п.7b).
-    const envelope = {
-      v: 1,
-      id: 'msg-1',
-      lamport: 3,
-      from: p2Id,
-      name: 'Аня',
-      kind: 'text',
-      text: 'Привет от Ани',
-      replyTo: null,
-      arbitraryField: { nested: [1, 2, 3] },
-      anotherOne: 'ромашки',
-    };
-    sendChat(p2, p1Id, envelope);
-    const m = await p1.next();
-    ok(m.type === 'chat' && m.fromPeerId === p2Id && deepEqual(m.envelope, envelope),
-      'адресату конверт доставлен побайтово как есть (опаковость), с fromPeerId отправителя');
-  }
-  {
-    // Доказываем, что это АДРЕСНЫЙ релей, а не broadcast: p2 шлёт p1
-    // envelope-A, затем сразу p3 envelope-B (маячок) — у p3 следующим
-    // сообщением должен прийти именно маячок B, а не просочившийся A.
-    const envelopeA = { kind: 'text', text: 'A — только для p1' };
-    const envelopeB = { kind: 'text', text: 'B — маячок для p3' };
-    sendChat(p2, p1Id, envelopeA);
-    sendChat(p2, p3Id, envelopeB);
-    const [mp1, mp3] = await Promise.all([p1.next(), p3.next()]);
-    ok(isChatMsg(mp1) && mp1.envelope.text === 'A — только для p1', 'p1 получил именно envelope A');
-    ok(isChatMsg(mp3) && mp3.envelope.text === 'B — маячок для p3', 'p3 получил именно маячок B, не A (адресный релей, не broadcast)');
-  }
-
-  // --- 7b. Чат: конверт больше 8КБ -> error, не доставляется ---
-  console.log('7b. чат: envelope больше 8КБ -> error');
-  {
-    const bigEnvelope = { kind: 'text', text: 'x'.repeat(9000) };
-    sendChat(p1, p2Id, bigEnvelope);
-    const m = await p1.next();
-    ok(m.type === 'error', `envelope >8КБ -> error отправителю (${m.message})`);
-
-    // Доказываем, что слишком большой конверт НЕ доставлен: следующим
-    // сообщением у p2 должен прийти явный маячок, а не просочившийся bigEnvelope.
-    sendChat(p1, p2Id, { kind: 'text', text: 'маячок-после-oversize' });
-    const m2 = await p2.next();
-    ok(isChatMsg(m2) && m2.envelope.text === 'маячок-после-oversize',
-      'слишком большой конверт не дошёл до адресата');
-  }
-
   // --- 8. Четвёртый участник входит (без истории — сервер её не хранит) ---
   console.log('8. четвёртый участник входит');
   const { peer: p4, joined: j4 } = await join(roomId, 'Вова');
   const p4Id = j4.peerId;
   ok(j4.peers.length === 3, 'у четвёртого участника peers содержит трёх предыдущих');
   await Promise.all([p1.next(), p2.next(), p3.next()]); // peer-joined всем троим
-
-  // --- 8b. Rate-limit: не более 10 сообщений за окно, 11-е -> error, не доставляется ---
-  console.log('8b. чат: rate-limit (серверный, на fallback-пути)');
-  {
-    // 10 адресных сообщений подряд с одного соединения (p4) — все проходят.
-    for (let i = 0; i < 10; i++) {
-      sendChat(p4, p1Id, { kind: 'text', text: `сообщение ${i}` });
-      const m = await p1.next();
-      ok(isChatMsg(m) && m.fromPeerId === p4Id, `сообщение ${i} доставлено (в пределах лимита)`);
-    }
-    // 11-е сообщение в окне -> error самому отправителю.
-    sendChat(p4, p1Id, { kind: 'text', text: 'одиннадцатое' });
-    const errMsg = await p4.next();
-    ok(errMsg.type === 'error', `11-е сообщение за окно -> error (${errMsg.message})`);
-
-    // Доказываем, что 11-е сообщение НЕ было доставлено: следующим сообщением
-    // p1 должен прийти заведомо другой маячок от другого отправителя (p2), а
-    // не просочившееся 11-е от p4.
-    sendChat(p2, p1Id, { kind: 'text', text: 'маячок-после-rate-limit' });
-    const beacon = await p1.next();
-    ok(isChatMsg(beacon) && beacon.fromPeerId === p2Id && beacon.envelope.text === 'маячок-после-rate-limit',
-      'сообщение, срезанное rate-limit, не доставлено адресату');
-  }
 
   // --- 9. Шаринг экрана: захват, отказ занятому, освобождение, перезахват ---
   console.log('9. шаринг экрана');
@@ -609,9 +536,9 @@ async function runTests() {
     // Доказываем, что share-rejected НЕ разослан остальным: следующим адресным
     // сообщением p1 должен прийти маячок, а не второй share-started/share-rejected.
     {
-      sendChat(p2, p1Id, { kind: 'text', text: 'маячок-после-share-rejected' });
+      sendBeacon(p2, p1Id, { kind: 'text', text: 'маячок-после-share-rejected' });
       const b = await p1.next();
-      ok(isChatMsg(b) && b.envelope.text === 'маячок-после-share-rejected',
+      ok(isBeaconMsg(b) && b.info.text === 'маячок-после-share-rejected',
         'share-rejected доставлен только инициатору, остальные его не получили');
     }
 
@@ -824,20 +751,6 @@ async function runTests() {
     const [stB, stC] = await Promise.all([b.next(), c.next()]); // сервер сам останавливает шаринг
     ok(stB.type === 'share-stopped' && stC.type === 'share-stopped' && stB.peerId === jc.peerId,
       'отзыв guestScreen у шарящего гостя -> сервер сам шлёт share-stopped всем участникам');
-
-    // --- 20. guest_chat=false: chat гостя error, лидера проходит ---
-    console.log('20. guest_chat=false enforcement');
-    updateSettings(b, defaultSettings({ guestScreen: false, guestChat: false }));
-    await Promise.all([b.next(), c.next()]); // settings-changed
-
-    sendChat(c, jb.peerId, { kind: 'text', text: 'запрещённое сообщение' });
-    const chatErr = await c.next();
-    ok(chatErr.type === 'error', `гостю с guestChat=false запрещён fallback-чат (${chatErr.message})`);
-
-    sendChat(b, jc.peerId, { kind: 'text', text: 'лидеру можно' });
-    const chatOk = await c.next();
-    ok(isChatMsg(chatOk) && chatOk.fromPeerId === jb.peerId && chatOk.envelope.text === 'лидеру можно',
-      'лидеру fallback-чат разрешён независимо от guestChat');
 
     b.ws.close();
     c.ws.close();

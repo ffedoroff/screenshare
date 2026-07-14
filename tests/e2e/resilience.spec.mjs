@@ -130,14 +130,14 @@ async function waitForClassOnSelector(page, selector, className, present, timeou
 async function waitParticipantCount(page, total, timeoutMs = 8000) {
   await page.waitForFunction(
     (text) => document.getElementById('participant-count')?.textContent === text,
-    `Участников: ${total} / 6`,
+    `Participants: ${total} / 6`,
     { polling: 100, timeout: timeoutMs }
   );
 }
 
 async function participantCount(page) {
   const text = await page.evaluate(() => document.getElementById('participant-count')?.textContent ?? '');
-  const match = text.match(/Участников:\s*(\d+)/);
+  const match = text.match(/Participants:\s*(\d+)/);
   return match ? Number(match[1]) : NaN;
 }
 
@@ -471,7 +471,7 @@ async function main() {
       const seventhPage = await seventhContext.newPage();
       await seventhPage.goto(roomUrl);
       await joinRoom(seventhPage);
-      await waitOverlayTitle(seventhPage, 'Комната заполнена', 10_000);
+      await waitOverlayTitle(seventhPage, 'Room is full', 10_000);
       roomFullOk = true;
       await seventhContext.close(); // в комнату не попал, дальше не нужен
     });
@@ -523,7 +523,7 @@ async function main() {
       await step('(е) вход в ту же комнату после истечения TTL — «Комната не найдена»', async () => {
         await test2Page.goto(roomUrl);
         await joinRoom(test2Page);
-        await waitOverlayTitle(test2Page, 'Комната не найдена', 10_000);
+        await waitOverlayTitle(test2Page, 'Room not found', 10_000);
       });
     } else {
       skip('(е) вход после истечения TTL', 'вход в течение TTL не удался, дальнейшая проверка не имеет смысла');

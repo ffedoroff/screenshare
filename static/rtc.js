@@ -108,6 +108,7 @@ class RtcPeer {
     onFileChannel,
     sigCrypto,
     onCryptoFailure,
+    certificate,
   }) {
     this.signaling = signaling;
     this.targetPeerId = targetPeerId;
@@ -152,7 +153,14 @@ class RtcPeer {
     this.busChannel = null;
     this.busQueue = [];
 
-    const pc = new RTCPeerConnection({ iceServers });
+    // SAS (см. static/crypto.js: deriveSas): чтобы у участника был ОДИН
+    // стабильный DTLS-фингерпринт на все его соединения в mesh, room.js
+    // генерирует один RTCCertificate на сессию и передаёт его сюда — иначе
+    // браузер сгенерировал бы новый сертификат на каждый RTCPeerConnection,
+    // и «отпечаток комнаты» не сошёлся бы у разных пиров.
+    const pcConfig = { iceServers };
+    if (certificate) pcConfig.certificates = [certificate];
+    const pc = new RTCPeerConnection(pcConfig);
     this.pc = pc;
 
     const setupBusChannel = (channel) => {
@@ -463,6 +471,36 @@ class RtcPeer {
    */
   createFileChannel(label) {
     return this.pc.createDataChannel(label);
+  }
+
+  /**
+   * Фингерпринт СЕРТИФИКАТА, который удалённый пир реально предъявил в
+   * DTLS-рукопожатии (не «обещанного» в SDP, а фактически использованного) —
+   * читается из pc.getStats() по записи type==='remote-certificate'. Нужен
+   * для SAS (см. static/room.js: recomputeRoomSas, static/crypto.js:
+   * deriveSas). Возвращает строку-фингерпринт или null, если DTLS ещё не
+   * установлен / статы недоступны.
+   */
+  async getRemoteCertificateFingerprint() {
+    try {
+      const report = await this.pc.getStats();
+      // Спек-путь (webrtc-stats): transport -> remoteCertificateId -> запись
+      // type:'certificate' с полем fingerprint. Именно фактически предъявленный
+      // в DTLS сертификат пира (не «обещанный» в SDP).
+      for (const stat of report.values()) {
+        if (stat.type === 'transport' && stat.remoteCertificateId) {
+          const cert = report.get(stat.remoteCertificateId);
+          if (cert && cert.fingerprint) return cert.fingerprint;
+        }
+      }
+      // Фоллбэк на нестандартный тип, если вдруг встретится.
+      for (const stat of report.values()) {
+        if (stat.type === 'remote-certificate' && stat.fingerprint) return stat.fingerprint;
+      }
+    } catch (err) {
+      console.warn(`[peer ${this.targetPeerId}] getStats() для SAS не удался:`, err);
+    }
+    return null;
   }
 
   close() {

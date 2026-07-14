@@ -104,7 +104,10 @@ compromised or coerced backend read connection metadata and, more
 seriously, tamper with DTLS fingerprints to sit in the middle of a
 connection. Every field the client sends through the signaling relay is
 therefore encrypted client-side under a key the server never has. See
-[`e2e-encryption.md`](e2e-encryption.md).
+[`e2e-encryption.md`](e2e-encryption.md). This contains a *relaying* server;
+the residual case of an active MITM that poisons the link itself (handing
+different keys to different participants) is caught by human comparison of a
+Short Authentication String — see [`sas-verification.md`](sas-verification.md).
 
 ### 2.2 Constraints
 
@@ -156,6 +159,7 @@ deploys (no rolling update / no horizontal scaling).
 | Chat envelope format, ordering, reactions/replies/edit/delete, file transfer | [`chat.md`](chat.md) |
 | Leader election/succession, room settings, waiting room, enforcement boundaries | [`permissions-and-leader.md`](permissions-and-leader.md) |
 | Full threat model and DoS mitigations | [`security.md`](security.md) |
+| Human-checkable MITM protection: the commit-before-reveal SAS (emoji) protocol | [`sas-verification.md`](sas-verification.md) |
 | Running your own instance: single-binary vs. split deployment, reverse proxy/TLS, TURN, environment variables | [`self-hosting.md`](self-hosting.md) |
 | What the server can and cannot see, retention/TTL behavior | [`privacy.md`](privacy.md) |
 

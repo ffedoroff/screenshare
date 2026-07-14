@@ -41,20 +41,20 @@ createButton.addEventListener('click', async () => {
     // фронт и API живут на разных хостах, same-origin '/api/rooms' бил бы
     // в сам Pages-хост, где такого пути нет.
     const res = await fetch(`${window.API_BASE}/api/rooms`, { method: 'POST' });
-    if (!res.ok) throw new Error(`сервер ответил статусом ${res.status}`);
+    if (!res.ok) throw new Error(`server responded with status ${res.status}`);
     const data = await res.json();
     if (!data || typeof data.roomId !== 'string' || !data.roomId) {
-      throw new Error('в ответе нет roomId');
+      throw new Error('response is missing roomId');
     }
     if (typeof data.leaderToken !== 'string' || !data.leaderToken) {
-      throw new Error('в ответе нет leaderToken');
+      throw new Error('response is missing leaderToken');
     }
     const roomKey = RoomCrypto.generateRoomKey();
     const roomKeyB64 = RoomCrypto.bytesToBase64url(roomKey);
     location.href = `/r/${data.roomId}#lt=${encodeURIComponent(data.leaderToken)}&k=${roomKeyB64}`;
   } catch (err) {
-    console.error('Не удалось создать комнату:', err);
-    showMessage('Не удалось создать комнату. Проверьте соединение и попробуйте снова.');
+    console.error('Failed to create room:', err);
+    showMessage('Failed to create room. Check your connection and try again.');
     createButton.disabled = false;
   }
 });

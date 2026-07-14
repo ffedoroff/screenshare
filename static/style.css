@@ -958,6 +958,93 @@ body {
   background: var(--bg-elevated-2);
 }
 
+/* SAS «отпечаток комнаты» в шапке чата (см. static/chat.js/room.js) —
+   человекоудобная проверка ключа против MITM. Компактная плашка с эмодзи,
+   тап раскрывает пояснение (.chat-sas-note). */
+.chat-sas {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-elevated-2);
+  color: var(--text);
+  cursor: pointer;
+  flex-shrink: 0;
+  line-height: 1.4;
+}
+
+.chat-sas::before {
+  /* Замочек-подсказка, что это про шифрование/верификацию. */
+  content: '🔐';
+  font-size: 0.8rem;
+}
+
+.chat-sas-emoji {
+  font-size: 0.95rem;
+  letter-spacing: 0.05em;
+  white-space: nowrap;
+}
+
+.chat-sas:hover {
+  border-color: var(--accent);
+}
+
+/* Состояния SAS (см. static/chat.js: setRoomSas, docs/sas-verification.md §9). */
+.chat-sas--verifying,
+.chat-sas--unavailable {
+  color: var(--text-muted);
+  opacity: 0.85;
+}
+
+.chat-sas--verifying .chat-sas-emoji,
+.chat-sas--unavailable .chat-sas-emoji,
+.chat-sas--mismatch .chat-sas-emoji {
+  font-size: 0.72rem;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.chat-sas--unavailable::before {
+  content: '🔓';
+}
+
+.chat-sas--mismatch {
+  border-color: #e5484d;
+  color: #e5484d;
+  background: rgba(229, 72, 77, 0.12);
+}
+
+.chat-sas--mismatch::before {
+  content: '⚠️';
+}
+
+.chat-sas-note {
+  padding: var(--space-2) var(--space-3);
+  font-size: 0.8rem;
+  line-height: 1.45;
+  color: var(--text-muted);
+  background: var(--bg-elevated-2);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+/* Текстовый фолбэк (hex) для сверки, когда эмодзи рендерятся неоднозначно.
+   Пуст (не показывается), пока состояние не 'ok'. */
+.chat-sas-hex {
+  display: block;
+  margin-top: var(--space-2);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.78rem;
+  letter-spacing: 0.08em;
+  color: var(--text);
+}
+
+.chat-sas-hex:empty {
+  display: none;
+}
+
 .chat-messages {
   flex: 1;
   overflow-y: auto;

@@ -21,21 +21,6 @@ use crate::state::{
     PENDING_JOIN_IP_LIMIT, PENDING_JOIN_IP_WINDOW,
 };
 
-/// Лимит на fallback-релей чата (см. `ClientMessage::Chat`): не более
-/// `CHAT_RATE_LIMIT` сообщений за `CHAT_RATE_WINDOW` с одного соединения.
-/// Основной путь чата (mesh RTCDataChannel) через сервер не идёт вообще и
-/// этому лимиту не подчиняется — см. `static/chat.js` (клиентский, мягкий
-/// rate-limit 10/10с там же, независимо от этого серверного). Простой
-/// скользящий счётчик, без сторонних крейтов.
-const CHAT_RATE_LIMIT: usize = 10;
-const CHAT_RATE_WINDOW: Duration = Duration::from_secs(10);
-
-/// Максимальный размер сериализованного JSON конверта чата (`envelope`) в
-/// байтах — сервер не разбирает содержимое, но обязан ограничить размер,
-/// чтобы fallback-релей нельзя было использовать для перекачки произвольных
-/// объёмов данных через сервер.
-const CHAT_ENVELOPE_MAX_BYTES: usize = 8 * 1024;
-
 /// Максимальная длина отображаемого имени в символах.
 ///
 /// Ш1 (E2E-шифрование, см. static/crypto.js/room.js): `name` теперь — не
@@ -57,8 +42,6 @@ const CHAT_NAME_MAX_CHARS: usize = 512;
 /// соответственно) в байтах. Сервер эти поля не разбирает (опаковый JSON),
 /// но обязан ограничить размер — иначе релей превращается в бесплатный канал
 /// перекачки произвольных объёмов данных через сервер под видом сигналинга.
-/// Отдельно от `CHAT_ENVELOPE_MAX_BYTES` (8КБ) — легитимный offer с
-/// несколькими медиалиниями крупнее заведомо крошечного чат-конверта.
 const RELAY_MAX_BYTES: usize = 16 * 1024;
 
 /// H2 (DoS-защита): скользящее окно rate-limit НА ВСЕ релеи одного
@@ -106,13 +89,11 @@ struct PeerCtx {
     peer_id: String,
 }
 
-/// Оба скользящих окна rate-limit одного соединения — чат-специфичное
-/// (`CHAT_RATE_LIMIT`) и общее на все релеи суммарно (`RELAY_RATE_LIMIT`) —
-/// сгруппированы в одну структуру, а не переданы в `handle_message` двумя
-/// отдельными параметрами, просто чтобы не раздувать её сигнатуру дальше.
+/// Скользящее окно rate-limit одного соединения — общее на все релеи суммарно
+/// (`RELAY_RATE_LIMIT`). В структуре (а не голым полем), чтобы легко было
+/// вернуть сюда дополнительные окна, если понадобятся.
 #[derive(Default)]
 struct RateLimits {
-    chat_times: VecDeque<Instant>,
     relay_times: VecDeque<Instant>,
 }
 
@@ -433,10 +414,6 @@ fn handle_message(
             }
         }
 
-        ClientMessage::Chat { target_peer_id, envelope } => {
-            handle_chat(target_peer_id, envelope, me, tx, rooms, rate_limits);
-        }
-
         ClientMessage::ShareStart => {
             handle_share_start(me, tx, rooms);
         }
@@ -700,66 +677,6 @@ fn handle_share_stop(me: &Option<PeerCtx>, rooms: &SharedRooms) {
     }
 }
 
-/// Обработка `chat` (адресный fallback-релей, см. `ClientMessage::Chat`):
-/// rate-limit + проверка размера конверта, затем релей `target_peer_id`
-/// один-в-один как `offer`/`answer`/`stream-info` — сервер содержимое
-/// `envelope` не разбирает и нигде не хранит (ни в памяти комнаты, ни тем
-/// более на диске). Основной путь чата — mesh RTCDataChannel напрямую между
-/// участниками, сюда попадают только сообщения к пирам, у которых шина ещё
-/// не открыта.
-fn handle_chat(
-    target_peer_id: String,
-    envelope: Value,
-    me: &Option<PeerCtx>,
-    tx: &PeerTx,
-    rooms: &SharedRooms,
-    rate_limits: &mut RateLimits,
-) {
-    let Some(ctx) = me else {
-        send_to(tx, err("not in a room"));
-        return;
-    };
-
-    // Право на чат: лидеру всегда можно, гостю — только если не отобрано
-    // настройками комнаты (`guest_chat`).
-    {
-        let rooms_guard = rooms.lock().unwrap();
-        if let Some(room) = rooms_guard.get(&ctx.room_id) {
-            let is_leader = room.leader_id.as_deref() == Some(ctx.peer_id.as_str());
-            if !is_leader && !room.settings.guest_chat {
-                drop(rooms_guard);
-                send_to(tx, err("чат запрещён лидером"));
-                return;
-            }
-        }
-    }
-
-    // H2 (DoS-защита): общий релей-лимит (все типы релеев суммарно) — раньше
-    // специфичного чат-лимита ниже и раньше проверки размера, тем же
-    // порядком, что и в offer/answer/ice/stream-info (см. их комментарий):
-    // расходует бюджет частоты даже для сообщений, отклонённых позже.
-    if !check_relay_rate_limit(&mut rate_limits.relay_times) {
-        send_to(tx, err("too many messages, slow down"));
-        return;
-    }
-
-    if !check_rate_limit(&mut rate_limits.chat_times) {
-        send_to(tx, err("too many chat messages, slow down"));
-        return;
-    }
-
-    let size = serde_json::to_vec(&envelope).map(|v| v.len()).unwrap_or(usize::MAX);
-    if size > CHAT_ENVELOPE_MAX_BYTES {
-        send_to(tx, err("chat envelope too large (max 8KB)"));
-        return;
-    }
-
-    relay(me, rooms, tx, &target_peer_id, |from| ServerMessage::Chat {
-        from_peer_id: from,
-        envelope,
-    });
-}
-
 /// Скользящее окно, общее для чат-лимита и релей-лимита (см.
 /// `check_rate_limit`/`check_relay_rate_limit`): не более `limit` меток за
 /// `window`. Возвращает `true`, если ещё одна метка разрешена (и тогда
@@ -780,17 +697,8 @@ fn sliding_window_ok(times: &mut VecDeque<Instant>, limit: usize, window: Durati
     true
 }
 
-/// Скользящий счётчик: не более `CHAT_RATE_LIMIT` сообщений за
-/// `CHAT_RATE_WINDOW` с одного соединения. Возвращает `true`, если сообщение
-/// разрешено (и тогда регистрирует его метку времени). Специфичный для
-/// адресного fallback-чата лимит — строже общего релей-лимита ниже.
-fn check_rate_limit(chat_times: &mut VecDeque<Instant>) -> bool {
-    sliding_window_ok(chat_times, CHAT_RATE_LIMIT, CHAT_RATE_WINDOW)
-}
-
 /// H2 (DoS-защита): общий скользящий счётчик на ВСЕ релеи соединения
-/// суммарно (offer/answer/ice-candidate/stream-info/chat) — см.
-/// `RELAY_RATE_LIMIT`.
+/// суммарно (offer/answer/ice-candidate/stream-info) — см. `RELAY_RATE_LIMIT`.
 fn check_relay_rate_limit(relay_times: &mut VecDeque<Instant>) -> bool {
     sliding_window_ok(relay_times, RELAY_RATE_LIMIT, RELAY_RATE_WINDOW)
 }

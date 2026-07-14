@@ -18,31 +18,36 @@
 - [9. Edit & Delete](#9-edit--delete)
 - [10. File Transfer](#10-file-transfer)
 - [11. Rate Limiting](#11-rate-limiting)
-- [12. Fallback Through the Server](#12-fallback-through-the-server)
+- [12. No Server Fallback](#12-no-server-fallback)
 
 <!-- /toc -->
 
 > Source of truth: [`../static/chat.js`](../static/chat.js). Bus transport
-> mechanics are in [`webrtc-mesh.md` §3](webrtc-mesh.md#3-the-data-channel-bus);
-> the server-side fallback relay is specified in
-> [`signaling-protocol.md`](signaling-protocol.md); what the server can and
-> cannot see about chat is covered in [`privacy.md`](privacy.md).
+> mechanics are in [`webrtc-mesh.md` §3](webrtc-mesh.md#3-the-data-channel-bus).
+> Chat runs only over the bus — there is no server relay for it (see
+> [§12](#12-no-server-fallback)); what the server can and cannot see about chat
+> is covered in [`privacy.md`](privacy.md).
 
 ## 1. Transport
 
-Chat travels **directly between participants** over the mesh
+Chat travels **exclusively between participants** over the mesh
 `RTCDataChannel` bus (see [`webrtc-mesh.md`](webrtc-mesh.md)):
 
-- **Primary path**: broadcast an envelope to every peer whose bus channel is
+- **The only path**: broadcast an envelope to every peer whose bus channel is
   currently open.
-- **Fallback path**: for a peer whose channel isn't open yet, the envelope
-  is sent as an addressed message through the signaling server
-  (`chat` / `envelope`, see [`signaling-protocol.md`](signaling-protocol.md)),
-  encrypted under `K_chat` (see [`e2e-encryption.md`](e2e-encryption.md)) so
-  the server sees only `{enc: {v, iv, ct}}`, never the envelope's content.
+- **Not yet open**: for a peer whose channel hasn't opened yet, the envelope
+  is held in a small **local outgoing queue** and flushed onto the bus the
+  moment that peer's channel opens (see [`../static/chat.js`](../static/chat.js):
+  `sendEnvelopeToPeer` / `notifyBusOpen`). It is **never** relayed through the
+  server.
 
-The server never sees, parses, or stores chat content on the primary path at
-all — it is not in that path in any capacity.
+There is **no server-relayed chat fallback** — the earlier addressed
+`chat`/`envelope` relay was removed (see [§12](#12-no-server-fallback) for the
+rationale). The server never sees, parses, relays, or stores chat content in
+any capacity; if no peer-to-peer path exists at all (direct or via TURN),
+there is simply no chat — and no media either, since the server carries no
+media. This keeps a single, uniform end-to-end story: everything is DTLS
+between the two browsers, with nothing weaker running alongside it.
 
 ## 2. The Message Envelope
 
@@ -169,9 +174,8 @@ traffic at all, so this is not a gap the server could plausibly close either.
 stops a sender from writing someone else's peer id into it. What can't be
 forged is the **transport-level** identity of who actually delivered the
 message: over the bus, that's the peer id of the specific `RtcPeer` whose
-data channel carried it; over the server fallback, it's the peer id the
-server itself attaches from the WebSocket connection's own identity — in
-neither case does the client control this value.
+data channel carried it — the client cannot control this value. (Chat only
+ever travels over the bus now; there is no server relay for it.)
 
 Before any other processing, the dispatcher overwrites `envelope.from` with
 this true transport identity for every `kind` that carries authorship
@@ -247,7 +251,7 @@ Strictly peer-to-peer — the server never sees file bytes, under any
 circumstance.
 
 1. **Offer.** The sender posts a `file-offer` envelope through the normal
-   chat transport (bus broadcast + server fallback) and it lands in the same
+   chat transport (bus broadcast) and it lands in the same
    history buffer as text messages — a late joiner sees the file card from
    history replay exactly as they would a historical text message. The
    actual `File` object lives only in the sender's tab memory
@@ -273,8 +277,8 @@ circumstance.
    won't fire if the buffer was already empty before the listener attached.
    The receiver accumulates chunks into a `Blob` and checks the final size
    against the declared size.
-5. **Unavailability.** An offer with no live P2P channel to the sender (a
-   fallback-only pair, or the sender having since left) results in the
+5. **Unavailability.** An offer with no live P2P channel to the sender (the
+   sender having since left, or no channel ever formed) results in the
    card honestly showing "unavailable" — the product never falls back to
    proxying file bytes through the server (see
    [`PRD.md` §5.3](PRD.md#53-chat) and [`privacy.md`](privacy.md)).
@@ -286,20 +290,30 @@ shows a card with an explicit download action.
 ## 11. Rate Limiting
 
 A **client-side, soft** rate limit — no more than 10 messages per 10 seconds
-— blocks sending with an inline error in the panel. This is independent of
-(and looser in spirit than) the server's own rate limit on the fallback
-relay path only (see [`security.md`](security.md)); reactions are not
-subject to this limit at all, being lightweight toggle events rather than
-full messages.
+— blocks sending with an inline error in the panel. Since chat never touches
+the server, this is the *only* chat rate limit there is (there is no
+server-side chat limit any more); reactions are not subject to it at all,
+being lightweight toggle events rather than full messages.
 
-## 12. Fallback Through the Server
+## 12. No Server Fallback
 
-The server-relayed fallback path exists purely for the bootstrap window
-before a pair's bus channel has opened (or for a pair that never manages to
-open one). Server enforcement on this path is described in
-[`signaling-protocol.md`](signaling-protocol.md) and
-[`permissions-and-leader.md`](permissions-and-leader.md) — envelope size cap,
-rate limit, and the `guestChat` permission check. None of this applies to
-the primary bus path, which the server cannot see or gate at all — see
-[`permissions-and-leader.md`](permissions-and-leader.md) for the honest
-statement of what is and isn't actually enforceable.
+Chat has **no server-relayed fallback**. An earlier version relayed
+addressed `chat`/`envelope` messages through the signaling server for the
+bootstrap window before a pair's bus channel opened; that path was removed.
+
+The reasoning: the server carries no media, so a session with no
+peer-to-peer path (direct or via TURN) has no call to speak of — a
+text-only "chat over the server" mode would prop up a corner where the
+actual product is already dead, at the cost of a second, weaker transport
+that bypasses the bus's DTLS end-to-end guarantee and complicates the trust
+story (see [`sas-verification.md`](sas-verification.md) and
+[`e2e-encryption.md`](e2e-encryption.md)). The bootstrap window is instead
+covered by a purely **local** outgoing queue that flushes onto the bus when
+the channel opens ([§1](#1-transport)) — one transport, no server chat path,
+and "no verification code shown" now unambiguously means "not connected yet"
+rather than "connected but unverifiable."
+
+Consequently the `guestChat` permission is now **cooperative only**, like the
+audio/video/screen permissions — there is no server-visible chat path left to
+gate. See [`permissions-and-leader.md`](permissions-and-leader.md) for the
+honest statement of what is and isn't enforceable.

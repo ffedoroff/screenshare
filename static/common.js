@@ -43,13 +43,9 @@ async function fetchIceServers() {
  */
 const ConnStats = {
   signalingRelayCount: 0, // offer/answer/ice-candidate/stream-info(fallback) — через серверный релей
-  fallbackChatCount: 0, // сообщения чата, ушедшие через сервер (P2P-шина к пиру не была открыта)
 
   incSignalingRelay() {
     this.signalingRelayCount++;
-  },
-  incFallbackChat() {
-    this.fallbackChatCount++;
   },
 };
 
