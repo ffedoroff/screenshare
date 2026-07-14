@@ -11,9 +11,10 @@ const FALLBACK_ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }];
  * При любой ошибке (сеть, парсинг, пустой ответ) — тихий фоллбэк на STUN.
  *
  * Ш2: бьём в `window.API_BASE` (см. static/config.js), а не в same-origin
- * `/config` напрямую — на Cloudflare Pages фронт и API живут на разных
- * хостах (chat.fedorov.it / chat-api.fedorov.it), API_BASE — единственная
- * точка, знающая актуальный адрес бэкенда.
+ * `/config` напрямую — в split-origin деплое (см. docs/self-hosting.md,
+ * «Split Origin (Frontend / Signaling Separated)») фронт и API живут на
+ * разных хостах (the static origin / a separate API host), API_BASE —
+ * единственная точка, знающая актуальный адрес бэкенда.
  */
 async function fetchIceServers() {
   try {
@@ -71,9 +72,10 @@ class Signaling {
    * Открыть WebSocket-соединение с `/ws`. Промис резолвится после открытия.
    *
    * Ш2: адрес выводится из `window.API_BASE` (см. static/config.js), а не из
-   * `location.host` — на Cloudflare Pages фронт и API на разных хостах,
+   * `location.host` — в split-origin деплое фронт и API на разных хостах,
    * `API_BASE.replace(/^http/, 'ws')` даёт `ws:`/`wss:` в зависимости от
-   * того, http или https там прописан (см. README.md «Топология Ш2»).
+   * того, http или https там прописан (см. docs/self-hosting.md, «Split
+   * Origin (Frontend / Signaling Separated)»).
    */
   connect() {
     // Повторный вызов (авто-reconnect, см. static/room.js) НЕ должен оставлять

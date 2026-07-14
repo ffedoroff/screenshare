@@ -17,7 +17,7 @@
 //!
 //! Протокол v4 (система прав): комната теперь имеет лидера (`leaderId`) и
 //! `settings` (права гостей), опционально wait room (`lobby_enabled`) —
-//! подробности модели см. README.md, раздел «Права и лидер».
+//! подробности модели см. docs/permissions-and-leader.md.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -84,7 +84,7 @@ pub enum ClientMessage {
         /// `AppState`/`main.rs::create_room`). Совпал с хранимым в комнате —
         /// вошедший становится лидером и токен сгорает. `PUT
         /// /api/rooms/{id}` токен не выдаёт вовсе — восстановленная комната
-        /// отдаёт лидерство первому вошедшему (см. README.md).
+        /// отдаёт лидерство первому вошедшему (см. docs/permissions-and-leader.md).
         #[serde(default)]
         leader_token: Option<String>,
     },
@@ -137,7 +137,7 @@ pub enum ServerMessage {
         peer_id: String,
         peers: Vec<PeerInfo>,
         screen_owner: Option<String>,
-        /// peerId текущего лидера комнаты (см. README.md, «Права и лидер»).
+        /// peerId текущего лидера комнаты (см. docs/permissions-and-leader.md).
         leader_id: String,
         /// Текущие настройки комнаты (права гостей + lobby).
         settings: RoomSettings,
@@ -146,8 +146,8 @@ pub enum ServerMessage {
         /// остальным приходит пустой список.
         pending: Vec<PendingInfo>,
         /// Остаток жизни комнаты в секундах на момент входа (лимит
-        /// длительности созвона — см. README.md, «Лимит длительности
-        /// созвона»): `MAX_ROOM_LIFETIME_SECONDS` минус возраст комнаты,
+        /// длительности созвона — см. docs/security.md, «Meeting Duration
+        /// Ceiling»): `MAX_ROOM_LIFETIME_SECONDS` минус возраст комнаты,
         /// зажатый снизу в 0. Сервер меряет возраст монотонными часами
         /// (`Instant`), поэтому клиенту шлём именно ОСТАТОК, а не абсолютное
         /// время истечения — у клиента нет способа сопоставить `Instant`
@@ -212,8 +212,8 @@ pub enum ServerMessage {
     /// детерминированно назначил участника с самым ранним `joined_at`).
     LeaderChanged { leader_id: String },
     /// Всем участникам И ожидающим в лобби: комната прожила дольше
-    /// `MAX_ROOM_LIFETIME_SECONDS` (см. README.md, «Лимит длительности
-    /// созвона») — реапер (`state::reap_rooms`) шлёт это сообщение каждому,
+    /// `MAX_ROOM_LIFETIME_SECONDS` (см. docs/security.md, «Meeting Duration
+    /// Ceiling») — реапер (`state::reap_rooms`) шлёт это сообщение каждому,
     /// затем удаляет комнату целиком, независимо от того, есть ли в ней
     /// живые участники. Как `room-full`/`room-not-found`/`join-rejected` —
     /// сервер сам закрывает сокет сразу вслед за этим сообщением (см.

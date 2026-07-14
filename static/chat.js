@@ -142,13 +142,14 @@
 // сюда параметром `name` в ChatPanel.create()/attach(). Никакого
 // localStorage/sessionStorage здесь и во всём файле нет.
 //
-// Права гостей (см. README.md, «Права и лидер»): при `guestChat=false`
-// инпут дизейблится (см. room.js: ChatPanel.setChatForbidden) и получатели
-// игнорируют входящие 'text'/'file-offer' конверты от НЕ-лидеров (см.
-// dispatchEnvelope ниже) — и по шине, и по серверному fallback, единая точка
-// входа. Это кооперативная защита: модифицированный клиент получателя может
-// её игнорировать и отрендерить конверт всё равно (сервер P2P-трафик не
-// видит и проверить не может) — так и задумано, см. README.md.
+// Права гостей (см. docs/permissions-and-leader.md, «Chat — Partially
+// Server-Enforced»): при `guestChat=false` инпут дизейблится (см. room.js:
+// ChatPanel.setChatForbidden) и получатели игнорируют входящие
+// 'text'/'file-offer' конверты от НЕ-лидеров (см. dispatchEnvelope ниже) —
+// и по шине, и по серверному fallback, единая точка входа. Это кооперативная
+// защита: модифицированный клиент получателя может её игнорировать и
+// отрендерить конверт всё равно (сервер P2P-трафик не видит и проверить не
+// может) — так и задумано, см. docs/permissions-and-leader.md.
 //
 // H3 — привязка личности (identity binding): envelope.from — САМОЗАЯВЛЕННОЕ
 // поле, отправитель волен вписать туда что угодно (в т.ч. чужой peerId).
@@ -579,7 +580,8 @@ const ChatPanel = (() => {
     // не шифруется этим слоем.
     let chatKey = null;
     let getPeerIds = () => [];
-    // Права гостей (см. README.md, «Права и лидер»): getLeaderId/getGuestChatAllowed
+    // Права гостей (см. docs/permissions-and-leader.md, «Chat — Partially
+    // Server-Enforced»): getLeaderId/getGuestChatAllowed
     // — колбэки room.js, читающие ЖИВЫЕ leaderId/roomSettings.guestChat на
     // момент вызова (не снимок на момент attach) — используются в
     // isIncomingEnvelopeAllowed ниже для игнорирования входящих text/file-offer
@@ -1358,8 +1360,9 @@ const ChatPanel = (() => {
     }
 
     /**
-     * Права гостей на стороне ПОЛУЧАТЕЛЯ (см. README.md, «Права и лидер» и
-     * заголовок файла): при `guestChat=false` входящие 'text'/'file-offer' от
+     * Права гостей на стороне ПОЛУЧАТЕЛЯ (см. docs/permissions-and-leader.md,
+     * «Chat — Partially Server-Enforced», и заголовок файла): при
+     * `guestChat=false` входящие 'text'/'file-offer' от
      * кого угодно, кроме текущего лидера, молча игнорируются — и по шине, и
      * по fallback-релею сервера (единая точка входа — dispatchEnvelope).
      * Остальные kind (reaction/edit/delete/history-*) этим ограничением не
@@ -1368,7 +1371,8 @@ const ChatPanel = (() => {
      *
      * Кооперативная защита: модифицированный клиент получателя может этот
      * фильтр не применять и отрендерить конверт всё равно — сервер P2P-байты
-     * не видит и запретить их доставку физически не может (см. README.md).
+     * не видит и запретить их доставку физически не может (см.
+     * docs/permissions-and-leader.md, «Chat — Partially Server-Enforced»).
      */
     function isIncomingEnvelopeAllowed(fromPeerId, envelope) {
       if (envelope.kind !== 'text' && envelope.kind !== 'file-offer') return true;
@@ -2029,7 +2033,7 @@ const ChatPanel = (() => {
       applyInputState();
     }
 
-    /** room.js вызывает при applyGuestEnforcement()/settings-changed (см. README.md, «Права и лидер»). */
+    /** room.js вызывает при applyGuestEnforcement()/settings-changed (см. docs/permissions-and-leader.md). */
     function setChatForbidden(forbidden) {
       forbiddenByLeader = forbidden;
       applyInputState();

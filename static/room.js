@@ -77,7 +77,7 @@ const reconnectBannerEl = document.getElementById('reconnect-banner');
 const versionBannerEl = document.getElementById('version-banner');
 const versionBannerReloadButtonEl = document.getElementById('version-banner-reload-button');
 
-// --- DOM: права и лидер (см. README.md, «Права и лидер») ---
+// --- DOM: права и лидер (см. docs/permissions-and-leader.md) ---
 const settingsButton = document.getElementById('settings-button');
 const settingsBadgeEl = document.getElementById('settings-badge');
 const joinRequestsEl = document.getElementById('join-requests');
@@ -165,8 +165,8 @@ let iceServersCache = null;
 //
 // Ключевая идея: обрыв WS-сигналинга сам по себе НЕ должен рушить mesh
 // (медиа/DataChannel-чат) — они физически не зависят от сигналинга и живут,
-// пока живо само P2P-соединение (см. README.md, раздел про живучесть звонка
-// при деплое). Поэтому неожиданный обрыв (не «Покинуть», не room-not-found/
+// пока живо само P2P-соединение (см. docs/self-hosting.md, «Surviving a
+// Restart/Redeploy»). Поэтому неожиданный обрыв (не «Покинуть», не room-not-found/
 // room-full — те уже терминальны сами по себе) запускает цикл
 // переподключения с экспоненциальным бэкоффом вместо немедленного
 // «Соединение потеряно».
@@ -198,10 +198,11 @@ const pendingPeerRemovals = new Map();
 let screenOwnerGraceTimer = null;
 // Версия приложения (см. GET /version.json), с которой была загружена эта
 // страница — сверяется заново после каждого успешного реконнекта (стандарт
-// version-skew баннера, см. README.md).
+// version-skew баннера, см. docs/signaling-protocol.md, «GET /version.json»).
 let lastKnownVersion = null;
 
-// --- Лимит длительности созвона (3 часа, см. README.md) ---
+// --- Лимит длительности созвона (3 часа, см. docs/security.md, «Meeting
+// Duration Ceiling») ---
 //
 // Сервер сам считает и присылает остаток жизни комнаты в `joined.expiresInSeconds`
 // (см. src/ws.rs::room_expires_in_seconds) — на КАЖДОМ joined, и при первом
@@ -262,7 +263,7 @@ const peerNames = new Map();
 // Свой тайл (создаётся сразу после joined).
 let ownTile = null;
 
-// --- Права и лидер (см. README.md, «Права и лидер») ---
+// --- Права и лидер (см. docs/permissions-and-leader.md) ---
 let leaderId = null;
 let isLeader = false;
 // RoomSettings с сервера (см. src/protocol.rs::RoomSettings) — null до первого joined.
@@ -294,7 +295,7 @@ let camRequestInProgress = false;
 // --- Выбор устройств (см. раздел «Камера и микрофон» ниже) ---
 //
 // Выбор пользователя живёт ТОЛЬКО в памяти вкладки (никакого localStorage —
-// анонимность, см. README.md) и переживает выключение/включение мика или
+// анонимность, см. docs/privacy.md, «Anonymity») и переживает выключение/включение мика или
 // камеры кнопкой, но не reload/переход в другую комнату.
 // selected*DeviceId — то, что выбрано в селекте прямо сейчас (желаемое);
 // current*DeviceId — deviceId, реально стоящий за активным треком (что
@@ -469,7 +470,7 @@ function showRoomMessage(text) {
   }, 4000);
 }
 
-/** Ненавязчивый тост (смена лидера и т.п., см. README.md «Права и лидер») — отдельно от showRoomMessage (та зарезервирована под предупреждения/ошибки). */
+/** Ненавязчивый тост (смена лидера и т.п., см. docs/permissions-and-leader.md) — отдельно от showRoomMessage (та зарезервирована под предупреждения/ошибки). */
 function showToast(text, ms = 3000) {
   toastEl.textContent = text;
   toastEl.classList.remove('hidden');
@@ -576,7 +577,7 @@ function createTile(peerId, name, isOwn) {
   label.className = 'tile-name';
   label.textContent = isOwn ? `Вы${trimmedName ? ` (${trimmedName})` : ''}` : (trimmedName || 'Гость');
 
-  // Корона лидера (см. README.md «Права и лидер») — скрыта по умолчанию,
+  // Корона лидера (см. docs/permissions-and-leader.md) — скрыта по умолчанию,
   // показывается/прячется через setLeaderIndicator() при смене leaderId.
   const crown = document.createElement('span');
   crown.className = 'tile-crown hidden';
@@ -687,7 +688,8 @@ function showTileVideo(peerId, show) {
 // ---------- Экран (главная зона) ----------
 
 function updateScreenButtonState() {
-  // Права гостей (см. README.md «Права и лидер»): guestScreen=false запрещает
+  // Права гостей (см. docs/permissions-and-leader.md, «Screen Sharing —
+  // Server-Enforced»): guestScreen=false запрещает
   // гостю (не лидеру) даже пробовать — кнопка задизейблена независимо от
   // текущего состояния владения экраном. Лидера это ограничение не касается.
   if (!isLeader && roomSettings && !roomSettings.guestScreen) {
@@ -745,7 +747,7 @@ function showRemoteScreenCaption(peerId) {
 
 // ---------- Права гостей: применение на своей стороне (отправитель) ----------
 //
-// Кооперативная защита (см. README.md «Права и лидер»): применяется на
+// Кооперативная защита (см. docs/permissions-and-leader.md, §7): применяется на
 // СВОЕЙ стороне (кнопки мик/камера/экран, инпут чата) при получении
 // settings-changed/joined. Обходится модифицированным клиентом — сервер это
 // и не пытается предотвратить технически (медиа/чат — P2P), только не
@@ -789,7 +791,8 @@ function applyGuestEnforcement() {
 // guestAudio/guestVideo=false — получатели не рендерят соответствующий трек
 // ГОСТЕЙ (не лидера), независимо от того, отключил ли сам гость трек кнопкой
 // (см. applyGuestEnforcement выше — защита именно кооперативная: сервер
-// медиапотоки не видит и не может их запретить технически, см. README.md).
+// медиапотоки не видит и не может их запретить технически, см.
+// docs/permissions-and-leader.md, «Audio & Video — Receiver-Enforced Only»).
 
 function getOrCreateMediaRefs(peerId) {
   let refs = peerMediaRefs.get(peerId);
@@ -1534,7 +1537,7 @@ function removeRemotePeer(peerId) {
  * signaling.on('room-expired') в registerSignalingHandlers: комната на
  * сервере уже удалена). В отличие от giveUpReconnect (там сокет сигналинга
  * умер, но mesh/DataChannel-чат физически могут пережить это и оставлены как
- * есть — см. README.md про живучесть звонка при деплое), здесь причина
+ * есть — см. docs/self-hosting.md, «Surviving a Restart/Redeploy»), здесь причина
  * терминальна ПО СУТИ (не «сервер моргнул», а «время вышло») — оставлять
  * висеть P2P-соединения и захваченные mic/camera/screen треки браузера
  * незачем, останавливаем их сразу.
@@ -1640,7 +1643,7 @@ joinNameInputEl.addEventListener('keydown', (event) => {
 async function init() {
   // Ш1 (E2E-шифрование): ключ комнаты обязателен ДО показа чего-либо
   // связанного с реальным входом — без него нет смысла даже спрашивать имя,
-  // всё равно ничего не заработает (см. README.md «Приватность»,
+  // всё равно ничего не заработает (см. docs/e2e-encryption.md,
   // deriveRoomKeys выше). Та же семантика, что и при отказе расшифровки
   // первого входящего сообщения (см. showInvalidLinkOverlay).
   const keysOk = await deriveRoomKeys();
@@ -1649,7 +1652,7 @@ async function init() {
     return;
   }
 
-  // Анонимность (см. README.md): имя спрашивается заново при КАЖДОМ заходе
+  // Анонимность (см. docs/privacy.md, «Anonymity»): имя спрашивается заново при КАЖДОМ заходе
   // этой модалкой — никакого localStorage. join-room уходит только после
   // клика «Войти» (см. onJoinModalSubmit). При авто-reconnect модалка не
   // показывается повторно — имя уже в памяти вкладки (myName), см.
@@ -1677,7 +1680,8 @@ async function connectAndJoin() {
     if (intentionalDisconnect || terminalState || !joinedOnce) return;
 
     // Неожиданный обрыв сигналинга после успешного входа — mesh (медиа,
-    // DataChannel-чат) при этом жив (см. README.md), поэтому НЕ рушим
+    // DataChannel-чат) при этом жив (см. docs/self-hosting.md, «Surviving a
+    // Restart/Redeploy»), поэтому НЕ рушим
     // интерфейс сразу: тонкий баннер + авто-reconnect с бэкоффом, и только
     // если он исчерпает бюджет — терминальный оверлей «Соединение потеряно».
     startReconnectLoop();
@@ -1715,7 +1719,8 @@ function registerSignalingHandlers(iceServers) {
 
     // Лимит длительности созвона: пересчитываем дедлайн из свежего
     // expiresInSeconds на КАЖДОМ joined — и при первом входе, и при
-    // реконнекте (см. startRoomTimer выше и README.md).
+    // реконнекте (см. startRoomTimer выше и docs/security.md, «Meeting
+    // Duration Ceiling»).
     startRoomTimer(expiresInSeconds);
 
     if (!joinedOnce) {
@@ -1777,8 +1782,9 @@ function registerSignalingHandlers(iceServers) {
     roomSettings = settings;
     setLeaderIndicator(joinedLeaderId);
     updateSettingsButtonVisibility();
-    // Лидерство при реконнекте может смениться (см. README.md «Права и
-    // лидер»: сервер мог уже удалить нас и назначить нового лидера) — pending
+    // Лидерство при реконнекте может смениться (см.
+    // docs/permissions-and-leader.md, «Reconnecting With the Same Peer Id»:
+    // сервер мог уже удалить нас и назначить нового лидера) — pending
     // видим заново, только если после реконнекта лидер снова мы.
     pendingRequests = isLeader
       ? await Promise.all((pending || []).map(async (p) => ({ peerId: p.peerId, name: await decryptPeerName(p.name) })))
@@ -1790,7 +1796,8 @@ function registerSignalingHandlers(iceServers) {
   });
 
   signaling.on('waiting', () => {
-    // Лобби (см. README.md «Права и лидер»): вместо joined сначала приходит
+    // Лобби (см. docs/permissions-and-leader.md, «The Waiting Room
+    // (Lobby)»): вместо joined сначала приходит
     // это — ждём решения лидера. «Отменить» = leave + на главную (тот же
     // приём, что и у leaveButton ниже — intentionalDisconnect до leave).
     showOverlay({
@@ -1867,7 +1874,8 @@ function registerSignalingHandlers(iceServers) {
     });
   });
 
-  // Лимит длительности созвона (3 часа, см. README.md и startRoomTimer выше):
+  // Лимит длительности созвона (3 часа, см. docs/security.md, «Meeting
+  // Duration Ceiling», и startRoomTimer выше):
   // сервер сам решает, что время вышло — рассылает это всем участникам И
   // ожидающим в лобби, и сам закрывает сокет сразу следом (см. src/ws.rs::
   // reap_rooms, src/state.rs). terminalState=true ставим СИНХРОННО здесь же
@@ -1981,7 +1989,8 @@ function registerSignalingHandlers(iceServers) {
       forceStopLocalScreenCapture();
     }
     if (reason === 'forbidden') {
-      // Отказ по правам (guestScreen=false, см. README.md «Права и лидер»),
+      // Отказ по правам (guestScreen=false, см. docs/permissions-and-leader.md,
+      // «Screen Sharing — Server-Enforced»),
       // а не потому что экран занят — busyPeerId в этом случае не приходит.
       currentScreenOwnerPeerId = null;
       updateScreenButtonState();
@@ -2106,7 +2115,7 @@ function finishReconnectSuccess() {
   reconnecting = false;
   hideReconnectBanner();
   // Стандарт version-skew баннера: перечитать /version.json после каждого
-  // успешного реконнекта (см. README.md).
+  // успешного реконнекта (см. docs/signaling-protocol.md, «GET /version.json»).
   checkVersionSkew();
 }
 

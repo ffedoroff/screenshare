@@ -263,7 +263,8 @@ body {
   white-space: nowrap;
 }
 
-/* Лимит длительности созвона (3 часа, см. README.md) — тот же стиль пилюли,
+/* Лимит длительности созвона (3 часа, см. docs/security.md, «Meeting
+   Duration Ceiling») — тот же стиль пилюли,
    что и .participant-count, но с явной сменой цвета по мере приближения к
    концу: обычный (text-muted) -> жёлтый (последние 10 минут) -> красный
    (последняя минута), см. static/room.js: updateRoomTimerDisplay. */

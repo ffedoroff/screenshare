@@ -25,11 +25,13 @@
 //! было информации о сессии. Комната умирает — умирает вся её память
 //! (участники, имена).
 //!
-//! Ш2 (разнесение доверия, см. README.md «Топология Ш2»): статика фронтенда
-//! уезжает на Cloudflare Pages, этот сервер остаётся ТОЛЬКО API/WS на
-//! отдельном хосте (`chat-api.fedorov.it`) — фронт и бэкенд МОГУТ жить на
-//! разных origin. Отсюда: CORS на кросс-оригин HTTP-эндпоинтах (`cors_middleware`
-//! ниже, включается через env `CORS_ORIGIN`) и опциональная проверка `Origin`
+//! Ш2 (разнесение доверия, см. docs/self-hosting.md, «Split Origin (Frontend
+//! / Signaling Separated)», и docs/e2e-encryption.md, «Trust Split»): статика
+//! фронтенда может уехать на отдельный статический хостинг, этот сервер
+//! остаётся ТОЛЬКО API/WS на отдельном хосте (a separate API host) — фронт и
+//! бэкенд МОГУТ жить на разных origin. Отсюда: CORS на кросс-оригин
+//! HTTP-эндпоинтах (`cors_middleware` ниже, включается через env
+//! `CORS_ORIGIN`) и опциональная проверка `Origin`
 //! на `/ws` (см. `ws.rs::ws_handler`) — оба выключены (никаких заголовков,
 //! никакой проверки) по умолчанию, пока `CORS_ORIGIN` не задан, так что
 //! локалка и нынешний прод (статика и API ещё на одном хосте) ведут себя
@@ -71,11 +73,13 @@ static STATIC_DIR: LazyLock<String> = LazyLock::new(|| {
         .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/static").to_string())
 });
 
-/// Ш2 (разнесение доверия — статика уезжает на Cloudflare Pages, этот сервер
-/// остаётся только API/WS на отдельном хосте, см. README.md «Топология Ш2»):
+/// Ш2 (разнесение доверия — статика уезжает на отдельный статический хостинг,
+/// этот сервер остаётся только API/WS на отдельном хосте, см.
+/// docs/self-hosting.md, «Split Origin (Frontend / Signaling Separated)»):
 /// разрешённый кросс-оригин для CORS, из env `CORS_ORIGIN` (например
-/// `https://chat.fedorov.it`). Пусто/не задано (дефолт — локалка и нынешний
-/// прод, где фронт и API ещё на одном хосте) значит «CORS выключен целиком»:
+/// `https://your-domain.example`). Пусто/не задано (дефолт — локалка и
+/// однохостовый деплой, где фронт и API ещё на одном хосте) значит «CORS
+/// выключен целиком»:
 /// ни один Access-Control-* заголовок не шлётся (см. `cors_middleware`) — с
 /// точки зрения браузера ничего не изменилось по сравнению с тем, как сервер
 /// вёл себя раньше.
@@ -85,8 +89,8 @@ pub(crate) static CORS_ORIGIN: LazyLock<Option<String>> = LazyLock::new(|| {
         .filter(|v| !v.is_empty())
 });
 
-/// Лимит длительности созвона (см. README.md, «Лимит длительности созвона»):
-/// комната старше этого возраста удаляется реапером (`state::reap_rooms`)
+/// Лимит длительности созвона (см. docs/security.md, «Meeting Duration
+/// Ceiling»): комната старше этого возраста удаляется реапером (`state::reap_rooms`)
 /// целиком, даже если в ней есть живые участники — им перед этим рассылается
 /// `room-expired`. Env `MAX_ROOM_LIFETIME_SECONDS`, дефолт 3 часа
 /// (`DEFAULT_MAX_ROOM_LIFETIME_SECONDS`). `LazyLock` (как `CORS_ORIGIN` выше)
@@ -187,8 +191,8 @@ async fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(120);
     let empty_room_ttl = Duration::from_secs(empty_room_ttl_secs);
-    // Лимит длительности созвона (H3/новое требование, см. README.md) —
-    // читаем сразу (форсируем LazyLock), чтобы значение зафиксировалось до
+    // Лимит длительности созвона (см. docs/security.md, «Meeting Duration
+    // Ceiling») — читаем сразу (форсируем LazyLock), чтобы значение зафиксировалось до
     // спауна реапера и первого запроса.
     let max_room_lifetime = *MAX_ROOM_LIFETIME;
     tokio::spawn(state::reap_rooms(rooms.clone(), empty_room_ttl, max_room_lifetime));
@@ -292,8 +296,8 @@ async fn shutdown_signal() {
 /// это время никто не подключится, реапер (`state::reap_rooms`) её
 /// удалит.
 ///
-/// Возвращает вместе с `roomId` одноразовый `leaderToken` (см. README.md,
-/// «Права и лидер»): создатель предъявляет его в своём `join-room`, чтобы
+/// Возвращает вместе с `roomId` одноразовый `leaderToken` (см.
+/// docs/permissions-and-leader.md): создатель предъявляет его в своём `join-room`, чтобы
 /// стать лидером комнаты — токен сгорает при первом же успешном предъявлении
 /// (совпавшем с хранимым). Если никто не предъявит токен, лидером станет
 /// первый вошедший как обычно.
@@ -357,8 +361,8 @@ async fn create_room(
 }
 
 /// `PUT /api/rooms/{room_id}`: идемпотентное восстановление комнаты после
-/// рестарта сервера (см. «Живучесть звонка при деплое» в README.md) — вся
-/// память комнат целиком в процессе, поэтому рестарт стирает её без следа, а
+/// рестарта сервера (см. docs/self-hosting.md, «Surviving a Restart/Redeploy»)
+/// — вся память комнат целиком в процессе, поэтому рестарт стирает её без следа, а
 /// клиенты при авто-reconnect могут наткнуться на `room-not-found` для
 /// комнаты, в которой только что были. Вместо того чтобы это было тупиком,
 /// фронтенд (см. `static/room.js`) в ответ на `room-not-found` при
@@ -375,7 +379,7 @@ async fn create_room(
 ///
 /// Про безопасность восстановления по известному id: комнаты в этом проекте
 /// эфемерны и не имеют отдельного контроля доступа — единственный секрет это
-/// сам `roomId` в ссылке (см. «Приватность» в README.md). Восстановление по
+/// сам `roomId` в ссылке (см. docs/privacy.md). Восстановление по
 /// уже известному клиенту id НИЧЕГО не расширяет по доступу — кто знал
 /// ссылку до рестарта, тот и после рестарта мог бы просто получить
 /// `room-not-found` и создать СВОЮ новую комнату с другим id; этот эндпоинт
@@ -410,7 +414,7 @@ async fn restore_room(
             screen_owner: None,
             emptied_at: Some(Instant::now()),
             // Восстановленная комната токен лидера не выдаёт — лидером
-            // станет первый вошедший (см. README.md, «Права и лидер»).
+            // станет первый вошедший (см. docs/permissions-and-leader.md).
             leader_id: None,
             leader_token: None,
             settings: RoomSettings::default(),
@@ -484,7 +488,8 @@ async fn static_file(Path(path): Path<String>) -> Response {
     }
 }
 
-/// H1 (эфемерные TURN-креды, см. README.md «TURN-сервер»): срок жизни
+/// H1 (эфемерные TURN-креды, см. docs/security.md, «H1 — Ephemeral TURN
+/// Credentials», и docs/self-hosting.md, «TURN (Optional)»): срок жизни
 /// каждой выданной `/config` пары username/credential — час достаточно на
 /// звонок (см. `MAX_ROOM_LIFETIME` — комнаты и так живут не дольше 3ч по
 /// умолчанию, а сам созвон переустанавливать ICE каждый час не должен: раз
@@ -592,8 +597,9 @@ fn is_valid_room_id(room: &str) -> bool {
 
 /// H1 (эфемерные TURN-креды): юнит-проверка `turn_hmac_credential` и
 /// формата `username`, без подъёма сервера/turn-rs (для end-to-end
-/// проверки формата ответа `/config` см. README.md/отчёт задачи — curl
-/// локально поднятого сервера с тестовым `TURN_STATIC_SECRET`).
+/// проверки формата ответа `/config` см. docs/security.md, «H1 — Ephemeral
+/// TURN Credentials» — curl локально поднятого сервера с тестовым
+/// `TURN_STATIC_SECRET`).
 #[cfg(test)]
 mod turn_credential_tests {
     use super::*;

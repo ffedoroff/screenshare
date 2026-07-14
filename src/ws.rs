@@ -804,7 +804,7 @@ fn relay_payload_too_large(value: &Value) -> bool {
 }
 
 /// Остаток жизни комнаты в секундах на текущий момент (лимит длительности
-/// созвона, см. README.md «Лимит длительности созвона») — `MAX_ROOM_LIFETIME`
+/// созвона, см. docs/security.md, «Meeting Duration Ceiling») — `MAX_ROOM_LIFETIME`
 /// минус возраст комнаты, зажатый снизу в 0. Используется в `Joined`, чтобы
 /// клиент мог сам показать обратный отсчёт/предупреждение.
 fn room_expires_in_seconds(room: &Room) -> u64 {
