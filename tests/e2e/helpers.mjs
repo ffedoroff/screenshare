@@ -752,6 +752,38 @@ export async function messageTextsInclude(page, text, timeoutMs = 5000) {
 }
 
 /**
+ * Дождаться отрисованного МНОГОСТРОЧНОГО сообщения из `lines` (см.
+ * static/chat.js: renderMessageBody вставляет между строками <br>, а НЕ
+ * текстовый '\n' — поэтому `.textContent` многострочного сообщения это
+ * строки, слитые БЕЗ разделителя, например ['a','b'] -> textContent "ab", а
+ * НЕ "a\nb"; `messageTextsInclude` с текстом, содержащим буквальный '\n',
+ * поэтому никогда не совпадёт с реальным textContent — этот хелпер проверяет
+ * многострочность правильно: конкатенация строк совпадает с textContent
+ * контейнера И внутри него есть хотя бы `lines.length - 1` элементов <br>
+ * (доказывает, что перенос действительно применился, а не просто визуально
+ * совпал текст без переноса).
+ */
+export async function messageWithLineBreaksIncludes(page, lines, timeoutMs = 5000) {
+  const expectedConcat = lines.join('');
+  const minBreaks = lines.length - 1;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const found = await page.evaluate(
+      ({ expectedConcat, minBreaks }) => {
+        const els = Array.from(document.querySelectorAll('.chat-message-text'));
+        return els.some(
+          (el) => el.textContent === expectedConcat && el.querySelectorAll('br').length >= minBreaks
+        );
+      },
+      { expectedConcat, minBreaks }
+    );
+    if (found) return true;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return false;
+}
+
+/**
  * Отправить текстовое сообщение и вернуть его сгенерированный id (см.
  * chat.js: dataset.msgId на .chat-message) — нужно, когда дальше по тесту
  * сообщение будут редактировать/удалять и его ТЕКСТ перестанет быть
@@ -770,6 +802,52 @@ export async function sendChatMessageAndGetId(page, text) {
     return null;
   }, text);
   return id;
+}
+
+// --- Попап действий сообщения (волна 13) — заменяет hover-кнопки/on-tap
+// action-row прошлых волн: единственный способ добраться до действий
+// сообщения теперь тап/клик по самому сообщению, см. static/chat.js:
+// openMessagePopover/closeMessagePopover. Общий синглтон на панель (не по
+// одному на сообщение) — все локаторы `.chat-message-popover *` ниже
+// работают ОДИНАКОВО на мобильном (bottom-sheet) и десктопе (поповер у
+// сообщения).
+
+/**
+ * Открыть попап действий для сообщения `messageLocator` (уже отфильтрованный
+ * `.chat-message`, например `page.locator('.chat-message', { hasText }).last()`).
+ * Клик — по `.chat-message-meta` (строка имя+время): она никогда не содержит
+ * ссылок/чипов реакций/спойлеров, поэтому не рискует попасть на элемент со
+ * своей отдельной клик-логикой (в отличие от клика по всему `.chat-message-text`,
+ * который для форматированных сообщений может содержать ссылку/спойлер).
+ */
+export async function openMessagePopoverFor(page, messageLocator) {
+  await messageLocator.locator('.chat-message-meta').click();
+  await page.locator('.chat-message-popover:not(.hidden)').waitFor({ state: 'visible', timeout: 3000 });
+}
+
+/** Закрыть попап действий кнопкой-крестиком (см. openMessagePopoverFor). */
+export async function closeMessagePopover(page) {
+  await page.click('.chat-message-popover-close');
+  await page.waitForFunction(
+    () => document.querySelector('.chat-message-popover')?.classList.contains('hidden'),
+    undefined,
+    { timeout: 2000 }
+  );
+}
+
+/** Локатор действия попапа по суффиксу класса (reply/react/edit/delete/copy) — попап один на страницу, поэтому без привязки к конкретному сообщению. */
+export function popoverAction(page, suffix) {
+  return page.locator(`.chat-message-popover .chat-message-action--${suffix}`);
+}
+
+/** Кликнуть эмодзи в палитре реакций попапа (см. .chat-message-popover-emoji). */
+export async function clickPopoverEmoji(page, emoji) {
+  await page.locator(`.chat-message-popover-emoji[data-emoji="${emoji}"]`).click();
+}
+
+/** Строки разбора реакций «кто/чем/когда» в открытом попапе (см. .chat-message-popover-reaction-row). */
+export function popoverReactionRows(page) {
+  return page.locator('.chat-message-popover-reaction-row');
 }
 
 // --- Передача файлов (Ф3): генерация тестовых файлов и хелпер вброса ---

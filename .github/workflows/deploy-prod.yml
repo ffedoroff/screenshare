@@ -79,6 +79,14 @@ jobs:
   deploy-pages:
     needs: [test, e2e]
     runs-on: ubuntu-latest
+    # Точечно поднимаем права ТОЛЬКО для этого job (глобально в файле —
+    # contents: read, см. верх файла) — нужен contents: write ровно для
+    # шага "Опубликовать хэш бандла в GitHub Release" ниже (создание/правка
+    # релиза через `gh`). Другие jobs (test/e2e/deploy) этот блок не
+    # затрагивает — per-job permissions полностью замещают глобальные только
+    # для job, где он задан.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - name: Собрать pages-dist/ (копия static/ + config.js под API-хост)
@@ -140,6 +148,71 @@ jobs:
             Referrer-Policy: no-referrer
             Permissions-Policy: camera=(self), microphone=(self), display-capture=(self), geolocation=(), interest-cohort=()
           HEADERS
+      - name: Посчитать детерминированный SHA-256 бандла и записать pages-dist/build-hash.json
+        # Форензический якорь против подмены статики хостером (Ш2 — см.
+        # docs/security.md, «Published Build Hash»): независимо от того, что
+        # отдаёт Cloudflare Pages, у любого проверяющего есть путь пересчитать
+        # тот же хэш из исходников и сверить его с GitHub Release (следующий
+        # шаг) — Cloudflare этот Release-канал не контролирует.
+        #
+        # Формула (ТОЧНО эта команда задокументирована в docs/security.md для
+        # независимого пересчёта — не меняйте одно без другого):
+        #   cd pages-dist && find . -type f ! -name build-hash.json \
+        #     | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -d' ' -f1
+        # — sha256 каждого файла бандла (кроме ещё не существующего на этот
+        # момент build-hash.json), список строк "hash  path" отсортирован
+        # БАЙТОВО (LC_ALL=C — не зависит от locale раннера/проверяющего), сам
+        # этот текст хэшируется ещё раз целиком -> берём первое поле.
+        # cd в pages-dist ОБЯЗАТЕЛЕН до find: пути должны быть относительными
+        # (`./static/chat.js`, не `/home/runner/.../pages-dist/static/chat.js`)
+        # — иначе хэш зависел бы от абсолютного пути чекаута и не совпал бы у
+        # стороннего проверяющего, распаковавшего бандл в другой каталог.
+        # build-hash.json пишется ПОСЛЕ вычисления и сам себя не хэширует
+        # (`! -name build-hash.json`) — иначе решение "что положить в файл"
+        # зависело бы от содержимого самого файла.
+        id: hash
+        run: |
+          cd pages-dist
+          HASH=$(find . -type f ! -name build-hash.json | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -d' ' -f1)
+          COMMIT="$(git -C .. rev-parse HEAD)"
+          BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          printf '{"hash":"%s","commit":"%s","buildDate":"%s"}' "$HASH" "$COMMIT" "$BUILD_DATE" > build-hash.json
+          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+          echo "build_date=$BUILD_DATE" >> "$GITHUB_OUTPUT"
+      - name: Опубликовать хэш бандла в GitHub Release (независимый канал сверки, см. docs/security.md)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          COMMIT="${{ steps.hash.outputs.commit }}"
+          SHORT_SHA="$(git rev-parse --short "$COMMIT")"
+          TAG="pages-$SHORT_SHA"
+          NOTES="$(cat <<EOF
+          Статика фронтенда (Cloudflare Pages), коммит \`$COMMIT\`.
+
+          - SHA-256 бандла: \`${{ steps.hash.outputs.hash }}\`
+          - commit: \`$COMMIT\`
+          - buildDate (UTC): \`${{ steps.hash.outputs.build_date }}\`
+
+          Пересчитать самостоятельно: собрать pages-dist/ теми же шагами, что
+          этот workflow (см. .github/workflows/deploy-prod.yml, job
+          deploy-pages, шаг «Собрать pages-dist/»), затем из корня бандла:
+
+              cd pages-dist && find . -type f ! -name build-hash.json | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -d' ' -f1
+
+          (на macOS нет sha256sum — используйте \`shasum -a 256\`, тот же
+          алгоритм и формат вывода, результат совпадёт).
+
+          Это форензическая точка сверки — независимый канал (сам этот
+          Release), НЕ криптогарантия: хостер статики теоретически может
+          подменить и то, что отдаёт /build-hash.json на странице, поэтому
+          сверять нужно с ЭТИМ значением, а не с тем, что показывает сама
+          страница. Подробности и честные границы — docs/security.md,
+          «Published Build Hash».
+          EOF
+          )"
+          gh release create "$TAG" --title "$TAG" --notes "$NOTES" --target "$COMMIT" \
+            || gh release edit "$TAG" --notes "$NOTES"
       - name: Проверка секрета CLOUDFLARE_API_TOKEN (гейт — Pages-проект/токен заводит координатор)
         id: gate
         env:

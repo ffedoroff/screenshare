@@ -76,6 +76,7 @@ const sharePopupBackdropEl = document.getElementById('share-popup-backdrop');
 const sharePopupCloseEl = document.getElementById('share-popup-close');
 const sharePopupQrEl = document.getElementById('share-popup-qr');
 const sharePopupLinkEl = document.getElementById('share-popup-link');
+const sharePopupBuildEl = document.getElementById('share-popup-build');
 const sharePopupCopyButtonEl = document.getElementById('share-popup-copy-button');
 const reconnectBannerEl = document.getElementById('reconnect-banner');
 const versionBannerEl = document.getElementById('version-banner');
@@ -101,6 +102,8 @@ const settingsCryptoTextEl = document.getElementById('settings-crypto-text');
 const settingsPeersListEl = document.getElementById('settings-peers-list');
 const settingsSignalingCountEl = document.getElementById('settings-signaling-count');
 const settingsFallbackCountEl = document.getElementById('settings-fallback-count');
+const settingsBuildRowEl = document.getElementById('settings-build-row');
+const settingsBuildTextEl = document.getElementById('settings-build-text');
 
 // --- DOM: устройства (см. заголовок раздела «Выбор камеры и микрофона» ниже) — видно ВСЕМ участникам, не только лидеру ---
 const settingMicDeviceSelect = document.getElementById('setting-mic-device');
@@ -654,6 +657,74 @@ async function checkVersionSkew() {
 
 versionBannerReloadButtonEl.addEventListener('click', () => {
   location.reload();
+});
+
+// ---------- Build-хэш опубликованной статики (форензический якорь, см.
+// docs/security.md, «Published Build Hash») ----------
+//
+// /build-hash.json лежит РЯДОМ со страницей — корень бандла на Cloudflare
+// Pages (см. .github/workflows/deploy-prod.yml, job deploy-pages), same-origin
+// fetch, НЕ через window.API_BASE (в отличие от /version.json выше — тот
+// живёт на сигналинг-хосте, этот — на хосте статики, см. Ш2 в
+// docs/self-hosting.md §1.2). В dev/self-hosted сборке файла нет вообще
+// (нет такого маршрута на сервере, см. src/main.rs) — тогда все три места
+// показа (лендинг, попап «Поделиться», настройки) остаются скрытыми,
+// ничего не падает. Кэш — только в памяти вкладки (fetch ровно один раз),
+// без localStorage — анонимность страницы не нарушается.
+//
+// ВАЖНО: это НЕ криптогарантия (см. docs/security.md §10.4) — хостер
+// статики теоретически может подменить и сам build-hash.json заодно с
+// остальным бандлом. Настоящая сверка — с GitHub Release, независимым
+// каналом, а не с тем, что показывает эта же страница.
+let buildHashInfo = null;
+let buildHashPromise = null;
+
+function fetchBuildHashOnce() {
+  if (!buildHashPromise) {
+    buildHashPromise = (async () => {
+      try {
+        const res = await fetch('/build-hash.json');
+        if (!res.ok) return null; // dev/self-hosted без build-hash.json — штатно
+        const data = await res.json();
+        if (!data || typeof data.hash !== 'string' || !data.hash) return null;
+        return data;
+      } catch (err) {
+        return null;
+      }
+    })().then((data) => {
+      buildHashInfo = data;
+      return data;
+    });
+  }
+  return buildHashPromise;
+}
+
+/** Строка «Build: <хэш>» в попапе «Поделиться» — рядом со ссылкой/QR, НЕ внутри них (см. static/room.html). */
+function renderShareBuildLine() {
+  if (!buildHashInfo) {
+    sharePopupBuildEl.classList.add('hidden');
+    sharePopupBuildEl.textContent = '';
+    return;
+  }
+  sharePopupBuildEl.textContent = `Build: ${buildHashInfo.hash}`;
+  sharePopupBuildEl.title = buildHashInfo.hash;
+  sharePopupBuildEl.classList.remove('hidden');
+}
+
+/** Необязательная строка в «Соединение и приватность» — тот же хэш, для тех, кто туда заглядывает вместо попапа «Поделиться». */
+function renderSettingsBuildRow() {
+  if (!buildHashInfo) {
+    settingsBuildRowEl.classList.add('hidden');
+    return;
+  }
+  settingsBuildTextEl.textContent = `Build: ${buildHashInfo.hash.slice(0, 12)}…`;
+  settingsBuildTextEl.title = buildHashInfo.hash;
+  settingsBuildRowEl.classList.remove('hidden');
+}
+
+fetchBuildHashOnce().then(() => {
+  renderShareBuildLine();
+  renderSettingsBuildRow();
 });
 
 // ---------- Воспроизведение с фоллбэком на mute при блокировке автовоспроизведения ----------
@@ -1213,6 +1284,7 @@ function renderServerCounters() {
 function refreshConnectionSection() {
   renderCryptoInfo();
   renderServerCounters();
+  renderSettingsBuildRow();
   renderPeerConnectionsList().catch((err) => {
     console.error('Не удалось обновить список соединений в настройках:', err);
   });
@@ -2774,6 +2846,7 @@ function openSharePopup() {
   const link = buildShareLink();
   renderShareQr(link);
   sharePopupLinkEl.textContent = link;
+  renderShareBuildLine(); // не блокирует открытие — если хэш ещё не подтянулся, fetchBuildHashOnce().then() выше обновит строку сам, когда придёт
   sharePopupEl.classList.remove('hidden');
   document.addEventListener('keydown', onSharePopupKeydown);
 }

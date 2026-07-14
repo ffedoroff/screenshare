@@ -23,6 +23,9 @@
 
 const createButton = document.getElementById('create-room-button');
 const messageEl = document.getElementById('landing-message');
+const buildFooterEl = document.getElementById('landing-build-footer');
+const buildShortEl = document.getElementById('landing-build-short');
+const buildFullEl = document.getElementById('landing-build-full');
 
 function showMessage(text, isError = true) {
   messageEl.textContent = text;
@@ -55,3 +58,37 @@ createButton.addEventListener('click', async () => {
     createButton.disabled = false;
   }
 });
+
+// --- Build-хэш опубликованной статики (форензический якорь, см.
+// docs/security.md, «Published Build Hash») ---
+//
+// /build-hash.json лежит РЯДОМ со страницей — корень бандла на Cloudflare
+// Pages (см. .github/workflows/deploy-prod.yml, job deploy-pages), same-origin
+// fetch, никакого window.API_BASE. В dev/self-hosted сборке файла нет
+// вообще (сервер отдаёт 404 — там просто нет такого маршрута, см.
+// src/main.rs) — тогда footer молча остаётся скрытым, ничего не падает.
+// Хэш живёт только в памяти вкладки (обычная переменная, без
+// localStorage/sessionStorage — анонимность страницы это не нарушает,
+// значение не привязано к пользователю).
+//
+// ВАЖНО: хэш — НЕ криптогарантия (см. docs/security.md, §10.4) — хостер
+// статики теоретически может подменить и сам build-hash.json. Реальная
+// сверка — с GitHub Release (ссылка «verify» ниже), а не с тем, что
+// показывает эта же страница.
+async function loadBuildHash() {
+  try {
+    const res = await fetch('/build-hash.json');
+    if (!res.ok) return; // dev/self-hosted без build-hash.json — штатно, footer остаётся скрытым
+    const data = await res.json();
+    if (!data || typeof data.hash !== 'string' || !data.hash) return;
+    buildShortEl.textContent = `${data.hash.slice(0, 12)}…`;
+    buildFullEl.textContent = data.hash;
+    buildFooterEl.title = data.hash;
+    buildFooterEl.classList.remove('hidden');
+  } catch (err) {
+    // Сеть/парсинг — тихо: это ненавязчивый индикатор, а не критичная часть UI.
+    console.warn('Не удалось загрузить build-hash.json:', err);
+  }
+}
+
+loadBuildHash();

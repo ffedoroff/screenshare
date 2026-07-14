@@ -11,6 +11,11 @@
 - [7. M3 — Waiting Room Flood Protection](#7-m3--waiting-room-flood-protection)
 - [8. Meeting Duration Ceiling](#8-meeting-duration-ceiling)
 - [9. Known Boundaries](#9-known-boundaries)
+- [10. Published Build Hash — Verifying Served Static](#10-published-build-hash--verifying-served-static)
+  - [10.1 What Gets Published, and Where](#101-what-gets-published-and-where)
+  - [10.2 Recomputing the Hash Yourself](#102-recomputing-the-hash-yourself)
+  - [10.3 Not in the Link, Not in the QR](#103-not-in-the-link-not-in-the-qr)
+  - [10.4 What This Doesn't Protect Against](#104-what-this-doesnt-protect-against)
 
 <!-- /toc -->
 
@@ -46,6 +51,7 @@ and states known gaps plainly rather than implying full coverage.
 | A guest bypassing a chat/audio/video restriction via a modified client | **Not fully mitigated — cooperative only** | See [`permissions-and-leader.md` §7](permissions-and-leader.md#7-guest-permissions--how-theyre-actually-enforced) and [§9](#9-known-boundaries) below |
 | Recovering plaintext of a past meeting after the room key leaks | **Not mitigated** (signaling); **Partially mitigated** (fallback chat content/names, going forward from a membership change) | No forward secrecy for `K_sig`/signaling — see [`e2e-encryption.md` §6](e2e-encryption.md#6-known-limitations). Content keys (`K_chat`/`K_meta`) rotate when a participant leaves or is rejected at the lobby — see [`e2e-encryption.md` §7](e2e-encryption.md#7-forward-secrecy-for-content-on-membership-change-ш3) |
 | A leaked/guessed room id or link granting access | Inherent to the model, mitigated by entropy | The link itself is the only credential; room ids are drawn from a large enough space that guessing one is impractical (see [`privacy.md`](privacy.md)) |
+| A compromised/malicious static-file host (Ш2 split-origin, [`self-hosting.md` §1.2](self-hosting.md#12-split-origin-frontend--signaling-separated)) silently serving tampered frontend JS | **Forensic checkpoint only, not preventive** | Reproducible SHA-256 of the deployed bundle, published to an independent channel (GitHub Release) the static host doesn't control (§10, [§10.4](#104-what-this-doesnt-protect-against) for exactly what this doesn't cover) |
 
 ## 3. H1 — Ephemeral TURN Credentials
 
@@ -227,3 +233,145 @@ Stated plainly, not buried:
   [`e2e-encryption.md`](e2e-encryption.md)). There is no per-participant
   authentication layered on top, by design (see
   [`PRD.md` §5.5](PRD.md#55-anonymity)).
+
+## 10. Published Build Hash — Verifying Served Static
+
+**What this is, stated plainly upfront**: a **forensic checkpoint**, not a
+cryptographic guarantee. It gives anyone who suspects the deployed frontend
+has been tampered with (by whoever operates the static host — the Ш2
+split-origin topology, [`self-hosting.md` §1.2](self-hosting.md#12-split-origin-frontend--signaling-separated))
+a way to compare what's actually being served against a value published
+through an **independent channel**: a GitHub Release, created by CI, that
+the static host has no ability to write to. It is not, and cannot be, a
+substitute for the actual guarantee — running your own instance (see
+[`self-hosting.md`](self-hosting.md)) — because the same host serving a
+tampered bundle could just as easily serve a tampered `/build-hash.json`
+alongside it. See [§10.4](#104-what-this-doesnt-protect-against).
+
+**Why not SRI / SXG instead** — the two standard web-platform mechanisms for
+verifying delivered content, both considered and rejected for this purpose:
+
+- **Subresource Integrity (SRI)** lets a parent HTML document pin a hash for
+  each `<script>`/`<link>` it loads, so the *browser itself* refuses a
+  tampered script. But the `integrity="..."` attribute lives in that same
+  HTML document, served by the same host being distrusted here — a host
+  willing to tamper with the JS is equally free to strip or rewrite the
+  attribute (or the hash it names) in the HTML it serves alongside it. SRI
+  only buys something when the *parent document* arrives over a channel
+  trusted independently of the resource it pins (e.g., a CDN script
+  referenced from an app you ship yourself) — that's not this deployment's
+  shape, where the static host serves the HTML too.
+- **Signed HTTP Exchanges (SXG)** let a publisher cryptographically sign a
+  response so a *different* distributor can serve it while the browser still
+  attributes it to the publisher's origin. That only helps if the signer is
+  independent of the host doing the serving — here the same CI pipeline that
+  builds the bundle would also have to hold the signing key, collapsing the
+  intended separation — on top of requiring a CA-issued signing certificate,
+  narrow (and shrinking) browser support, and real operational complexity,
+  for what a documented hash in a GitHub Release already achieves for this
+  project's threat model: a durable, independently-timestamped, publicly
+  diffable record of what was built.
+
+A plain, reproducible hash published somewhere the hosting provider cannot
+edit is cheaper, has no browser-support caveats, and — stated honestly —
+offers the same fundamental property SXG or SRI would here: a comparison
+point outside the host's control, not an in-browser enforcement mechanism.
+None of the three stop a compromised host from serving something different
+to end users in real time; all three only let a suspicious party *notice*
+after the fact, by fetching the independent record and comparing.
+
+### 10.1 What Gets Published, and Where
+
+On every `main` deploy ([`../.github/workflows/deploy-prod.yml`](../.github/workflows/deploy-prod.yml),
+job `deploy-pages`), after `pages-dist/` is assembled (the exact tree
+Cloudflare Pages serves) and before it's pushed to Cloudflare:
+
+1. A single SHA-256 is computed over **every file in the bundle** (HTML, JS,
+   CSS, SVG/PNG, `manifest.webmanifest`, `_redirects`, `_headers` — anything
+   actually served) **except `build-hash.json` itself**, which doesn't exist
+   yet at hashing time (see the exact command in [§10.2](#102-recomputing-the-hash-yourself)).
+2. `pages-dist/build-hash.json` is written —
+   `{"hash", "commit", "buildDate"}`, the same `commit`/`buildDate` as
+   `/version.json` on the signaling origin — and only **then** included in
+   what's deployed, so it never hashes itself.
+3. The hash, commit, and build date are published as a **GitHub Release**
+   tagged `pages-<short-sha>`, whose body includes the exact recomputation
+   command. This is the independent channel: creating it requires the
+   repo's `GITHUB_TOKEN` (scoped `contents: write` on just that one CI job),
+   not anything the Cloudflare Pages host can touch.
+4. The frontend fetches `/build-hash.json` itself (same-origin, once per
+   tab, never persisted to `localStorage`) and shows the hash in three
+   places: the landing page footer, the "Share" popup inside a room, and
+   (best-effort) the "Connection & Privacy" settings panel. In a
+   dev/self-hosted build — where no such route or file exists (see
+   [`self-hosting.md`](self-hosting.md)) — the fetch simply 404s and all
+   three stay hidden; nothing breaks.
+
+### 10.2 Recomputing the Hash Yourself
+
+From the root of an extracted/rebuilt `pages-dist/` (i.e., after running the
+same steps the workflow does — see the "Собрать pages-dist/" step in
+[`../.github/workflows/deploy-prod.yml`](../.github/workflows/deploy-prod.yml)),
+run:
+
+```bash
+cd pages-dist
+find . -type f ! -name build-hash.json | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -d' ' -f1
+```
+
+(macOS ships no `sha256sum` by default — `shasum -a 256` is a drop-in
+replacement: same algorithm, same output format, so substituting it into the
+command above gives the identical hash.)
+
+Two details matter for reproducibility:
+
+- **Paths must be relative to `pages-dist/`** — hence `cd` into it first. An
+  absolute-path prefix would make the hash depend on where the bundle
+  happens to sit on disk, breaking reproducibility for anyone checking out
+  or rebuilding it in a different location.
+- **`LC_ALL=C sort`** fixes the ordering independent of the checking
+  machine's locale — a locale-aware sort can order punctuation/case
+  differently across systems, which would silently change the combined hash
+  even though no file actually differs.
+
+Compare the result against the `hash` field in the GitHub Release for the
+commit in question, and against what `/build-hash.json` on the live site
+currently reports (see [§10.4](#104-what-this-doesnt-protect-against) for
+why the Release is the value that actually matters, not the page's own
+claim).
+
+### 10.3 Not in the Link, Not in the QR
+
+The room link (`<origin>/r/<id>#k=<key>`) and the QR code rendered from it
+(see [`e2e-encryption.md`](e2e-encryption.md) for what `#k` is) carry
+**only** the room URL — the build hash is never appended to either, and the
+QR-rendering code (`static/room.js`: `renderShareQr`/`buildShareLink`) is
+untouched by this feature. It's shown as a separate line of plain text next
+to the link and QR in the "Share" popup, precisely so that copying the link
+or scanning the QR can never accidentally include, depend on, or be
+lengthened by the build hash.
+
+### 10.4 What This Doesn't Protect Against
+
+Stated plainly, not buried:
+
+- **A host that tampers with everything, consistently.** If the static host
+  (or anyone with write access to it) serves a modified bundle, it can just
+  as easily serve a modified `/build-hash.json` right alongside it that
+  "confirms" the tampered bundle. The on-page display is a convenience, not
+  the proof — the actual check requires comparing against the **GitHub
+  Release** independently (or recomputing from source per
+  [§10.2](#102-recomputing-the-hash-yourself)), never trusting whatever hash
+  the page itself happens to claim.
+- **No detection at request time.** This is a forensic/audit anchor, checked
+  after the fact by someone who goes and looks — nothing here stops a
+  compromised host from serving different content to different users, or
+  from serving the honest bundle again the moment someone happens to check.
+- **The real guarantee is self-hosting.** Running your own instance (see
+  [`self-hosting.md`](self-hosting.md)) removes the split-trust problem
+  entirely — there's no third-party static host whose honesty needs
+  checking in the first place. Everything in this section exists for the
+  split-origin (Ш2) topology in
+  [`self-hosting.md` §1.2](self-hosting.md#12-split-origin-frontend--signaling-separated),
+  where the operator has intentionally chosen not to run their own static
+  hosting.

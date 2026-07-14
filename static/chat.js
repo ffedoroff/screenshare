@@ -146,11 +146,26 @@
 // Cmd/Ctrl+Shift+X/P/M/K); мобильный тулбар по выделению — следующая волна,
 // не здесь.
 //
-// Реплаи — кнопка «⤺ ответить» на каждом сообщении (см. .chat-message-action)
-// открывает компактную плашку над инпутом; отправка кладёт replyTo в
-// конверт. Сообщение с replyTo рендерит над текстом цитату оригинала (имя +
-// обрезанный текст) из локального буфера; клик по цитате — плавный скролл к
-// оригиналу с кратким подсвечиванием (см. scrollToMessageAndHighlight).
+// Реплаи — пункт «Ответить» в попапе действий сообщения (см. заголовок ниже,
+// раздел про попап) открывает компактную плашку над инпутом; отправка кладёт
+// replyTo в конверт. Сообщение с replyTo рендерит над текстом цитату
+// оригинала (имя + обрезанный текст) из локального буфера; клик по цитате —
+// плавный скролл к оригиналу с кратким подсвечиванием (см.
+// scrollToMessageAndHighlight).
+//
+// Попап действий сообщения (волна 13, заменяет on-tap action-row и
+// hover-кнопки прошлых волн целиком, и на мобильном, и на десктопе) — строка
+// сообщения в ленте несёт ТОЛЬКО текст/время/чипы реакций, никаких кнопок.
+// Клик/тап по самому сообщению открывает единый попап (см.
+// openMessagePopover/closeMessagePopover/toggleMessagePopover): на мобильном
+// — bottom-sheet снизу экрана, на десктопе — компактная карточка у
+// сообщения (см. positionMessagePopoverDesktop). Внутри — палитра
+// эмодзи-реакций (тап ставит/снимает реакцию и закрывает попап), разбор
+// «кто/чем/когда» уже поставленных реакций (см. buildPopoverReactionsList —
+// имя участника берётся тем же способом, что и подпись сообщения, см.
+// displayName), и список действий (Ответить/Редактировать[своё,
+// text]/Удалить[своё]/Копировать текст, см. populatePopoverActions).
+// Одновременно открыт попап только для одного сообщения — activePopoverMsgId.
 //
 // Панель — синглтон на страницу: DOM создаётся один раз при первом вызове
 // ChatPanel.create(), повторные вызовы переиспользуют ту же разметку, но
@@ -231,6 +246,10 @@ const ChatPanel = (() => {
   const REPLY_PREVIEW_MAX_LEN = 60;
   const HIGHLIGHT_DURATION_MS = 1200;
   const REACTION_EMOJIS = ['👍', '👎', '❤️', '😂', '😮', '😢'];
+  // Автоувеличение инпута (волна 13, требование «как в Telegram»): textarea
+  // растёт по мере строк до этого предела, дальше — внутренний скролл (см.
+  // autoGrowTextInput).
+  const MAX_INPUT_LINES = 13;
   // Та же граница, что и в style.css (@media (max-width: 640px)) — мобильный
   // UX волны 11 (полноэкранный чат, тап-активация действий сообщения,
   // мобильный тулбар форматирования, см. isMobileLayout/applyVisualViewportSizing
@@ -256,6 +275,12 @@ const ChatPanel = (() => {
 
   const ATTACH_ICON_SVG = `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
     <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path>
+  </svg>`;
+
+  // Действие «Копировать текст» в попапе сообщения (см. buildCopyButton).
+  const COPY_ICON_SVG = `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <rect x="9" y="9" width="13" height="13" rx="2"></rect>
+    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
   </svg>`;
 
   // Редактирование/удаление своих сообщений — кнопки в .chat-message-actions
@@ -541,11 +566,23 @@ const ChatPanel = (() => {
   }
 
   /**
-   * Скопировать текст код-блока в буфер обмена (кнопка «Копировать», см.
-   * buildCodeBlockEl) — сперва через navigator.clipboard (нужен
-   * secure-контекст, у нас всегда https/localhost), фоллбэк — скрытый
-   * textarea + document.execCommand('copy') для окружений без Clipboard API.
+   * Скопировать произвольный текст в буфер обмена — сперва через
+   * navigator.clipboard (нужен secure-контекст, у нас всегда https/
+   * localhost), фоллбэк — скрытый textarea + document.execCommand('copy')
+   * для окружений без Clipboard API. Общая для кнопки «Копировать» код-блока
+   * (см. copyCodeToClipboard/buildCodeBlockEl) и действия «Копировать текст»
+   * в попапе сообщения (см. buildCopyButton) — обе просто различаются
+   * визуальной обратной связью на СВОЕЙ кнопке, сам механизм копирования один.
    */
+  function copyTextToClipboard(text, onDone) {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      navigator.clipboard.writeText(text).then(onDone).catch(() => fallbackCopyToClipboard(text, onDone));
+    } else {
+      fallbackCopyToClipboard(text, onDone);
+    }
+  }
+
+  /** Кнопка «Копировать» код-блока (см. buildCodeBlockEl) — обёртка над copyTextToClipboard с визуальной обратной связью на этой конкретной кнопке. */
   function copyCodeToClipboard(code, buttonEl) {
     const showCopied = () => {
       const prevText = buttonEl.textContent;
@@ -556,11 +593,7 @@ const ChatPanel = (() => {
         buttonEl.textContent = prevText;
       }, 1500);
     };
-    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
-      navigator.clipboard.writeText(code).then(showCopied).catch(() => fallbackCopyToClipboard(code, showCopied));
-    } else {
-      fallbackCopyToClipboard(code, showCopied);
-    }
+    copyTextToClipboard(code, showCopied);
   }
 
   function fallbackCopyToClipboard(code, onDone) {
@@ -723,35 +756,57 @@ const ChatPanel = (() => {
         <button type="button" class="chat-format-btn chat-format-btn--link" data-format="link" aria-label="Ссылка" title="Ссылка">🔗</button>
       </div>
       <div class="chat-input-row">
-        <button type="button" class="chat-attach-button" aria-label="Прикрепить файл" title="Прикрепить файл"></button>
-        <input type="file" class="chat-file-input" multiple hidden />
-        <button type="button" class="chat-format-toggle-button" aria-label="Форматирование текста" title="Форматирование текста" aria-pressed="false">Aa</button>
         <textarea class="chat-text-input" rows="1" placeholder="Сообщение…" maxlength="2000"></textarea>
-        <button type="button" class="chat-send-button" aria-label="Отправить" title="Отправить">
-          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <line x1="22" y1="2" x2="11" y2="13"></line>
-            <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
-          </svg>
-        </button>
+        <div class="chat-input-actions">
+          <button type="button" class="chat-attach-button" aria-label="Прикрепить файл" title="Прикрепить файл"></button>
+          <input type="file" class="chat-file-input" multiple hidden />
+          <button type="button" class="chat-format-toggle-button" aria-label="Форматирование текста" title="Форматирование текста" aria-pressed="false">Aa</button>
+          <button type="button" class="chat-send-button" aria-label="Отправить" title="Отправить">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <line x1="22" y1="2" x2="11" y2="13"></line>
+              <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+            </svg>
+          </button>
+        </div>
       </div>
     `;
     panel.querySelector('.chat-attach-button').innerHTML = ATTACH_ICON_SVG; // статичная разметка
 
-    // Попап-палитра реакций — общий на панель (не по одному на сообщение),
-    // позиционируется абсолютно относительно панели при открытии (см.
-    // openReactionPopover). Набор эмодзи фиксирован и статичен — безопасно
-    // строить через innerHTML/textContent, это не пользовательские данные.
-    const reactionPopover = document.createElement('div');
-    reactionPopover.className = 'chat-reaction-popover hidden';
+    // Попап действий сообщения (волна 13) — ЕДИНАЯ точка входа для всех
+    // действий (ответить/реакция/редактировать/удалить/копировать) и разбора
+    // реакций «кто/чем/когда»; открывается тапом/кликом по самому сообщению
+    // (см. messagesEl click-делегирование ниже). Общий на панель (синглтон,
+    // не по одному на сообщение) — на мобильном раскрывается bottom-sheet'ом
+    // снизу (см. style.css: @media max-width:640px), на десктопе —
+    // компактным поповером у сообщения (см. positionMessagePopoverDesktop).
+    // Ряд эмодзи-реакций строится один раз (статичный, фиксированный набор —
+    // безопасно строить через textContent), список действий и разбор
+    // реакций — каждый раз заново при открытии (зависят от конкретного msg).
+    const messagePopover = document.createElement('div');
+    messagePopover.className = 'chat-message-popover hidden';
+    messagePopover.innerHTML = `
+      <div class="chat-message-popover-backdrop"></div>
+      <div class="chat-message-popover-card" role="dialog" aria-modal="true">
+        <div class="chat-message-popover-handle" aria-hidden="true"></div>
+        <button type="button" class="chat-message-popover-close" aria-label="Закрыть" title="Закрыть">×</button>
+        <div class="chat-message-popover-emojis"></div>
+        <div class="chat-message-popover-reactions hidden">
+          <div class="chat-message-popover-reactions-title">Реакции</div>
+          <div class="chat-message-popover-reactions-list"></div>
+        </div>
+        <div class="chat-message-popover-actions"></div>
+      </div>
+    `;
+    const popoverEmojisEl = messagePopover.querySelector('.chat-message-popover-emojis');
     for (const emoji of REACTION_EMOJIS) {
       const btn = document.createElement('button');
       btn.type = 'button';
-      btn.className = 'chat-reaction-popover-emoji';
+      btn.className = 'chat-message-popover-emoji';
       btn.dataset.emoji = emoji;
       btn.textContent = emoji;
-      reactionPopover.appendChild(btn);
+      popoverEmojisEl.appendChild(btn);
     }
-    panel.appendChild(reactionPopover);
+    panel.appendChild(messagePopover);
 
     document.body.appendChild(panel);
 
@@ -767,7 +822,15 @@ const ChatPanel = (() => {
       replyBarClose: panel.querySelector('.chat-reply-bar-close'),
       editBar: panel.querySelector('.chat-edit-bar'),
       editBarClose: panel.querySelector('.chat-edit-bar-close'),
-      reactionPopover,
+      messagePopover,
+      popoverBackdrop: messagePopover.querySelector('.chat-message-popover-backdrop'),
+      popoverCard: messagePopover.querySelector('.chat-message-popover-card'),
+      popoverClose: messagePopover.querySelector('.chat-message-popover-close'),
+      popoverEmojisEl,
+      popoverReactionsEl: messagePopover.querySelector('.chat-message-popover-reactions'),
+      popoverReactionsListEl: messagePopover.querySelector('.chat-message-popover-reactions-list'),
+      popoverActionsEl: messagePopover.querySelector('.chat-message-popover-actions'),
+      inputRow: panel.querySelector('.chat-input-row'),
       textInput: panel.querySelector('.chat-text-input'),
       sendButton: panel.querySelector('.chat-send-button'),
       attachButton: panel.querySelector('.chat-attach-button'),
@@ -836,7 +899,15 @@ const ChatPanel = (() => {
       replyBarClose,
       editBar,
       editBarClose,
-      reactionPopover,
+      messagePopover,
+      popoverBackdrop,
+      popoverCard,
+      popoverClose,
+      popoverEmojisEl,
+      popoverReactionsEl,
+      popoverReactionsListEl,
+      popoverActionsEl,
+      inputRow,
       textInput,
       sendButton,
       attachButton,
@@ -911,15 +982,15 @@ const ChatPanel = (() => {
     let historyResponseWaiters = new Map(); // peerId -> resolve(messages[])
     let replyTarget = null; // конверт сообщения, на которое сейчас отвечаем (или null)
     let editTarget = null; // конверт СВОЕГО сообщения, которое сейчас редактируем (или null) — взаимоисключается с replyTarget
-    let activeReactionTarget = null; // msgId, для которого сейчас открыт попап реакций (или null)
-    // Мобильный UX (волна 11): msgId сообщения, чьи действия (ответить/
-    // реакция/редактировать/удалить) сейчас показаны по тапу — см.
-    // setActiveMobileMessage/messagesEl click-делегирование ниже. Не более
-    // одного одновременно; на десктопе (>640px) не используется вовсе —
-    // там действия по-прежнему по hover (см. style.css). Отдельно от
-    // activeReactionTarget — это msgId, у которого раскрыт САМ попап
-    // реакций (шире: любое сообщение).
-    let activeMobileMessageId = null;
+    // Попап действий сообщения (волна 13, заменяет on-tap action-row и
+    // hover-кнопки прошлых волн) — msgId сообщения, для которого сейчас
+    // открыт попап (ответить/реакция/редактировать/удалить/копировать +
+    // разбор реакций), или null. Не более одного одновременно — открытие
+    // для нового сообщения переиспользует тот же DOM-синглтон (см.
+    // openMessagePopover). Работает ОДИНАКОВО на мобильном (bottom-sheet) и
+    // десктопе (компактный поповер у сообщения) — единая точка входа, без
+    // отдельного hover-состояния.
+    let activePopoverMsgId = null;
     // Мобильный тулбар форматирования (волна 11) — принудительно открыт
     // кнопкой «Aa» (см. formatToggleButton ниже); помимо этого тулбар также
     // показывается САМ, пока в textInput есть непустое выделение (см.
@@ -950,12 +1021,15 @@ const ChatPanel = (() => {
       messagesEl.scrollTop = messagesEl.scrollHeight;
     }
 
-    /** Найти текстовое сообщение по id в текущем буфере (для рендера цитаты реплая). */
-    function findMessageById(id) {
-      for (const msg of messages) {
-        if (msg.kind === 'text' && msg.id === id) return msg;
-      }
-      return null;
+    /**
+     * Текст превью для реплая/цитаты (волна 13: реплай теперь доступен из
+     * попапа на ЛЮБОМ сообщении, включая file-offer, — см.
+     * populatePopoverActions/buildReplyActionButton, у file-offer текста нет
+     * вовсе, поэтому превью строится из имени файла со скрепкой).
+     */
+    function replyPreviewBodyText(msg) {
+      if (msg.kind === 'file-offer') return `📎 ${msg.fileName}`;
+      return msg.text;
     }
 
     /** Найти ЛЮБОЕ редактируемое/удаляемое сообщение (text или file-offer) по id — для проверки авторства edit/delete. */
@@ -1001,7 +1075,15 @@ const ChatPanel = (() => {
       messageOverlays = next;
     }
 
-    /** Пересчитать map реакций с нуля из `messages`, применяя op'ы в порядке (lamport, from) — буфер уже так отсортирован. */
+    /**
+     * Пересчитать map реакций с нуля из `messages`, применяя op'ы в порядке
+     * (lamport, from) — буфер уже так отсортирован. Значение на нижнем
+     * уровне — Map(peerId -> {name, ts}), а не просто Set<peerId>: имя и
+     * время нужны для разбора «кто/чем/когда» в попапе действий (см.
+     * buildPopoverReactionsList) — тем не менее Map поддерживает те же
+     * .has()/.size, что и Set, поэтому весь остальной код (чипы реакций,
+     * toggle) не меняется вовсе.
+     */
     function recomputeReactions() {
       const next = new Map();
       for (const msg of messages) {
@@ -1014,10 +1096,10 @@ const ChatPanel = (() => {
         }
         let peers = byEmoji.get(msg.emoji);
         if (!peers) {
-          peers = new Set();
+          peers = new Map();
           byEmoji.set(msg.emoji, peers);
         }
-        if (msg.op === 'add') peers.add(msg.from);
+        if (msg.op === 'add') peers.set(msg.from, { name: msg.name || null, ts: msg.ts || Date.now() });
         else if (msg.op === 'remove') peers.delete(msg.from);
       }
       reactions = next;
@@ -1026,7 +1108,7 @@ const ChatPanel = (() => {
     function buildReplyQuoteEl(targetId) {
       const quote = document.createElement('div');
       quote.className = 'chat-reply-quote';
-      const original = findMessageById(targetId);
+      const original = findEditableOriginalById(targetId);
       if (!original) {
         quote.classList.add('chat-reply-quote--missing');
         quote.textContent = 'сообщение недоступно';
@@ -1041,7 +1123,8 @@ const ChatPanel = (() => {
       if (overlay && overlay.deleted) {
         textEl.textContent = 'Сообщение удалено';
       } else {
-        const bodyText = overlay && typeof overlay.editText === 'string' ? overlay.editText : original.text;
+        const bodyText =
+          overlay && typeof overlay.editText === 'string' ? overlay.editText : replyPreviewBodyText(original);
         textEl.textContent = truncateText(stripMarkdownForPreview(bodyText), REPLY_PREVIEW_MAX_LEN);
       }
       quote.appendChild(nameEl);
@@ -1112,39 +1195,8 @@ const ChatPanel = (() => {
         'chat-message' +
         (own ? ' chat-message--own' : '') +
         (isDeleted ? ' chat-message--deleted' : '') +
-        (msg.id === activeMobileMessageId ? ' chat-message--active' : '');
+        (msg.id === activePopoverMsgId ? ' chat-message--popover-open' : '');
       item.dataset.msgId = msg.id;
-
-      // Тумбстоуну действия (ответить/реакция/редактировать/удалить) не положены.
-      if (!isDeleted) {
-        const actions = document.createElement('div');
-        actions.className = 'chat-message-actions';
-
-        const replyButton = document.createElement('button');
-        replyButton.type = 'button';
-        replyButton.className = 'chat-message-action chat-message-action--reply';
-        replyButton.setAttribute('aria-label', 'Ответить');
-        replyButton.title = 'Ответить';
-        replyButton.innerHTML = REPLY_ICON_SVG; // статичная разметка, не пользовательские данные
-        replyButton.addEventListener('click', () => startReply(msg));
-        actions.appendChild(replyButton);
-
-        const reactButton = document.createElement('button');
-        reactButton.type = 'button';
-        reactButton.className = 'chat-message-action chat-message-action--react';
-        reactButton.setAttribute('aria-label', 'Добавить реакцию');
-        reactButton.title = 'Реакция';
-        reactButton.textContent = '☺+';
-        reactButton.addEventListener('click', () => toggleReactionPopover(reactButton, msg.id));
-        actions.appendChild(reactButton);
-
-        if (own) {
-          actions.appendChild(buildEditButton(msg));
-          actions.appendChild(buildDeleteButton(msg));
-        }
-
-        item.appendChild(actions);
-      }
 
       item.appendChild(buildMetaEl(msg, overlay));
 
@@ -1171,31 +1223,42 @@ const ChatPanel = (() => {
       messagesEl.appendChild(item);
     }
 
-    /** Карандаш — только на СВОИХ text-сообщениях (см. renderMessageEl); file-offer редактировать нельзя. */
-    function buildEditButton(msg) {
+    /** Строка попапа действий: иконка (статичный SVG) + подпись — единый вид для всех пунктов (см. populatePopoverActions). */
+    function buildPopoverActionRow(iconSvg, label) {
       const btn = document.createElement('button');
       btn.type = 'button';
+      const icon = document.createElement('span');
+      icon.className = 'chat-message-action-icon';
+      icon.innerHTML = iconSvg; // статичная разметка, не пользовательские данные
+      const labelEl = document.createElement('span');
+      labelEl.className = 'chat-message-action-label';
+      labelEl.textContent = label;
+      btn.appendChild(icon);
+      btn.appendChild(labelEl);
+      return { btn, labelEl };
+    }
+
+    /** Карандаш — только на СВОИХ text-сообщениях (см. populatePopoverActions); file-offer редактировать нельзя. */
+    function buildEditButton(msg) {
+      const { btn } = buildPopoverActionRow(EDIT_ICON_SVG, 'Редактировать');
       btn.className = 'chat-message-action chat-message-action--edit';
       btn.setAttribute('aria-label', 'Редактировать');
       btn.title = 'Редактировать';
-      btn.innerHTML = EDIT_ICON_SVG; // статичная разметка, не пользовательские данные
       btn.addEventListener('click', () => startEdit(msg));
       return btn;
     }
 
     /**
      * Корзина — на СВОИХ text- и file-offer-сообщениях. Первый клик переводит
-     * кнопку в состояние подтверждения («✓?») на DELETE_CONFIRM_MS; второй
-     * клик в этом окне шлёт delete; таймаут без второго клика — откат в
-     * исходную иконку без отправки чего-либо.
+     * кнопку в состояние подтверждения («Точно удалить?») на
+     * DELETE_CONFIRM_MS; второй клик в этом окне шлёт delete; таймаут без
+     * второго клика — откат в исходную подпись без отправки чего-либо.
      */
     function buildDeleteButton(msg) {
-      const btn = document.createElement('button');
-      btn.type = 'button';
+      const { btn, labelEl } = buildPopoverActionRow(DELETE_ICON_SVG, 'Удалить');
       btn.className = 'chat-message-action chat-message-action--delete';
       btn.setAttribute('aria-label', 'Удалить');
       btn.title = 'Удалить';
-      btn.innerHTML = DELETE_ICON_SVG; // статичная разметка, не пользовательские данные
       let confirmTimer = null;
 
       function resetToIdle() {
@@ -1204,7 +1267,7 @@ const ChatPanel = (() => {
           confirmTimer = null;
         }
         btn.classList.remove('chat-message-action--confirm');
-        btn.innerHTML = DELETE_ICON_SVG;
+        labelEl.textContent = 'Удалить';
         btn.setAttribute('aria-label', 'Удалить');
         btn.title = 'Удалить';
       }
@@ -1214,10 +1277,11 @@ const ChatPanel = (() => {
           clearTimeout(confirmTimer);
           confirmTimer = null;
           sendDeleteMessage(msg.id);
+          closeMessagePopover();
           return;
         }
         btn.classList.add('chat-message-action--confirm');
-        btn.textContent = '✓?';
+        labelEl.textContent = 'Точно удалить?';
         btn.setAttribute('aria-label', 'Подтвердите удаление');
         btn.title = 'Нажмите ещё раз, чтобы подтвердить удаление';
         confirmTimer = setTimeout(resetToIdle, DELETE_CONFIRM_MS);
@@ -1246,18 +1310,8 @@ const ChatPanel = (() => {
         'chat-message chat-message--file' +
         (own ? ' chat-message--own' : '') +
         (isDeleted ? ' chat-message--deleted' : '') +
-        (msg.id === activeMobileMessageId ? ' chat-message--active' : '');
+        (msg.id === activePopoverMsgId ? ' chat-message--popover-open' : '');
       item.dataset.msgId = msg.id;
-
-      // Файловые офферы удалять можно (тумбстоун ниже), редактировать —
-      // нет (см. заголовок файла), поэтому в actions только корзина, и
-      // только пока не удалено.
-      if (!isDeleted && own) {
-        const actions = document.createElement('div');
-        actions.className = 'chat-message-actions';
-        actions.appendChild(buildDeleteButton(msg));
-        item.appendChild(actions);
-      }
 
       item.appendChild(buildMetaEl(msg, overlay));
 
@@ -1602,10 +1656,10 @@ const ChatPanel = (() => {
       pendingFallbackSends = [];
       cancelReply();
       cancelEditAndClear();
-      closeReactionPopover();
-      activeMobileMessageId = null;
+      closeMessagePopover();
       formatToolbarForcedOpen = false;
       updateFormatToolbarVisibility();
+      autoGrowTextInput();
     }
 
     /**
@@ -1664,11 +1718,13 @@ const ChatPanel = (() => {
     window.addEventListener('resize', () => {
       syncMobileChatViewport();
       updateFormatToolbarVisibility();
-      // Ресайз с мобильного layout на десктопный (поворот/DevTools) — снять
-      // мобильную тап-активность: на десктопе действия и так по hover, а
-      // задержавшийся класс .chat-message--active там ни на что не влияет,
-      // но лучше не оставлять «протухшее» состояние.
-      if (!isMobileLayout() && activeMobileMessageId) setActiveMobileMessage(null);
+      // Ресайз десктоп<->мобайл (поворот/DevTools) — переположить открытый
+      // попап под новый layout (мобильный bottom-sheet <-> десктопный
+      // поповер у сообщения).
+      if (activePopoverMsgId && !messagePopover.classList.contains('hidden')) {
+        const el = messagesEl.querySelector(`.chat-message[data-msg-id="${escapeForSelector(activePopoverMsgId)}"]`);
+        positionMessagePopoverDesktop(el || panel);
+      }
     });
     window.addEventListener('orientationchange', syncMobileChatViewport);
 
@@ -1679,10 +1735,17 @@ const ChatPanel = (() => {
       if (!collapsed) {
         unreadCount = 0;
         updateUnreadBadge();
+        // Панель (и textarea внутри неё) до этого момента могла быть
+        // display:none (см. .chat-panel.hidden) — scrollHeight скрытого
+        // элемента всегда 0, поэтому autoGrowTextInput(), вызванный РАНЬШЕ
+        // (например, из clearMessages() при attach, панель тогда ещё
+        // закрыта), мог посчитать и проставить неверную (нулевую) высоту.
+        // Пересчитываем заново теперь, когда панель точно видима.
+        autoGrowTextInput();
         scrollToBottom();
         textInput.focus();
       } else {
-        setActiveMobileMessage(null);
+        closeMessagePopover();
         formatToolbarForcedOpen = false;
         updateFormatToolbarVisibility();
       }
@@ -1707,9 +1770,9 @@ const ChatPanel = (() => {
     function startReply(msg) {
       cancelEditAndClear(); // реплай и редактирование взаимоисключаются (см. заголовок файла)
       replyTarget = msg;
-      replyBarText.textContent = `Ответ ${displayName(msg)}: ${truncateText(stripMarkdownForPreview(msg.text), REPLY_PREVIEW_MAX_LEN)}`;
+      replyBarText.textContent = `Ответ ${displayName(msg)}: ${truncateText(stripMarkdownForPreview(replyPreviewBodyText(msg)), REPLY_PREVIEW_MAX_LEN)}`;
       replyBar.classList.remove('hidden');
-      closeReactionPopover();
+      closeMessagePopover();
       textInput.focus();
     }
 
@@ -1729,7 +1792,8 @@ const ChatPanel = (() => {
       const currentText = overlay && typeof overlay.editText === 'string' ? overlay.editText : msg.text;
       textInput.value = currentText;
       editBar.classList.remove('hidden');
-      closeReactionPopover();
+      autoGrowTextInput();
+      closeMessagePopover();
       textInput.focus();
       const len = textInput.value.length;
       textInput.setSelectionRange(len, len); // курсор в конец — иначе браузер ставит его в начало при программной установке value
@@ -1744,99 +1808,13 @@ const ChatPanel = (() => {
     function cancelEditAndClear() {
       const wasEditing = !!editTarget;
       cancelEdit();
-      if (wasEditing) textInput.value = '';
+      if (wasEditing) {
+        textInput.value = '';
+        autoGrowTextInput();
+      }
     }
 
     editBarClose.addEventListener('click', cancelEditAndClear);
-
-    // --- Реакции: общий попап-палитра, позиционируется под кнопкой сообщения ---
-    function openReactionPopover(anchorEl, msgId) {
-      activeReactionTarget = msgId;
-      reactionPopover.classList.remove('hidden');
-      const panelRect = panel.getBoundingClientRect();
-      const anchorRect = anchorEl.getBoundingClientRect();
-      const popoverRect = reactionPopover.getBoundingClientRect();
-
-      let left = anchorRect.left - panelRect.left;
-      const maxLeft = Math.max(4, panelRect.width - popoverRect.width - 4);
-      left = Math.max(4, Math.min(left, maxLeft));
-
-      let top = anchorRect.bottom - panelRect.top + 4;
-      if (top + popoverRect.height > panelRect.height - 4) {
-        // Не помещается снизу (мало места до конца панели) — раскрываем вверх от кнопки.
-        top = anchorRect.top - panelRect.top - popoverRect.height - 4;
-      }
-      top = Math.max(4, top);
-
-      reactionPopover.style.left = `${left}px`;
-      reactionPopover.style.top = `${top}px`;
-    }
-
-    function closeReactionPopover() {
-      activeReactionTarget = null;
-      reactionPopover.classList.add('hidden');
-    }
-
-    function toggleReactionPopover(anchorEl, msgId) {
-      if (activeReactionTarget === msgId && !reactionPopover.classList.contains('hidden')) {
-        closeReactionPopover();
-        return;
-      }
-      cancelReply();
-      openReactionPopover(anchorEl, msgId);
-    }
-
-    reactionPopover.querySelectorAll('.chat-reaction-popover-emoji').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        const emoji = btn.dataset.emoji;
-        const targetId = activeReactionTarget;
-        closeReactionPopover();
-        if (targetId && emoji) sendReactionToggle(targetId, emoji);
-      });
-    });
-
-    document.addEventListener('click', (event) => {
-      if (reactionPopover.classList.contains('hidden')) return;
-      if (reactionPopover.contains(event.target)) return;
-      if (event.target.closest && event.target.closest('.chat-message-action--react')) return;
-      closeReactionPopover();
-    });
-    document.addEventListener('keydown', (event) => {
-      if (event.key !== 'Escape') return;
-      if (!reactionPopover.classList.contains('hidden')) {
-        closeReactionPopover();
-        return;
-      }
-      if (!editBar.classList.contains('hidden')) {
-        cancelEditAndClear();
-      }
-    });
-
-    // --- Мобильный UX (волна 11): тап-активация действий ОДНОГО сообщения ---
-    //
-    // Требование владельца: на мобильном (≤640px) кнопки действий сообщения
-    // (ответить/реакция/редактировать/удалить) по умолчанию скрыты (см.
-    // .chat-message-actions в style.css: opacity:0/pointer-events:none внутри
-    // @media (max-width:640px)) и показываются ТОЛЬКО у одного «активного» (по
-    // тапу) сообщения — .chat-message--active снимает это ограничение (см.
-    // ту же секцию style.css). На десктопе (>640px) ничего из блока ниже не
-    // применяется вовсе (везде первая проверка — isMobileLayout()) — там
-    // по-прежнему действует hover из style.css, без какого-либо JS-состояния.
-    function setActiveMobileMessage(msgId) {
-      if (activeMobileMessageId === msgId) return;
-      const prevId = activeMobileMessageId;
-      activeMobileMessageId = msgId;
-      if (prevId) {
-        const prevEl = messagesEl.querySelector(`.chat-message[data-msg-id="${escapeForSelector(prevId)}"]`);
-        if (prevEl) prevEl.classList.remove('chat-message--active');
-      }
-      if (activeMobileMessageId) {
-        const el = messagesEl.querySelector(
-          `.chat-message[data-msg-id="${escapeForSelector(activeMobileMessageId)}"]`
-        );
-        if (el) el.classList.add('chat-message--active');
-      }
-    }
 
     /**
      * Есть ли в пути распространения события элемент, подходящий под
@@ -1849,11 +1827,9 @@ const ChatPanel = (() => {
      * (обычная ситуация: клик приходится на иконку внутри кнопки), то к
      * моменту, когда bubbling добирается до messagesEl/document,
      * `event.target.closest(...)` возвращает null — SVG уже отсоединён от
-     * родителя — и клик по кнопке «Удалить» ошибочно читался бы как тап по
-     * "телу" сообщения, гасящий/переключающий активность вместо no-op).
-     * `event.composedPath()` — снимок пути НА МОМЕНТ ДИСПЕТЧЕРИЗАЦИИ
-     * события, снятый ДО того, как какой-либо обработчик успел что-либо
-     * изменить в DOM, поэтому не подвержен этой проблеме.
+     * родителя). `event.composedPath()` — снимок пути НА МОМЕНТ
+     * ДИСПЕТЧЕРИЗАЦИИ события, снятый ДО того, как какой-либо обработчик
+     * успел что-либо изменить в DOM, поэтому не подвержен этой проблеме.
      */
     function eventPathMatches(event, selector) {
       const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
@@ -1863,59 +1839,247 @@ const ChatPanel = (() => {
       return false;
     }
 
-    // Тап по "телу" сообщения переключает активность: по неактивному —
-    // делает активным (и снимает активность с предыдущего, если был другой —
-    // не более одного одновременно, см. заголовок функции), повторный тап по
-    // уже активному — снимает. Тап по элементам, у которых УЖЕ есть своя
-    // клик-логика (кнопка действия, чип реакции, цитата реплая, ссылка,
-    // спойлер, любая <button>/медиа-контрол) — не переключает активность
-    // ДОПОЛНИТЕЛЬНО к их собственному обработчику (иначе, например, клик по
-    // кнопке «Ответить» ещё и гасил бы/переносил активность в той же
-    // операции). Кнопки действий физически недоступны тапу, пока сообщение не
-    // активно (pointer-events:none, см. style.css) — поэтому дойти до них
-    // можно только ПОСЛЕ активации отдельным тапом, что и даёт нужный
-    // двухшаговый UX («тап -> появились действия -> тап по конкретному
-    // действию»).
+    // --- Попап действий сообщения (волна 13) ---
+    //
+    // Заменяет ЦЕЛИКОМ и on-tap action-row мобильного UX прошлой волны, и
+    // hover-кнопки десктопа: единственный способ добраться до действий
+    // сообщения (ответить/реакция/редактировать/удалить/копировать) теперь —
+    // тап/клик по самому сообщению, ОДИНАКОВО на мобильном и десктопе (см.
+    // messagesEl click-делегирование ниже). В строке сообщения по умолчанию
+    // не остаётся вообще никаких кнопок — ни постоянных, ни по hover (жалоба
+    // владельца из прошлой волны была именно на визуальный шум действий,
+    // эта волна убирает его целиком, а не просто прячет за тапом).
+
+    /** Найти ЛЮБОЕ сообщение (text или file-offer) по id — то же самое, что findEditableOriginalById, отдельное имя для читаемости в контексте попапа. */
+    function findAnyMessageById(id) {
+      return findEditableOriginalById(id);
+    }
+
+    /** Построить разбор реакций «кто/чем/когда» — список по эмодзи (в порядке REACTION_EMOJIS), внутри каждой группы — по времени реакции. */
+    function buildPopoverReactionsList(msgId) {
+      popoverReactionsListEl.textContent = '';
+      const byEmoji = reactions.get(msgId);
+      let any = false;
+      if (byEmoji) {
+        for (const emoji of REACTION_EMOJIS) {
+          const peers = byEmoji.get(emoji);
+          if (!peers || peers.size === 0) continue;
+          const entries = Array.from(peers.entries()).sort((a, b) => (a[1].ts || 0) - (b[1].ts || 0));
+          for (const [reactorPeerId, info] of entries) {
+            any = true;
+            const row = document.createElement('div');
+            row.className = 'chat-message-popover-reaction-row';
+
+            const emojiEl = document.createElement('span');
+            emojiEl.className = 'chat-message-popover-reaction-emoji';
+            emojiEl.textContent = emoji;
+
+            const nameEl = document.createElement('span');
+            nameEl.className = 'chat-message-popover-reaction-name';
+            nameEl.textContent = displayName({ from: reactorPeerId, name: info.name });
+
+            const timeEl = document.createElement('span');
+            timeEl.className = 'chat-message-popover-reaction-time';
+            timeEl.textContent = formatTime(info.ts || Date.now());
+
+            row.appendChild(emojiEl);
+            row.appendChild(nameEl);
+            row.appendChild(timeEl);
+            popoverReactionsListEl.appendChild(row);
+          }
+        }
+      }
+      popoverReactionsEl.classList.toggle('hidden', !any);
+    }
+
+    /** Скопировать ТЕКУЩИЙ (с учётом правки) текст сообщения в буфер обмена — действие «Копировать» в попапе. */
+    function buildCopyButton(msg, overlay) {
+      const { btn, labelEl } = buildPopoverActionRow(COPY_ICON_SVG, 'Копировать текст');
+      btn.className = 'chat-message-action chat-message-action--copy';
+      btn.addEventListener('click', () => {
+        const bodyText = overlay && typeof overlay.editText === 'string' ? overlay.editText : msg.text;
+        copyTextToClipboard(String(bodyText || ''), () => {
+          labelEl.textContent = 'Скопировано';
+          setTimeout(() => {
+            labelEl.textContent = 'Копировать текст';
+          }, 1200);
+        });
+      });
+      return btn;
+    }
+
+    function buildReplyActionButton(msg) {
+      const { btn } = buildPopoverActionRow(REPLY_ICON_SVG, 'Ответить');
+      btn.className = 'chat-message-action chat-message-action--reply';
+      btn.addEventListener('click', () => {
+        closeMessagePopover();
+        startReply(msg);
+      });
+      return btn;
+    }
+
+    /** Заполнить `.chat-message-popover-actions` действиями, подходящими под конкретное сообщение (own/kind/deleted). */
+    function populatePopoverActions(msg, overlay) {
+      popoverActionsEl.textContent = '';
+      const own = msg.from === peerId;
+      popoverActionsEl.appendChild(buildReplyActionButton(msg));
+      if (own && msg.kind === 'text') {
+        const editBtn = buildEditButton(msg);
+        editBtn.addEventListener('click', closeMessagePopover);
+        popoverActionsEl.appendChild(editBtn);
+      }
+      if (own) {
+        popoverActionsEl.appendChild(buildDeleteButton(msg));
+      }
+      if (msg.kind === 'text') {
+        popoverActionsEl.appendChild(buildCopyButton(msg, overlay));
+      }
+    }
+
+    /**
+     * Позиционирование ТОЛЬКО для десктопа (>640px) — компактный поповер у
+     * сообщения. `.chat-message-popover` задуман как position:fixed;inset:0
+     * (см. style.css) — ПОЧТИ всегда containing block для абсолютно
+     * позиционированной `.chat-message-popover-card` оказывается вьюпортом
+     * целиком, НО не гарантированно: `.chat-panel--room` использует
+     * `backdrop-filter` (см. style.css), а filter/backdrop-filter на
+     * ПРЕДКЕ по спеке сами создают containing block для fixed-потомков —
+     * тогда `.chat-message-popover` фактически оказывается зажат в рамки
+     * `.chat-panel`, а не вьюпорта (обнаружено эмпирически при визуальной
+     * самопроверке: попап рендерился на сотни пикселей правее, чем ожидалось
+     * — карточка позиционировалась от границ ПАНЕЛИ, а расчёт координат
+     * предполагал границы ВЬЮПОРТА). Чтобы не зависеть от того, какой именно
+     * containing block достался в конкретном браузере/раскладке, координаты
+     * считаются относительно РЕАЛЬНОГО bounding rect самого
+     * `.chat-message-popover` (messagePopover.getBoundingClientRect()) — она
+     * и есть фактический containing block для absolute-карточки, кем бы он
+     * ни оказался. На мобильном (bottom-sheet) позицию целиком берёт на себя
+     * CSS — здесь инлайн-стили сбрасываются, чтобы не конфликтовать.
+     */
+    function positionMessagePopoverDesktop(anchorEl) {
+      if (isMobileLayout()) {
+        popoverCard.style.left = '';
+        popoverCard.style.top = '';
+        return;
+      }
+      const containingRect = messagePopover.getBoundingClientRect();
+      const anchorRect = anchorEl.getBoundingClientRect();
+      const cardRect = popoverCard.getBoundingClientRect();
+
+      let left = anchorRect.left - containingRect.left;
+      const maxLeft = Math.max(4, containingRect.width - cardRect.width - 4);
+      left = Math.max(4, Math.min(left, maxLeft));
+
+      let top = anchorRect.bottom - containingRect.top + 4;
+      if (top + cardRect.height > containingRect.height - 4) {
+        top = anchorRect.top - containingRect.top - cardRect.height - 4;
+      }
+      top = Math.max(4, top);
+
+      popoverCard.style.left = `${left}px`;
+      popoverCard.style.top = `${top}px`;
+    }
+
+    function openMessagePopover(msgId, anchorEl) {
+      const msg = findAnyMessageById(msgId);
+      if (!msg) return;
+      const overlay = messageOverlays.get(msgId);
+      if (overlay && overlay.deleted) return; // тумбстоуну действия не положены
+
+      const prevId = activePopoverMsgId;
+      activePopoverMsgId = msgId;
+      if (prevId && prevId !== msgId) {
+        const prevEl = messagesEl.querySelector(`.chat-message[data-msg-id="${escapeForSelector(prevId)}"]`);
+        if (prevEl) prevEl.classList.remove('chat-message--popover-open');
+      }
+      const el = messagesEl.querySelector(`.chat-message[data-msg-id="${escapeForSelector(msgId)}"]`);
+      if (el) el.classList.add('chat-message--popover-open');
+
+      buildPopoverReactionsList(msgId);
+      populatePopoverActions(msg, overlay);
+
+      messagePopover.classList.remove('hidden');
+      positionMessagePopoverDesktop(anchorEl || el || panel);
+    }
+
+    function closeMessagePopover() {
+      if (!activePopoverMsgId) {
+        messagePopover.classList.add('hidden');
+        return;
+      }
+      const el = messagesEl.querySelector(`.chat-message[data-msg-id="${escapeForSelector(activePopoverMsgId)}"]`);
+      if (el) el.classList.remove('chat-message--popover-open');
+      activePopoverMsgId = null;
+      messagePopover.classList.add('hidden');
+    }
+
+    function toggleMessagePopover(msgId, anchorEl) {
+      if (activePopoverMsgId === msgId && !messagePopover.classList.contains('hidden')) {
+        closeMessagePopover();
+        return;
+      }
+      cancelReply();
+      openMessagePopover(msgId, anchorEl);
+    }
+
+    // Эмодзи-палитра внутри попапа — тап/клик по эмодзи ставит/снимает
+    // реакцию (toggle, см. sendReactionToggle) и закрывает весь попап
+    // (Telegram: выбор реакции — финальное действие, не промежуточный шаг).
+    popoverEmojisEl.querySelectorAll('.chat-message-popover-emoji').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const emoji = btn.dataset.emoji;
+        const targetId = activePopoverMsgId;
+        closeMessagePopover();
+        if (targetId && emoji) sendReactionToggle(targetId, emoji);
+      });
+    });
+
+    popoverClose.addEventListener('click', closeMessagePopover);
+    popoverBackdrop.addEventListener('click', closeMessagePopover);
+
+    document.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape') return;
+      if (!messagePopover.classList.contains('hidden')) {
+        closeMessagePopover();
+        return;
+      }
+      if (!editBar.classList.contains('hidden')) {
+        cancelEditAndClear();
+      }
+    });
+
+    // Клик по телу сообщения открывает попап действий (повторный клик по
+    // уже открытому — закрывает, см. toggleMessagePopover). Клики по
+    // элементам с собственной клик-логикой (чип реакции, цитата реплая,
+    // ссылка, спойлер, кнопка/медиа-контрол внутри карточки файла) НЕ
+    // открывают попап дополнительно — тот же приём, что и в прошлой волне
+    // (см. eventPathMatches выше). Тумбстоуны (удалённые сообщения) действий
+    // не имеют — openMessagePopover сама не откроется (см. проверку overlay
+    // внутри), но и клик-делегирование их не запускает тоже, для ясности.
     messagesEl.addEventListener('click', (event) => {
-      if (!isMobileLayout()) return;
-      if (!eventPathMatches(event, '.chat-message')) return;
       if (
         eventPathMatches(
           event,
-          '.chat-message-action, .chat-reaction-chip, .chat-reply-quote, a, button, video, audio, .chat-md-spoiler'
+          '.chat-reaction-chip, .chat-reply-quote, a, button, video, audio, .chat-md-spoiler'
         )
       ) {
         return;
       }
       const item = event.target.closest ? event.target.closest('.chat-message') : null;
       if (!item) return;
-      const msgId = item.dataset.msgId;
-      setActiveMobileMessage(activeMobileMessageId === msgId ? null : msgId);
+      if (item.classList.contains('chat-message--deleted')) return;
+      toggleMessagePopover(item.dataset.msgId, item);
     });
 
-    // Тап МИМО любого сообщения (шапка/инпут/пустое место ленты) снимает
-    // активность. Клики ВНУТРИ сообщения (включая кнопки действий) сюда не
-    // попадают (см. eventPathMatches выше — устойчиво к отсоединению
-    // event.target серединой того же клика, см. её заголовок) — этот
-    // обработчик тогда no-op (актуальна только делегация на messagesEl
-    // выше). Попап реакций — отдельное исключение: он всплывает НЕ внутри
-    // `.chat-message` (общий на панель, см. buildDom), но тап по нему
-    // (выбор эмодзи) не должен гасить активное сообщение, к которому он
-    // относится.
+    // Клик МИМО любого сообщения и мимо самого попапа закрывает попап (тап
+    // по шапке чата, пустому месту ленты, инпуту и т.п.). Клики ВНУТРИ
+    // сообщения обрабатывает messagesEl-делегирование выше (toggle) — сюда
+    // они тоже долетают по всплытию, но исключены явной проверкой ниже,
+    // иначе этот обработчик немедленно закрывал бы только что открытый попап.
     document.addEventListener('click', (event) => {
-      if (!isMobileLayout() || !activeMobileMessageId) return;
-      if (eventPathMatches(event, '.chat-message') || eventPathMatches(event, '.chat-reaction-popover')) return;
-      setActiveMobileMessage(null);
-    });
-
-    // Скролл ленты тоже снимает активность (спека волны 11: «тап мимо/скролл
-    // — снимает») — рёндер (renderAll) прогонки этой ленты не считается
-    // "скроллом" сам по себе (не меняет messagesEl.scrollTop напрямую), сюда
-    // попадают и пользовательский свайп/колесо, и programmatic scrollToBottom
-    // (см. её вызовы после отправки/прихода сообщений) — оба варианта здесь
-    // намеренно не различаются, простая трактовка спеки.
-    messagesEl.addEventListener('scroll', () => {
-      if (isMobileLayout() && activeMobileMessageId) setActiveMobileMessage(null);
+      if (messagePopover.classList.contains('hidden')) return;
+      if (eventPathMatches(event, '.chat-message-popover') || eventPathMatches(event, '.chat-message')) return;
+      closeMessagePopover();
     });
 
     // --- Rate-limit (клиентский, мягкий) — только для текстовых сообщений ---
@@ -2490,6 +2654,7 @@ const ChatPanel = (() => {
         ts: Date.now(),
       };
       textInput.value = '';
+      autoGrowTextInput();
       cancelReply();
 
       // Своё сообщение — сразу и локально, оптимистично (эха от сервера
@@ -2516,6 +2681,7 @@ const ChatPanel = (() => {
         ts: Date.now(),
       };
       textInput.value = '';
+      autoGrowTextInput();
       cancelEdit();
 
       if (insertMessage(envelope)) {
@@ -2588,13 +2754,65 @@ const ChatPanel = (() => {
     collapseButton.addEventListener('click', () => setCollapsed(true));
 
     sendButton.addEventListener('click', sendCurrentText);
+    // Требование владельца («Telegram-подобно»): Enter — ВСЕГДА перенос
+    // строки, и на мобильном, и на десктопе — отправка только кнопкой
+    // (самолётик). Cmd/Ctrl+Enter — десктопное удобство для отправки, не
+    // заменяет одиночный Enter. Одиночный Enter здесь намеренно НЕ
+    // перехватывается (без event.preventDefault()) — обычный перенос строки
+    // остаётся полностью браузерным поведением textarea.
     textInput.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter' && !event.shiftKey) {
+      if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
         event.preventDefault();
         sendCurrentText();
         return;
       }
       handleFormattingShortcut(event);
+    });
+
+    /**
+     * Автоувеличение textarea по числу строк (волна 13, «как в Telegram») —
+     * растёт до MAX_INPUT_LINES, дальше — внутренний скролл самой textarea
+     * (overflow-y:auto), панель ввода при этом не уезжает (растёт только
+     * сама textarea, кнопки прижаты снизу через align-items:flex-end на
+     * .chat-input-row, см. style.css). Пересчитывается на каждое input-
+     * событие и везде, где value меняется программно (edit/отправка/отмена
+     * редактирования/форматирующие горячие клавиши) — см. вызовы ниже.
+     * Высота считается через временный сброс в 'auto' (чтобы scrollHeight
+     * отражал РЕАЛЬНОЕ содержимое, а не текущую растянутую высоту) — border
+     * учитывается отдельно (scrollHeight не включает border, а
+     * box-sizing:border-box у .chat-text-input предполагает высоту ВМЕСТЕ с
+     * border, см. style.css).
+     *
+     * Раскладка строки ввода (волна 14): пока textarea умещается в одну
+     * строку — компактный горизонтальный ряд [📎][Aa][textarea][➤] (как и
+     * раньше). Как только она вырастает больше чем на одну строку, кнопки
+     * (📎/Aa/➤, обёрнутые в .chat-input-actions — см. buildDom) перестраиваются
+     * в вертикальную колонку справа от textarea, прижатую к низу: см.
+     * .chat-input-row--expanded в style.css (там же — почему это работает
+     * без переноса кнопок в DOM: .chat-input-actions в обычном режиме —
+     * display:contents, в expanded — настоящий flex-column). Число строк
+     * считаем от содержимого (scrollHeight за вычетом паддингов), а не от
+     * итоговой (уже ограниченной MAX_INPUT_LINES) высоты.
+     */
+    function autoGrowTextInput() {
+      const style = getComputedStyle(textInput);
+      const borderY = (parseFloat(style.borderTopWidth) || 0) + (parseFloat(style.borderBottomWidth) || 0);
+      const paddingY = (parseFloat(style.paddingTop) || 0) + (parseFloat(style.paddingBottom) || 0);
+      const lineHeight = parseFloat(style.lineHeight) || 20;
+      textInput.style.height = 'auto';
+      const desired = textInput.scrollHeight + borderY;
+      const maxHeight = Math.round(lineHeight * MAX_INPUT_LINES + paddingY + borderY);
+      textInput.style.height = `${Math.min(desired, maxHeight)}px`;
+      textInput.style.overflowY = desired > maxHeight ? 'auto' : 'hidden';
+
+      const numLines = Math.round((textInput.scrollHeight - paddingY) / lineHeight);
+      inputRow.classList.toggle('chat-input-row--expanded', numLines > 1);
+    }
+
+    textInput.addEventListener('input', () => {
+      const wasNearBottom = isNearBottom();
+      autoGrowTextInput();
+      if (wasNearBottom) scrollToBottom();
     });
 
     // --- Десктопные горячие клавиши форматирования (см. заголовок файла) ---
@@ -2617,6 +2835,7 @@ const ChatPanel = (() => {
         : start + before.length;
       textInput.setSelectionRange(cursor, cursor);
       textInput.focus();
+      autoGrowTextInput();
     }
 
     /**
@@ -2640,6 +2859,7 @@ const ChatPanel = (() => {
       const cursor = start + inserted.length;
       textInput.setSelectionRange(cursor, cursor);
       textInput.focus();
+      autoGrowTextInput();
     }
 
     /**

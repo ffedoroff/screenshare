@@ -219,6 +219,58 @@ body {
   border-color: var(--accent);
 }
 
+/* ---------- Build-хэш (форензический якорь, см. docs/security.md,
+   «Published Build Hash») — ненавязчивый подвал лендинга. Комната переиспользует
+   .build-verify-link/.build-full ниже для попапа «Поделиться» и настроек,
+   с собственными контейнерами (.share-popup-build/.settings-build-row). ---------- */
+
+.build-footer {
+  width: 100%;
+  margin-top: var(--space-2);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border);
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+
+.build-details {
+  display: inline;
+}
+
+.build-details summary {
+  display: inline;
+  cursor: pointer;
+  list-style: none;
+}
+
+.build-details summary::-webkit-details-marker {
+  display: none;
+}
+
+.build-details summary::marker {
+  content: '';
+}
+
+.build-full {
+  margin-top: var(--space-1);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.build-verify-link {
+  color: var(--text-muted);
+  text-decoration: underline;
+}
+
+.build-verify-link:hover {
+  color: var(--text);
+}
+
 /* ---------- Комната: верхний бар ---------- */
 
 .room-page {
@@ -790,6 +842,16 @@ body {
   padding: var(--space-2) var(--space-3);
 }
 
+/* Хэш опубликованной статики — ОТДЕЛЬНОЙ строкой под ссылкой/QR (НЕ часть
+   ни того, ни другого — см. static/room.js: renderShareBuildLine). */
+.share-popup-build {
+  width: 100%;
+  word-break: break-all;
+  font-size: 0.72rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--text-muted);
+}
+
 .share-popup-copy-button {
   min-height: 44px;
   width: 100%;
@@ -1123,85 +1185,222 @@ body {
   color: #fff;
 }
 
-/* ---------- Реплаи ---------- */
+/* ---------- Попап действий сообщения (волна 13) ----------
+   Заменяет ЦЕЛИКОМ hover-кнопки и on-tap action-row прошлых волн: в строке
+   сообщения по умолчанию нет вообще никаких кнопок — ни постоянных, ни по
+   hover, ни на мобильном, ни на десктопе. Единственный способ добраться до
+   действий (ответить/реакция/редактировать/удалить/копировать) — клик/тап по
+   самому сообщению (см. chat.js: openMessagePopover), который открывает этот
+   попап: на десктопе — компактной карточкой у сообщения, на мобильном
+   (≤640px, см. media-запрос ниже) — bottom-sheet снизу экрана. */
+.chat-message-popover {
+  position: fixed;
+  inset: 0;
+  z-index: 45;
+}
 
-/* Кнопки-действия сообщения (ответить / реакция) — по умолчанию скрыты
-   (opacity), появляются мягко по ховеру самого сообщения (десктоп, >640px,
-   см. @media (min-width:641px) ниже); на мобильном (≤640px) ховера как
-   явления нет — там вместо него тап-активация ОДНОГО сообщения (класс
-   .chat-message--active, см. chat.js: setActiveMobileMessage, и
-   переопределение видимости в @media (max-width:640px) ниже) — жалоба
-   владельца была именно на то, что кнопки виднелись на КАЖДОМ сообщении
-   сразу. Обычный поток (не absolute) — прижаты вправо через align-self, а не
-   наложены поверх строки имя/время: у absolute-варианта с отрицательным
-   top для САМОГО ПЕРВОГО сообщения в короткой ленте кнопки уходили выше
-   собственного скролл-контейнера (.chat-messages, overflow-y: auto) и
-   визуально проваливались под шапку чата — недостаточно места сверху. */
-.chat-message-actions {
-  align-self: flex-end;
+.chat-message-popover.hidden {
+  display: none;
+}
+
+.chat-message-popover-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+}
+
+.chat-message-popover-card {
+  position: absolute;
+  z-index: 1;
+  width: 280px;
+  max-width: calc(100vw - var(--space-4) * 2);
+  max-height: calc(100% - var(--space-4) * 2);
+  overflow-y: auto;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+  padding: var(--space-2);
   display: flex;
-  gap: 4px;
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity 0.15s ease;
+  flex-direction: column;
+  gap: var(--space-1);
 }
 
-/* Hover-реveal — СТРОГО десктоп (>640px). Важно гейтить именно шириной, а не
-   полагаться на то, что у тач-устройств :hover просто не возникает сам по
-   себе: инструменты автоматизации (в т.ч. Playwright .click()) двигают
-   курсор по-настоящему и матчат :hover даже в mobile-эмуляции с
-   hasTouch:true — без этого гейта проверка «на мобильном действия скрыты по
-   умолчанию» была бы недостоверной (и потенциально то же самое в реальных
-   гибридных тач+мышь устройствах). :focus-within — тоже только здесь: это
-   путь клавиатурной доступности (Tab), которого на мобильном layout с его
-   тап-активацией не нужно (там показывает activeMobileMessageId). */
-@media (min-width: 641px) {
-  .chat-message:hover .chat-message-actions,
-  .chat-message-actions:focus-within {
-    opacity: 1;
-    pointer-events: auto;
-  }
+/* Ручка-индикатор свайпа — видна только в мобильном bottom-sheet (см. media-запрос ниже). */
+.chat-message-popover-handle {
+  display: none;
 }
 
-.chat-message-action {
+.chat-message-popover-close {
+  position: absolute;
+  top: var(--space-2);
+  right: var(--space-2);
+  z-index: 2;
+  width: 28px;
+  height: 28px;
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 32px;
-  height: 32px;
-  border: 1px solid var(--border);
+  border: none;
   border-radius: 50%;
   background: var(--bg-elevated-2);
   color: var(--text-muted);
+  font-size: 1.1rem;
+  line-height: 1;
   cursor: pointer;
   padding: 0;
-  font-size: 0.8rem;
-  font-weight: 700;
-  line-height: 1;
-  box-shadow: var(--shadow);
 }
 
-.chat-message-action .icon {
+.chat-message-popover-close:hover {
+  background: var(--bg);
+  color: var(--text);
+}
+
+.chat-message-popover-emojis {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 2px calc(var(--space-6) + var(--space-1)) var(--space-2) 2px;
+}
+
+.chat-message-popover-emoji {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  cursor: pointer;
+  font-size: 1.375rem; /* ~22px */
+  padding: 0;
+}
+
+.chat-message-popover-emoji:hover {
+  background: var(--bg-elevated-2);
+}
+
+/* Разбор реакций «кто/чем/когда» (см. chat.js: buildPopoverReactionsList) — скрыт целиком, если у сообщения нет ни одной реакции. */
+.chat-message-popover-reactions {
+  border-top: 1px solid var(--border);
+  padding-top: var(--space-2);
+  margin-top: 2px;
+}
+
+.chat-message-popover-reactions-title {
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  color: var(--text-muted);
+  margin-bottom: var(--space-1);
+}
+
+.chat-message-popover-reactions-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 160px;
+  overflow-y: auto;
+}
+
+.chat-message-popover-reaction-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 32px;
+  font-size: 0.85rem;
+}
+
+.chat-message-popover-reaction-emoji {
+  flex-shrink: 0;
+  font-size: 1rem;
+}
+
+.chat-message-popover-reaction-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-message-popover-reaction-time {
+  flex-shrink: 0;
+  color: var(--text-muted);
+  font-size: 0.76rem;
+}
+
+.chat-message-popover-actions {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+  padding-top: var(--space-1);
+  margin-top: 2px;
+}
+
+/* Пункт меню действий — крупная строка (≥44px тач-цель), иконка + подпись. */
+.chat-message-action {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-height: 44px;
+  padding: 0 var(--space-2);
+  border: none;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.92rem;
+  cursor: pointer;
+  text-align: left;
+}
+
+.chat-message-action:hover {
+  background: var(--bg-elevated-2);
+}
+
+.chat-message-action-icon {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  color: var(--text-muted);
+}
+
+.chat-message-action-icon .icon {
   width: 18px;
   height: 18px;
 }
 
-.chat-message-action:hover {
-  color: var(--text);
-  background: var(--bg-elevated);
+.chat-message-action-label {
+  flex: 1;
+  min-width: 0;
+}
+
+.chat-message-action--delete {
+  color: var(--danger-hover);
+}
+
+.chat-message-action--delete .chat-message-action-icon {
+  color: var(--danger);
 }
 
 .chat-message-action--delete:hover {
-  color: var(--danger-hover);
-  border-color: var(--danger);
+  background: rgba(229, 72, 77, 0.14);
 }
 
-/* Состояние подтверждения удаления («✓?» на 3с, см. chat.js: buildDeleteButton) */
+/* Состояние подтверждения удаления (см. chat.js: buildDeleteButton). */
 .chat-message-action--confirm {
   color: var(--danger-hover);
-  border-color: var(--danger);
-  background: rgba(229, 72, 77, 0.16);
-  font-size: 0.72rem;
+  font-weight: 600;
+}
+
+/* Лёгкая рамка-подсказка на сообщении, для которого сейчас открыт попап — та же подсветка что и было у активного мобильного сообщения прошлой волны, теперь единая для десктопа и мобайла. */
+.chat-message--popover-open .chat-message-text {
+  box-shadow: 0 0 0 1px var(--accent);
 }
 
 .chat-reply-quote {
@@ -1442,37 +1641,6 @@ body {
   color: var(--text);
 }
 
-.chat-reaction-popover {
-  position: absolute;
-  z-index: 30;
-  display: flex;
-  gap: 4px;
-  padding: 6px;
-  background: var(--bg-elevated-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  box-shadow: var(--shadow);
-  max-width: calc(100% - 8px);
-}
-
-.chat-reaction-popover-emoji {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 40px;
-  height: 40px;
-  border: none;
-  border-radius: 8px;
-  background: transparent;
-  cursor: pointer;
-  font-size: 1.375rem; /* ~22px */
-  padding: 0;
-}
-
-.chat-reaction-popover-emoji:hover {
-  background: var(--bg-elevated);
-}
-
 .chat-error-banner {
   padding: var(--space-2) var(--space-3);
   font-size: 0.8rem;
@@ -1491,25 +1659,99 @@ body {
   flex-shrink: 0;
 }
 
+/* Кнопки инпута (📎/Aa/➤) обёрнуты в .chat-input-actions (см. chat.js:
+   buildDom), но в обычном (однострочном) режиме этот контейнер сам в
+   разметке не участвует — display:contents «растворяет» его, и кнопки
+   становятся обычными flex-item'ами .chat-input-row наравне с textarea.
+   Порядок среди них задаётся order (ниже), а не DOM-порядком — сама
+   разметка теперь textarea → .chat-input-actions (см. chat.js), но
+   визуально нужно 📎, Aa, textarea, ➤, как раньше. */
+.chat-input-actions {
+  display: contents;
+}
+
+.chat-attach-button {
+  order: 1;
+}
+
+.chat-format-toggle-button {
+  order: 2;
+}
+
+.chat-text-input {
+  order: 3;
+}
+
+.chat-send-button {
+  order: 4;
+}
+
+/* Раскладка при разросшейся textarea (волна 14, см. chat.js:
+   autoGrowTextInput — класс навешивается/снимается по числу строк).
+   textarea растёт вверх по высоте (см. её правила ниже), и держать 📎/Aa/➤
+   в горизонтальном ряду рядом с ней становится тесно и неопрятно — вместо
+   этого правая тройка кнопок перестраивается в вертикальную колонку:
+   .chat-input-actions перестаёт быть «прозрачным» (display:contents) и
+   становится настоящим flex-контейнером с flex-direction:column, в который
+   попадают ровно те же кнопки (order внутри него сохраняет 📎 > Aa > ➤
+   сверху вниз — order — это свойство самого элемента, оно продолжает
+   действовать в любом флекс-контексте, в который элемент попадает).
+   justify-content:flex-end прижимает колонку к низу — так, что ➤ всегда на
+   уровне низа textarea, а если Aa скрыта (десктоп, см. .chat-format-toggle-button
+   display:none выше по файлу) — 📎 и ➤ просто ближе друг к другу, без дыр. */
+.chat-input-row--expanded {
+  align-items: stretch;
+}
+
+.chat-input-row--expanded .chat-input-actions {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  align-items: stretch;
+  gap: var(--space-2);
+  order: 5;
+  flex-shrink: 0;
+}
+
+/* Авторост (волна 13, «как в Telegram», см. chat.js: autoGrowTextInput) —
+   высота считается и проставляется через element.style.height В JS (растёт
+   по числу строк до MAX_INPUT_LINES, дальше — внутренний overflow-y:auto),
+   поэтому здесь НЕТ max-height. box-sizing:border-box (унаследован от
+   глобального ресета) — высота, которую ставит JS, включает border, поэтому
+   autoGrowTextInput() учитывает border отдельно (см. её комментарий).
+   Однострочный текст — ровно по центру поля: padding-top и padding-bottom
+   СИММЕТРИЧНЫ (var(--space-3) с обеих сторон) и в сумме с line-height дают
+   ту же min-height — то есть однострочному тексту НЕ достаётся лишнего
+   "слака" снизу (в отличие от прежней версии, где min-height был больше
+   естественной высоты строки+паддингов, и весь остаток становился видимым
+   только под текстом, тесто визуально смещало текст выше центра). */
 .chat-text-input {
   flex: 1;
   min-width: 0;
   resize: none;
   min-height: 44px;
-  max-height: 120px;
-  padding: var(--space-2) var(--space-3);
+  overflow-y: hidden;
+  padding: var(--space-3);
   border-radius: var(--radius);
   border: 1px solid var(--border);
   background: var(--bg);
   color: var(--text);
   font-family: inherit;
   font-size: 0.9375rem; /* 15px */
-  line-height: 1.45;
+  line-height: 1.3;
 }
 
 .chat-text-input:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* Явный акцентный фокус-ринг вместо браузерного дефолта (который на разных
+   ОС/движках отличается по цвету и не всегда согласуется с тёмной темой). */
+.chat-text-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(79, 140, 255, 0.35);
 }
 
 .chat-send-button {
@@ -1880,6 +2122,8 @@ body {
 
   .chat-text-input {
     min-height: 48px;
+    padding-top: 13px;
+    padding-bottom: 13px;
     font-size: 1rem;
   }
 
@@ -1889,89 +2133,54 @@ body {
     height: 48px;
   }
 
-  /* Мобильный UX (волна 11): постоянно видимые кнопки действий НА КАЖДОМ
-     сообщении оказались шумными на телефоне (жалоба владельца) — вместо
-     этого кнопки по умолчанию СКРЫТЫ (opacity/pointer-events, как у
-     десктопного hover-состояния до :hover) и показываются только у ОДНОГО
-     «активного» сообщения — класс .chat-message--active вешает/снимает
-     JS по тапу (см. chat.js: setActiveMobileMessage, messagesEl
-     click-делегирование). В обычном потоке (не absolute), прижаты вправо
-     через align-self — иначе показавшиеся кнопки накрывали бы собой строку
-     имя/время. */
-  .chat-message-actions {
-    position: static;
-    align-self: flex-end;
-    opacity: 0;
-    pointer-events: none;
-    margin-bottom: 2px;
+  /* Попап действий сообщения (волна 13) — на мобильном раскрывается
+     bottom-sheet'ом снизу экрана (не компактной карточкой у сообщения, как
+     на десктопе, см. базовые правила выше): позиция задаётся ЦЕЛИКОМ CSS
+     (fixed внизу, на всю ширину) — JS (positionMessagePopoverDesktop) на
+     мобильном layout инлайновые top/left не проставляет вовсе, поэтому
+     конфликта специфичности с этими правилами нет. */
+  .chat-message-popover-card {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    width: 100%;
+    max-width: 100%;
+    max-height: 80vh;
+    border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+    padding: var(--space-2) var(--space-3) calc(var(--space-4) + env(safe-area-inset-bottom));
   }
 
-  .chat-message--active .chat-message-actions {
-    opacity: 1;
-    pointer-events: auto;
+  .chat-message-popover-handle {
+    display: block;
+    align-self: center;
+    width: 36px;
+    height: 4px;
+    border-radius: 999px;
+    background: var(--border);
+    margin: var(--space-1) 0 var(--space-2);
   }
 
-  /* Крупные тач-цели (≥44px) — мельче 36px (как было раньше) на пальце
-     промахивается. */
+  .chat-message-popover-emoji {
+    width: 44px;
+    height: 44px;
+  }
+
+  /* Крупные тач-цели (≥44px) для пунктов меню действий. */
   .chat-message-action {
-    width: 44px;
-    height: 44px;
+    min-height: 48px;
+    font-size: 1rem;
   }
 
-  .chat-message-action .icon {
-    width: 22px;
-    height: 22px;
-  }
-
-  /* Активное сообщение — тонкая рамка-подсказка, что действия относятся
-     именно к нему (кнопки уже сами по себе сильный сигнал, рамка — просто
-     дополнительная ясность, особенно пока рядом раскрыта палитра реакций). */
-  .chat-message--active .chat-message-text {
-    box-shadow: 0 0 0 1px var(--accent);
-  }
-
-  .chat-reaction-popover {
-    max-width: calc(100vw - var(--space-4));
-  }
-
-  .chat-reaction-popover-emoji {
-    width: 44px;
-    height: 44px;
+  .chat-message-action-icon .icon {
+    width: 20px;
+    height: 20px;
   }
 
   /* Кнопка «Aa» и тулбар форматирования — см. секцию выше в файле, здесь
      только включаем видимость (на десктопе display:none). */
   .chat-format-toggle-button {
     display: flex;
-  }
-}
-
-/* Тач-устройства без ховера, НО шире мобильного порога (планшет, touch-
-   ноутбук, десктопный вьюпорт через touch-эмуляцию) — кнопки действий
-   сообщения всегда видимы, а не только по ховеру (там нет hover вовсе, а
-   тап-активация — специально мобильный приём для узких экранов, см. блок
-   max-width:640px выше). ВАЖНО: min-width:641px здесь принципиален — без
-   него это правило (объявленное позже в файле) перебивало бы каскадом
-   hidden-by-default из блока max-width:640px на 390px-вьюпорте с
-   hasTouch:true (та же специфичность класса, а побеждает последнее по
-   исходнику) и постоянно видимые кнопки вернулись бы на телефоне. */
-@media (hover: none) and (min-width: 641px) {
-  .chat-message-actions {
-    position: static;
-    align-self: flex-end;
-    opacity: 1;
-    pointer-events: auto;
-    margin-bottom: 2px;
-  }
-
-  .chat-message-action {
-    width: 36px;
-    height: 36px;
-  }
-
-  .chat-message-action .icon {
-    width: 20px;
-    height: 20px;
   }
 }
 
@@ -2354,6 +2563,16 @@ body {
    строка красная, тревожная, а не просто нейтрально серая. */
 .settings-crypto-row--off {
   color: var(--danger);
+}
+
+/* Хэш опубликованной статики (опционально, см. static/room.js:
+   renderSettingsBuildRow) — та же форензическая точка сверки, что в подвале
+   лендинга и попапе «Поделиться» (docs/security.md, «Published Build Hash»). */
+.settings-build-row {
+  font-size: 0.78rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--text-muted);
+  word-break: break-all;
 }
 
 .settings-crypto-row--off .settings-crypto-icon {

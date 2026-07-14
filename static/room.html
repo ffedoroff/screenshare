@@ -216,6 +216,13 @@
              покидать вкладку ради QR. -->
         <div id="share-popup-qr" class="share-popup-qr" role="img" aria-label="QR-код со ссылкой на комнату"></div>
         <div id="share-popup-link" class="share-popup-link"></div>
+        <!-- Хэш опубликованной статики — ОТДЕЛЬНОЙ строкой текста, для
+             сверки (форензический якорь, см. docs/security.md, «Published
+             Build Hash»). НЕ часть ссылки/QR выше — те несут только
+             `<origin>/r/<id>#k=<key>` (см. static/room.js: buildShareLink/
+             renderShareQr). Скрыт, пока /build-hash.json не подтянулся или
+             недоступен (dev/self-hosted, см. static/room.js: loadBuildHash). -->
+        <div id="share-popup-build" class="share-popup-build hidden"></div>
         <button id="share-popup-copy-button" class="share-popup-copy-button" type="button">Скопировать</button>
       </div>
     </div>
@@ -308,6 +315,15 @@
               <path d="M8 11V8a4 4 0 0 1 8 0v3"></path>
             </svg>
             <span id="settings-crypto-text"></span>
+          </div>
+
+          <!-- Хэш опубликованной статики (опционально, см. static/room.js:
+               loadBuildHash/renderSettingsBuildRow) — та же форензическая
+               точка сверки, что в подвале лендинга и попапе «Поделиться»,
+               см. docs/security.md, «Published Build Hash». Скрыт, если
+               /build-hash.json недоступен (dev/self-hosted). -->
+          <div id="settings-build-row" class="settings-build-row hidden">
+            <span id="settings-build-text"></span>
           </div>
 
           <div class="settings-section-label">Соединения с участниками</div>

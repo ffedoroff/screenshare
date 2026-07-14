@@ -32,6 +32,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { createRequire } from 'node:module';
 import {
   REAL_CAPTURE_TIMEOUT_MS,
   REAL_MIC_TIMEOUT_MS,
@@ -52,6 +53,7 @@ import {
   sendChatMessage,
   sendChatMessageAndGetId,
   messageTextsInclude,
+  messageWithLineBreaksIncludes,
   getChatDom,
   waitUntil,
   makeTestPngBuffer,
@@ -69,6 +71,11 @@ import {
   waitInvalidLinkOverlay,
   waitForBusOpenToAllPeers,
   installFakeVisualViewport,
+  openMessagePopoverFor,
+  closeMessagePopover,
+  popoverAction,
+  clickPopoverEmoji,
+  popoverReactionRows,
   REPO_ROOT,
 } from './helpers.mjs';
 
@@ -1088,8 +1095,8 @@ async function main() {
           assert.ok(await messageTextsInclude(cPage, originalText), 'оригинал не дошёл до Вити');
 
           const aOriginalMsg = aPage.locator('.chat-message', { hasText: originalText }).last();
-          await aOriginalMsg.hover();
-          await aOriginalMsg.locator('.chat-message-action--reply').click();
+          await openMessagePopoverFor(aPage, aOriginalMsg);
+          await popoverAction(aPage, 'reply').click();
           await aPage.locator('.chat-reply-bar:not(.hidden)').waitFor({ state: 'visible', timeout: 3000 });
           const replyBarText = (await aPage.locator('.chat-reply-bar-text').textContent()) || '';
           assert.ok(replyBarText.includes('Боря'), `плашка реплая должна упоминать автора оригинала «Боря»: ${replyBarText}`);
@@ -1109,8 +1116,8 @@ async function main() {
           // плашка над инпутом и цитата в полученном реплае должны показывать
           // ПЛЕЙН-текст, без сырых markdown-маркеров (см. static/chat.js:
           // stripMarkdownForPreview) ---
-          await bFmtMsg.hover();
-          await bFmtMsg.locator('.chat-message-action--reply').click();
+          await openMessagePopoverFor(bPage, bFmtMsg);
+          await popoverAction(bPage, 'reply').click();
           await bPage.locator('.chat-reply-bar:not(.hidden)').waitFor({ state: 'visible', timeout: 3000 });
           const fmtReplyBarText = (await bPage.locator('.chat-reply-bar-text').textContent()) || '';
           assert.ok(!fmtReplyBarText.includes('**'), `плашка реплая не должна показывать сырые "**": ${fmtReplyBarText}`);
@@ -1125,12 +1132,14 @@ async function main() {
           assert.ok(!fmtQuoteText.includes('**'), `цитата реплая не должна показывать сырые "**": ${fmtQuoteText}`);
           assert.ok(fmtQuoteText.includes('wow'), `цитата реплая должна содержать текст оригинала: ${fmtQuoteText}`);
 
-          // --- (в) реакции: Аня ставит 👍 на сообщение Бори -> у Бори и Вити чип «👍 1»; toggle убирает ---
+          // --- (в) реакции через попап действий: Аня ставит 👍 на сообщение
+          // Бори -> у Бори и Вити чип «👍 1»; toggle убирает. Палитра эмодзи
+          // теперь ЧАСТЬ единого попапа действий (волна 13), а не отдельный
+          // поповер по кнопке — открываем попап кликом по сообщению и сразу
+          // жмём эмодзи в нём. ---
           const aTargetMsg = aPage.locator('.chat-message', { hasText: originalText }).last();
-          await aTargetMsg.hover();
-          await aTargetMsg.locator('.chat-message-action--react').click();
-          await aPage.locator('.chat-reaction-popover:not(.hidden)').waitFor({ state: 'visible', timeout: 3000 });
-          await aPage.locator('.chat-reaction-popover-emoji[data-emoji="👍"]').click();
+          await openMessagePopoverFor(aPage, aTargetMsg);
+          await clickPopoverEmoji(aPage, '👍');
 
           const bTargetMsg = bPage.locator('.chat-message', { hasText: originalText }).last();
           const cTargetMsg = cPage.locator('.chat-message', { hasText: originalText }).last();
@@ -1141,11 +1150,31 @@ async function main() {
           assert.ok(bChipText.includes('👍') && bChipText.includes('1'), `у Бори должен появиться чип «👍 1»: ${bChipText}`);
           assert.ok(cChipText.includes('👍') && cChipText.includes('1'), `у Вити должен появиться чип «👍 1»: ${cChipText}`);
 
+          // Разбор реакций «кто/чем/когда» — в попапе у Бори (получателя)
+          // должна появиться строка с именем автора реакции (Аня), эмодзи и
+          // временем (ЧЧ:ММ).
+          await openMessagePopoverFor(bPage, bTargetMsg);
+          await bPage.waitForFunction(
+            () => !document.querySelector('.chat-message-popover-reactions')?.classList.contains('hidden'),
+            undefined,
+            { timeout: 3000 }
+          );
+          const reactionRows = popoverReactionRows(bPage);
+          await reactionRows.first().waitFor({ state: 'visible', timeout: 3000 });
+          const reactionRowText = (await reactionRows.first().textContent()) || '';
+          assert.ok(
+            reactionRowText.includes('Аня') && reactionRowText.includes('👍'),
+            `разбор реакций должен показывать имя и эмодзи реагировавшего (Аня, 👍): ${reactionRowText}`
+          );
+          assert.ok(
+            /\d{2}:\d{2}/.test(reactionRowText),
+            `разбор реакций должен показывать время реакции (ЧЧ:ММ): ${reactionRowText}`
+          );
+          await closeMessagePopover(bPage);
+
           // toggle: повторный клик своей же реакции убирает её у всех
-          await aTargetMsg.hover();
-          await aTargetMsg.locator('.chat-message-action--react').click();
-          await aPage.locator('.chat-reaction-popover:not(.hidden)').waitFor({ state: 'visible', timeout: 3000 });
-          await aPage.locator('.chat-reaction-popover-emoji[data-emoji="👍"]').click();
+          await openMessagePopoverFor(aPage, aTargetMsg);
+          await clickPopoverEmoji(aPage, '👍');
 
           await waitUntil(async () => (await bTargetMsg.locator('.chat-reaction-chip').count()) === 0, {
             timeoutMs: 5000,
@@ -1157,10 +1186,8 @@ async function main() {
           });
 
           // ставим реакцию заново — она должна быть в истории для опоздавшего (г)
-          await aTargetMsg.hover();
-          await aTargetMsg.locator('.chat-message-action--react').click();
-          await aPage.locator('.chat-reaction-popover:not(.hidden)').waitFor({ state: 'visible', timeout: 3000 });
-          await aPage.locator('.chat-reaction-popover-emoji[data-emoji="👍"]').click();
+          await openMessagePopoverFor(aPage, aTargetMsg);
+          await clickPopoverEmoji(aPage, '👍');
           await bTargetMsg.locator('.chat-reaction-chip').first().waitFor({ state: 'visible', timeout: 5000 });
 
           // --- (г) опоздавший (Гриша) видит и сообщение, и реакцию из истории ---
@@ -1184,6 +1211,19 @@ async function main() {
             assert.ok(
               dChipText.includes('👍') && dChipText.includes('1'),
               `опоздавший должен увидеть чип «👍 1» из реплея истории: ${dChipText}`
+            );
+
+            // Разбор реакций из реплея истории тоже должен знать имя реагировавшего.
+            await openMessagePopoverFor(dPage, dTargetMsg);
+            await dPage.waitForFunction(
+              () => !document.querySelector('.chat-message-popover-reactions')?.classList.contains('hidden'),
+              undefined,
+              { timeout: 3000 }
+            );
+            const dReactionRowText = (await popoverReactionRows(dPage).first().textContent()) || '';
+            assert.ok(
+              dReactionRowText.includes('Аня') && dReactionRowText.includes('👍'),
+              `опоздавший должен увидеть в разборе реакций имя и эмодзи из истории: ${dReactionRowText}`
             );
           } finally {
             await dContext.close();
@@ -1243,8 +1283,8 @@ async function main() {
           assert.ok(await messageTextsInclude(pPage, original1), 'М1 не дошло до Паши');
 
           const iMsg1Sel = `.chat-message[data-msg-id="${msg1Id}"]`;
-          await iPage.locator(iMsg1Sel).hover();
-          await iPage.locator(iMsg1Sel).locator('.chat-message-action--edit').click();
+          await openMessagePopoverFor(iPage, iPage.locator(iMsg1Sel));
+          await popoverAction(iPage, 'edit').click();
           await iPage.locator('.chat-edit-bar:not(.hidden)').waitFor({ state: 'visible', timeout: 3000 });
           const editBarValue = await iPage.locator('.chat-text-input').inputValue();
           assert.equal(editBarValue, original1, `textarea при открытии редактирования должна содержать текущий текст М1: ${editBarValue}`);
@@ -1286,24 +1326,28 @@ async function main() {
           const iMsg2Sel = `.chat-message[data-msg-id="${msg2Id}"]`;
           const pMsg2Sel = `.chat-message[data-msg-id="${msg2Id}"]`;
 
-          await pPage.locator(pMsg2Sel).hover();
-          await pPage.locator(pMsg2Sel).locator('.chat-message-action--react').click();
-          await pPage.locator('.chat-reaction-popover:not(.hidden)').waitFor({ state: 'visible', timeout: 3000 });
-          await pPage.locator('.chat-reaction-popover-emoji[data-emoji="👍"]').click();
+          await openMessagePopoverFor(pPage, pPage.locator(pMsg2Sel));
+          await clickPopoverEmoji(pPage, '👍');
           await iPage.locator(`${iMsg2Sel} .chat-reaction-chip`).first().waitFor({ state: 'visible', timeout: 5000 });
 
-          await iPage.locator(iMsg2Sel).hover();
-          const iDeleteBtn2 = iPage.locator(iMsg2Sel).locator('.chat-message-action--delete');
+          await openMessagePopoverFor(iPage, iPage.locator(iMsg2Sel));
+          const iDeleteBtn2 = popoverAction(iPage, 'delete');
           await iDeleteBtn2.click(); // первый клик — переход в состояние подтверждения
-          await iPage.locator(`${iMsg2Sel} .chat-message-action--confirm`).waitFor({ timeout: 2000 });
-          await iDeleteBtn2.click(); // второй клик в течение 3с — подтверждение, шлём delete
+          await iPage.locator('.chat-message-popover .chat-message-action--confirm').waitFor({ timeout: 2000 });
+          await iDeleteBtn2.click(); // второй клик в течение 3с — подтверждение, шлём delete и закрывает попап
 
-          // У автора: тумбстоун вместо текста, реакции и кнопки действий пропали.
+          // У автора: тумбстоун вместо текста, реакции пропали, попап на тумбстоуне больше не открывается.
           await iPage.locator(`${iMsg2Sel} .chat-message-text--deleted`).waitFor({ timeout: 5000 });
           const iTombstoneText = await iPage.locator(`${iMsg2Sel} .chat-message-text`).textContent();
           assert.equal(iTombstoneText, 'Сообщение удалено', `тумбстоун у автора должен показывать «Сообщение удалено»: ${iTombstoneText}`);
           assert.equal(await iPage.locator(`${iMsg2Sel} .chat-reaction-chip`).count(), 0, 'у автора чипы реакций должны исчезнуть у удалённого сообщения');
-          assert.equal(await iPage.locator(`${iMsg2Sel} .chat-message-actions`).count(), 0, 'у тумбстоуна не должно быть кнопок действий');
+          await iPage.locator(iMsg2Sel).locator('.chat-message-meta').click();
+          await new Promise((r) => setTimeout(r, 300));
+          assert.equal(
+            await iPage.evaluate(() => document.querySelector('.chat-message-popover')?.classList.contains('hidden')),
+            true,
+            'тап по тумбстоуну не должен открывать попап действий'
+          );
 
           // У Паши: то же самое — тумбстоун, чипы реакций пропали.
           await pPage.locator(`${pMsg2Sel} .chat-message-text--deleted`).waitFor({ timeout: 5000 });
@@ -1513,14 +1557,69 @@ async function main() {
           assert.ok(await messageTextsInclude(iPage, pOriginal), 'сообщение Паши не дошло до Инны');
           const pEdited = `Паша-правка-${Date.now()}`;
           const pMsgSel = `.chat-message[data-msg-id="${pMsgId}"]`;
-          await pPage.locator(pMsgSel).hover();
-          await pPage.locator(pMsgSel).locator('.chat-message-action--edit').click();
+          await openMessagePopoverFor(pPage, pPage.locator(pMsgSel));
+          await popoverAction(pPage, 'edit').click();
           await pPage.locator('.chat-edit-bar:not(.hidden)').waitFor({ state: 'visible', timeout: 3000 });
           await pPage.locator('.chat-text-input').fill(pEdited);
           await pPage.locator('.chat-send-button').click();
           assert.ok(
             await messageTextsInclude(iPage, pEdited),
             'легитимная правка настоящего автора должна дойти и примениться у Инны — нормализация from не должна ломать легитимный путь'
+          );
+
+          // --- (е) десктоп: Enter — ВСЕГДА перенос строки, не отправка;
+          // Cmd/Ctrl+Enter — отправляет (десктопное удобство, см. static/chat.js) ---
+          await iPage.fill('.chat-text-input', '');
+          await iPage.click('.chat-text-input');
+          await iPage.keyboard.type('первая строка десктоп');
+          await iPage.keyboard.press('Enter');
+          await iPage.keyboard.type('вторая строка десктоп');
+          const iValueAfterEnter = await iPage.inputValue('.chat-text-input');
+          assert.equal(
+            iValueAfterEnter,
+            'первая строка десктоп\nвторая строка десктоп',
+            `Enter на десктопе тоже должен быть переносом строки, не отправкой: ${JSON.stringify(iValueAfterEnter)}`
+          );
+          assert.equal(
+            await messageTextsInclude(iPage, 'первая строка десктоп', 300),
+            false,
+            'сообщение не должно было отправиться одиночным Enter на десктопе'
+          );
+          const modifier = process.platform === 'darwin' ? 'Meta' : 'Control';
+          await iPage.keyboard.press(`${modifier}+Enter`);
+          assert.ok(
+            await messageWithLineBreaksIncludes(iPage, ['первая строка десктоп', 'вторая строка десктоп']),
+            'Cmd/Ctrl+Enter должен отправить многострочное сообщение (с настоящим переносом строки — <br> между строками)'
+          );
+          assert.ok(
+            await messageWithLineBreaksIncludes(pPage, ['первая строка десктоп', 'вторая строка десктоп']),
+            'сообщение, отправленное Cmd/Ctrl+Enter, должно дойти до собеседника с переносом строки'
+          );
+
+          // --- (ж) попап действий на десктопе: закрытие крестиком, Esc и кликом по фону ---
+          const iLastMsg = iPage.locator('.chat-message', { hasText: pEdited }).last();
+          await openMessagePopoverFor(iPage, iLastMsg);
+          await iPage.click('.chat-message-popover-close');
+          await iPage.waitForFunction(
+            () => document.querySelector('.chat-message-popover')?.classList.contains('hidden'),
+            undefined,
+            { timeout: 2000 }
+          );
+
+          await openMessagePopoverFor(iPage, iLastMsg);
+          await iPage.keyboard.press('Escape');
+          await iPage.waitForFunction(
+            () => document.querySelector('.chat-message-popover')?.classList.contains('hidden'),
+            undefined,
+            { timeout: 2000 }
+          );
+
+          await openMessagePopoverFor(iPage, iLastMsg);
+          await iPage.click('.chat-message-popover-backdrop', { position: { x: 5, y: 5 } });
+          await iPage.waitForFunction(
+            () => document.querySelector('.chat-message-popover')?.classList.contains('hidden'),
+            undefined,
+            { timeout: 2000 }
           );
         } finally {
           await iContext.close();
@@ -2015,11 +2114,13 @@ async function main() {
     // сказала ни про десктоп (уже покрыт выше), ни про настоящий мобильный
     // Chrome/Safari.
     //
-    // Мобильный UX чата (тап-активация действий сообщения, контекстный
-    // реплай/реакция/редактирование/удаление, мобильный тулбар
-    // форматирования, VisualViewport-подгонка под клавиатуру) проверяется
-    // ЗДЕСЬ ЖЕ, вторым эпизодом того же шага (та же комната, тот же
-    // mobileContext) — а не отдельным step() с собственным POST /api/rooms:
+    // Мобильный UX чата (волна 13: чистая лента без кнопок, единый попап
+    // действий по тапу — реплай/реакция+разбор реакций/редактирование/
+    // удаление/копирование, Enter=перенос строки, авторост textarea,
+    // мобильный тулбар форматирования, VisualViewport-подгонка под
+    // клавиатуру) проверяется ЗДЕСЬ ЖЕ, вторым эпизодом того же шага (та же
+    // комната, тот же mobileContext) — а не отдельным step() с собственным
+    // POST /api/rooms:
     // весь файл держит бюджет ровно в 10 созданий комнат за прогон (H2:
     // ROOM_CREATION_IP_LIMIT — 10 за 60с с одного IP, см. roomIdForTimerTestReuse
     // ниже), лишний POST здесь столкнул бы файл за лимит и обрушил бы
@@ -2027,7 +2128,7 @@ async function main() {
     // комнате обычным join по ссылке (это не создание комнаты, лимита не
     // расходует).
     await step(
-      'Мобильный смоук (390x844, touch) + мобильный чат (волна 11): панель управления видима без горизонтального скролла, действия сообщения скрыты по умолчанию и показываются по тапу для ОДНОГО сообщения (тап по другому переносит, тап мимо снимает), реплай/реакция/редактирование/удаление работают через этот контекстный путь, мобильный тулбар форматирования (по выделению и по кнопке «Aa»), VisualViewport-подгонка под клавиатуру не даёт странице скроллиться и держит инпут в видимой области',
+      'Мобильный смоук (390x844, touch) + мобильный чат (волна 13): панель управления видима без горизонтального скролла, лента чата чистая (ни одной кнопки действия в DOM), тап по сообщению открывает попап действий для ОДНОГО сообщения (тап по другому переключает, тап мимо закрывает), реплай/реакция+разбор реакций/редактирование/удаление/копирование работают через попап, Enter вставляет перенос строки (не отправляет), отправка кнопкой, textarea растёт под многострочный текст, мобильный тулбар форматирования (по выделению и по кнопке «Aa»), VisualViewport-подгонка под клавиатуру не даёт странице скроллиться и держит инпут в видимой области',
       async () => {
         const res = await fetch(`${server.baseUrl}/api/rooms`, { method: 'POST' });
         assert.ok(res.ok, `POST /api/rooms ответил статусом ${res.status}`);
@@ -2138,7 +2239,10 @@ async function main() {
 
             await openChatPanel(deskPage);
 
-            // --- (1) действия скрыты по умолчанию, тап активирует ОДНО сообщение ---
+            // --- (1) лента ЧИСТАЯ: ни одной кнопки действия в DOM ни у
+            //     одного сообщения (волна 13 убрала on-tap action-row
+            //     прошлой волны и hover-кнопки целиком — не просто спрятала
+            //     их, а не рендерит вовсе), попап действий закрыт ---
             const msg1Text = `Моб-раз-${Date.now()}`;
             const msg1Id = await sendChatMessageAndGetId(mobilePage, msg1Text);
             const msg2Text = `Моб-два-${Date.now()}`;
@@ -2150,114 +2254,179 @@ async function main() {
             const msg1Sel = `.chat-message[data-msg-id="${msg1Id}"]`;
             const msg2Sel = `.chat-message[data-msg-id="${msg2Id}"]`;
 
-            const actionsBefore = await mobilePage.evaluate((sel) => {
-              const el = document.querySelector(`${sel} .chat-message-actions`);
-              const style = getComputedStyle(el);
-              return { opacity: style.opacity, pointerEvents: style.pointerEvents };
-            }, msg1Sel);
-            assert.equal(actionsBefore.opacity, '0', `действия должны быть скрыты (opacity=0) до тапа: ${JSON.stringify(actionsBefore)}`);
-            assert.equal(actionsBefore.pointerEvents, 'none', `действия должны быть некликабельны до тапа: ${JSON.stringify(actionsBefore)}`);
+            const actionButtonCount = await mobilePage.evaluate(
+              () => document.querySelectorAll('.chat-message-action').length
+            );
+            assert.equal(actionButtonCount, 0, 'в ленте не должно быть ни одной кнопки действия (никаких кнопок ни по умолчанию, ни всегда)');
+            const popoverHiddenInitially = await mobilePage.evaluate(
+              () => document.querySelector('.chat-message-popover')?.classList.contains('hidden')
+            );
+            assert.equal(popoverHiddenInitially, true, 'попап действий должен быть закрыт по умолчанию');
 
-            // Тап по msg1 -> активируется (класс + видимость действий). Опacity
-            // анимируется CSS-переходом (transition: opacity 0.15s, см.
-            // style.css) — ждём поллингом итоговое значение, а не читаем его
-            // сразу после появления класса (иначе можно поймать промежуточный
-            // кадр перехода и словить флейк).
-            await mobilePage.click(`${msg1Sel} .chat-message-text`);
+            // --- (2) тап по сообщению открывает попап действий; попап —
+            //     модальный (затемняющий фон backdrop реально перекрывает
+            //     остальную ленту, как и положено модалке/bottom-sheet'у —
+            //     см. style.css: .chat-message-popover-backdrop), поэтому
+            //     тапнуть ДРУГОЕ сообщение, пока попап открыт, физически
+            //     нельзя (backdrop перехватывает тап первым, как и тап
+            //     "мимо" в принципе) — сначала закрываем, потом открываем
+            //     для другого сообщения (не более одного одновременно) ---
+            await openMessagePopoverFor(mobilePage, mobilePage.locator(msg1Sel));
+            const popoverMsgIdAfterTap1 = await mobilePage.evaluate(
+              () => document.querySelector('.chat-message.chat-message--popover-open')?.dataset.msgId
+            );
+            assert.equal(popoverMsgIdAfterTap1, msg1Id, 'попап должен быть открыт для msg1 после тапа по нему');
+
+            // Тап по фону (backdrop) -> закрывает, снимает отметку с msg1.
+            await mobilePage.click('.chat-message-popover-backdrop', { position: { x: 5, y: 5 } });
             await mobilePage.waitForFunction(
-              (sel) => document.querySelector(sel)?.classList.contains('chat-message--active'),
-              msg1Sel,
+              () => document.querySelector('.chat-message-popover')?.classList.contains('hidden'),
+              undefined,
               { timeout: 2000 }
             );
-            await mobilePage.waitForFunction(
-              (sel) => getComputedStyle(document.querySelector(`${sel} .chat-message-actions`)).opacity === '1',
-              msg1Sel,
-              { timeout: 2000 }
-            );
-            const actionsAfterTap1 = await mobilePage.evaluate(
-              (sel) => getComputedStyle(document.querySelector(`${sel} .chat-message-actions`)).opacity,
+            const msg1StillActive = await mobilePage.evaluate(
+              (sel) => document.querySelector(sel)?.classList.contains('chat-message--popover-open'),
               msg1Sel
             );
-            assert.equal(actionsAfterTap1, '1', 'после тапа действия msg1 должны стать видимыми (opacity=1)');
-            const msg2ActiveWhileMsg1Active = await mobilePage.evaluate(
-              (sel) => document.querySelector(sel)?.classList.contains('chat-message--active'),
-              msg2Sel
-            );
-            assert.equal(msg2ActiveWhileMsg1Active, false, 'msg2 не должно быть активным, пока активен msg1 (не более одного одновременно)');
+            assert.equal(msg1StillActive, false, 'закрытие попапа (тап по фону) должно снять отметку с msg1');
 
-            // Тап по msg2 -> активность ПЕРЕНОСИТСЯ (msg1 гаснет).
-            await mobilePage.click(`${msg2Sel} .chat-message-text`);
-            await mobilePage.waitForFunction(
-              (sel) => document.querySelector(sel)?.classList.contains('chat-message--active'),
-              msg2Sel,
-              { timeout: 2000 }
+            await openMessagePopoverFor(mobilePage, mobilePage.locator(msg2Sel));
+            const popoverMsgIdAfterTap2 = await mobilePage.evaluate(
+              () => document.querySelector('.chat-message.chat-message--popover-open')?.dataset.msgId
             );
-            const msg1ActiveAfterMsg2Tap = await mobilePage.evaluate(
-              (sel) => document.querySelector(sel)?.classList.contains('chat-message--active'),
-              msg1Sel
-            );
-            assert.equal(msg1ActiveAfterMsg2Tap, false, 'активация msg2 должна снять активность с msg1');
+            assert.equal(popoverMsgIdAfterTap2, msg2Id, 'попап должен открыться для msg2 отдельным тапом (после закрытия предыдущего)');
 
-            // Тап мимо (по шапке чата) -> снимает активность.
-            await mobilePage.click('.chat-title');
+            // Esc тоже закрывает попап (пока фон/крестик уже покрыты выше).
+            await mobilePage.keyboard.press('Escape');
             await mobilePage.waitForFunction(
-              (sel) => !document.querySelector(sel)?.classList.contains('chat-message--active'),
-              msg2Sel,
+              () => document.querySelector('.chat-message-popover')?.classList.contains('hidden'),
+              undefined,
               { timeout: 2000 }
             );
 
-            // --- (2) реплай через новый контекстный (тап) путь ---
-            await mobilePage.click(`${msg1Sel} .chat-message-text`);
-            await mobilePage.waitForFunction(
-              (sel) => document.querySelector(sel)?.classList.contains('chat-message--active'),
-              msg1Sel,
-              { timeout: 2000 }
-            );
-            await mobilePage.click(`${msg1Sel} .chat-message-action--reply`);
+            // --- (3) реплай через попап ---
+            await openMessagePopoverFor(mobilePage, mobilePage.locator(msg1Sel));
+            await mobilePage.click('.chat-message-popover .chat-message-action--reply');
             await mobilePage.locator('.chat-reply-bar:not(.hidden)').waitFor({ state: 'visible', timeout: 3000 });
             const replyText = `Моб-реплай-${Date.now()}`;
             await sendChatMessage(mobilePage, replyText);
-            assert.ok(await messageTextsInclude(deskPage, replyText), 'реплай с мобильного (через тап-контекст) не дошёл до десктоп-участника');
+            assert.ok(await messageTextsInclude(deskPage, replyText), 'реплай с мобильного (через попап) не дошёл до десктоп-участника');
 
-            // --- (3) реакция через новый контекстный (тап) путь ---
-            await mobilePage.click(`${msg2Sel} .chat-message-text`);
-            await mobilePage.waitForFunction(
-              (sel) => document.querySelector(sel)?.classList.contains('chat-message--active'),
-              msg2Sel,
-              { timeout: 2000 }
-            );
-            await mobilePage.click(`${msg2Sel} .chat-message-action--react`);
-            await mobilePage.locator('.chat-reaction-popover:not(.hidden)').waitFor({ state: 'visible', timeout: 3000 });
-            await mobilePage.locator('.chat-reaction-popover-emoji[data-emoji="👍"]').click();
+            // --- (4) реакция через палитру эмодзи В ТОМ ЖЕ попапе, разбор
+            //     реакций «кто/чем/когда» показывает автора ---
+            await openMessagePopoverFor(mobilePage, mobilePage.locator(msg2Sel));
+            await mobilePage.click('.chat-message-popover-emoji[data-emoji="👍"]');
             await deskPage.locator(`${msg2Sel} .chat-reaction-chip`).first().waitFor({ state: 'visible', timeout: 5000 });
 
-            // --- (4) редактирование через новый контекстный (тап) путь ---
-            await mobilePage.click(`${msg1Sel} .chat-message-text`);
+            await openMessagePopoverFor(mobilePage, mobilePage.locator(msg2Sel));
             await mobilePage.waitForFunction(
-              (sel) => document.querySelector(sel)?.classList.contains('chat-message--active'),
-              msg1Sel,
+              () => !document.querySelector('.chat-message-popover-reactions')?.classList.contains('hidden'),
+              undefined,
+              { timeout: 3000 }
+            );
+            const mobileReactionRowText =
+              (await mobilePage.locator('.chat-message-popover-reaction-row').first().textContent()) || '';
+            assert.ok(
+              mobileReactionRowText.includes('Мобильный') && mobileReactionRowText.includes('👍'),
+              `разбор реакций в попапе должен показывать имя и эмодзи реагировавшего: ${mobileReactionRowText}`
+            );
+            await mobilePage.click('.chat-message-popover-close');
+            await mobilePage.waitForFunction(
+              () => document.querySelector('.chat-message-popover')?.classList.contains('hidden'),
+              undefined,
               { timeout: 2000 }
             );
-            await mobilePage.click(`${msg1Sel} .chat-message-action--edit`);
+
+            // --- (5) редактирование через попап ---
+            await openMessagePopoverFor(mobilePage, mobilePage.locator(msg1Sel));
+            await mobilePage.click('.chat-message-popover .chat-message-action--edit');
             await mobilePage.locator('.chat-edit-bar:not(.hidden)').waitFor({ state: 'visible', timeout: 3000 });
             const editedText = `${msg1Text}-правка`;
             await mobilePage.fill('.chat-text-input', editedText);
             await mobilePage.click('.chat-send-button');
-            assert.ok(await messageTextsInclude(deskPage, editedText), 'отредактированный (через тап-контекст) текст не дошёл до десктоп-участника');
+            assert.ok(await messageTextsInclude(deskPage, editedText), 'отредактированный (через попап) текст не дошёл до десктоп-участника');
 
-            // --- (5) удаление через новый контекстный (тап) путь ---
-            await mobilePage.click(`${msg2Sel} .chat-message-text`);
-            await mobilePage.waitForFunction(
-              (sel) => document.querySelector(sel)?.classList.contains('chat-message--active'),
-              msg2Sel,
-              { timeout: 2000 }
-            );
-            await mobilePage.click(`${msg2Sel} .chat-message-action--delete`);
-            await mobilePage.locator(`${msg2Sel} .chat-message-action--confirm`).waitFor({ timeout: 2000 });
-            await mobilePage.click(`${msg2Sel} .chat-message-action--delete`);
+            // --- (6) удаление (двойное подтверждение) через попап ---
+            await openMessagePopoverFor(mobilePage, mobilePage.locator(msg2Sel));
+            const mobileDeleteBtn = mobilePage.locator('.chat-message-popover .chat-message-action--delete');
+            await mobileDeleteBtn.click();
+            await mobilePage.locator('.chat-message-popover .chat-message-action--confirm').waitFor({ timeout: 2000 });
+            await mobileDeleteBtn.click();
             await waitUntil(
               async () => (await deskPage.locator(`${msg2Sel}.chat-message--deleted`).count()) === 1,
-              { timeoutMs: 5000, message: 'удаление msg2 (через тап-контекст) не дошло до десктоп-участника' }
+              { timeoutMs: 5000, message: 'удаление msg2 (через попап) не дошло до десктоп-участника' }
+            );
+            // Попап закрывается сам после подтверждённого удаления.
+            await mobilePage.waitForFunction(
+              () => document.querySelector('.chat-message-popover')?.classList.contains('hidden'),
+              undefined,
+              { timeout: 2000 }
+            );
+
+            // --- (7) копирование текста через попап (третье сообщение — msg1/msg2 уже отредактировано/удалено) ---
+            const msg3Text = `Моб-три-${Date.now()}`;
+            const msg3Id = await sendChatMessageAndGetId(mobilePage, msg3Text);
+            await openMessagePopoverFor(mobilePage, mobilePage.locator(`.chat-message[data-msg-id="${msg3Id}"]`));
+            const copyBtn = mobilePage.locator('.chat-message-popover .chat-message-action--copy');
+            await copyBtn.click();
+            await waitUntil(async () => (await copyBtn.textContent())?.includes('Скопировано'), {
+              timeoutMs: 2000,
+              message: 'кнопка «Копировать текст» должна показать «Скопировано» после клика',
+            });
+            await mobilePage.click('.chat-message-popover-close');
+            await mobilePage.waitForFunction(
+              () => document.querySelector('.chat-message-popover')?.classList.contains('hidden'),
+              undefined,
+              { timeout: 2000 }
+            );
+
+            // --- (8) Enter — ВСЕГДА перенос строки, не отправка (ни на
+            //     мобильном, ни на десктопе); отправка — только кнопкой ---
+            await mobilePage.fill('.chat-text-input', '');
+            await mobilePage.click('.chat-text-input');
+            await mobilePage.keyboard.type('первая строка');
+            await mobilePage.keyboard.press('Enter');
+            await mobilePage.keyboard.type('вторая строка');
+            const valueAfterEnter = await mobilePage.inputValue('.chat-text-input');
+            assert.equal(
+              valueAfterEnter,
+              'первая строка\nвторая строка',
+              `Enter должен вставить перенос строки, а не отправить сообщение: ${JSON.stringify(valueAfterEnter)}`
+            );
+            assert.equal(
+              await messageTextsInclude(mobilePage, 'первая строка', 300),
+              false,
+              'сообщение НЕ должно было отправиться одиночным Enter'
+            );
+            // Отправка кнопкой — обычный путь, текст с переносом строки уходит как есть
+            // (см. messageWithLineBreaksIncludes — рендер вставляет <br>, а не '\n' в textContent).
+            await mobilePage.click('.chat-send-button');
+            assert.ok(
+              await messageWithLineBreaksIncludes(mobilePage, ['первая строка', 'вторая строка']),
+              'многострочное сообщение должно было отправиться по клику на кнопку отправки, с настоящим переносом строки'
+            );
+
+            // --- (9) авторост textarea: многострочный ввод увеличивает высоту инпута ---
+            await mobilePage.fill('.chat-text-input', '');
+            const singleLineHeight = (await mobilePage.locator('.chat-text-input').boundingBox()).height;
+            const manyLines = Array.from({ length: 8 }, (_, i) => `строка ${i}`).join('\n');
+            await mobilePage.locator('.chat-text-input').fill(manyLines);
+            await mobilePage.waitForFunction(
+              (baseline) => document.querySelector('.chat-text-input').getBoundingClientRect().height > baseline + 20,
+              singleLineHeight,
+              { timeout: 2000 }
+            );
+            const grownHeight = (await mobilePage.locator('.chat-text-input').boundingBox()).height;
+            assert.ok(
+              grownHeight > singleLineHeight,
+              `инпут должен вырасти под многострочный текст: было ${singleLineHeight}, стало ${grownHeight}`
+            );
+            // Отправляем и очищаем — не мешает следующим проверкам.
+            await mobilePage.click('.chat-send-button');
+            await mobilePage.waitForFunction(
+              (baseline) => document.querySelector('.chat-text-input').getBoundingClientRect().height <= baseline + 2,
+              singleLineHeight,
+              { timeout: 2000 }
             );
 
             // --- (6а) мобильный тулбар форматирования появляется САМ по выделению ---
@@ -2928,6 +3097,151 @@ async function main() {
         await petyaContext.close();
         await olyaContext.close();
       }
+    }
+
+    // --- Build-хэш опубликованной статики (форензический якорь, см.
+    // docs/security.md, «Published Build Hash») ---
+    //
+    // Тестовый сервер (target/debug/screenshare) НЕ отдаёт /build-hash.json —
+    // такого маршрута у него вообще нет (см. src/main.rs): это артефакт,
+    // который кладёт в бандл ТОЛЬКО job deploy-pages в CI (см.
+    // .github/workflows/deploy-prod.yml), для Cloudflare Pages. Чтобы
+    // проверить, что фронт КОРРЕКТНО показывает хэш, когда он есть, мокаем
+    // /build-hash.json на уровне сетевого перехвата Playwright
+    // (context.route) — надёжнее временного файла в static/ (тот всё равно
+    // был бы недоступен по правильному пути: сервер отдаёт статику только
+    // под /static/*, см. src/main.rs — корневого маршрута для произвольных
+    // файлов нет) и ничего не оставляет за собой на диске.
+    {
+      const FAKE_BUILD_HASH = 'b5f68626b068a00bfcabf88ccf3efda9519de4208858eeca7e0367320519c195';
+      assert.equal(FAKE_BUILD_HASH.length, 64, 'тестовый фейковый хэш должен быть похож на настоящий SHA-256 (64 hex-символа)');
+
+      await step('Build-хэш: подвал лендинга показывает build-строку из /build-hash.json', async () => {
+        const context = await browser.newContext();
+        try {
+          await context.route('**/build-hash.json', (route) =>
+            route.fulfill({
+              status: 200,
+              contentType: 'application/json',
+              body: JSON.stringify({ hash: FAKE_BUILD_HASH, commit: 'deadbeef', buildDate: '2026-01-01T00:00:00Z' }),
+            })
+          );
+          const page = await context.newPage();
+          await page.goto(server.baseUrl);
+          await page.waitForSelector('#landing-build-footer:not(.hidden)', { timeout: 5000 });
+
+          const shortText = await page.locator('#landing-build-short').textContent();
+          const fullText = await page.locator('#landing-build-full').textContent();
+          const verifyHref = await page.locator('#landing-build-verify-link').getAttribute('href');
+
+          assert.equal(
+            shortText,
+            `${FAKE_BUILD_HASH.slice(0, 12)}…`,
+            `подвал должен показывать первые 12 символов хэша: ${shortText}`
+          );
+          assert.equal(fullText, FAKE_BUILD_HASH, `полный хэш должен быть доступен по раскрытию (details): ${fullText}`);
+          assert.match(verifyHref || '', /github\.com\/.+\/releases/, `ссылка "verify" должна вести на GitHub Releases: ${verifyHref}`);
+        } finally {
+          await context.close();
+        }
+      });
+
+      await step('Build-хэш: без /build-hash.json (дев/self-hosted, 404) подвал остаётся скрытым, ничего не падает', async () => {
+        const context = await browser.newContext();
+        try {
+          const page = await context.newPage();
+          const consoleErrors = [];
+          page.on('pageerror', (err) => consoleErrors.push(String(err)));
+          await page.goto(server.baseUrl);
+          // Реальный тестовый сервер и так не отдаёт /build-hash.json — не мокаем ничего, проверяем поведение "как есть".
+          await page.waitForTimeout(500); // дать fetch() отработать (он в fire-and-forget loadBuildHash())
+          const hidden = await page.locator('#landing-build-footer').evaluate((el) => el.classList.contains('hidden'));
+          assert.ok(hidden, 'подвал build-хэша должен остаться скрытым, когда /build-hash.json недоступен (404)');
+          assert.equal(consoleErrors.length, 0, `не должно быть неотловленных ошибок страницы: ${consoleErrors.join('; ')}`);
+        } finally {
+          await context.close();
+        }
+      });
+
+      await step(
+        'Build-хэш: попап «Поделиться» показывает хэш ОТДЕЛЬНОЙ строкой; ссылка и QR хэш не содержат',
+        async () => {
+          const context = await browser.newContext();
+          try {
+            await context.route('**/build-hash.json', (route) =>
+              route.fulfill({
+                status: 200,
+                contentType: 'application/json',
+                body: JSON.stringify({ hash: FAKE_BUILD_HASH, commit: 'deadbeef', buildDate: '2026-01-01T00:00:00Z' }),
+              })
+            );
+            const page = await context.newPage();
+
+            // PUT /api/rooms/<id>, а не POST: к этому месту файла счёт
+            // POST-запросов (H2: ROOM_CREATION_IP_LIMIT — 10 за 60с с одного
+            // IP, см. src/state.rs) уже исчерпан другими шагами этого файла
+            // — тот же приём, что и в Ш3-блоке выше (см. комментарий там).
+            // PUT restore_room этот лимит не проверяет вовсе; комната
+            // создаётся пустой, без лидера — первый вошедший (эта страница)
+            // станет лидером автоматически, leaderToken не нужен.
+            const roomId = Array.from({ length: 8 }, () => 'abcdefghijklmnopqrstuvwxyz0123456789'[Math.floor(Math.random() * 36)]).join('');
+            const roomKey = generateRoomKeyBase64url();
+            const putRes = await fetch(`${server.baseUrl}/api/rooms/${roomId}`, { method: 'PUT' });
+            assert.ok(putRes.ok, `PUT /api/rooms/${roomId} ответил статусом ${putRes.status}`);
+
+            await page.goto(roomUrlWithKey(server.baseUrl, roomId, roomKey));
+            await joinRoom(page, 'Тестировщик');
+            await waitForOverlayHidden(page);
+
+            await page.click('#share-button');
+            await page.waitForSelector('#share-popup:not(.hidden)');
+            await page.waitForSelector('#share-popup-build:not(.hidden)', { timeout: 5000 });
+
+            const linkText = await page.locator('#share-popup-link').textContent();
+            const buildText = await page.locator('#share-popup-build').textContent();
+            const expectedLink = `${server.baseUrl}/r/${roomId}#k=${roomKey}`;
+
+            assert.equal(linkText, expectedLink, `ссылка должна быть ровно "<origin>/r/<id>#k=<key>", без хэша: ${linkText}`);
+            assert.ok(!linkText.includes(FAKE_BUILD_HASH), `ссылка НЕ должна содержать build-хэш: ${linkText}`);
+            assert.ok(buildText.includes(FAKE_BUILD_HASH), `строка "Build:" должна содержать полный хэш отдельно от ссылки: ${buildText}`);
+            assert.notEqual(buildText, linkText, 'строка build и строка ссылки должны быть разными DOM-узлами с разным текстом');
+
+            // QR: сравниваем ВЕКТОРНЫЕ ДАННЫЕ (атрибут `d` у <path> — сами
+            // координаты закрашенных модулей QR) с тем, что даёт ТА ЖЕ
+            // вендоренная библиотека (static/vendor/qrcode.js) при
+            // кодировании ТОЛЬКО ссылки — если бы хэш был примешан к данным
+            // QR (даже не видимым текстом в SVG-разметке — она чисто
+            // векторная), сами координаты отличались бы, и это сравнение
+            // поймало бы расхождение. Сравниваем именно `d`, а не всю
+            // разметку целиком байт-в-байт: page.innerHTML() отдаёт СЕРИАЛИЗАЦИЮ
+            // РЕАЛЬНОГО DOM (браузер разворачивает самозакрывающиеся теги типа
+            // `<rect .../>` в `<rect ...></rect>` и нормализует пробелы в
+            // атрибутах при парсинге/сериализации) — это отличается от сырой
+            // строки, которую отдаёт createSvgTag() библиотеки НЕ пройдя через
+            // DOM, хотя кодируемые данные при этом идентичны.
+            const require = createRequire(import.meta.url);
+            const qrcodeFactory = require(path.join(REPO_ROOT, 'static/vendor/qrcode.js'));
+            const expectedQr = qrcodeFactory(0, 'M');
+            expectedQr.addData(expectedLink);
+            expectedQr.make();
+            const expectedSvg = expectedQr.createSvgTag(4, 12);
+            const expectedPathD = expectedSvg.match(/<path d="([^"]*)"/)?.[1];
+            assert.ok(expectedPathD, 'не удалось извлечь d= из ожидаемого (эталонного) SVG QR-кода');
+
+            const actualSvg = await page.locator('#share-popup-qr').innerHTML();
+            const actualPathD = actualSvg.match(/<path d="([^"]*)"/)?.[1];
+            assert.ok(actualPathD, 'не удалось извлечь d= из отрисованного в попапе SVG QR-кода');
+
+            assert.equal(
+              actualPathD,
+              expectedPathD,
+              'координаты модулей QR должны байт-в-байт совпадать с кодированием ТОЛЬКО ссылки комнаты (без build-хэша)'
+            );
+          } finally {
+            await context.close();
+          }
+        }
+      );
     }
 
     // --- M2: заголовки Cloudflare Pages (_headers) ---

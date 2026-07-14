@@ -18,6 +18,27 @@
       <button id="create-room-button" class="start-button">Создать комнату</button>
 
       <div id="landing-message" class="status-message"></div>
+
+      <!-- Форензический якорь против подмены статики хостером (Ш2, см.
+           docs/security.md, «Published Build Hash») — НЕ криптогарантия,
+           только точка сверки с независимым каналом (GitHub Release).
+           Скрыт, пока /build-hash.json не подтянулся (см. static/landing.js:
+           loadBuildHash) — в dev/self-hosted сборке файла нет вовсе, и это
+           штатно. -->
+      <footer id="landing-build-footer" class="build-footer hidden">
+        <details class="build-details">
+          <summary class="build-summary">build: <span id="landing-build-short"></span></summary>
+          <div id="landing-build-full" class="build-full"></div>
+        </details>
+        <a
+          id="landing-build-verify-link"
+          class="build-verify-link"
+          href="https://github.com/ffedoroff/screenshare/releases"
+          target="_blank"
+          rel="noopener noreferrer"
+          >verify</a
+        >
+      </footer>
     </div>
   </div>
 
