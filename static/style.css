@@ -47,6 +47,16 @@ body {
   overflow-x: hidden;
 }
 
+/* Полноэкранный мобильный чат открыт (см. chat.js: syncMobileChatViewport) —
+   страница НЕ скроллится, пока клавиатура/адресная строка меняют видимую
+   область: панель чата и так перекрывает весь вьюпорт (position:fixed;
+   inset:0), но фокус textarea рядом с открывающейся клавиатурой на части
+   браузеров провоцирует попытку "проскроллить поле в видимую область" на
+   уровне документа — этот класс гарантированно её глушит. */
+.chat-mobile-scroll-lock {
+  overflow: hidden;
+}
+
 .icon {
   width: 24px;
   height: 24px;
@@ -986,12 +996,143 @@ body {
   box-shadow: 0 0 0 2px var(--accent);
 }
 
+/* ---------- Форматирование (Ф4): спойлер, инлайн-код, блок кода ---------- */
+
+/* Спойлер (||...||, см. chat.js: buildSpoilerEl) — размыт и приглушён до
+   клика/Enter/Space, класс .revealed добавляется НАВСЕГДА (раскрытие в рамках
+   уже отрендеренного элемента не откатывается назад — как в Telegram). */
+.chat-md-spoiler {
+  display: inline;
+  border-radius: 4px;
+  padding: 0 2px;
+  background: rgba(140, 140, 155, 0.35);
+  filter: blur(4px);
+  cursor: pointer;
+  transition: filter 0.15s ease, background-color 0.15s ease;
+}
+
+.chat-md-spoiler.revealed {
+  filter: none;
+  background: transparent;
+  cursor: text;
+}
+
+.chat-message--own .chat-message-text .chat-md-spoiler {
+  background: rgba(255, 255, 255, 0.3);
+}
+
+.chat-message--own .chat-message-text .chat-md-spoiler.revealed {
+  background: transparent;
+}
+
+/* Инлайн-код (`...`) — моноширинный, лёгкий фон-плашка. */
+.chat-inline-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Courier New', monospace;
+  font-size: 0.86em;
+  background: var(--bg-elevated-2);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+
+.chat-message--own .chat-message-text .chat-inline-code {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+/* Блок кода (```[lang]\n...\n```, см. chat.js: buildCodeBlockEl) — метка языка
+   и кнопка «копировать» в шапке, моноширинный <pre><code> со своим
+   горизонтальным скроллом (длинные строки НЕ распирают пузырь сообщения). */
+.chat-code-block {
+  margin: 2px 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elevated-2);
+  overflow: hidden;
+}
+
+.chat-code-block-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: 3px var(--space-2);
+  background: rgba(0, 0, 0, 0.15);
+  font-size: 0.7rem;
+  color: var(--text-muted);
+}
+
+.chat-code-block-lang {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Courier New', monospace;
+  text-transform: lowercase;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-code-block-copy {
+  flex-shrink: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 2px 7px;
+  cursor: pointer;
+}
+
+.chat-code-block-copy:hover {
+  background: var(--bg-elevated);
+  color: var(--text);
+}
+
+.chat-code-block-copy--done {
+  color: var(--accent-hover);
+}
+
+.chat-code-block pre {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  overflow-x: auto;
+}
+
+.chat-code-block code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Courier New', monospace;
+  font-size: 0.82rem;
+  line-height: 1.4;
+  white-space: pre;
+}
+
+.chat-message--own .chat-message-text .chat-code-block {
+  background: rgba(255, 255, 255, 0.16);
+  border-color: rgba(255, 255, 255, 0.35);
+}
+
+.chat-message--own .chat-message-text .chat-code-block-header {
+  background: rgba(0, 0, 0, 0.12);
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.chat-message--own .chat-message-text .chat-code-block-copy {
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.chat-message--own .chat-message-text .chat-code-block-copy:hover {
+  background: rgba(255, 255, 255, 0.2);
+  color: #fff;
+}
+
 /* ---------- Реплаи ---------- */
 
 /* Кнопки-действия сообщения (ответить / реакция) — по умолчанию скрыты
-   (opacity), появляются мягко по ховеру самого сообщения (десктоп); на
-   тач-устройствах и узких экранах — всегда видимы (см. медиа-запросы ниже).
-   Обычный поток (не absolute) — прижаты вправо через align-self, а не
+   (opacity), появляются мягко по ховеру самого сообщения (десктоп, >640px,
+   см. @media (min-width:641px) ниже); на мобильном (≤640px) ховера как
+   явления нет — там вместо него тап-активация ОДНОГО сообщения (класс
+   .chat-message--active, см. chat.js: setActiveMobileMessage, и
+   переопределение видимости в @media (max-width:640px) ниже) — жалоба
+   владельца была именно на то, что кнопки виднелись на КАЖДОМ сообщении
+   сразу. Обычный поток (не absolute) — прижаты вправо через align-self, а не
    наложены поверх строки имя/время: у absolute-варианта с отрицательным
    top для САМОГО ПЕРВОГО сообщения в короткой ленте кнопки уходили выше
    собственного скролл-контейнера (.chat-messages, overflow-y: auto) и
@@ -1005,10 +1146,21 @@ body {
   transition: opacity 0.15s ease;
 }
 
-.chat-message:hover .chat-message-actions,
-.chat-message-actions:focus-within {
-  opacity: 1;
-  pointer-events: auto;
+/* Hover-реveal — СТРОГО десктоп (>640px). Важно гейтить именно шириной, а не
+   полагаться на то, что у тач-устройств :hover просто не возникает сам по
+   себе: инструменты автоматизации (в т.ч. Playwright .click()) двигают
+   курсор по-настоящему и матчат :hover даже в mobile-эмуляции с
+   hasTouch:true — без этого гейта проверка «на мобильном действия скрыты по
+   умолчанию» была бы недостоверной (и потенциально то же самое в реальных
+   гибридных тач+мышь устройствах). :focus-within — тоже только здесь: это
+   путь клавиатурной доступности (Tab), которого на мобильном layout с его
+   тап-активацией не нужно (там показывает activeMobileMessageId). */
+@media (min-width: 641px) {
+  .chat-message:hover .chat-message-actions,
+  .chat-message-actions:focus-within {
+    opacity: 1;
+    pointer-events: auto;
+  }
 }
 
 .chat-message-action {
@@ -1168,6 +1320,92 @@ body {
 .chat-edit-bar-close:hover {
   color: var(--text);
   background: var(--bg-elevated);
+}
+
+/* ---------- Мобильный тулбар форматирования (см. chat.js:
+   updateFormatToolbarVisibility) ----------
+   Кнопка «Aa» сама по себе скрыта на десктопе (display:none здесь) — тулбар
+   там не нужен, форматирование — горячими клавишами (Cmd/Ctrl+B/I/…, см.
+   chat.js). Обе показываются только в @media (max-width:640px) ниже. */
+.chat-format-toggle-button {
+  display: none;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--bg-elevated-2);
+  color: var(--text-muted);
+  font-family: inherit;
+  font-weight: 700;
+  font-size: 0.8rem;
+  padding: 0;
+  cursor: pointer;
+}
+
+.chat-format-toggle-button:hover {
+  color: var(--text);
+  background: var(--bg-elevated);
+}
+
+.chat-format-toggle-button--on {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.chat-format-toggle-button--on:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+  color: #fff;
+}
+
+/* Сам тулбар — строка кнопок над .chat-input-row (по образцу
+   .chat-reply-bar/.chat-edit-bar); flex-wrap, а не горизонтальный скролл —
+   гарантирует, что на 390px тулбар никогда не вылезет за экран (см. общее
+   требование «никакого горизонтального скролла» в шапке комнаты). */
+.chat-format-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-top: 1px solid var(--border);
+  background: var(--bg-elevated-2);
+}
+
+.chat-format-btn {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 44px;
+  height: 44px;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 1rem;
+  cursor: pointer;
+}
+
+.chat-format-btn:hover {
+  background: var(--bg);
+}
+
+.chat-format-btn--bold {
+  font-weight: 700;
+}
+
+.chat-format-btn--italic {
+  font-style: italic;
+}
+
+.chat-format-btn--strike {
+  text-decoration: line-through;
 }
 
 /* ---------- Реакции ---------- */
@@ -1463,14 +1701,64 @@ body {
 .chat-file-image {
   display: block;
   max-width: 100%;
-  max-height: 240px;
+  max-height: 280px;
   border-radius: var(--radius);
   cursor: pointer;
+}
+
+/* Клик по картинке — оригинал в новой вкладке (см. chat.js: renderFileDoneBody, <a target=_blank>). */
+.chat-file-media-link {
+  display: block;
+  align-self: flex-start;
+}
+
+.chat-file-video {
+  display: block;
+  max-width: 100%;
+  max-height: 320px;
+  border-radius: var(--radius);
+  background: #000;
 }
 
 .chat-file-audio {
   width: 100%;
   max-width: 260px;
+}
+
+/* Мета-строка под инлайн-медиа (картинка/видео/аудио, см. chat.js:
+   buildFileMetaRow) — имя, размер, (длительность — только audio/video, по
+   loadedmetadata), кнопка «Скачать» прижата вправо через margin-left: auto. */
+.chat-file-meta-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  font-size: 0.74rem;
+  color: var(--text-muted);
+}
+
+.chat-file-meta-name {
+  font-weight: 600;
+  color: var(--text);
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-message--own .chat-file-meta-name {
+  color: var(--text);
+}
+
+.chat-file-meta-size,
+.chat-file-meta-duration {
+  flex-shrink: 0;
+}
+
+.chat-file-download-link--compact {
+  margin-left: auto;
+  padding: 4px 10px;
+  font-size: 0.72rem;
 }
 
 @media (max-width: 700px) {
@@ -1601,38 +1889,73 @@ body {
     height: 48px;
   }
 
-  /* На тач-устройствах ховера нет — кнопки «ответить»/«реакция»/«редактировать»/
-     «удалить» держим постоянно видимыми (спец. требование мобильного UX) и
-     увеличиваем тач-цель. В обычном потоке (не absolute), прижаты вправо через
-     align-self — иначе постоянно видимые кнопки накрывали бы собой строку
+  /* Мобильный UX (волна 11): постоянно видимые кнопки действий НА КАЖДОМ
+     сообщении оказались шумными на телефоне (жалоба владельца) — вместо
+     этого кнопки по умолчанию СКРЫТЫ (opacity/pointer-events, как у
+     десктопного hover-состояния до :hover) и показываются только у ОДНОГО
+     «активного» сообщения — класс .chat-message--active вешает/снимает
+     JS по тапу (см. chat.js: setActiveMobileMessage, messagesEl
+     click-делегирование). В обычном потоке (не absolute), прижаты вправо
+     через align-self — иначе показавшиеся кнопки накрывали бы собой строку
      имя/время. */
   .chat-message-actions {
     position: static;
     align-self: flex-end;
-    opacity: 1;
-    pointer-events: auto;
+    opacity: 0;
+    pointer-events: none;
     margin-bottom: 2px;
   }
 
+  .chat-message--active .chat-message-actions {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  /* Крупные тач-цели (≥44px) — мельче 36px (как было раньше) на пальце
+     промахивается. */
   .chat-message-action {
-    width: 36px;
-    height: 36px;
+    width: 44px;
+    height: 44px;
   }
 
   .chat-message-action .icon {
-    width: 20px;
-    height: 20px;
+    width: 22px;
+    height: 22px;
+  }
+
+  /* Активное сообщение — тонкая рамка-подсказка, что действия относятся
+     именно к нему (кнопки уже сами по себе сильный сигнал, рамка — просто
+     дополнительная ясность, особенно пока рядом раскрыта палитра реакций). */
+  .chat-message--active .chat-message-text {
+    box-shadow: 0 0 0 1px var(--accent);
   }
 
   .chat-reaction-popover {
     max-width: calc(100vw - var(--space-4));
   }
+
+  .chat-reaction-popover-emoji {
+    width: 44px;
+    height: 44px;
+  }
+
+  /* Кнопка «Aa» и тулбар форматирования — см. секцию выше в файле, здесь
+     только включаем видимость (на десктопе display:none). */
+  .chat-format-toggle-button {
+    display: flex;
+  }
 }
 
-/* Тач-устройства без ховера (в т.ч. десктопные вьюпорты через touch-эмуляцию)
-   — кнопки действий сообщения всегда видимы, а не только по ховеру, и живут
-   в обычном потоке (см. комментарий в блоке max-width:640px выше). */
-@media (hover: none) {
+/* Тач-устройства без ховера, НО шире мобильного порога (планшет, touch-
+   ноутбук, десктопный вьюпорт через touch-эмуляцию) — кнопки действий
+   сообщения всегда видимы, а не только по ховеру (там нет hover вовсе, а
+   тап-активация — специально мобильный приём для узких экранов, см. блок
+   max-width:640px выше). ВАЖНО: min-width:641px здесь принципиален — без
+   него это правило (объявленное позже в файле) перебивало бы каскадом
+   hidden-by-default из блока max-width:640px на 390px-вьюпорте с
+   hasTouch:true (та же специфичность класса, а побеждает последнее по
+   исходнику) и постоянно видимые кнопки вернулись бы на телефоне. */
+@media (hover: none) and (min-width: 641px) {
   .chat-message-actions {
     position: static;
     align-self: flex-end;

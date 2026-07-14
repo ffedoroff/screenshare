@@ -9,11 +9,13 @@
 - [3. Reverse Proxy & TLS](#3-reverse-proxy--tls)
 - [4. The `localhost` vs. LAN/Domain Secure-Context Nuance](#4-the-localhost-vs-landomain-secure-context-nuance)
 - [5. TURN (Optional)](#5-turn-optional)
+  - [5.1 Rotating the Shared Secret](#51-rotating-the-shared-secret)
 - [6. Environment Variables](#6-environment-variables)
 - [7. Operational Notes](#7-operational-notes)
   - [7.1 Single Replica, In-Memory State](#71-single-replica-in-memory-state)
   - [7.2 Surviving a Restart/Redeploy](#72-surviving-a-restartredeploy)
   - [7.3 Health Checks](#73-health-checks)
+- [8. Keeping Deployment Private (Two-Repo Pattern)](#8-keeping-deployment-private-two-repo-pattern)
 
 <!-- /toc -->
 
@@ -155,6 +157,60 @@ Recommended setup — a shared-secret (TURN REST API-style) credential scheme,
    the open-relay risk described in [`security.md` §3](security.md#3-h1--ephemeral-turn-credentials)
    until you migrate to the shared-secret scheme.
 
+### 5.1 Rotating the Shared Secret
+
+The TURN REST API scheme in [§5](#5-turn-optional) only delivers real
+ephemerality if you **rotate `TURN_STATIC_SECRET` periodically**. As
+explained in [`security.md` §3](security.md#3-h1--ephemeral-turn-credentials),
+the expiry timestamp embedded in the credential's `username` is a
+convention this project's issuer follows — it is **not enforced by the
+TURN server itself**. Your TURN server's static-auth-secret setting (e.g.
+`coturn`'s `use-auth-secret`/`static-auth-secret`, or `turn-rs`'s
+`static-auth-secret`) only checks the HMAC, not the timestamp, so a
+credential pair keeps validating past its embedded expiry for as long as
+the secret that produced it stays unchanged. Rotating that one secret is
+therefore the actual mechanism that bounds how long a leaked credential
+stays usable — not the TTL in `/config`'s response.
+
+Procedure (see the runnable example at
+[`../scripts/rotate-turn-secret.example.sh`](../scripts/rotate-turn-secret.example.sh)):
+
+1. **Generate a new secret** — any high-entropy random value works, e.g.:
+   ```bash
+   openssl rand -hex 32
+   ```
+2. **Update it in both places at once.** The TURN server's static-auth-secret
+   setting and this project's `TURN_STATIC_SECRET` env var must hold the
+   **same** value — update your TURN server's config and the application's
+   env simultaneously (e.g. both entries in your secret store, config
+   management, or `docker-compose.yml` override).
+3. **Restart both.** The TURN server needs to reload/restart to pick up its
+   new static-auth-secret; this application only reads `TURN_STATIC_SECRET`
+   at process start ([§6](#6-environment-variables)), so it needs a restart
+   too. Expect a brief interruption of the TURN relay during the restart —
+   this affects only participants who need the relay (those behind
+   restrictive/symmetric NATs); it does **not** affect direct peer-to-peer
+   connections, which are the majority case (see
+   [`webrtc-mesh.md`](webrtc-mesh.md)).
+4. **Do this on a schedule.** How often is a trade-off you choose — e.g.
+   weekly or monthly, ideally outside your busiest hours. The more
+   frequently you rotate, the shorter the window a single leaked credential
+   stays useful. Automating this with a scheduler in your own
+   infrastructure (cron, a Kubernetes `CronJob`, a systemd timer, or
+   whatever your deployment already uses) is worthwhile once you're doing
+   it regularly — this is exactly the kind of deployment-specific
+   automation that's a good fit for keeping your infra separate from the
+   public code repo (see [§8](#8-keeping-deployment-private-two-repo-pattern)).
+
+A stronger, optional alternative: if your TURN server supports an
+authentication webhook per allocation request, it can validate the
+timestamp itself and reject expired credentials outright — making the TTL
+a real, server-enforced boundary rather than a convention. That's more
+setup than the static-secret scheme above and isn't required to get the
+main benefit (bounding a leak's lifetime via rotation); it's worth
+considering if your TURN server supports it and you want the TTL to be a
+hard guarantee rather than an operational habit.
+
 ## 6. Environment Variables
 
 | Variable | Required | Default | Purpose |
@@ -213,3 +269,46 @@ not a bug to route around.
 whatever liveness/readiness probe your runtime environment expects. There is
 no separate startup dependency (no database, no external service) to wait
 on.
+
+## 8. Keeping Deployment Private (Two-Repo Pattern)
+
+This is an optional pattern for operators who want to run a public
+open-source instance while keeping their **own** infrastructure and CI
+credentials private. Nothing in the application requires it — it is purely a
+repository/CI arrangement.
+
+**Two repositories:**
+
+- **Public code repo** (this one) — application source, docs, `Dockerfile`,
+  `docker-compose.yml`, generic self-hosting. Its CI runs only build and
+  tests (signaling + browser e2e); it holds **no** deployment secrets and
+  references **no** specific host, domain, or cluster. This keeps the
+  open-source repository clean and safe to publish.
+- **Private infra repo** — deployment manifests, reverse-proxy / TLS config,
+  TURN configuration, and all deployment secrets (SSH keys, CDN/API tokens),
+  living only in that private repo's CI secret store.
+
+**Event-driven deploy.** The private repo deploys **only after the public
+repo's build and tests succeed on the main branch** — i.e. after a
+successful build/release of the main repo, not on every raw commit. Two ways
+to wire the trigger:
+
+1. **Dispatch (event-driven, immediate).** The public repo's CI, once its
+   `test`/`e2e` jobs pass on `main`, emits a cross-repo event (e.g. GitHub
+   `repository_dispatch`) to the private repo, passing the released commit
+   SHA. The private repo's workflow then checks out the public repo at that
+   SHA, builds the image, and deploys. This requires a single narrowly-scoped
+   token in the public repo's CI secrets (able only to trigger the private
+   repo) — it lives in the encrypted secret store, never in tracked files.
+2. **Poll (no secret in the public repo).** The private repo periodically
+   checks the public repo's main branch for a new released SHA and deploys
+   when it changes. Zero coupling and zero secrets in the public repo, at the
+   cost of a short polling delay.
+
+Either way, the private repo checks out the public source at the released
+commit and owns the entire deploy: image build, delivery to the server, and
+static-frontend publishing. The public repo never learns anything about where
+or how the instance is hosted.
+
+> Status: planned arrangement for this project's own hosted instance — not
+> yet implemented in these repositories.

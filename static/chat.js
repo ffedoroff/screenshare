@@ -13,8 +13,22 @@
 // (P2P DataChannel уже E2E за счёт DTLS) — а вот в fallback-пути через
 // сервер конверт целиком шифруется под K_chat, выведенный из ключа комнаты
 // (см. static/room.js): на проводе вместо открытого конверта уходит
-// {enc:{v,iv,ct}} (см. sendEnvelopeToPeer/attach ниже) — сервер видит только
-// непрозрачный блоб, как и остальной сигналинг-релей.
+// {enc:{v,iv,ct}, epoch} (см. sendEnvelopeToPeer/attach ниже) — сервер видит
+// только непрозрачный блоб + номер эпохи, как и остальной сигналинг-релей.
+//
+// Ш3 (forward secrecy контента при смене состава, см.
+// docs/e2e-encryption.md §7): K_chat не один статичный ключ на всю сессию —
+// лидер комнаты может выпустить НОВУЮ эпоху (при уходе участника/отказе в
+// лобби), после чего этот fallback-путь шифрует ИСХОДЯЩЕЕ под новой эпохой, а
+// ВХОДЯЩЕЕ расшифровывает ключом ТОЙ эпохи, что указана в самом конверте
+// (`epoch`, открытым текстом рядом с `enc` — иначе получателю нечем было бы
+// выбрать нужный ключ ДО расшифровки). Участник, уже покинувший комнату (или
+// отклонённый в лобби), никогда не получает ключ новой эпохи (раздача —
+// строго по P2P-шине, см. static/room.js: rotateContentKeysIfLeader) — вот
+// он, весь выигрыш: то, что отправлено в fallback-путь ПОСЛЕ его ухода, он
+// прочитать не может, даже если бы каким-то образом снова слушал трафик
+// сервера. P2P-путь по шине этим слоем не защищается и не нуждается в этом —
+// см. заголовок выше про DTLS.
 //
 // Конверт сообщения (РАСШИРЯЕМЫЙ — расширения будущих волн должны лечь без
 // ломки формата):
@@ -113,13 +127,24 @@
 // это лёгкие toggle-события, не полноценные сообщения.
 //
 // Форматирование текста (kind=text) — см. renderMessageBody/appendInlineNodes
-// ниже: подмножество markdown (**жирный**, *курсив*, ~~зачёркнутый~~, "> "
-// в начале строки — блок-цитата, http(s)-ссылки кликабельны без
-// карточек-превью — никаких сетевых запросов по ссылке ради приватности).
-// КРИТИЧНО: рендер строит DOM-ноды через createElement/textContent —
-// никакого innerHTML с пользовательскими данными нигде в этом файле
-// (innerHTML используется только для статичной, не зависящей от
-// пользовательского ввода разметки — сама панель и попап реакций).
+// ниже (Ф4, Telegram-подобный синтаксис, двойные маркеры): **жирный**,
+// __курсив__ И *курсив* (обе формы), ~~зачёркнутый~~, ||спойлер|| (блюр,
+// раскрытие по клику/Enter/Space — класс .revealed), `инлайн-код` (не
+// разбирается дальше), тройные бэктики ```[lang]\n...\n``` — блок кода
+// (<pre><code>, метка языка, кнопка «копировать», внутри тоже не
+// разбирается), "> " в начале строки — блок-цитата (уже было), http(s)-ссылки
+// и именованные [текст](url)-ссылки кликабельны без карточек-превью — никаких
+// сетевых запросов по ссылке ради приватности. Вложенность — где осмысленно
+// (форматирование внутри цитаты и внутри спойлера — оба рекурсивно прогоняют
+// свой контент через appendInlineNodes), но НЕ внутри инлайн-кода/код-блока
+// (код есть код). КРИТИЧНО: рендер строит DOM-ноды через
+// createElement/textContent — никакого innerHTML с пользовательскими данными
+// нигде в этом файле (innerHTML используется только для статичной, не
+// зависящей от пользовательского ввода разметки — сама панель и попап
+// реакций). Десктопные горячие клавиши для этих же маркеров — см.
+// wrapSelectionWithMarkers/handleFormattingShortcut ниже (Cmd/Ctrl+B/I,
+// Cmd/Ctrl+Shift+X/P/M/K); мобильный тулбар по выделению — следующая волна,
+// не здесь.
 //
 // Реплаи — кнопка «⤺ ответить» на каждом сообщении (см. .chat-message-action)
 // открывает компактную плашку над инпутом; отправка кладёт replyTo в
@@ -206,6 +231,12 @@ const ChatPanel = (() => {
   const REPLY_PREVIEW_MAX_LEN = 60;
   const HIGHLIGHT_DURATION_MS = 1200;
   const REACTION_EMOJIS = ['👍', '👎', '❤️', '😂', '😮', '😢'];
+  // Та же граница, что и в style.css (@media (max-width: 640px)) — мобильный
+  // UX волны 11 (полноэкранный чат, тап-активация действий сообщения,
+  // мобильный тулбар форматирования, см. isMobileLayout/applyVisualViewportSizing
+  // ниже) переключается ровно по ней, чтобы JS-состояние и CSS-разметка не
+  // расходились на границе ширины.
+  const MOBILE_BREAKPOINT_QUERY = '(max-width: 640px)';
 
   // --- Передача файлов (Ф3) ---
   const FILE_SIZE_LIMIT_BYTES = 25 * 1024 * 1024; // 25МБ — жёсткий лимит на файл
@@ -256,6 +287,10 @@ const ChatPanel = (() => {
     <circle cx="6" cy="18" r="3"></circle>
     <circle cx="18" cy="16" r="3"></circle>
   </svg>`;
+  const FILE_ICON_VIDEO_SVG = `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <polygon points="23 7 16 12 23 17 23 7"></polygon>
+    <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
+  </svg>`;
   const FILE_ICON_GENERIC_SVG = `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
     <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
     <polyline points="14 2 14 8 20 8"></polyline>
@@ -265,6 +300,7 @@ const ChatPanel = (() => {
     const m = String(mime || '');
     if (m.startsWith('image/')) return FILE_ICON_IMAGE_SVG;
     if (m.startsWith('audio/')) return FILE_ICON_AUDIO_SVG;
+    if (m.startsWith('video/')) return FILE_ICON_VIDEO_SVG;
     return FILE_ICON_GENERIC_SVG;
   }
 
@@ -287,22 +323,34 @@ const ChatPanel = (() => {
   }
 
   /**
-   * Убрать markdown-маркеры (**жирный**, *курсив*, ~~зачёркнутый~~, "> "
-   * цитата) из текста для PLAIN-TEXT превью — реплай-плашка над инпутом
-   * (startReply) и цитата оригинала в самом сообщении (buildReplyQuoteEl) не
-   * рендерят разметку (места мало, важнее компактность), поэтому маркеры не
-   * должны "протекать" в них сырыми звёздочками. Тот же синтаксис, что
-   * renderMessageBody/INLINE_MD_RE рендерят полноценно — здесь просто снятие
-   * маркеров, без построения DOM. Переводы строк схлопываются в пробел —
-   * превью однострочное.
+   * Убрать markdown-маркеры (**жирный**, __курсив__/*курсив*, ~~зачёркнутый~~,
+   * ||спойлер||, `код`, ```код-блок```, "> " цитата, [текст](url)) из текста
+   * для PLAIN-TEXT превью — реплай-плашка над инпутом (startReply) и цитата
+   * оригинала в самом сообщении (buildReplyQuoteEl) не рендерят разметку
+   * (места мало, важнее компактность), поэтому маркеры не должны "протекать"
+   * в них сырыми звёздочками. Тот же синтаксис, что renderMessageBody/
+   * INLINE_MD_RE рендерят полноценно — здесь просто снятие маркеров, без
+   * построения DOM. Спойлер намеренно заменяется словом «спойлер», а не
+   * своим (скрытым) содержимым — превью не должно "спойлерить" раньше клика
+   * пользователя по самому сообщению. Код-блок заменяется своим текстом
+   * (переводы строк внутри схлопываются в пробел, как и переводы строк между
+   * блоками сообщения) — превью однострочное.
    */
   function stripMarkdownForPreview(text) {
-    return String(text || '')
+    let result = String(text || '').replace(/```[^\n`]*\n([\s\S]*?)```/g, (_, code) =>
+      code.replace(/\n/g, ' ').trim()
+    );
+    result = result
       .split('\n')
       .map((line) => (line.startsWith('> ') ? line.slice(2) : line))
-      .join(' ')
+      .join(' ');
+    return result
+      .replace(/\|\|(?!\s)([^|]+?)(?<!\s)\|\|/g, 'спойлер')
+      .replace(/`([^`]+?)`/g, '$1')
       .replace(/\*\*(?!\s)([^*]+?)(?<!\s)\*\*/g, '$1')
+      .replace(/__(?!\s)([^_]+?)(?<!\s)__/g, '$1')
       .replace(/~~(?!\s)([^~]+?)(?<!\s)~~/g, '$1')
+      .replace(/\[([^\]\n]+)\]\((?:https?:\/\/[^\s)]+)\)/g, '$1')
       .replace(/\*(?!\s)([^*]+?)(?<!\s)\*/g, '$1');
   }
 
@@ -323,6 +371,15 @@ const ChatPanel = (() => {
       unitIndex++;
     }
     return `${value.toFixed(value < 10 ? 1 : 0)} ${units[unitIndex]}`;
+  }
+
+  /** Человекочитаемая длительность (аудио/видео, из `loadedmetadata` уже полученного blob) в формате "М:СС". */
+  function humanDuration(seconds) {
+    if (!Number.isFinite(seconds) || seconds < 0) return '';
+    const total = Math.round(seconds);
+    const m = Math.floor(total / 60);
+    const s = total % 60;
+    return `${m}:${String(s).padStart(2, '0')}`;
   }
 
   /** uuid v4 (crypto.randomUUID — везде, где живёт RTCPeerConnection, доступен). */
@@ -347,53 +404,106 @@ const ChatPanel = (() => {
     return 0;
   }
 
+  /**
+   * Мобильный layout прямо сейчас (та же граница, что и style.css: см.
+   * MOBILE_BREAKPOINT_QUERY выше) — используется, чтобы JS-поведение
+   * (тап-активация действий сообщения, VisualViewport-подгонка панели,
+   * видимость мобильного тулбара форматирования) применялось РОВНО там же,
+   * где CSS переключает вёрстку на полноэкранный мобильный вид, а не по
+   * отдельному, потенциально рассинхронизированному порогу. matchMedia
+   * недоступен только в совсем экзотических/тестовых окружениях без DOM —
+   * тогда просто считаем layout десктопным (безопасный дефолт: ничего не
+   * меняется относительно поведения до этой волны).
+   */
+  function isMobileLayout() {
+    return typeof window.matchMedia === 'function' && window.matchMedia(MOBILE_BREAKPOINT_QUERY).matches;
+  }
+
   // --- Рендер markdown-подмножества в тексте сообщения ---
   //
-  // Только createElement/textContent — никакого innerHTML с пользовательским
-  // текстом (см. заголовок файла). Вложенность инлайн-разметки не нужна
-  // (жирный внутри цитаты — работает, т.к. цитата прогоняется через тот же
-  // инлайн-парсер; жирный внутри курсива — не обязателен и не поддержан).
+  // Только createElement/textContent — никакого innerHTML с пользовательскими
+  // данными (см. заголовок файла). Вложенность инлайн-разметки — только там,
+  // где осмысленно: цитата (buildReplyQuoteEl/renderMessageBody) и спойлер
+  // (buildSpoilerEl) рекурсивно прогоняют СВОЁ содержимое через
+  // appendInlineNodes — то есть **жирный** внутри "> цитаты" или внутри
+  // ||спойлера|| рендерится полноценно. Инлайн-код и код-блок — НЕ
+  // прогоняются повторно никогда (код есть код, см. buildCodeBlockEl).
   //
   // Порядок альтернатив в регэкспе важен: на каждой стартовой позиции regex
-  // пробует альтернативы слева направо, поэтому "**" (жирный) проверяется
+  // пробует альтернативы слева направо. Инлайн-код проверяется ПЕРВЫМ — его
+  // содержимое должно достаться целиком одному матчу, не быть растащенным
+  // другими маркерами. "**" (жирный) и "__" (курсив-подчёркивание) проверяются
   // раньше одиночного "*" (курсив) — иначе жирный никогда бы не совпал.
-  // Символ-маркер исключён из содержимого класса символов ([^*]/[^~]) — это
-  // не только упрощает жадность, но и не даёт одиночному "*" случайно
-  // "прыгнуть" через границу уже распознанного **...**. Лукэхеды/лукбихайнды
-  // на пробел у краёв (*(?!\s)...(?<!\s)*) отсекают самый частый ложный
-  // срабатывающий случай — одиночные "*" как умножение/разделитель
-  // ("5 * 3 * 2"), не образующие настоящей пары курсива.
+  // Именованная ссылка "[текст](url)" проверяется раньше голой ссылки, иначе
+  // голая альтернатива забрала бы "url)" без скобок. Символ-маркер исключён
+  // из содержимого класса символов ([^*]/[^_]/[^~]/[^|]) — это не только
+  // упрощает жадность, но и не даёт одиночному "*" случайно "прыгнуть" через
+  // границу уже распознанного **...**. Лукэхеды/лукбихайнды на пробел у краёв
+  // (*(?!\s)...(?<!\s)*) отсекают самый частый ложный срабатывающий случай —
+  // одиночные "*" как умножение/разделитель ("5 * 3 * 2"), не образующие
+  // настоящей пары курсива.
   const INLINE_MD_RE =
-    /\*\*(?!\s)([^*]+?)(?<!\s)\*\*|~~(?!\s)([^~]+?)(?<!\s)~~|\*(?!\s)([^*]+?)(?<!\s)\*|(https?:\/\/[^\s<>"')]+)/g;
+    /`([^`]+?)`|\*\*(?!\s)([^*]+?)(?<!\s)\*\*|__(?!\s)([^_]+?)(?<!\s)__|~~(?!\s)([^~]+?)(?<!\s)~~|\|\|(?!\s)([^|]+?)(?<!\s)\|\||\*(?!\s)([^*]+?)(?<!\s)\*|\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s<>"')]+)/g;
 
-  /** Разобрать одну строку (без переводов строк) на текстовые узлы + инлайн-элементы и добавить их в `parent`. */
+  /**
+   * Разобрать одну строку (без переводов строк) на текстовые узлы +
+   * инлайн-элементы и добавить их в `parent`. Спойлер (см. buildSpoilerEl)
+   * рекурсивно вызывает ЭТУ ЖЕ функцию, находясь ВНУТРИ тела текущего цикла
+   * — если бы регэксп был одним общим объектом с мутируемым lastIndex
+   * (как было раньше), рекурсивный вызов сбросил бы lastIndex ИЗ-ПОД
+   * внешнего цикла, который на следующей итерации начал бы матчиться заново
+   * с начала строки и НИКОГДА не дошёл бы до конца line — вечный цикл,
+   * замораживающий вкладку (обнаружено эмпирически: клик «Отправить» с
+   * сообщением вида "||спойлер||" вешал страницу намертво). Поэтому здесь —
+   * СВОЙ экземпляр RegExp на каждый вызов (в т.ч. рекурсивный), никакого
+   * общего мутируемого состояния между уровнями рекурсии.
+   */
   function appendInlineNodes(parent, line) {
     if (line === '') return;
-    INLINE_MD_RE.lastIndex = 0;
+    const inlineRe = new RegExp(INLINE_MD_RE.source, 'g');
     let lastIndex = 0;
     let match;
-    while ((match = INLINE_MD_RE.exec(line))) {
+    while ((match = inlineRe.exec(line))) {
       if (match.index > lastIndex) {
         parent.appendChild(document.createTextNode(line.slice(lastIndex, match.index)));
       }
       if (match[1] !== undefined) {
-        const strong = document.createElement('strong');
-        strong.textContent = match[1];
-        parent.appendChild(strong);
+        // Инлайн-код — textContent напрямую, БЕЗ рекурсии (см. заголовок).
+        const code = document.createElement('code');
+        code.className = 'chat-inline-code';
+        code.textContent = match[1];
+        parent.appendChild(code);
       } else if (match[2] !== undefined) {
-        const del = document.createElement('del');
-        del.textContent = match[2];
-        parent.appendChild(del);
+        const strong = document.createElement('strong');
+        strong.textContent = match[2];
+        parent.appendChild(strong);
       } else if (match[3] !== undefined) {
         const em = document.createElement('em');
         em.textContent = match[3];
         parent.appendChild(em);
       } else if (match[4] !== undefined) {
+        const del = document.createElement('del');
+        del.textContent = match[4];
+        parent.appendChild(del);
+      } else if (match[5] !== undefined) {
+        parent.appendChild(buildSpoilerEl(match[5]));
+      } else if (match[6] !== undefined) {
+        const em = document.createElement('em');
+        em.textContent = match[6];
+        parent.appendChild(em);
+      } else if (match[7] !== undefined && match[8] !== undefined) {
         const a = document.createElement('a');
-        a.href = match[4];
+        a.href = match[8];
         a.target = '_blank';
         a.rel = 'noopener noreferrer';
-        a.textContent = match[4];
+        a.textContent = match[7];
+        parent.appendChild(a);
+      } else if (match[9] !== undefined) {
+        const a = document.createElement('a');
+        a.href = match[9];
+        a.target = '_blank';
+        a.rel = 'noopener noreferrer';
+        a.textContent = match[9];
         parent.appendChild(a);
       }
       lastIndex = match.index + match[0].length;
@@ -404,10 +514,124 @@ const ChatPanel = (() => {
   }
 
   /**
+   * Спойлер (||...||) — размыт до клика/Enter/Space (см. .chat-md-spoiler в
+   * style.css), раскрывается НАВСЕГДА в рамках отрендеренного элемента (класс
+   * .revealed добавляется, не убирается обратно — как в клиенте Telegram).
+   * Содержимое рендерится РЕКУРСИВНО через appendInlineNodes (см. заголовок
+   * файла выше) — форматирование под спойлером (например **жирный**) тоже
+   * работает. role="button"+tabindex — доступность с клавиатуры (только
+   * десктопный ввод в этой волне, мобильный тулбар — следующая).
+   */
+  function buildSpoilerEl(content) {
+    const span = document.createElement('span');
+    span.className = 'chat-md-spoiler';
+    span.setAttribute('role', 'button');
+    span.setAttribute('tabindex', '0');
+    span.setAttribute('aria-label', 'Спойлер, нажмите, чтобы показать');
+    appendInlineNodes(span, content);
+    const reveal = () => span.classList.add('revealed');
+    span.addEventListener('click', reveal);
+    span.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        reveal();
+      }
+    });
+    return span;
+  }
+
+  /**
+   * Скопировать текст код-блока в буфер обмена (кнопка «Копировать», см.
+   * buildCodeBlockEl) — сперва через navigator.clipboard (нужен
+   * secure-контекст, у нас всегда https/localhost), фоллбэк — скрытый
+   * textarea + document.execCommand('copy') для окружений без Clipboard API.
+   */
+  function copyCodeToClipboard(code, buttonEl) {
+    const showCopied = () => {
+      const prevText = buttonEl.textContent;
+      buttonEl.classList.add('chat-code-block-copy--done');
+      buttonEl.textContent = 'Скопировано';
+      setTimeout(() => {
+        buttonEl.classList.remove('chat-code-block-copy--done');
+        buttonEl.textContent = prevText;
+      }, 1500);
+    };
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      navigator.clipboard.writeText(code).then(showCopied).catch(() => fallbackCopyToClipboard(code, showCopied));
+    } else {
+      fallbackCopyToClipboard(code, showCopied);
+    }
+  }
+
+  function fallbackCopyToClipboard(code, onDone) {
+    const textarea = document.createElement('textarea');
+    textarea.value = code;
+    // Вне видимой области, но не display:none (Safari не копирует из
+    // невидимых/нерендерящихся элементов) — offset-позиционирование через
+    // CSSOM (element.style), не инлайн-атрибут — CSP это не нарушает (см.
+    // заголовок файла: то же допущение, что и у .style.width полосы прогресса).
+    textarea.style.position = 'fixed';
+    textarea.style.top = '0';
+    textarea.style.left = '0';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+    try {
+      document.execCommand('copy');
+    } catch (err) {
+      console.warn('Не удалось скопировать код блока (ни Clipboard API, ни execCommand):', err);
+    }
+    document.body.removeChild(textarea);
+    onDone();
+  }
+
+  /**
+   * Блок кода (```[lang]\n...\n```, см. renderMessageBody) — <pre><code>
+   * моноширинным шрифтом, метка языка (если указан) и кнопка «копировать».
+   * `code` — textContent напрямую, БЕЗ appendInlineNodes (код есть код, см.
+   * заголовок файла) — символы-маркеры внутри не интерпретируются.
+   */
+  function buildCodeBlockEl(lang, code) {
+    const wrap = document.createElement('div');
+    wrap.className = 'chat-code-block';
+
+    const header = document.createElement('div');
+    header.className = 'chat-code-block-header';
+
+    const langEl = document.createElement('span');
+    langEl.className = 'chat-code-block-lang';
+    langEl.textContent = lang || '';
+    header.appendChild(langEl);
+
+    const copyBtn = document.createElement('button');
+    copyBtn.type = 'button';
+    copyBtn.className = 'chat-code-block-copy';
+    copyBtn.textContent = 'Копировать';
+    copyBtn.addEventListener('click', () => copyCodeToClipboard(code, copyBtn));
+    header.appendChild(copyBtn);
+
+    wrap.appendChild(header);
+
+    const pre = document.createElement('pre');
+    const codeEl = document.createElement('code');
+    codeEl.textContent = code;
+    pre.appendChild(codeEl);
+    wrap.appendChild(pre);
+
+    return wrap;
+  }
+
+  /**
    * Отрендерить полное тело сообщения в `container` (обычно .chat-message-text).
-   * Строки, начинающиеся ровно с "> ", группируются в блок-цитату (левая
-   * полоска, см. .chat-md-quote в style.css); остальные строки — обычный
-   * инлайн-форматированный текст. Переводы строк между блоками — <br>.
+   * Блочные конструкции распознаются построчно СВЕРХУ ВНИЗ, до инлайн-парсера:
+   * тройные бэктики ```[lang]``` … ``` — блок кода (см. buildCodeBlockEl,
+   * содержимое НЕ прогоняется через инлайн-парсер — код есть код); строки,
+   * начинающиеся ровно с "> ", группируются в блок-цитату (левая полоска, см.
+   * .chat-md-quote в style.css, содержимое прогоняется через
+   * appendInlineNodes — жирный/курсив и т.п. внутри цитаты работают);
+   * остальные строки — обычный инлайн-форматированный текст. Переводы строк
+   * между блоками — <br>.
    */
   function renderMessageBody(container, text) {
     const lines = String(text || '').split('\n');
@@ -415,6 +639,30 @@ const ChatPanel = (() => {
     let i = 0;
     while (i < lines.length) {
       const line = lines[i];
+      const fenceMatch = /^```(\S*)$/.exec(line.replace(/\s+$/, ''));
+      if (fenceMatch) {
+        // Ищем закрывающую тройку бэктиков среди СЛЕДУЮЩИХ строк. Не нашли
+        // до конца сообщения — незакрытый фенс, откатываемся и рендерим эту
+        // строку как обычный текст (а не проглатываем всё до конца).
+        let j = i + 1;
+        const codeLines = [];
+        let closed = false;
+        while (j < lines.length) {
+          if (lines[j].replace(/\s+$/, '') === '```') {
+            closed = true;
+            break;
+          }
+          codeLines.push(lines[j]);
+          j++;
+        }
+        if (closed) {
+          if (!firstBlock) container.appendChild(document.createElement('br'));
+          container.appendChild(buildCodeBlockEl(fenceMatch[1], codeLines.join('\n')));
+          firstBlock = false;
+          i = j + 1;
+          continue;
+        }
+      }
       if (line.startsWith('> ')) {
         const quoteLines = [];
         while (i < lines.length && lines[i].startsWith('> ')) {
@@ -466,9 +714,18 @@ const ChatPanel = (() => {
         <span class="chat-edit-bar-label">Редактирование</span>
         <button type="button" class="chat-edit-bar-close" aria-label="Отменить редактирование" title="Отменить редактирование">×</button>
       </div>
+      <div class="chat-format-toolbar hidden">
+        <button type="button" class="chat-format-btn chat-format-btn--bold" data-format="bold" aria-label="Жирный" title="Жирный">Ж</button>
+        <button type="button" class="chat-format-btn chat-format-btn--italic" data-format="italic" aria-label="Курсив" title="Курсив">К</button>
+        <button type="button" class="chat-format-btn chat-format-btn--strike" data-format="strike" aria-label="Зачёркнутый" title="Зачёркнутый">З</button>
+        <button type="button" class="chat-format-btn chat-format-btn--spoiler" data-format="spoiler" aria-label="Спойлер" title="Спойлер">🙈</button>
+        <button type="button" class="chat-format-btn chat-format-btn--code" data-format="code" aria-label="Код" title="Код">&lt;/&gt;</button>
+        <button type="button" class="chat-format-btn chat-format-btn--link" data-format="link" aria-label="Ссылка" title="Ссылка">🔗</button>
+      </div>
       <div class="chat-input-row">
         <button type="button" class="chat-attach-button" aria-label="Прикрепить файл" title="Прикрепить файл"></button>
         <input type="file" class="chat-file-input" multiple hidden />
+        <button type="button" class="chat-format-toggle-button" aria-label="Форматирование текста" title="Форматирование текста" aria-pressed="false">Aa</button>
         <textarea class="chat-text-input" rows="1" placeholder="Сообщение…" maxlength="2000"></textarea>
         <button type="button" class="chat-send-button" aria-label="Отправить" title="Отправить">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -515,6 +772,8 @@ const ChatPanel = (() => {
       sendButton: panel.querySelector('.chat-send-button'),
       attachButton: panel.querySelector('.chat-attach-button'),
       fileInput: panel.querySelector('.chat-file-input'),
+      formatToolbar: panel.querySelector('.chat-format-toolbar'),
+      formatToggleButton: panel.querySelector('.chat-format-toggle-button'),
     };
   }
 
@@ -540,13 +799,27 @@ const ChatPanel = (() => {
     initialPeerIds,
     getLeaderId,
     getGuestChatAllowed,
-    chatKey,
+    getChatKeyForEpoch,
+    getCurrentContentEpoch,
+    isContentEpochReady,
   }) {
     if (!singleton) {
       const dom = buildDom(variant, toggleButton);
       singleton = createController(dom);
     }
-    singleton.attach({ signaling, bus, peerId, name, getPeerIds, initialPeerIds, getLeaderId, getGuestChatAllowed, chatKey });
+    singleton.attach({
+      signaling,
+      bus,
+      peerId,
+      name,
+      getPeerIds,
+      initialPeerIds,
+      getLeaderId,
+      getGuestChatAllowed,
+      getChatKeyForEpoch,
+      getCurrentContentEpoch,
+      isContentEpochReady,
+    });
     return singleton.publicApi;
   }
 
@@ -568,17 +841,38 @@ const ChatPanel = (() => {
       sendButton,
       attachButton,
       fileInput,
+      formatToolbar,
+      formatToggleButton,
     } = dom;
 
     let signaling = null;
     let bus = null;
     let peerId = null;
     let myName = null;
-    // Ш1 (E2E-шифрование): K_chat, выведенный из ключа комнаты (см.
-    // static/crypto.js/room.js) — используется ТОЛЬКО для серверного
-    // fallback-релея (см. sendEnvelopeToPeer/attach ниже), по шине конверт
-    // не шифруется этим слоем.
-    let chatKey = null;
+    // Ш1/Ш3 (E2E-шифрование + forward secrecy контента, см.
+    // static/crypto.js/room.js): K_chat используется ТОЛЬКО для серверного
+    // fallback-релея (см. sendEnvelopeToPeer/attach ниже) — по шине конверт
+    // не шифруется этим слоем вовсе. Ключ больше не статичен на всю сессию
+    // (см. docs/e2e-encryption.md §7): комната может пережить смену эпохи
+    // (лидер ротирует K_chat/K_meta при уходе участника), поэтому вместо
+    // одного сохранённого CryptoKey здесь — колбэки room.js, читающие ЖИВОЕ
+    // состояние contentEpochs на момент вызова:
+    //   - getChatKeyForEpoch(epoch) -> CryptoKey чата этой эпохи, или null,
+    //     если эпоха нам неизвестна (не должно случаться при корректной
+    //     раздаче — см. заголовок файла и signaling.on('chat', ...) ниже);
+    //   - getCurrentContentEpoch() -> номер эпохи, которой шифруем ИСХОДЯЩИЙ
+    //     fallback-конверт прямо сейчас;
+    //   - isContentEpochReady() -> false у новичка, пока текущая эпоха ещё
+    //     не подтверждена по шине (см. room.js: contentEpochReady) — пока
+    //     false, исходящий fallback-конверт СТАВИТСЯ В ОЧЕРЕДЬ
+    //     (pendingFallbackSends), а не шифруется устаревшей эпохой 0.
+    let getChatKeyForEpoch = () => null;
+    let getCurrentContentEpoch = () => 0;
+    let isContentEpochReady = () => true;
+    // Очередь исходящих fallback-отправок, накопленная, пока
+    // isContentEpochReady() возвращал false — сливается разом в
+    // notifyContentEpochReady() (room.js зовёт её из markContentEpochReady).
+    let pendingFallbackSends = [];
     let getPeerIds = () => [];
     // Права гостей (см. docs/permissions-and-leader.md, «Chat — Partially
     // Server-Enforced»): getLeaderId/getGuestChatAllowed
@@ -618,6 +912,19 @@ const ChatPanel = (() => {
     let replyTarget = null; // конверт сообщения, на которое сейчас отвечаем (или null)
     let editTarget = null; // конверт СВОЕГО сообщения, которое сейчас редактируем (или null) — взаимоисключается с replyTarget
     let activeReactionTarget = null; // msgId, для которого сейчас открыт попап реакций (или null)
+    // Мобильный UX (волна 11): msgId сообщения, чьи действия (ответить/
+    // реакция/редактировать/удалить) сейчас показаны по тапу — см.
+    // setActiveMobileMessage/messagesEl click-делегирование ниже. Не более
+    // одного одновременно; на десктопе (>640px) не используется вовсе —
+    // там действия по-прежнему по hover (см. style.css). Отдельно от
+    // activeReactionTarget — это msgId, у которого раскрыт САМ попап
+    // реакций (шире: любое сообщение).
+    let activeMobileMessageId = null;
+    // Мобильный тулбар форматирования (волна 11) — принудительно открыт
+    // кнопкой «Aa» (см. formatToggleButton ниже); помимо этого тулбар также
+    // показывается САМ, пока в textInput есть непустое выделение (см.
+    // updateFormatToolbarVisibility/document 'selectionchange').
+    let formatToolbarForcedOpen = false;
 
     // --- Состояние передачи файлов (Ф3) ---
     // fileId -> File — файлы, которые МЫ отправили (держим, пока живёт вкладка/сессия),
@@ -802,7 +1109,10 @@ const ChatPanel = (() => {
 
       const item = document.createElement('div');
       item.className =
-        'chat-message' + (own ? ' chat-message--own' : '') + (isDeleted ? ' chat-message--deleted' : '');
+        'chat-message' +
+        (own ? ' chat-message--own' : '') +
+        (isDeleted ? ' chat-message--deleted' : '') +
+        (msg.id === activeMobileMessageId ? ' chat-message--active' : '');
       item.dataset.msgId = msg.id;
 
       // Тумбстоуну действия (ответить/реакция/редактировать/удалить) не положены.
@@ -935,7 +1245,8 @@ const ChatPanel = (() => {
       item.className =
         'chat-message chat-message--file' +
         (own ? ' chat-message--own' : '') +
-        (isDeleted ? ' chat-message--deleted' : '');
+        (isDeleted ? ' chat-message--deleted' : '') +
+        (msg.id === activeMobileMessageId ? ' chat-message--active' : '');
       item.dataset.msgId = msg.id;
 
       // Файловые офферы удалять можно (тумбстоун ниже), редактировать —
@@ -1088,31 +1399,135 @@ const ChatPanel = (() => {
       card.appendChild(downloadButton);
     }
 
-    /** Финальный вид готовой (status='done') карточки: превью картинки / audio-плеер / ссылка-скачивание. */
+    /**
+     * Строка меты под инлайн-медиа (картинка/видео/аудио) готовой карточки:
+     * имя файла + размер (+ пустой узел под длительность — заполняется
+     * позже событием loadedmetadata, см. вызывающий код) + кнопка «Скачать»
+     * из уже полученного objectUrl (сеть повторно не дёргаем — см. заголовок
+     * файла про Ф3: сервер байты не видит и не хранит, а сам файл уже у нас
+     * в виде Blob/ObjectURL).
+     */
+    function buildFileMetaRow(msg) {
+      const meta = document.createElement('div');
+      meta.className = 'chat-file-meta-row';
+
+      const nameEl = document.createElement('span');
+      nameEl.className = 'chat-file-meta-name';
+      nameEl.textContent = msg.fileName;
+      nameEl.title = msg.fileName;
+      meta.appendChild(nameEl);
+
+      const sizeEl = document.createElement('span');
+      sizeEl.className = 'chat-file-meta-size';
+      sizeEl.textContent = humanFileSize(msg.size);
+      meta.appendChild(sizeEl);
+
+      return meta;
+    }
+
+    /** Пустой узел под длительность — текст проставляется по loadedmetadata (см. renderFileDoneBody). */
+    function buildFileMetaDurationEl() {
+      const durationEl = document.createElement('span');
+      durationEl.className = 'chat-file-meta-duration';
+      return durationEl;
+    }
+
+    /** Компактная кнопка-ссылка «Скачать» из уже полученного objectUrl (см. buildFileMetaRow). */
+    function buildFileMetaDownloadLink(msg, state) {
+      const link = document.createElement('a');
+      link.className = 'chat-file-download-link chat-file-download-link--compact';
+      link.href = state.objectUrl;
+      link.download = msg.fileName;
+      link.textContent = 'Скачать';
+      return link;
+    }
+
+    /**
+     * Финальный вид готовой (status='done') карточки — по mime полученного
+     * файла (см. заголовок файла, раздел B):
+     *  - image/* — инлайн-превью (клик по картинке — оригинал в новой
+     *    вкладке, как и было), под ней мета-строка (имя, размер, «Скачать»);
+     *  - video/* — <video controls preload=metadata>, длительность
+     *    проставляется по loadedmetadata (М:СС, см. humanDuration) —
+     *    невалидный/непроигрываемый контейнер просто не пришлёт это событие,
+     *    строка меты тогда остаётся без длительности (не ошибка);
+     *  - audio/* — <audio controls>, длительность так же по loadedmetadata;
+     *  - остальное — карточка-заголовок (иконка/имя/размер) + отдельная
+     *    ссылка-кнопка «Скачать» (как было раньше).
+     * objectUrl НЕ создаётся здесь заново на каждый ререндер — он уже лежит
+     * в fileStates (см. beginReceivingFile: URL.createObjectURL вызывается
+     * РОВНО ОДИН РАЗ при получении Blob), сюда просто передаётся `state`.
+     */
     function renderFileDoneBody(card, msg, state) {
       const mime = msg.mime || '';
+
       if (mime.startsWith('image/')) {
         const link = document.createElement('a');
         link.href = state.objectUrl;
         link.target = '_blank';
         link.rel = 'noopener noreferrer';
+        link.className = 'chat-file-media-link';
         const img = document.createElement('img');
         img.className = 'chat-file-image';
         img.src = state.objectUrl;
         img.alt = msg.fileName;
         link.appendChild(img);
         card.appendChild(link);
+
+        const meta = buildFileMetaRow(msg);
+        meta.appendChild(buildFileMetaDownloadLink(msg, state));
+        card.appendChild(meta);
         return;
       }
+
+      if (mime.startsWith('video/')) {
+        const video = document.createElement('video');
+        video.className = 'chat-file-video';
+        video.controls = true;
+        video.preload = 'metadata';
+        video.src = state.objectUrl;
+        card.appendChild(video);
+
+        const meta = buildFileMetaRow(msg);
+        const durationEl = buildFileMetaDurationEl();
+        meta.appendChild(durationEl);
+        meta.appendChild(buildFileMetaDownloadLink(msg, state));
+        card.appendChild(meta);
+
+        video.addEventListener(
+          'loadedmetadata',
+          () => {
+            if (Number.isFinite(video.duration)) durationEl.textContent = humanDuration(video.duration);
+          },
+          { once: true }
+        );
+        return;
+      }
+
       if (mime.startsWith('audio/')) {
-        card.appendChild(fileCardHeaderEl(msg));
         const audio = document.createElement('audio');
         audio.className = 'chat-file-audio';
         audio.controls = true;
         audio.src = state.objectUrl;
         card.appendChild(audio);
+
+        const meta = buildFileMetaRow(msg);
+        const durationEl = buildFileMetaDurationEl();
+        meta.appendChild(durationEl);
+        meta.appendChild(buildFileMetaDownloadLink(msg, state));
+        card.appendChild(meta);
+
+        audio.addEventListener(
+          'loadedmetadata',
+          () => {
+            if (Number.isFinite(audio.duration)) durationEl.textContent = humanDuration(audio.duration);
+          },
+          { once: true }
+        );
         return;
       }
+
+      // Прочее — карточка-заголовок (иконка по mime/имя/размер) + ссылка-кнопка.
       card.appendChild(fileCardHeaderEl(msg));
       const link = document.createElement('a');
       link.className = 'chat-file-download-link';
@@ -1184,10 +1599,78 @@ const ChatPanel = (() => {
       fileSendMap = new Map();
       fileStates = new Map();
       pendingFileRequests = new Map();
+      pendingFallbackSends = [];
       cancelReply();
       cancelEditAndClear();
       closeReactionPopover();
+      activeMobileMessageId = null;
+      formatToolbarForcedOpen = false;
+      updateFormatToolbarVisibility();
     }
+
+    /**
+     * VisualViewport-подгонка полноэкранной мобильной панели чата (жалоба
+     * владельца: системная клавиатура перекрывала часть чата и добавляла
+     * лишний скролл страницы вместо того, чтобы чат ужался в видимую
+     * область, см. style.css: @media (max-width:640px) .chat-panel, 100dvh).
+     * 100dvh реагирует на смену адресной строки/ориентации, но НЕ на
+     * появление клавиатуры на iOS — основной путь здесь поэтому
+     * VisualViewport API: пока чат открыт на мобильном layout, высота панели
+     * = visualViewport.height, верх панели = visualViewport.offsetTop (сдвиг
+     * видимой области относительно layout-вьюпорта) — так инпут (прижатый к
+     * низу панели) остаётся НАД клавиатурой, а не уезжает под неё. Список
+     * сообщений сам ужимается (flex:1 на .chat-messages) — здесь только
+     * подскролливаем его к низу, чтобы последнее сообщение оставалось
+     * видимым после сжатия видимой области.
+     *
+     * Фоллбэк (нет window.visualViewport — старые браузеры): сбрасываем
+     * инлайн-стили в пустую строку, дальше работает только CSS (100dvh) — не
+     * хуже поведения до этой волны.
+     *
+     * .chat-mobile-scroll-lock на body (см. style.css) — пока чат открыт на
+     * мобильном, страница НЕ скроллится ни при каких обстоятельствах: панель
+     * и так перекрывает весь вьюпорт (position:fixed; inset:0), но фокус
+     * textarea рядом с открывающейся клавиатурой на части браузеров
+     * провоцирует попытку "проскроллить поле в видимую область" на уровне
+     * документа — лок гарантированно её глушит.
+     */
+    function syncMobileChatViewport() {
+      const isOpen = !panel.classList.contains('hidden');
+      const mobile = isOpen && isMobileLayout();
+      document.body.classList.toggle('chat-mobile-scroll-lock', mobile);
+      if (!mobile || !window.visualViewport) {
+        panel.style.top = '';
+        panel.style.height = '';
+        return;
+      }
+      const vv = window.visualViewport;
+      panel.style.top = `${vv.offsetTop}px`;
+      panel.style.height = `${vv.height}px`;
+      scrollToBottom();
+    }
+
+    // Слушатели VisualViewport ставятся РОВНО ОДИН РАЗ (createController —
+    // синглтон на страницу, см. заголовок файла) — 'resize' срабатывает и на
+    // появление/исчезновение клавиатуры, и на pinch-zoom; 'scroll' — когда
+    // видимая область сдвигается относительно layout-вьюпорта (например,
+    // браузер докручивает фокусированное поле в видимую часть). window
+    // 'resize'/'orientationchange' — фоллбэк-путь и смена ориентации:
+    // window.visualViewport в части браузеров тоже эмитит на это resize, но
+    // не везде гарантированно, поэтому подписываемся отдельно ещё и на них.
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', syncMobileChatViewport);
+      window.visualViewport.addEventListener('scroll', syncMobileChatViewport);
+    }
+    window.addEventListener('resize', () => {
+      syncMobileChatViewport();
+      updateFormatToolbarVisibility();
+      // Ресайз с мобильного layout на десктопный (поворот/DevTools) — снять
+      // мобильную тап-активность: на десктопе действия и так по hover, а
+      // задержавшийся класс .chat-message--active там ни на что не влияет,
+      // но лучше не оставлять «протухшее» состояние.
+      if (!isMobileLayout() && activeMobileMessageId) setActiveMobileMessage(null);
+    });
+    window.addEventListener('orientationchange', syncMobileChatViewport);
 
     function setCollapsed(collapsed) {
       panel.classList.toggle('hidden', collapsed);
@@ -1198,7 +1681,12 @@ const ChatPanel = (() => {
         updateUnreadBadge();
         scrollToBottom();
         textInput.focus();
+      } else {
+        setActiveMobileMessage(null);
+        formatToolbarForcedOpen = false;
+        updateFormatToolbarVisibility();
       }
+      syncMobileChatViewport();
     }
 
     function updateUnreadBadge() {
@@ -1324,6 +1812,112 @@ const ChatPanel = (() => {
       }
     });
 
+    // --- Мобильный UX (волна 11): тап-активация действий ОДНОГО сообщения ---
+    //
+    // Требование владельца: на мобильном (≤640px) кнопки действий сообщения
+    // (ответить/реакция/редактировать/удалить) по умолчанию скрыты (см.
+    // .chat-message-actions в style.css: opacity:0/pointer-events:none внутри
+    // @media (max-width:640px)) и показываются ТОЛЬКО у одного «активного» (по
+    // тапу) сообщения — .chat-message--active снимает это ограничение (см.
+    // ту же секцию style.css). На десктопе (>640px) ничего из блока ниже не
+    // применяется вовсе (везде первая проверка — isMobileLayout()) — там
+    // по-прежнему действует hover из style.css, без какого-либо JS-состояния.
+    function setActiveMobileMessage(msgId) {
+      if (activeMobileMessageId === msgId) return;
+      const prevId = activeMobileMessageId;
+      activeMobileMessageId = msgId;
+      if (prevId) {
+        const prevEl = messagesEl.querySelector(`.chat-message[data-msg-id="${escapeForSelector(prevId)}"]`);
+        if (prevEl) prevEl.classList.remove('chat-message--active');
+      }
+      if (activeMobileMessageId) {
+        const el = messagesEl.querySelector(
+          `.chat-message[data-msg-id="${escapeForSelector(activeMobileMessageId)}"]`
+        );
+        if (el) el.classList.add('chat-message--active');
+      }
+    }
+
+    /**
+     * Есть ли в пути распространения события элемент, подходящий под
+     * `selector` — то же самое, что `event.target.closest(selector)`, НО
+     * устойчиво к тому, что сам `event.target` мог быть отсоединён от DOM
+     * ДРУГИМ обработчиком ЭТОГО ЖЕ события до того, как оно добубнило сюда
+     * (обнаружено эмпирически: клик по кнопке удаления — buildDeleteButton
+     * на первом клике синхронно делает `btn.textContent = '✓?'`, заменяя
+     * дочерний SVG-элемент — если event.target был именно этим SVG
+     * (обычная ситуация: клик приходится на иконку внутри кнопки), то к
+     * моменту, когда bubbling добирается до messagesEl/document,
+     * `event.target.closest(...)` возвращает null — SVG уже отсоединён от
+     * родителя — и клик по кнопке «Удалить» ошибочно читался бы как тап по
+     * "телу" сообщения, гасящий/переключающий активность вместо no-op).
+     * `event.composedPath()` — снимок пути НА МОМЕНТ ДИСПЕТЧЕРИЗАЦИИ
+     * события, снятый ДО того, как какой-либо обработчик успел что-либо
+     * изменить в DOM, поэтому не подвержен этой проблеме.
+     */
+    function eventPathMatches(event, selector) {
+      const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+      for (const node of path) {
+        if (node instanceof Element && node.matches(selector)) return true;
+      }
+      return false;
+    }
+
+    // Тап по "телу" сообщения переключает активность: по неактивному —
+    // делает активным (и снимает активность с предыдущего, если был другой —
+    // не более одного одновременно, см. заголовок функции), повторный тап по
+    // уже активному — снимает. Тап по элементам, у которых УЖЕ есть своя
+    // клик-логика (кнопка действия, чип реакции, цитата реплая, ссылка,
+    // спойлер, любая <button>/медиа-контрол) — не переключает активность
+    // ДОПОЛНИТЕЛЬНО к их собственному обработчику (иначе, например, клик по
+    // кнопке «Ответить» ещё и гасил бы/переносил активность в той же
+    // операции). Кнопки действий физически недоступны тапу, пока сообщение не
+    // активно (pointer-events:none, см. style.css) — поэтому дойти до них
+    // можно только ПОСЛЕ активации отдельным тапом, что и даёт нужный
+    // двухшаговый UX («тап -> появились действия -> тап по конкретному
+    // действию»).
+    messagesEl.addEventListener('click', (event) => {
+      if (!isMobileLayout()) return;
+      if (!eventPathMatches(event, '.chat-message')) return;
+      if (
+        eventPathMatches(
+          event,
+          '.chat-message-action, .chat-reaction-chip, .chat-reply-quote, a, button, video, audio, .chat-md-spoiler'
+        )
+      ) {
+        return;
+      }
+      const item = event.target.closest ? event.target.closest('.chat-message') : null;
+      if (!item) return;
+      const msgId = item.dataset.msgId;
+      setActiveMobileMessage(activeMobileMessageId === msgId ? null : msgId);
+    });
+
+    // Тап МИМО любого сообщения (шапка/инпут/пустое место ленты) снимает
+    // активность. Клики ВНУТРИ сообщения (включая кнопки действий) сюда не
+    // попадают (см. eventPathMatches выше — устойчиво к отсоединению
+    // event.target серединой того же клика, см. её заголовок) — этот
+    // обработчик тогда no-op (актуальна только делегация на messagesEl
+    // выше). Попап реакций — отдельное исключение: он всплывает НЕ внутри
+    // `.chat-message` (общий на панель, см. buildDom), но тап по нему
+    // (выбор эмодзи) не должен гасить активное сообщение, к которому он
+    // относится.
+    document.addEventListener('click', (event) => {
+      if (!isMobileLayout() || !activeMobileMessageId) return;
+      if (eventPathMatches(event, '.chat-message') || eventPathMatches(event, '.chat-reaction-popover')) return;
+      setActiveMobileMessage(null);
+    });
+
+    // Скролл ленты тоже снимает активность (спека волны 11: «тап мимо/скролл
+    // — снимает») — рёндер (renderAll) прогонки этой ленты не считается
+    // "скроллом" сам по себе (не меняет messagesEl.scrollTop напрямую), сюда
+    // попадают и пользовательский свайп/колесо, и programmatic scrollToBottom
+    // (см. её вызовы после отправки/прихода сообщений) — оба варианта здесь
+    // намеренно не различаются, простая трактовка спеки.
+    messagesEl.addEventListener('scroll', () => {
+      if (isMobileLayout() && activeMobileMessageId) setActiveMobileMessage(null);
+    });
+
     // --- Rate-limit (клиентский, мягкий) — только для текстовых сообщений ---
     function checkClientRateLimit() {
       const now = Date.now();
@@ -1346,17 +1940,56 @@ const ChatPanel = (() => {
      * (используется file-request). Ш1 (E2E-шифрование, см. static/crypto.js):
      * по шине конверт уходит КАК ЕСТЬ (P2P DataChannel уже E2E за счёт DTLS,
      * см. static/rtc.js) — а вот серверный fallback шифрует конверт ЦЕЛИКОМ
-     * под K_chat, сервер видит только {enc:{v,iv,ct}} вместо содержимого.
+     * под K_chat ТЕКУЩЕЙ эпохи, сервер видит только {enc:{v,iv,ct}, epoch}
+     * вместо содержимого.
+     *
+     * Ш3 (forward secrecy, см. docs/e2e-encryption.md §7): эпоха проставляется
+     * ТОЛЬКО на fallback-пути (по шине конверт и так не шифрован этим слоем —
+     * ему эпоха ни для чего не нужна, см. static/room.js: bus уже DTLS-E2E).
+     * Пока isContentEpochReady() ложно (новичок ещё ждёт key-rotate от
+     * лидера, см. room.js: contentEpochReady) — отправку ЭТОГО конкретного
+     * конверта в fallback-путь НЕЛЬЗЯ шифровать устаревшей эпохой 0 (именно
+     * так ушедший участник мог бы её прочитать, раз уже держит K_chat_0) —
+     * поэтому конверт копится в pendingFallbackSends и уходит позже, разом,
+     * через notifyContentEpochReady().
      */
     function sendEnvelopeToPeer(targetPeerId, envelope) {
       if (bus.isOpen(targetPeerId)) {
         bus.sendToPeer(targetPeerId, envelope);
-      } else {
-        RoomCrypto.encrypt(chatKey, envelope).then((enc) => {
-          signaling.send('chat', { targetPeerId, envelope: { enc } });
-          ConnStats.incFallbackChat();
-        });
+        return;
       }
+      if (!isContentEpochReady()) {
+        pendingFallbackSends.push({ targetPeerId, envelope });
+        return;
+      }
+      const epoch = getCurrentContentEpoch();
+      const key = getChatKeyForEpoch(epoch);
+      if (!key) {
+        // Не должно случаться при корректной раздаче (см. заголовок файла) —
+        // своя ЖЕ текущая эпоха всегда должна быть у нас в карте контентных
+        // ключей. Молча не отправляем, а не шифруем под чем попало.
+        console.error(`Ш3: нет ключа для собственной текущей эпохи ${epoch} — fallback-конверт не отправлен`);
+        return;
+      }
+      RoomCrypto.encrypt(key, envelope).then((enc) => {
+        signaling.send('chat', { targetPeerId, envelope: { enc, epoch } });
+        ConnStats.incFallbackChat();
+      });
+    }
+
+    /** Слить очередь fallback-отправок, накопленную, пока эпоха не была подтверждена (см. sendEnvelopeToPeer/isContentEpochReady) — вызывается room.js через publicApi.notifyContentEpochReady, как только эпоха наконец известна. */
+    function flushPendingFallbackSends() {
+      if (pendingFallbackSends.length === 0) return;
+      const queued = pendingFallbackSends;
+      pendingFallbackSends = [];
+      for (const { targetPeerId, envelope } of queued) {
+        sendEnvelopeToPeer(targetPeerId, envelope);
+      }
+    }
+
+    /** Вызывается room.js (см. markContentEpochReady), когда текущая эпоха контентных ключей наконец точно известна — отпускает очередь исходящего fallback-чата. */
+    function notifyContentEpochReady() {
+      flushPendingFallbackSends();
     }
 
     /**
@@ -1959,7 +2592,171 @@ const ChatPanel = (() => {
       if (event.key === 'Enter' && !event.shiftKey) {
         event.preventDefault();
         sendCurrentText();
+        return;
       }
+      handleFormattingShortcut(event);
+    });
+
+    // --- Десктопные горячие клавиши форматирования (см. заголовок файла) ---
+    // Мобильный тулбар (по выделению/по кнопке «Aa») — см. блок ниже, после
+    // handleFormattingShortcut, переиспользует ЭТИ ЖЕ функции-обёртки.
+    /**
+     * Обернуть текущее выделение textInput парой маркеров (**, __, ~~, ||,
+     * `); нет выделения — вставить пустую пару и поставить курсор МЕЖДУ
+     * маркерами (а не оставлять плейсхолдер), как и требует спека горячих
+     * клавиш.
+     */
+    function wrapSelectionWithMarkers(before, after) {
+      const start = textInput.selectionStart;
+      const end = textInput.selectionEnd;
+      const value = textInput.value;
+      const selected = value.slice(start, end);
+      textInput.value = value.slice(0, start) + before + selected + after + value.slice(end);
+      const cursor = selected
+        ? start + before.length + selected.length + after.length
+        : start + before.length;
+      textInput.setSelectionRange(cursor, cursor);
+      textInput.focus();
+    }
+
+    /**
+     * Cmd/Ctrl+Shift+K — обернуть выделение в markdown-ссылку [текст](url) с
+     * подстановкой URL через window.prompt (нет выделения — плейсхолдер
+     * «ссылка» вместо текста). Отмена промпта (null/пусто) — no-op, ничего не
+     * вставляем.
+     */
+    function insertLinkMarkdown() {
+      const start = textInput.selectionStart;
+      const end = textInput.selectionEnd;
+      const value = textInput.value;
+      const selected = value.slice(start, end);
+      const url = window.prompt('Ссылка (URL):', 'https://');
+      if (!url) {
+        textInput.focus();
+        return;
+      }
+      const inserted = `[${selected || 'ссылка'}](${url})`;
+      textInput.value = value.slice(0, start) + inserted + value.slice(end);
+      const cursor = start + inserted.length;
+      textInput.setSelectionRange(cursor, cursor);
+      textInput.focus();
+    }
+
+    /**
+     * Cmd/Ctrl+B/I — жирный/курсив без Shift; Cmd/Ctrl+Shift+X/P/M/K —
+     * зачёркнутый/спойлер/инлайн-код/ссылка. metaKey — Mac (Cmd), ctrlKey —
+     * Windows/Linux (Ctrl); оба ловятся одинаково, реального смысла их
+     * различать для этих сочетаний нет (ни одно не занято браузером в
+     * обычном <textarea>).
+     */
+    function handleFormattingShortcut(event) {
+      if (!(event.metaKey || event.ctrlKey)) return;
+      const key = event.key.toLowerCase();
+      if (!event.shiftKey && key === 'b') {
+        event.preventDefault();
+        wrapSelectionWithMarkers('**', '**');
+      } else if (!event.shiftKey && key === 'i') {
+        event.preventDefault();
+        wrapSelectionWithMarkers('__', '__');
+      } else if (event.shiftKey && key === 'x') {
+        event.preventDefault();
+        wrapSelectionWithMarkers('~~', '~~');
+      } else if (event.shiftKey && key === 'p') {
+        event.preventDefault();
+        wrapSelectionWithMarkers('||', '||');
+      } else if (event.shiftKey && key === 'm') {
+        event.preventDefault();
+        wrapSelectionWithMarkers('`', '`');
+      } else if (event.shiftKey && key === 'k') {
+        event.preventDefault();
+        insertLinkMarkdown();
+      }
+    }
+
+    // --- Мобильный тулбар форматирования (волна 11) ---
+    //
+    // Набирать "**"/"||" руками на телефоне неудобно — десктопные горячие
+    // клавиши (Cmd/Ctrl+B/I/Shift+X/P/M/K, см. выше) на мобильной
+    // виртуальной клавиатуре либо недоступны, либо неочевидны. Два триггера
+    // показа ОДНОГО и того же тулбара (переиспользует wrapSelectionWithMarkers/
+    // insertLinkMarkdown — ту же логику, что и десктопные хоткеи, никакого
+    // отдельного форматирующего кода):
+    //   1) «по выделению» — выделили текст в textarea на мобильном layout —
+    //      тулбар появляется сам (см. document 'selectionchange' ниже);
+    //   2) «по кнопке» — кнопка «Aa» рядом с инпутом (см. formatToggleButton,
+    //      видна только на мобильном layout, см. style.css) открывает тот же
+    //      тулбар вручную (работает и без выделения — тогда кнопки вставляют
+    //      пустую пару маркеров с курсором между ними, тот же фоллбэк
+    //      поведения, что и у десктопных хоткеев без выделения).
+    // Оба состояния независимы и складываются через ИЛИ — см.
+    // updateFormatToolbarVisibility: тулбар виден, если открыт вручную (Aa)
+    // ИЛИ прямо сейчас есть непустое выделение, и только на мобильном layout
+    // (десктоп продолжает жить на горячих клавишах, без этого тулбара).
+    function updateFormatToolbarVisibility() {
+      const mobile = isMobileLayout();
+      const hasSelection =
+        mobile && document.activeElement === textInput && textInput.selectionStart !== textInput.selectionEnd;
+      const shouldShow = mobile && (formatToolbarForcedOpen || hasSelection);
+      formatToolbar.classList.toggle('hidden', !shouldShow);
+      formatToggleButton.classList.toggle('chat-format-toggle-button--on', formatToolbarForcedOpen);
+      formatToggleButton.setAttribute('aria-pressed', String(formatToolbarForcedOpen));
+    }
+
+    formatToggleButton.addEventListener('click', () => {
+      formatToolbarForcedOpen = !formatToolbarForcedOpen;
+      if (formatToolbarForcedOpen) textInput.focus();
+      updateFormatToolbarVisibility();
+    });
+
+    // 'selectionchange' — глобальное DOM-событие (не у конкретного элемента):
+    // фильтруем по activeElement внутри updateFormatToolbarVisibility. Ловит
+    // и выделение свайпом/долгим тапом на телефоне, и программные изменения
+    // выделения (в т.ч. textInput.setSelectionRange из самих же
+    // wrapSelectionWithMarkers/insertLinkMarkdown после применения
+    // форматирования — выделение схлопывается в курсор, hasSelection
+    // становится false, и тулбар сам скрывается, если не закреплён кнопкой
+    // «Aa»).
+    document.addEventListener('selectionchange', () => {
+      if (!isMobileLayout()) return;
+      updateFormatToolbarVisibility();
+    });
+
+    // Кнопки тулбара: mousedown с preventDefault — чтобы тап по кнопке НЕ
+    // забирал фокус (и вместе с ним выделение) у textarea ДО того, как
+    // click-обработчик ниже успеет прочитать textInput.selectionStart/End
+    // (по факту selectionStart/End не сбрасываются при потере фокуса — это
+    // просто свойства DOM-элемента — но preventDefault на mousedown это
+    // распространённый и более надёжный приём для тулбаров форматирования,
+    // не полагающийся на данную деталь реализации браузера). click всё равно
+    // срабатывает как обычно — preventDefault на mousedown отменяет только
+    // фокусировку/выделение самой кнопки, не последующий click.
+    formatToolbar.querySelectorAll('.chat-format-btn').forEach((btn) => {
+      btn.addEventListener('mousedown', (event) => event.preventDefault());
+      btn.addEventListener('click', () => {
+        switch (btn.dataset.format) {
+          case 'bold':
+            wrapSelectionWithMarkers('**', '**');
+            break;
+          case 'italic':
+            wrapSelectionWithMarkers('__', '__');
+            break;
+          case 'strike':
+            wrapSelectionWithMarkers('~~', '~~');
+            break;
+          case 'spoiler':
+            wrapSelectionWithMarkers('||', '||');
+            break;
+          case 'code':
+            wrapSelectionWithMarkers('`', '`');
+            break;
+          case 'link':
+            insertLinkMarkdown();
+            break;
+          default:
+            break;
+        }
+        updateFormatToolbarVisibility();
+      });
     });
 
     // --- UI отправки файлов: скрепка, drag&drop, paste картинки из буфера ---
@@ -2039,7 +2836,13 @@ const ChatPanel = (() => {
       applyInputState();
     }
 
-    const publicApi = { disableInput, enableInput, setChatForbidden, handleIncomingFileChannel };
+    const publicApi = {
+      disableInput,
+      enableInput,
+      setChatForbidden,
+      handleIncomingFileChannel,
+      notifyContentEpochReady,
+    };
 
     function handleServerError({ message }) {
       // Ошибки fallback-релея сервера (envelope > 8KB, серверный rate-limit
@@ -2056,16 +2859,20 @@ const ChatPanel = (() => {
       initialPeerIds,
       getLeaderId: newGetLeaderId,
       getGuestChatAllowed: newGetGuestChatAllowed,
-      chatKey: newChatKey,
+      getChatKeyForEpoch: newGetChatKeyForEpoch,
+      getCurrentContentEpoch: newGetCurrentContentEpoch,
+      isContentEpochReady: newIsContentEpochReady,
     }) {
       signaling = newSignaling;
       bus = newBus;
       peerId = newPeerId;
       myName = name || null;
-      chatKey = newChatKey || null;
       getPeerIds = typeof newGetPeerIds === 'function' ? newGetPeerIds : () => [];
       getLeaderId = typeof newGetLeaderId === 'function' ? newGetLeaderId : () => null;
       getGuestChatAllowed = typeof newGetGuestChatAllowed === 'function' ? newGetGuestChatAllowed : () => true;
+      getChatKeyForEpoch = typeof newGetChatKeyForEpoch === 'function' ? newGetChatKeyForEpoch : () => null;
+      getCurrentContentEpoch = typeof newGetCurrentContentEpoch === 'function' ? newGetCurrentContentEpoch : () => 0;
+      isContentEpochReady = typeof newIsContentEpochReady === 'function' ? newIsContentEpochReady : () => true;
 
       clearMessages();
       unreadCount = 0;
@@ -2077,15 +2884,29 @@ const ChatPanel = (() => {
       setCollapsed(true);
 
       bus.onMessage(dispatchEnvelope);
-      // Ш1 (E2E-шифрование): фоллбэк-релей сервера несёт конверт как
-      // {enc:{v,iv,ct}} (см. sendEnvelopeToPeer выше) — расшифровываем ПЕРЕД
-      // dispatchEnvelope; по шине конверт приходит как обычно (не завёрнут).
-      // Неверный ключ комнаты/повреждённый блоб — тихо логируем и
+      // Ш1/Ш3 (E2E-шифрование + forward secrecy, см. static/crypto.js/room.js):
+      // фоллбэк-релей сервера несёт конверт как {enc:{v,iv,ct}, epoch} (см.
+      // sendEnvelopeToPeer выше) — расшифровываем ключом ИМЕННО той эпохи,
+      // под которой конверт был зашифрован (не обязательно текущей — история/
+      // запоздавшие сообщения могут быть под более старой), ПЕРЕД
+      // dispatchEnvelope; по шине конверт приходит как обычно (не завёрнут,
+      // эпоха ему не нужна — см. заголовок файла). Отсутствующее поле epoch
+      // трактуется как эпоха 0 (обратная совместимость формата, хотя вживую
+      // после этой волны такого конверта прийти уже не должно). Неверный
+      // ключ/эпоха нам неизвестна/повреждённый блоб — тихо логируем и
       // игнорируем это одно сообщение (не валим всю панель чата — соседние
       // конверты по шине продолжают работать как ни в чём не бывало).
       signaling.on('chat', ({ fromPeerId, envelope }) => {
         if (envelope && typeof envelope === 'object' && envelope.enc) {
-          RoomCrypto.decrypt(chatKey, envelope.enc)
+          const epoch = typeof envelope.epoch === 'number' ? envelope.epoch : 0;
+          const key = getChatKeyForEpoch(epoch);
+          if (!key) {
+            console.warn(
+              `Ш3: неизвестная эпоха ${epoch} контентного ключа — fallback-конверт чата проигнорирован (не должно случаться при корректной раздаче, см. docs/e2e-encryption.md)`
+            );
+            return;
+          }
+          RoomCrypto.decrypt(key, envelope.enc)
             .then((plain) => dispatchEnvelope(fromPeerId, plain))
             .catch((err) => {
               console.warn('Не удалось расшифровать fallback-конверт чата (неверный ключ комнаты?):', err);

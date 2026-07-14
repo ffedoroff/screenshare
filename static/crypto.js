@@ -28,6 +28,18 @@
 //     подменить DTLS-отпечатки — см. docs/e2e-encryption.md, «Why This
 //     Exists», зачем это вообще нужно) или содержимое.
 //
+//   - Ш3 (forward secrecy контента при смене состава, см.
+//     docs/e2e-encryption.md §7): K_chat/K_meta не привязаны навечно к `k` —
+//     лидер комнаты может сгенерировать НОВЫЙ случайный 32-байтный ключ
+//     («эпоха») и вывести из него новую пару chat/meta через
+//     deriveContentKeys() ниже (те же info-строки 'chat-v1'/'meta-v1', что и
+//     в deriveKeys(), но с ДРУГИМ входным материалом) — модуль здесь остаётся
+//     epoch-agnostic (просто выводит ключи из того, что дали), вся
+//     логика "какая эпоха сейчас/кто её раздаёт/кому доверять" — в
+//     static/room.js. K_sig НАРОЧНО не имеет эпох — deriveKeys() выше
+//     остаётся единственным источником K_sig, привязанным к `k` на всю жизнь
+//     комнаты (нужен неизменным для бутстрапа новичка).
+//
 // Формат зашифрованного значения для полей-JSON (`Value` в Rust, см.
 // src/protocol.rs — sdp/candidate/info/chat-конверт): объект
 // `{v:1, iv: base64, ct: base64}`, iv — 12 случайных байт (стандарт для
@@ -123,6 +135,30 @@ const RoomCrypto = (() => {
     return { sig, meta, chat };
   }
 
+  /**
+   * Ш3 (forward secrecy контента, см. docs/e2e-encryption.md §7): вывести
+   * ТОЛЬКО ДВА контентных ключа (chat/meta, БЕЗ sig) из произвольного
+   * 32-байтного ключа — используется для ключей ЭПОХ >0 (сгенерированных
+   * лидером при смене состава комнаты, см. static/room.js:
+   * rotateContentKeysIfLeader), в отличие от deriveKeys() выше, который
+   * выводит из `k` НЕИЗМЕНЯЕМУЮ на всю жизнь комнаты sig-эпоху 0. Те же
+   * `info`-строки ('chat-v1'/'meta-v1'), что и в deriveKeys() — эпохи
+   * различаются только ключевым материалом на входе HKDF, не схемой вывода:
+   * K_sig НАРОЧНО не ротируется (нужен неизменным для бутстрапа новичка по
+   * #k), поэтому у эпох >0 просто нет и не может быть своего sig.
+   */
+  async function deriveContentKeys(rawKeyBytes) {
+    if (!(rawKeyBytes instanceof Uint8Array) || rawKeyBytes.length !== KEY_BYTES) {
+      throw new Error(`RoomCrypto.deriveContentKeys: ожидались ровно ${KEY_BYTES} байт ключа`);
+    }
+    const baseKey = await importBaseKey(rawKeyBytes);
+    const [meta, chat] = await Promise.all([
+      deriveContextKey(baseKey, 'meta-v1'),
+      deriveContextKey(baseKey, 'chat-v1'),
+    ]);
+    return { meta, chat };
+  }
+
   // --- Шифрование JSON-объектов в опаковый {v,iv,ct} (для полей-Value) ---
 
   /** Зашифровать произвольный JSON-сериализуемый `obj` под контекстный ключ `key`. */
@@ -199,6 +235,7 @@ const RoomCrypto = (() => {
   return {
     generateRoomKey,
     deriveKeys,
+    deriveContentKeys,
     encrypt,
     decrypt,
     encryptToBase64,

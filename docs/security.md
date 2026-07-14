@@ -44,7 +44,7 @@ and states known gaps plainly rather than implying full coverage.
 | A hostile origin reading camera/microphone/screen through an embedded frame | Mitigated | `Permissions-Policy` restricts capture APIs to `self` (M2, [§6](#6-m2--security-headers--csp)) |
 | A meeting running indefinitely, accumulating state forever | Mitigated | Hard maximum meeting lifetime, enforced by a background reaper regardless of live participants ([§8](#8-meeting-duration-ceiling)) |
 | A guest bypassing a chat/audio/video restriction via a modified client | **Not fully mitigated — cooperative only** | See [`permissions-and-leader.md` §7](permissions-and-leader.md#7-guest-permissions--how-theyre-actually-enforced) and [§9](#9-known-boundaries) below |
-| Recovering plaintext of a past meeting after the room key leaks | **Not mitigated** | No forward secrecy — see [`e2e-encryption.md` §6](e2e-encryption.md#6-known-limitations) |
+| Recovering plaintext of a past meeting after the room key leaks | **Not mitigated** (signaling); **Partially mitigated** (fallback chat content/names, going forward from a membership change) | No forward secrecy for `K_sig`/signaling — see [`e2e-encryption.md` §6](e2e-encryption.md#6-known-limitations). Content keys (`K_chat`/`K_meta`) rotate when a participant leaves or is rejected at the lobby — see [`e2e-encryption.md` §7](e2e-encryption.md#7-forward-secrecy-for-content-on-membership-change-ш3) |
 | A leaked/guessed room id or link granting access | Inherent to the model, mitigated by entropy | The link itself is the only credential; room ids are drawn from a large enough space that guessing one is impractical (see [`privacy.md`](privacy.md)) |
 
 ## 3. H1 — Ephemeral TURN Credentials
@@ -92,6 +92,13 @@ required by an operator to notice or limit it; now, the only lever needed to
 invalidate every outstanding credential is one secret rotation, and the
 issued timestamp gives an operator's TURN server logs a signal for
 detecting anomalous reuse.
+
+**This makes periodic secret rotation a required operational practice for
+this scheme, not an optional future hardening step**: without it, a leaked
+credential is effectively as long-lived as the secret itself, since nothing
+else expires it. See [`self-hosting.md` §5.1](self-hosting.md#51-rotating-the-shared-secret)
+for the rotation procedure and the runnable example at
+[`../scripts/rotate-turn-secret.example.sh`](../scripts/rotate-turn-secret.example.sh).
 
 ## 4. H2 — Denial of Service Limits
 
@@ -201,8 +208,14 @@ Stated plainly, not buried:
   mechanism, even in principle, for the server to detect or prevent that
   without becoming a media/data relay itself — which would contradict the
   product's core privacy property (see [`PRD.md` §6.1](PRD.md#61-nfr-inclusions)).
-- **No forward secrecy** for signaling-relayed content — see
-  [`e2e-encryption.md` §6](e2e-encryption.md#6-known-limitations).
+- **No forward secrecy for signaling** (`K_sig` is never rotated — see
+  [`e2e-encryption.md` §7.7](e2e-encryption.md#77-what-this-does-and-doesnt-fix--stated-plainly)),
+  and forward secrecy for content (`K_chat`/`K_meta`, rotated on membership
+  change) is **partial**, not a general ratchet — see
+  [`e2e-encryption.md` §7](e2e-encryption.md#7-forward-secrecy-for-content-on-membership-change-ш3)
+  for exactly what it covers (fallback-relayed chat content and names, going
+  forward from a departure/lobby rejection) and what it plainly doesn't
+  (signaling, a newcomer's own name, post-compromise security).
 - **Per-IP rate limiting is not attacker-proof.** Client IP is inferred from
   proxy headers with a direct-connection fallback; a sufficiently motivated
   attacker behind a spoofable or absent proxy chain could evade it. The goal

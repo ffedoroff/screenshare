@@ -25,8 +25,12 @@
 //
 // Ключ комнаты (Ш1, E2E-шифрование, см. static/crypto.js): `k` парсится ЗДЕСЬ
 // ЖЕ — до того, как страница успела показать что-либо, и до какого-либо
-// обращения к сигналингу; от него позже выводятся sigKey/metaKey/chatKey
-// (см. deriveRoomKeys).
+// обращения к сигналингу; от него позже выводятся sigKey/metaKey и эпоха 0
+// контентных ключей (см. deriveRoomKeys). Ш3 (forward secrecy контента при
+// смене состава, см. docs/e2e-encryption.md §7): лидер может выпустить
+// НОВУЮ эпоху K_chat/K_meta поверх этой — см. contentEpochs/
+// rotateContentKeysIfLeader ниже; sigKey остаётся неизменным на всю жизнь
+// комнаты.
 const { initialLeaderToken, roomKeyBase64url } = (() => {
   const hash = location.hash;
   const ltMatch = hash.match(/(?:^|[&#])lt=([^&]+)/);
@@ -139,15 +143,38 @@ if (!screenShareSupported) {
 // --- Ш1: криптографические ключи комнаты (см. static/crypto.js) ---
 // Выводятся один раз при старте страницы из roomKeyBase64url (см. init/
 // deriveRoomKeys ниже) — null, пока вывод не завершился (или не начинался).
-let sigKey = null; // K_sig — sdp/candidate/info в серверном релее
-let metaKey = null; // K_meta — отображаемое имя участника в join-room
-let chatKey = null; // K_chat — fallback-конверт чата через сервер
+let sigKey = null; // K_sig — sdp/candidate/info в серверном релее (НЕ ротируется, см. Ш3 ниже)
+let metaKey = null; // K_meta эпохи 0 — отображаемое имя участника в join-room (см. Ш3: имя новичка ВСЕГДА эпохи 0)
 // Взводится один раз на первую же неудачную расшифровку входящего
 // (SDP/ICE/stream-info с серверного релея) — почти всегда значит, что ключ
 // комнаты неверный (см. handleCryptoFailureOnce). Отдельно от terminalState,
 // чтобы не показать оверлей дважды при параллельных отказах нескольких
 // пиров сразу.
 let cryptoFailureHandled = false;
+
+// --- Ш3: forward secrecy контента при смене состава (см.
+// docs/e2e-encryption.md §7) ---
+//
+// Ротируются ТОЛЬКО контентные ключи (K_chat/K_meta) — K_sig выше НЕ
+// ротируется никогда. Map<epoch:number, {raw:Uint8Array, chat:CryptoKey,
+// meta:CryptoKey}> — эпоха 0 заполняется в deriveRoomKeys() тем же
+// материалом, что и `k`. Старые эпохи НЕ выбрасываются (нужны для истории/
+// запоздавших fallback-конвертов под прежней эпохой) — память ничтожна
+// (несколько эпох за ≤3ч жизни комнаты). `raw` (сырые байты, не только
+// производные CryptoKey) хранится специально — лидеру нужно уметь заново
+// переслать его новичку по key-request (CryptoKey из deriveKey создаётся
+// неэкспортируемым, см. static/crypto.js: deriveContextKey).
+const contentEpochs = new Map();
+let currentContentEpoch = 0;
+// false у новичка сразу после входа, ЕСЛИ в комнате уже кто-то есть и это не
+// он сам лидер — до тех пор, пока не получен ответ на key-request (см.
+// createRemotePeer: onBusOpen) или не истёк CONTENT_EPOCH_REQUEST_TIMEOUT_MS
+// (после которого сдаёмся и шлём под тем, что знаем — доступность важнее).
+// Пока false — исходящий fallback-чат ставится в очередь (см.
+// static/chat.js: isContentEpochReady/notifyContentEpochReady).
+let contentEpochReady = true;
+let contentEpochRequestSent = false;
+const CONTENT_EPOCH_REQUEST_TIMEOUT_MS = 3000;
 
 // --- Общее состояние комнаты/сигналинга ---
 let signaling = null;
@@ -372,11 +399,11 @@ overlayActionButtonEl.addEventListener('click', () => {
 // ---------- Ш1: криптографические ключи комнаты ----------
 
 /**
- * Вывести sigKey/metaKey/chatKey из roomKeyBase64url (см. верх файла).
- * Возвращает false при ЛЮБОЙ проблеме: `k` отсутствует в ссылке, не
- * декодируется как base64url, декодируется не в 32 байта, либо сам
- * HKDF/AES-GCM отказался (WebCrypto недоступен и т.п.) — вызывающая сторона
- * (см. init ниже) трактует false как «ссылка неполная».
+ * Вывести sigKey/metaKey/эпоху 0 контентных ключей из roomKeyBase64url (см.
+ * верх файла). Возвращает false при ЛЮБОЙ проблеме: `k` отсутствует в
+ * ссылке, не декодируется как base64url, декодируется не в 32 байта, либо
+ * сам HKDF/AES-GCM отказался (WebCrypto недоступен и т.п.) — вызывающая
+ * сторона (см. init ниже) трактует false как «ссылка неполная».
  */
 async function deriveRoomKeys() {
   if (!roomKeyBase64url) return false;
@@ -391,7 +418,12 @@ async function deriveRoomKeys() {
     const keys = await RoomCrypto.deriveKeys(rawKey);
     sigKey = keys.sig;
     metaKey = keys.meta;
-    chatKey = keys.chat;
+    // Ш3: `k` — это и есть материал эпохи 0 контентных ключей (chat/meta);
+    // хранится в contentEpochs как ЛЮБАЯ другая эпоха (см. заголовок раздела
+    // выше), чтобы вся остальная логика (chatKeyForEpoch/applyContentEpoch)
+    // не различала эпоху 0 как особый случай.
+    contentEpochs.set(0, { raw: rawKey, chat: keys.chat, meta: keys.meta });
+    currentContentEpoch = 0;
     return true;
   } catch (err) {
     console.error('Не удалось вывести криптографические ключи комнаты:', err);
@@ -457,6 +489,113 @@ async function decryptPeerName(cipherName) {
     return null;
   }
 }
+
+// ---------- Ш3: forward secrecy — ротация контентных ключей по эпохам ----------
+//
+// См. docs/e2e-encryption.md §7 для полной модели; здесь только механика.
+// Инвариант: K_sig НИКОГДА не ротируется (см. sigKey выше) — эпохи касаются
+// исключительно K_chat/K_meta, и раздаются ИСКЛЮЧИТЕЛЬНО по P2P-шине
+// (bus.sendToPeer/bus.onMessage) — сырой ключ эпохи никогда не проходит
+// через сервер ни в каком виде, даже зашифрованным.
+
+/** CryptoKey чата нужной эпохи (или null, если эта эпоха нам ещё/уже неизвестна) — см. static/chat.js: getChatKeyForEpoch. */
+function chatKeyForEpoch(epoch) {
+  const entry = contentEpochs.get(epoch);
+  return entry ? entry.chat : null;
+}
+
+/** Взводится, когда текущая эпоха наконец точно известна (сразу у большинства, у новичка — после key-request/таймаута) — снимает очередь исходящего fallback-чата, см. static/chat.js: notifyContentEpochReady. Идемпотентно. */
+function markContentEpochReady() {
+  if (contentEpochReady) return;
+  contentEpochReady = true;
+  if (chat) chat.notifyContentEpochReady();
+}
+
+/**
+ * Применить входящий `{epoch, key}` из key-rotate (см. bus.onMessage ниже) —
+ * и чужая ротация от лидера, и адресный ответ на наш собственный key-request
+ * приходят в одном и том же формате. Идемпотентно: повторная доставка уже
+ * известной эпохи не пересчитывает ключ заново (HKDF — не бесплатная
+ * операция, а бывает как минимум двойная доставка — бродкаст лидера мог
+ * застать нас уже знающими эту эпоху из ответа на key-request, и наоборот).
+ */
+async function applyContentEpoch(epoch, keyBase64url) {
+  if (typeof epoch !== 'number' || !Number.isInteger(epoch) || epoch < 0) return;
+  if (typeof keyBase64url !== 'string' || !keyBase64url) return;
+  if (contentEpochs.has(epoch)) {
+    if (epoch > currentContentEpoch) currentContentEpoch = epoch;
+    markContentEpochReady();
+    return;
+  }
+  let raw;
+  try {
+    raw = RoomCrypto.base64urlToBytes(keyBase64url);
+  } catch (err) {
+    console.error('Ш3: не удалось декодировать ключ эпохи из key-rotate:', err);
+    return;
+  }
+  try {
+    const keys = await RoomCrypto.deriveContentKeys(raw);
+    contentEpochs.set(epoch, { raw, chat: keys.chat, meta: keys.meta });
+    if (epoch > currentContentEpoch) currentContentEpoch = epoch;
+    markContentEpochReady();
+  } catch (err) {
+    console.error('Ш3: не удалось вывести контентные ключи новой эпохи:', err);
+  }
+}
+
+/**
+ * Только ЛИДЕР и только при реальной смене состава — участник ушёл
+ * (peer-left) или отклонён в лобби (reject) — см. вызовы в
+ * registerSignalingHandlers/buildJoinRequestCardEl. Генерирует новый
+ * случайный 32-байтный ключ, инкрементит эпоху и рассылает её ТЕКУЩИМ пирам
+ * ИСКЛЮЧИТЕЛЬНО по шине (см. заголовок раздела). Пустая комната после ухода
+ * (peers.size===0) — рассылать некому, ротацию пропускаем: лишняя эпоха без
+ * единого получателя не даёт никакого выигрыша в forward secrecy, только
+ * шум.
+ */
+async function rotateContentKeysIfLeader() {
+  if (!isLeader || peers.size === 0) return;
+  const raw = RoomCrypto.generateRoomKey();
+  let keys;
+  try {
+    keys = await RoomCrypto.deriveContentKeys(raw);
+  } catch (err) {
+    console.error('Ш3: не удалось сгенерировать новую эпоху контентных ключей:', err);
+    return;
+  }
+  currentContentEpoch += 1;
+  contentEpochs.set(currentContentEpoch, { raw, chat: keys.chat, meta: keys.meta });
+  const payload = { kind: 'key-rotate', epoch: currentContentEpoch, key: RoomCrypto.bytesToBase64url(raw) };
+  for (const peerId of peers.keys()) {
+    // bus.sendToPeer очередит отправку внутри RtcPeer, если канал конкретно
+    // к этому пиру почему-то ещё не открыт (редкий край) — не теряется.
+    bus.sendToPeer(peerId, payload);
+  }
+}
+
+// Приём с шины: чужая ротация (от лидера) ИЛИ адресный ответ на наш
+// key-request — оба несут одинаковый {kind:'key-rotate', epoch, key}.
+bus.onMessage((_fromPeerId, obj) => {
+  if (!obj || obj.kind !== 'key-rotate') return;
+  applyContentEpoch(obj.epoch, obj.key).catch((err) =>
+    console.error('Ш3: обработка key-rotate завершилась с ошибкой:', err)
+  );
+});
+
+// Приём с шины: key-request — отвечает ТОЛЬКО текущий лидер, ТОЛЬКО
+// запросившему (адресно), текущей эпохой целиком (не историей всех эпох —
+// новичку живые сообщения важнее, а эпоху 0 он и так уже знает из #k).
+bus.onMessage((fromPeerId, obj) => {
+  if (!obj || obj.kind !== 'key-request' || !isLeader) return;
+  const entry = contentEpochs.get(currentContentEpoch);
+  if (!entry) return;
+  bus.sendToPeer(fromPeerId, {
+    kind: 'key-rotate',
+    epoch: currentContentEpoch,
+    key: RoomCrypto.bytesToBase64url(entry.raw),
+  });
+});
 
 // ---------- Ненавязчивые сообщения ----------
 
@@ -875,6 +1014,15 @@ function buildJoinRequestCardEl(req) {
   rejectButton.addEventListener('click', () => {
     signaling.send('reject', { peerId: req.peerId });
     removePendingRequest(req.peerId);
+    // Ш3: смена состава — заявка отклонена лидером (см. docs/e2e-encryption.md
+    // §7). Сам отклонённый ничего не выигрывает от этой ротации (он никогда
+    // не был в `peers` и не получал ни одной эпохи контентных ключей — не от
+    // чего его отрезать), но событие формально попадает под «смена состава»,
+    // и ротация здесь дёшева, поэтому проще выполнять её единообразно, чем
+    // отдельно объяснять, почему в этом случае её нет.
+    rotateContentKeysIfLeader().catch((err) =>
+      console.error('Ш3: ротация ключей после отказа в лобби не удалась:', err)
+    );
   });
 
   actions.appendChild(acceptButton);
@@ -1482,7 +1630,20 @@ function createRemotePeer(peerId, name, iceServers) {
     // Ф2: как только шина к этому пиру открылась — сразу переслать ему по
     // ней снапшот всех наших актуальных stream-info (см.
     // sendAllActiveStreamInfoTo, там же почему это нужно ВТОРЫМ разом).
-    onBusOpen: () => sendAllActiveStreamInfoTo(peerId),
+    onBusOpen: () => {
+      sendAllActiveStreamInfoTo(peerId);
+      // Ш3: мы новичок (не лидер), эпоха контентных ключей ещё не
+      // подтверждена, и шина только что открылась ИМЕННО до лидера — самое
+      // время спросить у него текущую эпоху (см. bus.onMessage('key-request')
+      // выше). leaderId к этому моменту уже точно известен (onBusOpen —
+      // асинхронный колбэк много позже синхронной обработки joined, где
+      // leaderId выставляется, см. registerSignalingHandlers). Шлём не более
+      // одного запроса за сессию (contentEpochRequestSent).
+      if (!contentEpochReady && !isLeader && !contentEpochRequestSent && peerId === leaderId) {
+        contentEpochRequestSent = true;
+        bus.sendToPeer(peerId, { kind: 'key-request' });
+      }
+    },
     // Ф3: входящий файловый DataChannel — маршрутизируем в ChatPanel (там
     // живёт протокол передачи файлов, см. static/chat.js). `chat` в момент
     // регистрации этого колбэка может быть ещё не создан (для первых пиров
@@ -1754,6 +1915,16 @@ function registerSignalingHandlers(iceServers) {
       renderJoinRequests();
       applyGuestEnforcement();
 
+      // Ш3: если в комнате уже кто-то есть и это не мы сами лидер — наша
+      // эпоха 0 (из #k) МОЖЕТ уже быть устаревшей (лидер мог поротировать её
+      // до нашего входа) — ждём key-request/key-rotate по шине (см.
+      // createRemotePeer: onBusOpen) прежде чем слать fallback-контент.
+      // Одни в комнате или мы сами лидер — эпоха 0 заведомо актуальна.
+      contentEpochReady = isLeader || otherPeers.length === 0;
+      if (!contentEpochReady) {
+        setTimeout(() => markContentEpochReady(), CONTENT_EPOCH_REQUEST_TIMEOUT_MS);
+      }
+
       updateScreenButtonState();
       updateParticipantCount();
 
@@ -1768,7 +1939,11 @@ function registerSignalingHandlers(iceServers) {
         initialPeerIds: otherPeers.map((p) => p.peerId),
         getLeaderId: () => leaderId,
         getGuestChatAllowed: () => (roomSettings ? roomSettings.guestChat : true),
-        chatKey,
+        // Ш3: чат больше не получает один статичный ключ — эпоха может
+        // смениться в любой момент сессии (см. rotateContentKeysIfLeader).
+        getChatKeyForEpoch: chatKeyForEpoch,
+        getCurrentContentEpoch: () => currentContentEpoch,
+        isContentEpochReady: () => contentEpochReady,
       });
       return;
     }
@@ -1916,8 +2091,13 @@ function registerSignalingHandlers(iceServers) {
   });
 
   signaling.on('peer-left', ({ peerId }) => {
-    removeRemotePeer(peerId);
+    removeRemotePeer(peerId); // peers больше не содержит peerId — rotateContentKeysIfLeader() ниже его уже не разошлёт
     updateParticipantCount();
+    // Ш3: смена состава — участник ушёл (см. docs/e2e-encryption.md §7). Нет
+    // эффекта, если мы не лидер (guard внутри) — только лидер рассылает.
+    rotateContentKeysIfLeader().catch((err) =>
+      console.error('Ш3: ротация ключей после ухода участника не удалась:', err)
+    );
   });
 
   signaling.on('offer', async ({ fromPeerId, sdp }) => {

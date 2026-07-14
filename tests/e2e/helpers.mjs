@@ -383,6 +383,85 @@ export function installCamStub() {
   };
 }
 
+// --- Мобильный UX чата (волна 11): фейковый window.visualViewport ---
+//
+// Реальной виртуальной клавиатуры в headless Chromium (даже с isMobile:true/
+// hasTouch:true) не бывает — фокус на textarea её не открывает и
+// window.visualViewport никак не сжимается сам по себе, поэтому для проверки
+// подгонки полноэкранной мобильной панели чата под клавиатуру (см.
+// static/chat.js: syncMobileChatViewport) нужен детерминированный способ
+// эмулировать её появление. Настоящий VisualViewport — почти все свойства
+// (height/width/offsetTop/offsetLeft/scale) read-only геттеры на прототипе,
+// присвоить им напрямую нельзя; вместо этого ДО первой навигации (см.
+// addInitScript) подменяем весь window.visualViewport на простой EventTarget
+// с теми же именами свойств (обычные mutable-поля, не геттеры) — chat.js
+// работает с ним ровно так же (feature-detect + addEventListener/height/
+// offsetTop), продуктовый код не меняется и не знает, что viewport фейковый.
+// window.__e2eSetVisualViewport(height, offsetTop) — дёргается из теста,
+// чтобы "сжать" видимую область (как будто снизу выросла клавиатура) и
+// продиспатчить 'resize', на который подписан chat.js.
+// ВАЖНО (обнаружено эмпирически): addInitScript выполняется в момент
+// СОЗДАНИЯ документа — ДО того, как HTML-парсер дошёл до <meta
+// name="viewport">, поэтому window.innerHeight/innerWidth, прочитанные ПРЯМО
+// В КОНСТРУКТОРЕ синхронно, на мобильной эмуляции (isMobile:true) в этот
+// момент отражают ещё не применённый viewport-meta и оказываются дикими
+// числами (наблюдалось: 844 -> 2121) — из-за этого при первом же измерении
+// панель "сжималась" в гигантский исходный размер, а не в реальный размер
+// вьюпорта, отправить сообщение (или ткнуть по кнопке) было physически
+// невозможно (элемент вне вьюпорта). Фикс — читать innerHeight/innerWidth
+// ЛЕНИВО через геттеры (значение по умолчанию, пока explicitTest ничего не
+// задал явно) — к моменту, когда chat.js реально обращается к .height (после
+// открытия чата, много позже DOMContentLoaded), window.innerHeight уже верный.
+export function installFakeVisualViewport(context) {
+  return context.addInitScript(() => {
+    class FakeVisualViewport extends EventTarget {
+      constructor() {
+        super();
+        this._height = null;
+        this._width = null;
+        this._offsetTop = 0;
+        this._offsetLeft = 0;
+        this.scale = 1;
+      }
+      get height() {
+        return this._height === null ? window.innerHeight : this._height;
+      }
+      set height(v) {
+        this._height = v;
+      }
+      get width() {
+        return this._width === null ? window.innerWidth : this._width;
+      }
+      set width(v) {
+        this._width = v;
+      }
+      get offsetTop() {
+        return this._offsetTop;
+      }
+      set offsetTop(v) {
+        this._offsetTop = v;
+      }
+      get offsetLeft() {
+        return this._offsetLeft;
+      }
+      set offsetLeft(v) {
+        this._offsetLeft = v;
+      }
+    }
+    const fake = new FakeVisualViewport();
+    Object.defineProperty(window, 'visualViewport', {
+      value: fake,
+      configurable: true,
+      writable: false,
+    });
+    window.__e2eSetVisualViewport = (height, offsetTop = 0) => {
+      fake.height = height;
+      fake.offsetTop = offsetTop;
+      fake.dispatchEvent(new Event('resize'));
+    };
+  });
+}
+
 // --- Модалка входа (анонимность — см. static/room.js) ---
 //
 // Никакого localStorage больше нет: имя вводится в модалке «Присоединиться»
@@ -762,6 +841,64 @@ export function makeTestTextFileBuffer(sizeBytes) {
     pos += n;
   }
   return buf;
+}
+
+/**
+ * Валидный WAV (PCM 16-бит, тон 440Гц заданной длительности) — тривиально
+ * настоящий аудио-контейнер (заголовок RIFF/WAVE/fmt/data по спецификации),
+ * никаких сторонних зависимостей/кодеков не нужно, Chromium проигрывает и
+ * репортит длительность через `loadedmetadata` детерминированно (в отличие
+ * от видео-контейнеров, см. TINY_WEBM_BASE64 ниже). Размер файла и
+ * длительность связаны напрямую (durationSeconds * sampleRate * 2 байта +
+ * 44 байта заголовка) — оба свойства проверяются в тестах.
+ */
+export function makeTestWavBuffer({ durationSeconds = 1, sampleRate = 8000, numChannels = 1 } = {}) {
+  const bitsPerSample = 16;
+  const blockAlign = numChannels * (bitsPerSample / 8);
+  const numSamples = Math.round(durationSeconds * sampleRate);
+  const dataSize = numSamples * blockAlign;
+  const buf = Buffer.alloc(44 + dataSize);
+
+  buf.write('RIFF', 0, 'ascii');
+  buf.writeUInt32LE(36 + dataSize, 4);
+  buf.write('WAVE', 8, 'ascii');
+  buf.write('fmt ', 12, 'ascii');
+  buf.writeUInt32LE(16, 16); // размер subchunk1 (PCM)
+  buf.writeUInt16LE(1, 20); // audio format = PCM (без сжатия)
+  buf.writeUInt16LE(numChannels, 22);
+  buf.writeUInt32LE(sampleRate, 24);
+  buf.writeUInt32LE(sampleRate * blockAlign, 28); // byte rate
+  buf.writeUInt16LE(blockAlign, 32);
+  buf.writeUInt16LE(bitsPerSample, 34);
+  buf.write('data', 36, 'ascii');
+  buf.writeUInt32LE(dataSize, 40);
+
+  // Не чистая цифровая тишина (хотя и она была бы валидна) — простой тон
+  // 440Гц, чтобы файл не выглядел как "пустой" при ручной проверке.
+  for (let i = 0; i < numSamples; i++) {
+    const sample = Math.round(Math.sin((2 * Math.PI * 440 * i) / sampleRate) * 3000);
+    for (let ch = 0; ch < numChannels; ch++) {
+      buf.writeInt16LE(sample, 44 + i * blockAlign + ch * 2);
+    }
+  }
+  return buf;
+}
+
+// --- Крошечный, но НАСТОЯЩИЙ валидный WebM-контейнер (видео) ---
+//
+// В отличие от WAV (собирается тривиально вручную по спецификации), валидный
+// видео-контейнер руками не соберёшь — используем заранее (офлайн, ffmpeg)
+// сгенерированный минимальный VP8/WebM: 64×64, 5 кадров/с, 1 секунда, без
+// звука (`ffmpeg -f lavfi -i color=c=blue:s=64x64:d=1:r=5 -c:v libvpx -crf 40
+// -b:v 40k -an tiny.webm`) — захардкожен как base64, тесты его не
+// перегенерируют и сторонних бинарных зависимостей (ffmpeg) на машине с
+// тестами не требуют. Chromium реально проигрывает этот файл и репортит
+// duration≈1с через `loadedmetadata` — тест ниже это проверяет.
+const TINY_WEBM_BASE64 =
+  'GkXfo59ChoEBQveBAULygQRC84EIQoKEd2VibUKHgQJChYECGFOAZwEAAAAAAAJnEU2bdLpNu4tTq4QVSalmU6yBoU27i1OrhBZUrmtTrIHWTbuMU6uEElTDZ1OsggEjTbuMU6uEHFO7a1OsggJR7AEAAAAAAABZAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVSalmsCrXsYMPQkBNgIxMYXZmNjEuNy4xMDBXQYxMYXZmNjEuNy4xMDBEiYhAj0AAAAAAABZUrmvIrgEAAAAAAAA/14EBc8WIa65O3zZP2V+cgQAitZyDdW5kiIEAhoVWX1ZQOIOBASPjg4QL68IA4JCwgUC6gUCagQJVsIRVuYEBElTDZ/tzc59jwIBnyJlFo4dFTkNPREVSRIeMTGF2ZjYxLjcuMTAwc3PWY8CLY8WIa65O3zZP2V9nyKFFo4dFTkNPREVSRIeUTGF2YzYxLjE5LjEwMSBsaWJ2cHhnyKFFo4hEVVJBVElPTkSHkzAwOjAwOjAxLjAwMDAwMDAwMAAfQ7Z1QKjngQCjw4EAAICQAwCdASpAAEAAAEcIhYWIhYSIAgICdaoD+AIG6EFcMdITAFVYAP7/TRL//FhX8WFfxYV/8WFf/PzO7cX85gCjloEAyADRAQAHEOwAGAAYWC/0AAiOgACjloEBkADRAQAHEOwAGAAYWC/0AAiOgACjloECWADRAQAHEOwAGAAYWC/0AAiOgACjloEDIADRAQAHEOwAGAAYWC/0AAiOgAAcU7trkbuPs4EAt4r3gQHxggGj8IED';
+
+export function makeTestWebmBuffer() {
+  return Buffer.from(TINY_WEBM_BASE64, 'base64');
 }
 
 /**

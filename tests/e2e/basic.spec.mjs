@@ -56,6 +56,8 @@ import {
   waitUntil,
   makeTestPngBuffer,
   makeTestTextFileBuffer,
+  makeTestWavBuffer,
+  makeTestWebmBuffer,
   attachFilesToChat,
   generateRoomKeyBase64url,
   roomUrlWithKey,
@@ -66,6 +68,7 @@ import {
   framesOfTypeSentOn,
   waitInvalidLinkOverlay,
   waitForBusOpenToAllPeers,
+  installFakeVisualViewport,
   REPO_ROOT,
 } from './helpers.mjs';
 
@@ -976,6 +979,108 @@ async function main() {
           );
           assert.equal(scriptTagCount, 0, 'тег <script> не должен появиться как реальный DOM-элемент');
 
+          // --- (a-2) Ф4: курсив __...__, спойлер ||...|| (скрыт -> клик -> .revealed),
+          //     инлайн-код `...` (маркеры внутри НЕ разбираются), именованная
+          //     ссылка [текст](url) ---
+          const spoilerSecret = `secret-${Date.now()}`;
+          const uniqueTag2 = `MARK2-${Date.now()}`;
+          const fmtText2 = `__ital__ ||${spoilerSecret}|| \`code*x~y\` [linktext](https://example.org/z) ${uniqueTag2}`;
+          await sendChatMessage(aPage, fmtText2);
+
+          const bFmtMsg2 = bPage.locator('.chat-message', { hasText: uniqueTag2 }).last();
+          await bFmtMsg2.locator('em').first().waitFor({ state: 'visible', timeout: 5000 });
+
+          const em2Text = await bFmtMsg2.locator('em').first().textContent();
+          assert.equal(em2Text, 'ital', `__..__ должен рендериться как <em> "ital", получено: ${em2Text}`);
+
+          const codeEl2 = bFmtMsg2.locator('code.chat-inline-code').first();
+          await codeEl2.waitFor({ state: 'visible', timeout: 3000 });
+          const codeText2 = await codeEl2.textContent();
+          assert.equal(
+            codeText2,
+            'code*x~y',
+            `инлайн-код должен содержать текст буквально, без разбора маркеров внутри: ${codeText2}`
+          );
+
+          const link2 = bFmtMsg2.locator('a', { hasText: 'linktext' }).first();
+          const link2Href = await link2.getAttribute('href');
+          assert.equal(
+            link2Href,
+            'https://example.org/z',
+            `именованная ссылка должна вести на https://example.org/z, получено: ${link2Href}`
+          );
+
+          const spoilerEl = bFmtMsg2.locator('.chat-md-spoiler').first();
+          await spoilerEl.waitFor({ state: 'visible', timeout: 3000 });
+          const revealedBefore = await spoilerEl.evaluate((el) => el.classList.contains('revealed'));
+          assert.equal(revealedBefore, false, 'спойлер не должен быть раскрыт (.revealed) до клика');
+          const filterBefore = await spoilerEl.evaluate((el) => getComputedStyle(el).filter);
+          assert.notEqual(
+            filterBefore,
+            'none',
+            `спойлер должен быть визуально размыт до клика (filter должен быть != none), получено: ${filterBefore}`
+          );
+
+          await spoilerEl.click();
+          await waitUntil(async () => spoilerEl.evaluate((el) => el.classList.contains('revealed')), {
+            timeoutMs: 3000,
+            message: 'клик по спойлеру должен добавить класс .revealed',
+          });
+          const spoilerTextAfter = await spoilerEl.textContent();
+          assert.equal(
+            spoilerTextAfter,
+            spoilerSecret,
+            `после раскрытия текст спойлера должен быть виден: ${spoilerTextAfter}`
+          );
+          // filter анимируется через CSS transition (0.15с, см. style.css:
+          // .chat-md-spoiler), поэтому сразу после появления класса .revealed
+          // getComputedStyle может ещё вернуть промежуточный/старый кадр —
+          // ждём завершения перехода, а не проверяем один раз синхронно.
+          let filterAfter = null;
+          await waitUntil(
+            async () => {
+              filterAfter = await spoilerEl.evaluate((el) => getComputedStyle(el).filter);
+              return filterAfter === 'none';
+            },
+            { timeoutMs: 2000, message: `после раскрытия filter должен вернуться в none (был: ${filterAfter})` }
+          );
+
+          const bFmtText2 = await bFmtMsg2.locator('.chat-message-text').textContent();
+          assert.ok(!bFmtText2.includes('__'), `сырых "__" не должно остаться в рендере: ${bFmtText2}`);
+          assert.ok(!bFmtText2.includes('||'), `сырых "||" не должно остаться в рендере: ${bFmtText2}`);
+          assert.ok(!bFmtText2.includes('`'), `сырых обратных кавычек не должно остаться в рендере: ${bFmtText2}`);
+
+          // --- (a-3) блок кода: метка языка, кнопка «копировать», содержимое
+          //     (включая markdown-подобные символы) НЕ разбирается ---
+          const codeBlockTag = `MARK3-${Date.now()}`;
+          const codeBlockText = `перед\n\`\`\`js\nlet x = 1; // **not bold** __not italic__\nconsole.log(x);\n\`\`\`\nпосле ${codeBlockTag}`;
+          await sendChatMessage(aPage, codeBlockText);
+
+          const bCodeMsg = bPage.locator('.chat-message', { hasText: codeBlockTag }).last();
+          const codeBlockEl = bCodeMsg.locator('.chat-code-block').first();
+          await codeBlockEl.waitFor({ state: 'visible', timeout: 5000 });
+
+          const langText = await codeBlockEl.locator('.chat-code-block-lang').textContent();
+          assert.equal(langText, 'js', `метка языка должна показывать "js", получено: ${langText}`);
+
+          const codeBlockContent = await codeBlockEl.locator('pre code').textContent();
+          assert.ok(
+            codeBlockContent.includes('**not bold**') && codeBlockContent.includes('__not italic__'),
+            `внутри код-блока маркеры не должны разбираться — должны остаться буквально: ${codeBlockContent}`
+          );
+          assert.equal(
+            await codeBlockEl.locator('pre code strong').count(),
+            0,
+            'внутри код-блока не должно быть <strong> (маркеры не разбираются)'
+          );
+
+          const copyButton = codeBlockEl.locator('.chat-code-block-copy');
+          await copyButton.click();
+          await waitUntil(async () => (await copyButton.textContent()) === 'Скопировано', {
+            timeoutMs: 2000,
+            message: 'кнопка «копировать» должна показать «Скопировано» после клика',
+          });
+
           // --- (б) реплай: у получателя видна цитата с именем автора оригинала ---
           const originalText = `Оригинал-от-Бори-${Date.now()}`;
           await sendChatMessage(bPage, originalText);
@@ -1437,7 +1542,7 @@ async function main() {
     // живьём) и всё ещё может их запросить, пока Женя (исходный отправитель)
     // в комнате.
     await step(
-      'Передача файлов: авто-скачивание картинки, ручное скачивание файла с прогрессом и сверкой размера, опоздавший скачивает из истории',
+      'Передача файлов: авто-скачивание картинки, ручное скачивание файла с прогрессом и сверкой размера, опоздавший скачивает из истории, инлайн-плееры audio/video (Ф4, раздел B)',
       async () => {
         const res = await fetch(`${server.baseUrl}/api/rooms`, { method: 'POST' });
         assert.ok(res.ok, `POST /api/rooms ответил статусом ${res.status}`);
@@ -1537,6 +1642,119 @@ async function main() {
             );
           } finally {
             await gContext.close();
+          }
+
+          // --- (г) аудио: валидный WAV ~1.5с (см. helpers.mjs:
+          //     makeTestWavBuffer) — не авто-скачивается (порог ≤2МБ только
+          //     для картинок), Захар жмёт «Скачать» -> <audio controls>,
+          //     мета-строка (имя/размер/длительность из loadedmetadata),
+          //     скачанный Blob совпадает по размеру. ---
+          const wavBuffer = makeTestWavBuffer({ durationSeconds: 1.5 });
+          await attachFilesToChat(ePage, [{ name: 'sound.wav', mimeType: 'audio/wav', buffer: wavBuffer }]);
+
+          const fAudioCard = fPage.locator('.chat-file-card', { hasText: 'sound.wav' });
+          const fAudioDownloadButton = fAudioCard.locator('.chat-file-download-button');
+          await fAudioDownloadButton.waitFor({ state: 'visible', timeout: 10_000 });
+          await fAudioDownloadButton.click();
+
+          const fAudioEl = fAudioCard.locator('audio.chat-file-audio');
+          await fAudioEl.waitFor({ state: 'attached', timeout: 15_000 });
+
+          const fAudioSizeText = await fAudioCard.locator('.chat-file-meta-size').textContent();
+          assert.ok(
+            fAudioSizeText && /Б|КБ|МБ/.test(fAudioSizeText),
+            `у аудио должен быть виден человекочитаемый размер: ${fAudioSizeText}`
+          );
+
+          await fPage.waitForFunction(
+            () => {
+              const el = document.querySelector('.chat-file-card audio.chat-file-audio');
+              return !!el && Number.isFinite(el.duration) && el.duration > 0;
+            },
+            undefined,
+            { polling: 100, timeout: 10_000 }
+          );
+          const fAudioDurationText = await fAudioCard.locator('.chat-file-meta-duration').textContent();
+          assert.ok(
+            /^\d+:\d{2}$/.test(fAudioDurationText || ''),
+            `длительность аудио должна отображаться в формате М:СС, получено: ${fAudioDurationText}`
+          );
+
+          const fAudioDownloadLink = fAudioCard.locator('.chat-file-download-link--compact');
+          await fAudioDownloadLink.waitFor({ state: 'visible', timeout: 5000 });
+          const fAudioObjectUrl = await fAudioDownloadLink.getAttribute('href');
+          const fAudioBlobSize = await fPage.evaluate(async (url) => {
+            const blob = await (await fetch(url)).blob();
+            return blob.size;
+          }, fAudioObjectUrl);
+          assert.equal(
+            fAudioBlobSize,
+            wavBuffer.length,
+            `скачанное аудио должно совпадать по размеру с исходным (${wavBuffer.length}), получено ${fAudioBlobSize}`
+          );
+
+          // --- (д) видео: крошечный, но настоящий валидный WebM (см.
+          //     helpers.mjs: makeTestWebmBuffer) — <video controls>,
+          //     src=blob, размер и кнопка «Скачать» проверяются всегда;
+          //     длительность из loadedmetadata — проверяем, ТОЛЬКО если
+          //     Chromium реально успел её вычислить за отведённое время,
+          //     иначе честно логируем и пропускаем именно эту под-проверку
+          //     (см. комментарий в задаче про video-duration). ---
+          const webmBuffer = makeTestWebmBuffer();
+          await attachFilesToChat(ePage, [{ name: 'clip.webm', mimeType: 'video/webm', buffer: webmBuffer }]);
+
+          const fVideoCard = fPage.locator('.chat-file-card', { hasText: 'clip.webm' });
+          const fVideoDownloadButton = fVideoCard.locator('.chat-file-download-button');
+          await fVideoDownloadButton.waitFor({ state: 'visible', timeout: 10_000 });
+          await fVideoDownloadButton.click();
+
+          const fVideoEl = fVideoCard.locator('video.chat-file-video');
+          await fVideoEl.waitFor({ state: 'attached', timeout: 15_000 });
+          assert.equal(
+            await fVideoEl.evaluate((el) => el.hasAttribute('controls')),
+            true,
+            'видео-плеер должен иметь атрибут controls'
+          );
+          const fVideoSrc = await fVideoEl.evaluate((el) => el.src);
+          assert.ok(fVideoSrc && fVideoSrc.startsWith('blob:'), `src видео должен быть blob-URL, получено: ${fVideoSrc}`);
+
+          const fVideoSizeText = await fVideoCard.locator('.chat-file-meta-size').textContent();
+          assert.ok(
+            fVideoSizeText && /Б|КБ|МБ/.test(fVideoSizeText),
+            `у видео должен быть виден человекочитаемый размер: ${fVideoSizeText}`
+          );
+
+          const fVideoDownloadLink = fVideoCard.locator('.chat-file-download-link--compact');
+          await fVideoDownloadLink.waitFor({ state: 'visible', timeout: 5000 });
+          const fVideoObjectUrl = await fVideoDownloadLink.getAttribute('href');
+          const fVideoBlobSize = await fPage.evaluate(async (url) => {
+            const blob = await (await fetch(url)).blob();
+            return blob.size;
+          }, fVideoObjectUrl);
+          assert.equal(
+            fVideoBlobSize,
+            webmBuffer.length,
+            `скачанное видео должно совпадать по размеру с исходным (${webmBuffer.length}), получено ${fVideoBlobSize}`
+          );
+
+          try {
+            await fPage.waitForFunction(
+              () => {
+                const el = document.querySelector('.chat-file-card video.chat-file-video');
+                return !!el && Number.isFinite(el.duration) && el.duration > 0;
+              },
+              undefined,
+              { polling: 100, timeout: 5000 }
+            );
+            const fVideoDurationText = await fVideoCard.locator('.chat-file-meta-duration').textContent();
+            assert.ok(
+              /^\d+:\d{2}$/.test(fVideoDurationText || ''),
+              `длительность видео должна отображаться в формате М:СС, получено: ${fVideoDurationText}`
+            );
+          } catch (err) {
+            console.log(
+              `# [честно опущено] Chromium не вычислил duration для тестового WebM за отведённое время — проверка длительности видео пропущена (элемент <video>/src=blob/размер/кнопка «Скачать» уже проверены выше): ${err.message}`
+            );
           }
         } finally {
           await eContext.close();
@@ -1788,15 +2006,28 @@ async function main() {
       }
     );
 
-    // --- Мобильный смоук: узкий вьюпорт, новая (отдельная) комната ---
+    // --- Мобильный смоук + мобильный чат (волна 11): узкий вьюпорт, новая
+    //     (отдельная) комната ---
     // Экран не проверяем намеренно: на реальных мобильных браузерах
     // getDisplayMedia недоступен вовсе и кнопка «Экран» скрывается (см.
     // room.js), а этот тест эмулирует вьюпорт/тач в том же десктопном
     // Chrome, где API формально есть — проверка кнопки тут ничего бы не
     // сказала ни про десктоп (уже покрыт выше), ни про настоящий мобильный
     // Chrome/Safari.
+    //
+    // Мобильный UX чата (тап-активация действий сообщения, контекстный
+    // реплай/реакция/редактирование/удаление, мобильный тулбар
+    // форматирования, VisualViewport-подгонка под клавиатуру) проверяется
+    // ЗДЕСЬ ЖЕ, вторым эпизодом того же шага (та же комната, тот же
+    // mobileContext) — а не отдельным step() с собственным POST /api/rooms:
+    // весь файл держит бюджет ровно в 10 созданий комнат за прогон (H2:
+    // ROOM_CREATION_IP_LIMIT — 10 за 60с с одного IP, см. roomIdForTimerTestReuse
+    // ниже), лишний POST здесь столкнул бы файл за лимит и обрушил бы
+    // (429) последующие шаги. Десктопный собеседник подключается к ТОЙ ЖЕ
+    // комнате обычным join по ссылке (это не создание комнаты, лимита не
+    // расходует).
     await step(
-      'Мобильный смоук (390x844, touch): участник заходит в комнату, панель управления видима, страница без горизонтального скролла, микрофон переключается',
+      'Мобильный смоук (390x844, touch) + мобильный чат (волна 11): панель управления видима без горизонтального скролла, действия сообщения скрыты по умолчанию и показываются по тапу для ОДНОГО сообщения (тап по другому переносит, тап мимо снимает), реплай/реакция/редактирование/удаление работают через этот контекстный путь, мобильный тулбар форматирования (по выделению и по кнопке «Aa»), VisualViewport-подгонка под клавиатуру не даёт странице скроллиться и держит инпут в видимой области',
       async () => {
         const res = await fetch(`${server.baseUrl}/api/rooms`, { method: 'POST' });
         assert.ok(res.ok, `POST /api/rooms ответил статусом ${res.status}`);
@@ -1812,6 +2043,7 @@ async function main() {
         });
         try {
           await installMediaStubs(mobileContext);
+          await installFakeVisualViewport(mobileContext);
           const mobilePage = await mobileContext.newPage();
 
           await mobilePage.goto(roomUrlWithKey(server.baseUrl, mobileRoomId, mobileRoomKey));
@@ -1881,6 +2113,242 @@ async function main() {
             chatArea >= viewportArea * 0.95,
             `открытый чат на мобильном должен покрывать почти весь экран (>=95%): ${JSON.stringify(chatBox)}`
           );
+          // --- Мобильный UX волны 11: тап-активация действий сообщения,
+          //     контекстный реплай/реакция/редактирование/удаление, мобильный
+          //     тулбар форматирования, VisualViewport-подгонка под клавиатуру.
+          //     Продолжение ТОГО ЖЕ шага/той же комнаты (см. заголовок выше
+          //     — экономим POST /api/rooms): десктопный собеседник
+          //     присоединяется по ссылке той же комнаты — так реплай/реакция/
+          //     редактирование/удаление можно проверить сквозным образом
+          //     (действие с мобильного должно долететь и отрендериться у
+          //     собеседника), а не только по локальному DOM-состоянию. ---
+          const deskContext = await browser.newContext();
+          const deskPage = await deskContext.newPage();
+          try {
+            await installMediaStubs(deskContext);
+
+            await deskPage.goto(roomUrlWithKey(server.baseUrl, mobileRoomId, mobileRoomKey));
+            await joinRoom(deskPage, 'Комп');
+            await waitForOverlayHidden(deskPage);
+
+            await waitForTileCount(mobilePage, 2);
+            await waitForTileCount(deskPage, 2);
+            await waitForBusOpenToAllPeers(mobilePage);
+            await waitForBusOpenToAllPeers(deskPage);
+
+            await openChatPanel(deskPage);
+
+            // --- (1) действия скрыты по умолчанию, тап активирует ОДНО сообщение ---
+            const msg1Text = `Моб-раз-${Date.now()}`;
+            const msg1Id = await sendChatMessageAndGetId(mobilePage, msg1Text);
+            const msg2Text = `Моб-два-${Date.now()}`;
+            const msg2Id = await sendChatMessageAndGetId(mobilePage, msg2Text);
+            assert.ok(msg1Id && msg2Id, 'оба сообщения должны получить общий id (data-msg-id)');
+            assert.ok(await messageTextsInclude(deskPage, msg1Text), 'msg1 не дошло до десктоп-участника');
+            assert.ok(await messageTextsInclude(deskPage, msg2Text), 'msg2 не дошло до десктоп-участника');
+
+            const msg1Sel = `.chat-message[data-msg-id="${msg1Id}"]`;
+            const msg2Sel = `.chat-message[data-msg-id="${msg2Id}"]`;
+
+            const actionsBefore = await mobilePage.evaluate((sel) => {
+              const el = document.querySelector(`${sel} .chat-message-actions`);
+              const style = getComputedStyle(el);
+              return { opacity: style.opacity, pointerEvents: style.pointerEvents };
+            }, msg1Sel);
+            assert.equal(actionsBefore.opacity, '0', `действия должны быть скрыты (opacity=0) до тапа: ${JSON.stringify(actionsBefore)}`);
+            assert.equal(actionsBefore.pointerEvents, 'none', `действия должны быть некликабельны до тапа: ${JSON.stringify(actionsBefore)}`);
+
+            // Тап по msg1 -> активируется (класс + видимость действий). Опacity
+            // анимируется CSS-переходом (transition: opacity 0.15s, см.
+            // style.css) — ждём поллингом итоговое значение, а не читаем его
+            // сразу после появления класса (иначе можно поймать промежуточный
+            // кадр перехода и словить флейк).
+            await mobilePage.click(`${msg1Sel} .chat-message-text`);
+            await mobilePage.waitForFunction(
+              (sel) => document.querySelector(sel)?.classList.contains('chat-message--active'),
+              msg1Sel,
+              { timeout: 2000 }
+            );
+            await mobilePage.waitForFunction(
+              (sel) => getComputedStyle(document.querySelector(`${sel} .chat-message-actions`)).opacity === '1',
+              msg1Sel,
+              { timeout: 2000 }
+            );
+            const actionsAfterTap1 = await mobilePage.evaluate(
+              (sel) => getComputedStyle(document.querySelector(`${sel} .chat-message-actions`)).opacity,
+              msg1Sel
+            );
+            assert.equal(actionsAfterTap1, '1', 'после тапа действия msg1 должны стать видимыми (opacity=1)');
+            const msg2ActiveWhileMsg1Active = await mobilePage.evaluate(
+              (sel) => document.querySelector(sel)?.classList.contains('chat-message--active'),
+              msg2Sel
+            );
+            assert.equal(msg2ActiveWhileMsg1Active, false, 'msg2 не должно быть активным, пока активен msg1 (не более одного одновременно)');
+
+            // Тап по msg2 -> активность ПЕРЕНОСИТСЯ (msg1 гаснет).
+            await mobilePage.click(`${msg2Sel} .chat-message-text`);
+            await mobilePage.waitForFunction(
+              (sel) => document.querySelector(sel)?.classList.contains('chat-message--active'),
+              msg2Sel,
+              { timeout: 2000 }
+            );
+            const msg1ActiveAfterMsg2Tap = await mobilePage.evaluate(
+              (sel) => document.querySelector(sel)?.classList.contains('chat-message--active'),
+              msg1Sel
+            );
+            assert.equal(msg1ActiveAfterMsg2Tap, false, 'активация msg2 должна снять активность с msg1');
+
+            // Тап мимо (по шапке чата) -> снимает активность.
+            await mobilePage.click('.chat-title');
+            await mobilePage.waitForFunction(
+              (sel) => !document.querySelector(sel)?.classList.contains('chat-message--active'),
+              msg2Sel,
+              { timeout: 2000 }
+            );
+
+            // --- (2) реплай через новый контекстный (тап) путь ---
+            await mobilePage.click(`${msg1Sel} .chat-message-text`);
+            await mobilePage.waitForFunction(
+              (sel) => document.querySelector(sel)?.classList.contains('chat-message--active'),
+              msg1Sel,
+              { timeout: 2000 }
+            );
+            await mobilePage.click(`${msg1Sel} .chat-message-action--reply`);
+            await mobilePage.locator('.chat-reply-bar:not(.hidden)').waitFor({ state: 'visible', timeout: 3000 });
+            const replyText = `Моб-реплай-${Date.now()}`;
+            await sendChatMessage(mobilePage, replyText);
+            assert.ok(await messageTextsInclude(deskPage, replyText), 'реплай с мобильного (через тап-контекст) не дошёл до десктоп-участника');
+
+            // --- (3) реакция через новый контекстный (тап) путь ---
+            await mobilePage.click(`${msg2Sel} .chat-message-text`);
+            await mobilePage.waitForFunction(
+              (sel) => document.querySelector(sel)?.classList.contains('chat-message--active'),
+              msg2Sel,
+              { timeout: 2000 }
+            );
+            await mobilePage.click(`${msg2Sel} .chat-message-action--react`);
+            await mobilePage.locator('.chat-reaction-popover:not(.hidden)').waitFor({ state: 'visible', timeout: 3000 });
+            await mobilePage.locator('.chat-reaction-popover-emoji[data-emoji="👍"]').click();
+            await deskPage.locator(`${msg2Sel} .chat-reaction-chip`).first().waitFor({ state: 'visible', timeout: 5000 });
+
+            // --- (4) редактирование через новый контекстный (тап) путь ---
+            await mobilePage.click(`${msg1Sel} .chat-message-text`);
+            await mobilePage.waitForFunction(
+              (sel) => document.querySelector(sel)?.classList.contains('chat-message--active'),
+              msg1Sel,
+              { timeout: 2000 }
+            );
+            await mobilePage.click(`${msg1Sel} .chat-message-action--edit`);
+            await mobilePage.locator('.chat-edit-bar:not(.hidden)').waitFor({ state: 'visible', timeout: 3000 });
+            const editedText = `${msg1Text}-правка`;
+            await mobilePage.fill('.chat-text-input', editedText);
+            await mobilePage.click('.chat-send-button');
+            assert.ok(await messageTextsInclude(deskPage, editedText), 'отредактированный (через тап-контекст) текст не дошёл до десктоп-участника');
+
+            // --- (5) удаление через новый контекстный (тап) путь ---
+            await mobilePage.click(`${msg2Sel} .chat-message-text`);
+            await mobilePage.waitForFunction(
+              (sel) => document.querySelector(sel)?.classList.contains('chat-message--active'),
+              msg2Sel,
+              { timeout: 2000 }
+            );
+            await mobilePage.click(`${msg2Sel} .chat-message-action--delete`);
+            await mobilePage.locator(`${msg2Sel} .chat-message-action--confirm`).waitFor({ timeout: 2000 });
+            await mobilePage.click(`${msg2Sel} .chat-message-action--delete`);
+            await waitUntil(
+              async () => (await deskPage.locator(`${msg2Sel}.chat-message--deleted`).count()) === 1,
+              { timeoutMs: 5000, message: 'удаление msg2 (через тап-контекст) не дошло до десктоп-участника' }
+            );
+
+            // --- (6а) мобильный тулбар форматирования появляется САМ по выделению ---
+            await mobilePage.fill('.chat-text-input', 'выделенный текст');
+            await mobilePage.waitForFunction(
+              () => document.querySelector('.chat-format-toolbar')?.classList.contains('hidden'),
+              undefined,
+              { timeout: 2000 }
+            );
+            await mobilePage.evaluate(() => {
+              const el = document.querySelector('.chat-text-input');
+              el.focus();
+              el.setSelectionRange(0, el.value.length);
+              document.dispatchEvent(new Event('selectionchange'));
+            });
+            await mobilePage.waitForFunction(
+              () => !document.querySelector('.chat-format-toolbar')?.classList.contains('hidden'),
+              undefined,
+              { timeout: 2000 }
+            );
+            // Схлопнули выделение (курсор без диапазона), кнопку «Aa» не жали — тулбар должен сам спрятаться.
+            await mobilePage.evaluate(() => {
+              const el = document.querySelector('.chat-text-input');
+              el.setSelectionRange(0, 0);
+              document.dispatchEvent(new Event('selectionchange'));
+            });
+            await mobilePage.waitForFunction(
+              () => document.querySelector('.chat-format-toolbar')?.classList.contains('hidden'),
+              undefined,
+              { timeout: 2000 }
+            );
+
+            // --- (6б) мобильный тулбар форматирования по кнопке «Aa», оборачивание выделения ---
+            await mobilePage.click('.chat-format-toggle-button');
+            await mobilePage.locator('.chat-format-toolbar:not(.hidden)').waitFor({ state: 'visible', timeout: 2000 });
+            await mobilePage.evaluate(() => {
+              const el = document.querySelector('.chat-text-input');
+              el.focus();
+              el.setSelectionRange(0, el.value.length);
+            });
+            await mobilePage.click('.chat-format-btn--bold');
+            const boldedValue = await mobilePage.inputValue('.chat-text-input');
+            assert.equal(boldedValue, '**выделенный текст**', `тулбар «Ж» должен обернуть выделение в ** **: ${boldedValue}`);
+            await mobilePage.click('.chat-format-toggle-button'); // снять принудительное открытие (toggle off)
+            await mobilePage.fill('.chat-text-input', '');
+
+            // --- (7) VisualViewport-подгонка под клавиатуру ---
+            const fullVvHeight = await mobilePage.evaluate(() => window.visualViewport.height);
+            const shrunkHeight = Math.round(fullVvHeight * 0.55); // "клавиатура" заняла ~45% высоты
+            await mobilePage.evaluate((h) => window.__e2eSetVisualViewport(h, 0), shrunkHeight);
+            await mobilePage.waitForFunction(
+              (h) => Math.abs(document.querySelector('.chat-panel').getBoundingClientRect().height - h) < 2,
+              shrunkHeight,
+              { timeout: 2000 }
+            );
+
+            const inputBoxShrunk = await mobilePage.locator('.chat-text-input').boundingBox();
+            assert.ok(
+              inputBoxShrunk.y + inputBoxShrunk.height <= shrunkHeight + 1,
+              `инпут должен оставаться в пределах сжатой видимой области (высота=${shrunkHeight}): ${JSON.stringify(inputBoxShrunk)}`
+            );
+
+            const scrollInfoShrunk = await mobilePage.evaluate(() => ({
+              scrollWidth: document.documentElement.scrollWidth,
+              clientWidth: document.documentElement.clientWidth,
+              scrollY: window.scrollY,
+              bodyLocked: document.body.classList.contains('chat-mobile-scroll-lock'),
+            }));
+            assert.ok(
+              scrollInfoShrunk.scrollWidth <= scrollInfoShrunk.clientWidth + 1,
+              `не должно быть горизонтального скролла при сжатой (клавиатурой) видимой области: ${JSON.stringify(scrollInfoShrunk)}`
+            );
+            assert.equal(scrollInfoShrunk.scrollY, 0, 'страница не должна скроллиться, пока открыта клавиатура');
+            assert.equal(scrollInfoShrunk.bodyLocked, true, 'body должен быть залочен от скролла, пока мобильный чат открыт на весь экран');
+
+            const messagesGapShrunk = await mobilePage.evaluate(() => {
+              const el = document.querySelector('.chat-messages');
+              return el.scrollHeight - el.scrollTop - el.clientHeight;
+            });
+            assert.ok(messagesGapShrunk < 40, `лента сообщений должна оставаться проскрolленной к низу после сжатия под клавиатуру: delta=${messagesGapShrunk}`);
+
+            // --- (8) клавиатура "закрылась" -> панель возвращается на всю высоту ---
+            await mobilePage.evaluate((h) => window.__e2eSetVisualViewport(h, 0), fullVvHeight);
+            await mobilePage.waitForFunction(
+              (h) => Math.abs(document.querySelector('.chat-panel').getBoundingClientRect().height - h) < 2,
+              fullVvHeight,
+              { timeout: 2000 }
+            );
+          } finally {
+            await deskContext.close();
+          }
         } finally {
           await mobileContext.close();
         }
@@ -2169,6 +2637,298 @@ async function main() {
         }
       }
     );
+
+    // --- Ш3: forward secrecy контента при смене состава (см.
+    //     docs/e2e-encryption.md §7) ---
+    //
+    // Ротируются ТОЛЬКО K_chat/K_meta (НЕ K_sig), и только лидером, при
+    // уходе участника (peer-left). Раздача — строго по P2P-шине (bus),
+    // никогда через сервер. `contentEpochs`/`currentContentEpoch` — обычные
+    // top-level `let`/`const` в room.js (классический скрипт, не module —
+    // тот же приём, что и с `bus`/`roomSettings` в других тестах этого
+    // файла), поэтому видны из page.evaluate() напрямую, без всякого
+    // window.__debug-моста.
+    //
+    // Собственный блок ({ ... }), а не отдельная функция — тесту нужны свои
+    // vasyaContext/vasyaPage и т.п., те же имена уже заняты (const) самым
+    // первым сценарием этого файла; блочная область видимости даёт завести
+    // их заново без конфликта, не переименовывая персонажей.
+    //
+    // Комната — через PUT /api/rooms/<id> (см. static/room.js:
+    // restoreRoomViaPut), а не POST: к этому месту файла счёт POST-запросов
+    // (H2: ROOM_CREATION_IP_LIMIT — 10 за 60с с одного IP, см.
+    // src/state.rs) уже насчитывает 10 других шагов этого файла — ещё один
+    // POST здесь мог бы упереться в лимит (не время создания растянуто
+    // равномерно: несколько «лёгких» Ш1-шагов подряд перед этим местом
+    // укладываются в куда меньше 60с). PUT восстановления комнаты, в
+    // отличие от POST её создания, НЕ проверяет этот лимит вовсе (см.
+    // src/main.rs::restore_room) — комната создаётся пустой, БЕЗ лидера:
+    // первый вошедший (Вася) станет лидером автоматически (см.
+    // src/ws.rs::JoinRoom: `!becomes_leader && room.leader_id.is_none()`),
+    // никакого leaderToken не нужно.
+    {
+      const epochRoomId = Array.from({ length: 8 }, () => 'abcdefghijklmnopqrstuvwxyz0123456789'[Math.floor(Math.random() * 36)]).join('');
+      const epochRoomKey = generateRoomKeyBase64url(); // Ш1: см. комментарий у histRoomKey выше
+      const epochRoomUrl = roomUrlWithKey(server.baseUrl, epochRoomId, epochRoomKey);
+
+      const vasyaContext = await browser.newContext();
+      const petyaContext = await browser.newContext();
+      const olyaContext = await browser.newContext();
+      // Нужен, чтобы поймать реальный fallback-фрейм 'chat' на проводе и
+      // проверить его поле `epoch` (см. шаг «fallback-конверт» ниже).
+      await installChatWsSpy(vasyaContext);
+
+      let vasyaPage, petyaPage, olyaPage;
+      let petyaPeerId = null;
+      let olyaEpoch0Raw = null;
+      let preRotationMsg = null;
+      let capturedFallbackEnc = null;
+
+      try {
+        const sceneReadyOk = await step(
+          'Ш3: Вася (лидер), Петя и Оля устанавливают mesh; Петя шлёт сообщение под эпохой 0 (для будущей проверки истории у новичка)',
+          async () => {
+            const putRes = await fetch(`${server.baseUrl}/api/rooms/${epochRoomId}`, { method: 'PUT' });
+            assert.ok(putRes.ok, `PUT /api/rooms/${epochRoomId} ответил статусом ${putRes.status}`);
+
+            vasyaPage = await vasyaContext.newPage();
+            petyaPage = await petyaContext.newPage();
+            olyaPage = await olyaContext.newPage();
+
+            // Вася входит ПЕРВОЙ и ОТДЕЛЬНО от Пети/Оли (не параллельно) —
+            // комната только что создана PUT'ом пустой, без лидера: лидером
+            // становится первый, чьё join-room сервер обработает (см.
+            // src/ws.rs выше). joinRoom() лишь кликает кнопку модалки и не
+            // дожидается ответа сервера — если бы все трое стартовали
+            // join-room без барьера, порядок обработки на сервере не был бы
+            // гарантирован. Дожидаемся короны на тайле Васи — это и есть
+            // подтверждение, что лидерство уже закреплено сервером за ней,
+            // прежде чем впускать остальных.
+            await vasyaPage.goto(epochRoomUrl);
+            await joinRoom(vasyaPage, 'Вася');
+            await waitForOverlayHidden(vasyaPage);
+            await vasyaPage.waitForFunction(
+              () => !document.querySelector('.tile--own .tile-crown')?.classList.contains('hidden'),
+              undefined,
+              { polling: 100, timeout: 5000 }
+            );
+
+            await petyaPage.goto(epochRoomUrl);
+            await olyaPage.goto(epochRoomUrl);
+            await joinRoom(petyaPage, 'Петя');
+            await joinRoom(olyaPage, 'Оля');
+            await waitForOverlayHidden(petyaPage);
+            await waitForOverlayHidden(olyaPage);
+            await waitForTileCount(vasyaPage, 3, 10_000);
+            await waitForTileCount(petyaPage, 3, 10_000);
+            await waitForTileCount(olyaPage, 3, 10_000);
+            // Шина должна быть открыта до ВСЕХ, прежде чем Оля уйдёт —
+            // иначе key-rotate от Васи к Пете лёг бы в очередь RtcPeer
+            // (доставился бы всё равно, но смазал бы тайминг проверки ниже).
+            await waitForBusOpenToAllPeers(vasyaPage);
+            await waitForBusOpenToAllPeers(petyaPage);
+            await waitForBusOpenToAllPeers(olyaPage);
+
+            petyaPeerId = await vasyaPage.evaluate(
+              () => document.querySelector('.tile[data-name="Петя"]').dataset.peerId
+            );
+            // Улика forward secrecy: сырой ключ эпохи 0, который держит Оля
+            // ДО своего ухода — ровно то, чем бы располагал настоящий
+            // ушедший участник (см. проверку «FS» ниже).
+            olyaEpoch0Raw = await olyaPage.evaluate(() => Array.from(contentEpochs.get(0).raw));
+
+            await openChatPanel(vasyaPage);
+            await openChatPanel(petyaPage);
+            await openChatPanel(olyaPage);
+            preRotationMsg = `Ш3-до-ротации-эпоха0-${Date.now()}`;
+            await sendChatMessage(petyaPage, preRotationMsg);
+            assert.ok(
+              await messageTextsInclude(vasyaPage, preRotationMsg),
+              'Вася должен был увидеть сообщение Пети до ротации (эпоха 0, живой mesh)'
+            );
+          }
+        );
+
+        const rotatedOk =
+          sceneReadyOk &&
+          (await step(
+            'Ш3: Оля уходит (peer-left) — Вася (лидер) ротирует контентные ключи; эпоха инкрементнулась и разошлась по шине Пете',
+            async () => {
+              await olyaPage.click('#leave-button');
+              // olyaContext закрывается один раз, в общем finally этого
+              // блока ниже — не здесь, чтобы не рисковать двойным close(),
+              // если этот шаг вообще не выполнится (sceneReadyOk === false).
+
+              await waitForTileCount(vasyaPage, 2, 8000);
+              await waitForTileCount(petyaPage, 2, 8000);
+
+              await waitUntil(async () => (await vasyaPage.evaluate(() => currentContentEpoch === 1)), {
+                timeoutMs: 5000,
+                message: 'у Васи (лидера) currentContentEpoch не стал 1 после ухода Оли',
+              });
+              await waitUntil(async () => (await petyaPage.evaluate(() => currentContentEpoch === 1)), {
+                timeoutMs: 5000,
+                message: 'у Пети currentContentEpoch не стал 1 — не дошёл key-rotate от лидера по шине?',
+              });
+
+              const vasyaEpochCount = await vasyaPage.evaluate(() => contentEpochs.size);
+              const petyaEpochCount = await petyaPage.evaluate(() => contentEpochs.size);
+              assert.equal(vasyaEpochCount, 2, `у Васи должно быть известно 2 эпохи (0 и 1), получено ${vasyaEpochCount}`);
+              assert.equal(petyaEpochCount, 2, `у Пети должно быть известно 2 эпохи (0 и 1), получено ${petyaEpochCount}`);
+
+              // K_sig НЕ ротируется (см. docs/e2e-encryption.md §7.1) —
+              // sigKey остаётся тем же самым объектом на всю жизнь комнаты.
+              const sigUnchanged = await vasyaPage.evaluate(() => typeof sigKey === 'object' && sigKey !== null);
+              assert.equal(sigUnchanged, true, 'sigKey должен остаться валидным CryptoKey (K_sig не ротируется)');
+            }
+          ));
+
+        const fallbackEpochOk =
+          rotatedOk &&
+          (await step(
+            'Ш3: fallback-конверт чата после ротации несёт epoch:1 и Петя корректно его расшифровывает новой эпохой',
+            async () => {
+              // Шина между Васей и Петей и так открыта — форсируем именно
+              // серверный fallback-путь, временно "притворяясь", что канал
+              // к Пете закрыт (единственный воспроизводимый способ проверить
+              // реальный fallback у уже устоявшегося mesh, не разрывая его
+              // по-настоящему).
+              await vasyaPage.evaluate((pid) => {
+                window.__e2eRealBusIsOpen = bus.isOpen.bind(bus);
+                bus.isOpen = (id) => (id === pid ? false : window.__e2eRealBusIsOpen(id));
+              }, petyaPeerId);
+
+              const fallbackMsg = `Ш3-fallback-эпоха1-${Date.now()}`;
+              try {
+                await sendChatMessage(vasyaPage, fallbackMsg);
+                assert.ok(
+                  await messageTextsInclude(petyaPage, fallbackMsg),
+                  'Петя должен был получить и расшифровать fallback-сообщение под новой эпохой'
+                );
+              } finally {
+                await vasyaPage.evaluate(() => {
+                  bus.isOpen = window.__e2eRealBusIsOpen;
+                  delete window.__e2eRealBusIsOpen;
+                });
+              }
+
+              const chatFrames = await chatFramesSentOn(vasyaPage);
+              const targeted = chatFrames.filter(
+                (f) => f.targetPeerId === petyaPeerId && f.envelope && f.envelope.enc
+              );
+              assert.ok(
+                targeted.length > 0,
+                `не нашли ни одного fallback-фрейма 'chat' к Пете: ${JSON.stringify(chatFrames)}`
+              );
+              const lastFrame = targeted[targeted.length - 1];
+              assert.equal(
+                lastFrame.envelope.epoch,
+                1,
+                `fallback-конверт должен нести epoch:1 (текущая эпоха после ротации), получено: ${JSON.stringify(lastFrame.envelope)}`
+              );
+              capturedFallbackEnc = lastFrame.envelope.enc;
+            }
+          ));
+
+        if (fallbackEpochOk) {
+          await step(
+            'Ш3 (forward secrecy): ушедшая Оля (держит только ключ эпохи 0) НЕ может расшифровать конверт новой эпохи',
+            async () => {
+              assert.ok(capturedFallbackEnc, 'нет захваченного зашифрованного конверта новой эпохи из предыдущего шага');
+              const olyaCanStillDecrypt = await vasyaPage.evaluate(async ({ rawArr, enc }) => {
+                const raw = new Uint8Array(rawArr);
+                const keys = await RoomCrypto.deriveContentKeys(raw);
+                try {
+                  await RoomCrypto.decrypt(keys.chat, enc);
+                  return true; // расшифровалось бы — это и была бы поломанная FS
+                } catch (err) {
+                  return false;
+                }
+              }, { rawArr: olyaEpoch0Raw, enc: capturedFallbackEnc });
+              assert.equal(
+                olyaCanStillDecrypt,
+                false,
+                'ушедшая Оля (только ключ эпохи 0) смогла расшифровать конверт новой эпохи — forward secrecy нарушена'
+              );
+            }
+          );
+        } else {
+          skip('Ш3 (forward secrecy): ушедшая Оля не может расшифровать конверт новой эпохи', 'предыдущий шаг (fallback-конверт) не прошёл');
+        }
+
+        if (rotatedOk) {
+          const igorContext = await browser.newContext();
+          let igorPage;
+          try {
+            const igorReadyOk = await step(
+              'Ш3: новичок Игорь входит ПОСЛЕ ротации — запрашивает и получает текущую эпоху у лидера по шине (key-request/key-rotate)',
+              async () => {
+                igorPage = await igorContext.newPage();
+                await igorPage.goto(epochRoomUrl);
+                await joinRoom(igorPage, 'Игорь');
+                await waitForOverlayHidden(igorPage);
+                await waitForTileCount(igorPage, 3, 10_000);
+
+                await waitUntil(async () => (await igorPage.evaluate(() => currentContentEpoch === 1)), {
+                  timeoutMs: 8000,
+                  message: 'Игорь не получил текущую эпоху (1) от лидера по key-request/key-rotate',
+                });
+              }
+            );
+
+            if (igorReadyOk) {
+              await step('Ш3: Игорь видит историю чата под эпохой 0 (сообщение, отправленное до ротации)', async () => {
+                await openChatPanel(igorPage);
+                assert.ok(
+                  await messageTextsInclude(igorPage, preRotationMsg, 8000),
+                  'Игорь должен был увидеть историческое сообщение (эпоха 0), полученное по DataChannel'
+                );
+              });
+
+              await step(
+                'Ш3: Игорь получает и корректно расшифровывает НОВЫЙ fallback-конверт под текущей (уже не нулевой) эпохой',
+                async () => {
+                  const igorPeerId = await vasyaPage.evaluate(
+                    () => document.querySelector('.tile[data-name="Игорь"]')?.dataset.peerId
+                  );
+                  assert.ok(igorPeerId, 'у Васи не нашёлся тайл Игоря');
+
+                  await vasyaPage.evaluate((pid) => {
+                    window.__e2eRealBusIsOpen = bus.isOpen.bind(bus);
+                    bus.isOpen = (id) => (id === pid ? false : window.__e2eRealBusIsOpen(id));
+                  }, igorPeerId);
+
+                  const msgToIgor = `Ш3-новичку-эпоха1-${Date.now()}`;
+                  try {
+                    await sendChatMessage(vasyaPage, msgToIgor);
+                    assert.ok(
+                      await messageTextsInclude(igorPage, msgToIgor),
+                      'Игорь должен был расшифровать fallback-сообщение под текущей эпохой сразу после входа'
+                    );
+                  } finally {
+                    await vasyaPage.evaluate(() => {
+                      bus.isOpen = window.__e2eRealBusIsOpen;
+                      delete window.__e2eRealBusIsOpen;
+                    });
+                  }
+                }
+              );
+            } else {
+              skip('Ш3: Игорь видит историю чата под эпохой 0', 'новичок не получил текущую эпоху');
+              skip('Ш3: Игорь получает новый fallback-конверт под текущей эпохой', 'новичок не получил текущую эпоху');
+            }
+          } finally {
+            await igorContext.close();
+          }
+        } else {
+          skip('Ш3: новичок входит после ротации и получает текущую эпоху', 'ротация ключей не удалась на предыдущем шаге');
+        }
+      } finally {
+        await vasyaContext.close();
+        await petyaContext.close();
+        await olyaContext.close();
+      }
+    }
 
     // --- M2: заголовки Cloudflare Pages (_headers) ---
     //
