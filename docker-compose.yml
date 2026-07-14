@@ -1,0 +1,68 @@
+# Self-host in one command: `docker compose up -d`, then open http://localhost:3000
+#
+# This runs the single Rust/axum binary that serves both the WebSocket
+# signaling relay and the static frontend from the SAME origin — static/config.js
+# defaults to `window.API_BASE = location.origin`, so nothing needs
+# configuring for the common case (one machine, one origin).
+#
+# No database, no volumes: everything the server keeps (rooms, peers) lives
+# in memory only and disappears on restart — this is by design (see README
+# "Privacy"), not a limitation of this compose file.
+#
+# For a domain with HTTPS or LAN access from other devices, camera/mic
+# require a "secure context" — see the Self-hosting section of README.md.
+
+services:
+  chat:
+    build: .
+    # Alternative to `build: .` once images are published to a registry:
+    # image: ghcr.io/<you>/chat:latest
+    container_name: chat
+    restart: unless-stopped
+    ports:
+      # host:container — change the left side (e.g. "8080:8080") if 3000
+      # is already taken on your machine. The container always listens on
+      # the port from the PORT env below (default 8080).
+      - "3000:8080"
+    environment:
+      # Port the binary listens on INSIDE the container. Only change this
+      # together with the container-side number in `ports:` above.
+      PORT: "8080"
+
+      # Cross-origin CORS header, only needed if the frontend is served
+      # from a DIFFERENT origin than this API (e.g. a separate static
+      # host). Leave unset for the default self-host setup (one origin).
+      # CORS_ORIGIN: "https://your-domain.example"
+
+      # Room lifecycle knobs — all optional, defaults are sane for
+      # self-hosting. Uncomment to override.
+      # MAX_ROOM_LIFETIME_SECONDS: "10800"   # hard cap per room, default 3h
+      # EMPTY_ROOM_TTL_SECONDS: "300"        # how long an empty room lingers
+      # MAX_ROOMS: "1000"                    # ceiling on concurrent rooms (DoS guard)
+
+      # --- TURN (optional) ---------------------------------------------
+      # STUN alone (the default, no config needed) is enough for most
+      # networks. Add a TURN server only if some of your users sit behind
+      # symmetric NAT / restrictive firewalls and can't connect peer-to-peer.
+      # This does NOT run a TURN server for you — point it at one you
+      # already run (e.g. coturn/eturnal) or a hosted TURN provider.
+      #
+      # Preferred: ephemeral HMAC credentials (TURN_STATIC_SECRET must match
+      # your TURN server's static-auth-secret; a fresh username/credential
+      # pair is minted per /config call and expires in 1h):
+      # TURN_URL: "turn:your-turn-server.example:3478"
+      # TURN_STATIC_SECRET: "change-me-shared-secret"
+      #
+      # Fallback: fixed username/password instead of TURN_STATIC_SECRET
+      # (works, but the same credential is handed to every visitor):
+      # TURN_USERNAME: "webrtc"
+      # TURN_PASSWORD: "change-me"
+    healthcheck:
+      # distroless/cc ships no shell/curl of its own; the image bakes in a
+      # single static busybox (see Dockerfile) purely so this check can run
+      # from inside the container. Probes GET /healthz on the container port.
+      test: ["CMD", "/bin/busybox", "sh", "-c", "/bin/busybox wget -q -O /dev/null http://127.0.0.1:${PORT:-8080}/healthz || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
