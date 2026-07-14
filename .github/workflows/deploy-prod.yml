@@ -17,7 +17,8 @@ concurrency: { group: deploy-prod, cancel-in-progress: false }
 permissions: { contents: read }
 jobs:
   # Красные тесты не пускают деплой: протокол сигналинга гоняется целиком
-  # (тест сам собирает и поднимает сервер). Браузерный e2e в CI не гоняем.
+  # (тест сам собирает и поднимает сервер). Браузерный e2e — отдельным
+  # job `e2e` ниже (тоже гейтит деплой).
   test:
     runs-on: ubuntu-latest
     steps:
@@ -28,8 +29,11 @@ jobs:
       - name: Тесты протокола сигналинга (включает cargo build)
         run: node tests/signaling.test.mjs
 
-  # Браузерный e2e-гейт: тот же basic.spec.mjs, что локально — стабы медиа
+  # Браузерный e2e-гейт: те же basic/resilience, что локально — стабы медиа
   # синтетические по умолчанию, Chrome на ubuntu-раннере предустановлен.
+  # basic и resilience гоняются РАЗДЕЛЬНЫМИ запусками (отдельные node-процессы):
+  # при цепочке в одну команду resilience флачит — порты/контексты предыдущего
+  # сьюта не успевают освободиться; отдельные процессы освобождают их на выходе.
   e2e:
     runs-on: ubuntu-latest
     steps:
@@ -37,10 +41,12 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
       - uses: Swatinem/rust-cache@v2
+      - name: Установка зависимостей e2e
+        run: cd tests/e2e && npm install --no-audit --no-fund
       - name: Браузерный e2e (basic)
-        run: |
-          cd tests/e2e && npm install --no-audit --no-fund
-          node basic.spec.mjs
+        run: cd tests/e2e && node basic.spec.mjs
+      - name: Браузерный e2e (resilience) — отдельным запуском
+        run: cd tests/e2e && node resilience.spec.mjs
 
   deploy:
     needs: [test, e2e]
