@@ -37,9 +37,17 @@ terms, the server never has access to:
 - File contents, images, or audio clips shared in chat — transferred over a
   dedicated peer-to-peer data channel; never proxied through the server
   under any circumstance, including when a direct connection can't be
-  established (see [`chat.md` §10](chat.md#10-file-transfer)).
+  established (see [`chat.md` §10](chat.md#10-file-transfer)). None of this
+  is downloaded even peer-to-peer until the recipient explicitly clicks —
+  a fresh offer shows only a name and size, so a bystander glancing at the
+  server's traffic timing learns nothing about which attachments anyone
+  actually opened.
 - Participants' display names — encrypted client-side before being sent in
   `join-room` (see [`e2e-encryption.md`](e2e-encryption.md)).
+- A room's own name, if its creator gave it one — unlike a participant's
+  name, it isn't merely encrypted before being sent, it is never sent to the
+  server at all, encrypted or otherwise (see [§4](#4-anonymity) for where it
+  actually lives).
 - SDP offers/answers and ICE candidates — encrypted client-side; the server
   relays opaque ciphertext blobs, not real connection descriptions.
 
@@ -111,10 +119,27 @@ survives a redeploy from a user's perspective.
 - **No accounts, no login, ever.** There is nothing to register for and
   nothing to authenticate against beyond possessing the meeting link.
 - **No cookies, no `localStorage`, no cross-session identifier of any
-  kind**, anywhere in the frontend. A display name is entered fresh in a
-  join modal every single time a participant enters a meeting — it is never
+  kind**, anywhere in the frontend. The join modal's name field comes
+  pre-filled with a randomly generated pseudonym (e.g. `🦊 Brave Fox`) —
+  picked entirely client-side, via `crypto.getRandomValues`, before Join is
+  even clicked, so the suggestion itself never touches the network. A
+  participant is free to keep it, edit it, or clear the field back to
+  anonymous, exactly as before; whatever is finally submitted still lives
+  only in that tab's memory for the meeting's duration — it is never
   remembered between visits, and it never leaves the browser except as
   ciphertext (see [`e2e-encryption.md`](e2e-encryption.md)).
+- **A room's name is a creator-only convenience that never becomes shared
+  state.** The creator's own link carries an optional, locally generated
+  name (the same kind of client-side suggestion as above, e.g. `🌿 Quiet
+  Meadow`) in the URL fragment next to the room key — read back out of that
+  fragment only in the creator's own tab, and shown only in that tab's title
+  and header. It is stripped from the address bar immediately, and it is
+  never copied into the invite link the creator shares, so guests never
+  receive it and the server never sees it, in any form. One consequence of
+  keeping it in the fragment rather than in any persistent storage: reloading
+  the creator's own tab loses the name, the same way it loses the one-time
+  leader token — a deliberate trade-off for adding zero new client-side
+  storage.
 - Every identifier a client has during a meeting (its peer id, in
   particular) is generated fresh for that session and held only in memory —
   it is not derived from, or correlatable with, anything from a previous
@@ -133,7 +158,13 @@ participants to trust a document:
   peer-to-peer or via a TURN relay — computed
   from real connection statistics (see
   [`webrtc-mesh.md` §7](webrtc-mesh.md#7-connection-mode-detection)), not
-  assumed.
+  assumed. The same per-peer read also surfaces a live transfer speed and
+  round-trip time, refreshed every few seconds, and the tile grid mirrors a
+  simplified version of the speed as a small badge on each participant's own
+  video. All of it comes from the browser's local `RTCPeerConnection.getStats()`
+  — a client-side measurement of a connection the browser already holds, not
+  a new signal sent anywhere; nothing about it reaches the server or any
+  other participant.
 - A plain-language list of exactly what the server can see (matching
   [§2](#2-what-the-server-does-see) above), plus a **live session counter**
   for how many messages actually went through the server-relayed signaling

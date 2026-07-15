@@ -13,9 +13,10 @@
 'use strict';
 
 // --- Анонимность: leaderToken из фрагмента ссылки (см. static/landing.js —
-// POST /api/rooms -> редирект на /r/<id>#lt=<token>&k=<key>) читается ДО ВСЕГО
-// остального. Из адресной строки вычищается ТОЛЬКО одноразовый #lt (после
-// первого join он сожжён сервером и бесполезен, светить его незачем).
+// POST /api/rooms -> редирект на /r/<id>#lt=<token>&k=<key>&n=<имя>) читается
+// ДО ВСЕГО остального. Из адресной строки вычищается ТОЛЬКО одноразовый #lt
+// (после первого join он сожжён сервером и бесполезен, светить его незачем)
+// и #n (см. ниже).
 //
 // Ключ комнаты #k СОЗНАТЕЛЬНО ОСТАЁТСЯ в адресной строке: ссылка = ключ по
 // самой модели (ей и делятся), а сохранение k в URL позволяет пережить F5 —
@@ -27,20 +28,49 @@
 // ЖЕ — до того, как страница успела показать что-либо, и до какого-либо
 // обращения к сигналингу; от него выводятся sigKey (сигналинг) и metaKey
 // (имя участника) — см. deriveRoomKeys. Оба неизменны на всю жизнь комнаты.
-const { initialLeaderToken, roomKeyBase64url } = (() => {
+//
+// `n` — имя комнаты, которое ввёл СОЗДАТЕЛЬ на лендинге (см. static/landing.js,
+// static/namegen.js). Кладётся в одноразовый фрагмент точно как `lt` и по той
+// же причине вычищается тем же history.replaceState: сервер и гости имя
+// комнаты не видят вовсе (buildShareLink собирает инвайт-ссылку заново из
+// одного `k`), а у создателя оно живёт только до первого F5 — осознанный
+// trade-off, симметричный `lt`. Битый percent-encoding (напр. от ручного
+// редактирования URL) не должен ронять страницу — decodeURIComponent в
+// try/catch, при ошибке имя просто отсутствует (null).
+const { initialLeaderToken, roomKeyBase64url, initialRoomName } = (() => {
   const hash = location.hash;
   const ltMatch = hash.match(/(?:^|[&#])lt=([^&]+)/);
   const kMatch = hash.match(/(?:^|[&#])k=([^&]+)/);
+  const nMatch = hash.match(/(?:^|[&#])n=([^&]+)/);
   const lt = ltMatch ? decodeURIComponent(ltMatch[1]) : null;
   // `k` — base64url, состоит только из URL-safe символов (A-Za-z0-9-_) —
   // decodeURIComponent не нужен (и вреден не был бы, но не нужен).
   const k = kMatch ? kMatch[1] : null;
-  if (lt) {
-    // Пересобираем фрагмент без lt, сохраняя k.
+  let n = null;
+  if (nMatch) {
+    try {
+      n = decodeURIComponent(nMatch[1]);
+    } catch (err) {
+      n = null; // битый percent-encoding — просто без имени, страницу не роняем
+    }
+  }
+  if (lt || n) {
+    // Пересобираем фрагмент без lt и n, сохраняя k.
     history.replaceState(null, '', location.pathname + location.search + (k ? `#k=${k}` : ''));
   }
-  return { initialLeaderToken: lt, roomKeyBase64url: k };
+  return { initialLeaderToken: lt, roomKeyBase64url: k, initialRoomName: n };
 })();
+
+// --- Локальный рендер имени комнаты (только у создателя, см. комментарий
+// выше про `n`) — делаем это СРАЗУ, до init(), чтобы заголовок вкладки и
+// шапка не мигали дефолтным текстом. Гости initialRoomName не получают вовсе
+// (в их ссылке `n` никогда не было), поэтому у них .room-logo/title остаются
+// дефолтными.
+if (initialRoomName) {
+  document.title = `${initialRoomName} — video call`;
+  const roomLogoEl = document.querySelector('.room-logo');
+  if (roomLogoEl) roomLogoEl.textContent = initialRoomName;
+}
 
 // --- DOM ---
 const joinModalEl = document.getElementById('join-modal');
@@ -54,6 +84,7 @@ const overlayTextEl = document.getElementById('overlay-text');
 const overlayActionButtonEl = document.getElementById('overlay-action-button');
 const participantCountEl = document.getElementById('participant-count');
 const roomTimerEl = document.getElementById('room-timer');
+const topbarSasEl = document.getElementById('topbar-sas');
 const screenStageEl = document.getElementById('screen-stage');
 const screenVideoEl = document.getElementById('screen-video');
 const screenCaptionEl = document.getElementById('screen-caption');
@@ -289,8 +320,19 @@ function stopRoomTimer() {
 const peers = new Map();
 // peerId -> имя (включая себя не храним — своё имя в myName).
 const peerNames = new Map();
+// peerId -> { bytesSent, bytesReceived, ts } — снимок счётчиков transport-статы
+// с ПРЕДЫДУЩЕГО тика единого поллера скоростей (PEER_STATS_REFRESH_MS, см.
+// pollPeerStats/computePeerConnectionStats дальше в файле) — точка отсчёта
+// для расчёта скорости in/out между тиками. Чистим запись при уходе пира
+// (removeRemotePeer) — иначе, если тот же peerId переиспользуется в новом
+// соединении, скорость на первом тике посчиталась бы от чужих старых байт.
+const peerStatsHistory = new Map();
 // Свой тайл (создаётся сразу после joined).
 let ownTile = null;
+// Объект тайла (как из createTile), сейчас развёрнутый на всю страницу
+// кликом (см. maximizeTile/unmaximizeTile), либо null. Одновременно
+// максимизирован только один тайл — свой или чужой.
+let maximizedTile = null;
 
 // --- Права и лидер (см. docs/permissions-and-leader.md) ---
 let leaderId = null;
@@ -687,7 +729,17 @@ function createTile(peerId, name, isOwn) {
   const letter = document.createElement('span');
   letter.className = 'tile-placeholder-letter';
   const trimmedName = (name || '').trim();
-  letter.textContent = trimmedName ? trimmedName.charAt(0).toUpperCase() : '?';
+  // Первый графем-кластер, а не charAt(0): на имени, начинающемся с эмоджи
+  // (см. static/namegen.js: userName()), charAt(0) вернул бы половину
+  // суррогатной пары («�»). Intl.Segmenter — точный способ; фолбэк [...str][0]
+  // берёт первую код-точку целиком (корректно для однокодпойнтных эмодзи
+  // ANIMALS, см. namegen.js). toUpperCase() на эмодзи — no-op, это ок.
+  const firstGrapheme = trimmedName
+    ? (typeof Intl !== 'undefined' && Intl.Segmenter
+        ? [...new Intl.Segmenter().segment(trimmedName)][0]?.segment
+        : [...trimmedName][0])
+    : null;
+  letter.textContent = firstGrapheme ? firstGrapheme.toUpperCase() : '?';
   placeholder.appendChild(letter);
 
   const label = document.createElement('div');
@@ -710,11 +762,21 @@ function createTile(peerId, name, isOwn) {
   micOff.setAttribute('aria-hidden', 'true');
   micOff.innerHTML = MIC_OFF_ICON_SVG; // статичная разметка, не пользовательские данные
 
+  // Бейдж скорости (см. static/style.css: .tile-speed, static/room.js:
+  // updateTileSpeedBadges) — скрыт по умолчанию: скорость известна не раньше
+  // первого тика поллера скоростей, где для этого пира уже набралось два
+  // снимка трафика (см. pollPeerStats). Свободный угол — правый нижний
+  // (левый нижний занят .tile-name, оба верхних — короной/микрофоном).
+  const speed = document.createElement('span');
+  speed.className = 'tile-speed hidden';
+  speed.setAttribute('aria-hidden', 'true');
+
   tile.appendChild(video);
   tile.appendChild(placeholder);
   tile.appendChild(label);
   tile.appendChild(crown);
   tile.appendChild(micOff);
+  tile.appendChild(speed);
 
   if (isOwn) {
     tilesGridEl.prepend(tile);
@@ -722,7 +784,69 @@ function createTile(peerId, name, isOwn) {
     tilesGridEl.appendChild(tile);
   }
 
-  return { root: tile, videoEl: video, placeholderEl: placeholder, labelEl: label, crownEl: crown, micOffEl: micOff };
+  const tileObj = { root: tile, videoEl: video, placeholderEl: placeholder, labelEl: label, crownEl: crown, micOffEl: micOff, speedEl: speed };
+
+  // Клик по тайлу — тоггл «на всю страницу» (см. maximizeTile/unmaximizeTile
+  // и .tile--maximized в style.css). Вешаем один раз тут, а не глобальным
+  // делегированием на #tiles-grid, — у тайла и так уже есть замыкание на
+  // свои videoEl/tileObj, лишний обход DOM не нужен. closest('button') — на
+  // будущее: если внутри тайла появятся кнопки, клик по ним не должен
+  // тоглить максимизацию.
+  tile.addEventListener('click', (event) => {
+    if (event.target.closest('button')) return;
+    if (maximizedTile === tileObj) {
+      unmaximizeTile();
+    } else if (!video.classList.contains('hidden')) {
+      // Максимизировать есть смысл только когда видео реально показывается —
+      // на голой заглушке (аватар-плейсхолдер) разворачивать нечего.
+      maximizeTile(tileObj);
+    }
+  });
+
+  return tileObj;
+}
+
+/**
+ * Развернуть тайл на всю страницу поверх всего интерфейса. Сознательно
+ * простой fixed-оверлей (см. .tile--maximized), а НЕ Fullscreen API:
+ * во-первых, по заданию это тоггл «на всю страницу» (в пределах вкладки), а
+ * не «на весь экран» — F11-подобный режим не нужен и был бы неожиданным для
+ * пользователя; во-вторых, полноэкранный показ шаринга экрана
+ * (#screen-fullscreen-button/requestFullscreenCompat) — это ДРУГАЯ сцена и
+ * другой механизм (настоящий Fullscreen API), им незачем пересекаться:
+ * fixed-оверлей просто рисуется поверх (z-index выше всего остального) и не
+ * лезет в top-layer браузера.
+ */
+function maximizeTile(tile) {
+  if (maximizedTile === tile) return;
+  if (maximizedTile) unmaximizeTile(); // защита: максимизированным может быть только один тайл одновременно
+  maximizedTile = tile;
+  tile.root.classList.add('tile--maximized');
+  document.addEventListener('keydown', onMaximizedTileKeydown);
+}
+
+/** Свернуть текущий максимизированный тайл обратно в грид. */
+function unmaximizeTile() {
+  if (!maximizedTile) return;
+  maximizedTile.root.classList.remove('tile--maximized');
+  maximizedTile = null;
+  document.removeEventListener('keydown', onMaximizedTileKeydown);
+}
+
+function onMaximizedTileKeydown(event) {
+  if (event.key === 'Escape') unmaximizeTile();
+}
+
+/**
+ * Авто-выход из максимизации, если у ЭТОГО тайла видео только что скрылось
+ * (выключили камеру/трек пропал), пока тайл был развёрнут — иначе останется
+ * чёрный полноэкранный оверлей без картинки, из которого обычный пользователь
+ * без Esc не выйдет. Вызывается из всех мест, где скрывается video конкретного
+ * тайла — showTileVideo(peerId, false) для чужих тайлов и ручные тоглы
+ * ownTile.videoEl (кнопка камеры, guest enforcement) для своего.
+ */
+function exitMaximizeIfHidden(tile, show) {
+  if (!show && maximizedTile === tile) unmaximizeTile();
 }
 
 /** Показать/скрыть значок «микрофон выключен» на конкретном объекте тайла (свой ownTile или peers.get(id).tile). */
@@ -800,6 +924,7 @@ function showTileVideo(peerId, show) {
   if (!entry) return;
   entry.tile.videoEl.classList.toggle('hidden', !show);
   entry.tile.placeholderEl.classList.toggle('hidden', show);
+  exitMaximizeIfHidden(entry.tile, show);
 }
 
 // ---------- Экран (главная зона) ----------
@@ -894,6 +1019,7 @@ function applyGuestEnforcement() {
     if (ownTile) {
       ownTile.videoEl.classList.add('hidden');
       ownTile.placeholderEl.classList.remove('hidden');
+      exitMaximizeIfHidden(ownTile, false);
     }
     broadcastStreamEnabled(camStream, 'camera', false);
   }
@@ -1032,17 +1158,19 @@ function openSettingsPanel() {
   syncSettingsPanelInputs();
   refreshDeviceLists();
   refreshConnectionSection();
-  if (connectionSectionTimer) clearInterval(connectionSectionTimer);
-  connectionSectionTimer = setInterval(refreshConnectionSection, CONNECTION_SECTION_REFRESH_MS);
+  // Список пиров — сразу из кеша поллера скоростей (см. PEER_STATS_REFRESH_MS/
+  // pollPeerStats), не дожидаясь его следующего тика: поллер тикает постоянно
+  // и независимо от панели, но между появлением пира и первым тиком кеш мог
+  // быть ещё пуст (renderPeerConnectionsList сама учитывает это, показывая
+  // «устанавливается»). Пока панель открыта, дальше всё обновляет тик поллера
+  // (и refreshConnectionSection, и список пиров) — отдельного таймера у
+  // панели нет, весь ритм страницы — единый, раз в 3 секунды.
+  renderPeerConnectionsList();
   settingsPanelEl.classList.remove('hidden');
 }
 
 function closeSettingsPanel() {
   settingsPanelEl.classList.add('hidden');
-  if (connectionSectionTimer) {
-    clearInterval(connectionSectionTimer);
-    connectionSectionTimer = null;
-  }
 }
 
 // ---------- «Соединение и приватность»: режим по каждому пиру + что видит сервер ----------
@@ -1053,15 +1181,22 @@ function closeSettingsPanel() {
 //   1) статичная строка шифрования — из RoomCrypto.getCryptoInfo(), НЕ
 //      хардкодим текст алгоритма (см. static/crypto.js);
 //   2) режим соединения с каждым пиром — P2P/TURN-релей/серверный fallback/
-//      устанавливается — см. computePeerConnectionMode ниже;
+//      устанавливается — см. computePeerConnectionStats ниже (там же —
+//      трафик in/out и RTT из того же statsReport);
 //   3) статичный список того, что видит сервер, плюс счётчики за сессию
 //      (см. static/common.js: ConnStats — инкрементируется в местах реальной
 //      отправки через signaling.send в rtc.js/room.js/chat.js).
-// Обновляется при открытии шита и раз в CONNECTION_SECTION_REFRESH_MS, пока
-// шит открыт — таймер чистится в closeSettingsPanel() выше.
-
-const CONNECTION_SECTION_REFRESH_MS = 5000;
-let connectionSectionTimer = null;
+//
+// Обновляется вся секция ЕДИНЫМ поллером скоростей (PEER_STATS_REFRESH_MS,
+// см. ниже, у renderPeerConnectionsList) — раз в 3 секунды, других
+// периодических таймеров у панели настроек нет. Поллер тикает ВСЕГДА, а не
+// только пока открыта эта панель: те же цифры нужны бейджам скорости на
+// тайлах (см. updateTileSpeedBadges), которые видны независимо от настроек.
+// При открытой панели тик дополнительно перерисовывает и дешёвые части (1 и 3
+// — refreshConnectionSection, без getStats), и список пиров (2).
+// renderPeerConnectionsList() при этом не дёргает getStats() сама — только
+// читает готовый кеш поллера (peerLastStats), так что на одного пира за тик
+// существует ровно один вызов getStats(), даже если панель настроек открыта.
 
 const PEER_MODE_LABELS = {
   p2p: 'direct (P2P)',
@@ -1115,30 +1250,126 @@ function candidatePairMode(pair, statsReport) {
 }
 
 /**
- * Режим соединения с одним пиром — приоритет ровно как в задании:
+ * Байтовый счётчик транспорта пары (peerConnection, а не одного кандидата) —
+ * запись type==='transport' покрывает ВЕСЬ DTLS-трафик соединения: медиа
+ * (audio/video RTP) И датаканалы (файлы, чат, бас-протокол), поэтому это
+ * честный in/out для пира. Если браузер такую запись не отдал (старый
+ * Firefox), фоллбэк — сумма outbound-rtp/inbound-rtp записей, это только
+ * медиа без датаканалов, но лучше, чем ничего.
+ */
+function findTransportBytes(statsReport) {
+  for (const stat of statsReport.values()) {
+    if (stat.type === 'transport' && (typeof stat.bytesSent === 'number' || typeof stat.bytesReceived === 'number')) {
+      return { bytesSent: stat.bytesSent || 0, bytesReceived: stat.bytesReceived || 0 };
+    }
+  }
+  let bytesSent = null;
+  let bytesReceived = null;
+  for (const stat of statsReport.values()) {
+    if (stat.type === 'outbound-rtp' && typeof stat.bytesSent === 'number') {
+      bytesSent = (bytesSent || 0) + stat.bytesSent;
+    } else if (stat.type === 'inbound-rtp' && typeof stat.bytesReceived === 'number') {
+      bytesReceived = (bytesReceived || 0) + stat.bytesReceived;
+    }
+  }
+  return { bytesSent, bytesReceived };
+}
+
+/**
+ * Режим + трафик + RTT соединения с одним пиром — единый обход ОДНОГО
+ * statsReport (второй getStats() на пира не делаем, дорогая операция).
+ * Режим — приоритет ровно как в задании:
  *  1) есть selected candidate-pair -> 'p2p' (host/srflx/prflx с обеих
- *     сторон) или 'turn' (кто-то из пары — relay);
+ *     сторон) или 'turn' (кто-то из пары — relay); тут же берём RTT —
+ *     currentRoundTripTime у candidate-pair, секунды -> мс;
  *  2) пары ещё нет и DataChannel-шина к пиру не открыта -> 'fallback'
  *     (весь трафик до пира — через серверный релей: signaling.send для
  *     ещё не устаканившегося mesh);
  *  3) иначе (пары нет, но шина каким-то образом уже открыта — гоночный
  *     край, в норме недостижимо) -> 'connecting'.
+ * bytesSent/bytesReceived — null, если статы получить не удалось вовсе
+ * (см. catch) или транспорт/rtp-записей не нашлось.
  */
-async function computePeerConnectionMode(peerId, entry) {
+async function computePeerConnectionStats(peerId, entry) {
   const pc = entry.rtc && entry.rtc.pc;
-  if (!pc) return 'connecting';
+  if (!pc) return { mode: 'connecting', rtt: null, bytesSent: null, bytesReceived: null };
   try {
     const statsReport = await pc.getStats();
     const pair = findSelectedCandidatePair(statsReport);
-    if (pair) return candidatePairMode(pair, statsReport);
+    const { bytesSent, bytesReceived } = findTransportBytes(statsReport);
+    const rtt = pair && typeof pair.currentRoundTripTime === 'number' ? pair.currentRoundTripTime * 1000 : null;
+    const mode = pair ? candidatePairMode(pair, statsReport) : (bus.isOpen(peerId) ? 'connecting' : 'fallback');
+    return { mode, rtt, bytesSent, bytesReceived };
   } catch (err) {
     console.warn(`[peer ${peerId}] getStats() для секции настроек не удался:`, err);
   }
-  return bus.isOpen(peerId) ? 'connecting' : 'fallback';
+  return { mode: bus.isOpen(peerId) ? 'connecting' : 'fallback', rtt: null, bytesSent: null, bytesReceived: null };
 }
 
-/** Перерисовать список «Соединения с участниками» — режим у каждого пира считается асинхронно (getStats), поэтому вся отрисовка целиком после Promise.all, без мигания частично готового списка. */
-async function renderPeerConnectionsList() {
+/**
+ * Адаптивный формат размера: B / KB / MB (база 1024). Целые байты без
+ * дробной части (мелкие числа не нуждаются в точности до десятых), КБ/МБ —
+ * с одним знаком после запятой. Используется и для накопленного объёма
+ * (`formatBytesCompact(4404019)` -> «4.2 MB»), и — с дописанным «/s» — для
+ * скорости (см. formatPeerStatsLine).
+ */
+function formatBytesCompact(bytes) {
+  const abs = Math.abs(bytes);
+  if (abs < 1024) return `${Math.round(bytes)} B`;
+  if (abs < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * Скорость для БЕЙДЖА НА ТАЙЛЕ (см. updateTileSpeedBadges) — в отличие от
+ * formatBytesCompact выше (тот честно печатает и мелкие «3 B», это годится
+ * для настроек, где рядом есть контекст), на тайле поверх видео нужен
+ * компактный порядок величины, а не точные байты в секунду — до 1 KB/s
+ * печатаем фиксированную «<1 KB/s».
+ */
+function formatSpeedBadge(bytesPerSec) {
+  if (bytesPerSec < 1024) return '<1 KB/s';
+  return `${formatBytesCompact(bytesPerSec)}/s`;
+}
+
+/**
+ * Строка статы под именем пира: «↓ 320 KB/s ↑ 12 KB/s · 45 ms».
+ *
+ * Скорость — это ВСЕГДА дельта байт между двумя тиками секции (WebRTC не
+ * отдаёт мгновенный throughput, только монотонно растущие счётчики с начала
+ * соединения), поэтому нужна точка отсчёта — prevSnapshot из
+ * peerStatsHistory. На первом тике после открытия панели (или после
+ * появления transport-статы у только что подключившегося пира) точки
+ * отсчёта ещё нет: показываем накопленный с начала соединения итог
+ * (префикс «∑») — это честнее прочерков (данные реальные, просто не
+ * скорость) и не требует у пользователя ждать «пустой» тик.
+ */
+function formatPeerStatsLine(prevSnapshot, stats, nowMs) {
+  if (stats.bytesSent == null || stats.bytesReceived == null) return null; // ни transport-, ни rtp-статы не нашлось — нечего показывать
+  const rttPart = typeof stats.rtt === 'number' ? ` · ${Math.round(stats.rtt)} ms` : '';
+
+  if (!prevSnapshot) {
+    return `∑ ↓ ${formatBytesCompact(stats.bytesReceived)} ↑ ${formatBytesCompact(stats.bytesSent)}${rttPart}`;
+  }
+  const dtSec = Math.max(0.001, (nowMs - prevSnapshot.ts) / 1000);
+  // Math.max(0, …) — счётчики могут «просесть», если пара пересобралась
+  // (ICE restart / смена transport'а с p2p на turn) и статистика начала
+  // отсчёт заново; отрицательную дельту в такой момент лучше показать как 0,
+  // чем как «минус трафик».
+  const downRate = Math.max(0, (stats.bytesReceived - prevSnapshot.bytesReceived) / dtSec);
+  const upRate = Math.max(0, (stats.bytesSent - prevSnapshot.bytesSent) / dtSec);
+  return `↓ ${formatBytesCompact(downRate)}/s ↑ ${formatBytesCompact(upRate)}/s${rttPart}`;
+}
+
+/**
+ * Перерисовать список «Соединения с участниками» — ЧИТАЕТ кеш peerLastStats,
+ * НИКАКИХ собственных getStats(): цифры считает единый поллер скоростей (см.
+ * pollPeerStats ниже), который тикает независимо от того, открыта ли эта
+ * панель. Синхронна (раньше была async из-за собственного Promise.all по
+ * getStats) — рендер мгновенный, мигания частично готового списка не было и
+ * не стало.
+ */
+function renderPeerConnectionsList() {
   const entries = Array.from(peers.entries());
   if (entries.length === 0) {
     settingsPeersListEl.textContent = '';
@@ -1149,13 +1380,13 @@ async function renderPeerConnectionsList() {
     return;
   }
 
-  const modes = await Promise.all(
-    entries.map(([peerId, entry]) => computePeerConnectionMode(peerId, entry))
-  );
-
   settingsPeersListEl.textContent = '';
-  entries.forEach(([peerId], i) => {
-    const mode = modes[i];
+  for (const [peerId] of entries) {
+    // До первого тика поллера после появления пира кеша ещё нет — тот же
+    // фоллбэк-режим, что раньше отдавал сам computePeerConnectionStats на
+    // пире без готового pc.
+    const cached = peerLastStats.get(peerId);
+    const mode = cached ? cached.mode : 'connecting';
     const li = document.createElement('li');
     li.className = 'settings-peer-row';
 
@@ -1163,14 +1394,144 @@ async function renderPeerConnectionsList() {
     dot.className = `settings-peer-dot settings-peer-dot--${mode}`;
     dot.setAttribute('aria-hidden', 'true');
 
+    const info = document.createElement('span');
+    info.className = 'settings-peer-info';
+
     const label = document.createElement('span');
     label.className = 'settings-peer-label';
     label.textContent = `${peerNames.get(peerId) || 'Guest'} — ${PEER_MODE_LABELS[mode]}`;
+    info.appendChild(label);
+
+    if (cached && cached.statsLine) {
+      const statsEl = document.createElement('span');
+      statsEl.className = 'settings-peer-stats';
+      statsEl.textContent = cached.statsLine;
+      info.appendChild(statsEl);
+    }
 
     li.appendChild(dot);
-    li.appendChild(label);
+    li.appendChild(info);
     settingsPeersListEl.appendChild(li);
-  });
+  }
+}
+
+// ---------- Единый поллер скоростей (см. верхний комментарий раздела «Соединение и приватность») ----------
+//
+// Раз в PEER_STATS_REFRESH_MS, ВСЕГДА (не только при открытых настройках) —
+// по одному getStats() на каждого пира считает режим/RTT/трафик, обновляет
+// peerStatsHistory (точка отсчёта для следующего тика, см. formatPeerStatsLine
+// выше) и кеширует готовый результат в peerLastStats. Этим кешем пользуются и
+// renderPeerConnectionsList (если открыта панель настроек), и бейджи скорости
+// на тайлах (updateTileSpeedBadges) — второго обхода getStats() ни для панели,
+// ни для бейджей нет.
+const PEER_STATS_REFRESH_MS = 3000;
+let peerStatsTimer = null;
+// peerId -> { mode, rtt, statsLine, downRate, upRate } — готовый результат
+// последнего тика поллера. downRate/upRate — null, пока для этого пира не
+// набралось хотя бы двух снимков (первый тик после подключения/после
+// пересборки пары) — тот же гейт, что у formatPeerStatsLine («∑ …» вместо
+// «…/s»), но отдельно от готовой строки: бейджам нужны сами числа.
+const peerLastStats = new Map();
+
+/** Один тик поллера — см. комментарий раздела выше. */
+async function pollPeerStats() {
+  const nowMs = Date.now();
+  for (const [peerId, entry] of peers) {
+    const stats = await computePeerConnectionStats(peerId, entry);
+    const prev = peerStatsHistory.get(peerId);
+    const statsLine = formatPeerStatsLine(prev, stats, nowMs);
+
+    let downRate = null;
+    let upRate = null;
+    if (prev && stats.bytesSent != null && stats.bytesReceived != null) {
+      const dtSec = Math.max(0.001, (nowMs - prev.ts) / 1000);
+      // Math.max(0, …) — та же защита от «просевших» счётчиков после
+      // пересборки пары (ICE restart/смена transport'а), что и в
+      // formatPeerStatsLine.
+      downRate = Math.max(0, (stats.bytesReceived - prev.bytesReceived) / dtSec);
+      upRate = Math.max(0, (stats.bytesSent - prev.bytesSent) / dtSec);
+    }
+
+    // Точка отсчёта для скорости на СЛЕДУЮЩЕМ тике. Если статы недоступны в
+    // этот раз (bytes === null) — запись не обновляем/удаляем, чтобы
+    // временный сбой getStats() не сбросил уже накопленную точку отсчёта.
+    if (stats.bytesSent != null && stats.bytesReceived != null) {
+      peerStatsHistory.set(peerId, { bytesSent: stats.bytesSent, bytesReceived: stats.bytesReceived, ts: nowMs });
+    }
+
+    peerLastStats.set(peerId, { mode: stats.mode, rtt: stats.rtt, statsLine, downRate, upRate });
+  }
+
+  updateTileSpeedBadges();
+  // Панель настроек может быть открыта прямо сейчас — перерисовываем всю
+  // секцию «Соединение и приватность» тут же: список пиров из уже готового
+  // кеша (без лишнего getStats(), см. renderPeerConnectionsList) и дешёвые
+  // части (refreshConnectionSection). Отдельного таймера у панели нет —
+  // это единственный периодический механизм её обновления.
+  if (!settingsPanelEl.classList.contains('hidden')) {
+    refreshConnectionSection();
+    renderPeerConnectionsList();
+  }
+}
+
+/**
+ * Запустить поллер (идемпотентно) — вызывается при входе в комнату (первый
+ * joined, см. registerSignalingHandlers, рядом со startSasUpdates) и тикает
+ * дальше всю сессию: тик без пиров — почти no-op (for…of по пустой Map), а
+ * refreshConnectionSection с тика нужен и одинокому участнику с открытой
+ * панелью. Поэтому не останавливаем/не перезапускаем его на каждый
+ * join/leave — только на терминальном teardown (см. stopPeerStatsPolling).
+ */
+function startPeerStatsPolling() {
+  if (peerStatsTimer) return;
+  peerStatsTimer = setInterval(() => {
+    pollPeerStats().catch((err) => console.warn('Поллер скоростей пиров не удался:', err));
+  }, PEER_STATS_REFRESH_MS);
+}
+
+/** Остановить поллер — терминальный teardown (см. teardownMeshMediaChat). */
+function stopPeerStatsPolling() {
+  if (peerStatsTimer) {
+    clearInterval(peerStatsTimer);
+    peerStatsTimer = null;
+  }
+}
+
+/**
+ * Бейджи скорости на тайлах (.tile-speed, см. createTile/static/style.css) —
+ * вызывается из pollPeerStats на каждом тике. На тайле ЧУЖОГО пира — его
+ * ВХОДЯЩАЯ скорость (его медиа К НАМ): это честная «скорость его видео у
+ * меня», которую и хочет видеть смотрящий на конкретный тайл (а не то, с
+ * какой скоростью МЫ ему отдаём). На СВОЁМ тайле — суммарная ИСХОДЯЩАЯ
+ * скорость по всем пирам (с «↑»): в mesh мы шлём n отдельных копий своего
+ * медиа, ровно по копии на каждого участника, и честная «моя отдача» — это
+ * сумма по всем, а не скорость к одному произвольному пиру. Пока скорость не
+ * посчитана (первый тик после подключения пира — downRate/upRate ещё null)
+ * — бейдж остаётся/становится скрытым.
+ */
+function updateTileSpeedBadges() {
+  let totalUpRate = null;
+  for (const [peerId, entry] of peers) {
+    const cached = peerLastStats.get(peerId);
+    const downRate = cached ? cached.downRate : null;
+    if (downRate == null) {
+      entry.tile.speedEl.classList.add('hidden');
+    } else {
+      entry.tile.speedEl.textContent = formatSpeedBadge(downRate);
+      entry.tile.speedEl.classList.remove('hidden');
+    }
+    if (cached && cached.upRate != null) {
+      totalUpRate = (totalUpRate || 0) + cached.upRate;
+    }
+  }
+
+  if (!ownTile) return;
+  if (totalUpRate == null) {
+    ownTile.speedEl.classList.add('hidden');
+  } else {
+    ownTile.speedEl.textContent = `↑ ${formatSpeedBadge(totalUpRate)}`;
+    ownTile.speedEl.classList.remove('hidden');
+  }
 }
 
 /** Динамические счётчики «что видит сервер» — см. static/common.js: ConnStats. */
@@ -1213,6 +1574,41 @@ async function ensureSessionCertificate() {
 /** Отрисовать текущее состояние SAS в шапке чата (см. static/chat.js: setRoomSas). Идемпотентна, безопасна до создания ChatPanel. */
 function renderRoomSas() {
   if (chat && typeof chat.setRoomSas === 'function') chat.setRoomSas(sasState, sasResult);
+  renderTopbarSas(sasState, sasResult);
+}
+
+/**
+ * Тот же SAS «отпечаток комнаты», что и в шапке чат-панели (см.
+ * static/chat.js: setRoomSas — образец для состояний), но в топ-баре
+ * главного окна: виден сразу, не открывая чат. Дублирующий рендер того же
+ * стейта sasState/sasResult, а не отдельный источник истины — chat.js не
+ * трогаем, топ-бар только читает уже готовый результат.
+ */
+function renderTopbarSas(state, result) {
+  if (!topbarSasEl) return;
+  topbarSasEl.classList.remove('topbar-sas--ok', 'topbar-sas--verifying', 'topbar-sas--mismatch');
+  topbarSasEl.title = '';
+
+  if (!state || state === 'hidden' || state === 'unavailable') {
+    topbarSasEl.classList.add('hidden');
+    topbarSasEl.textContent = '';
+    return;
+  }
+  topbarSasEl.classList.remove('hidden');
+
+  if (state === 'ok' && result && Array.isArray(result.emoji)) {
+    topbarSasEl.classList.add('topbar-sas--ok');
+    topbarSasEl.textContent = result.emoji.join(' ');
+    topbarSasEl.title = result.hex ? `Text code: ${result.hex}` : 'Room verification code';
+  } else if (state === 'mismatch') {
+    topbarSasEl.classList.add('topbar-sas--mismatch');
+    topbarSasEl.textContent = '⚠️ verification failed';
+    topbarSasEl.title = 'Room verification failed — codes do not match';
+  } else {
+    topbarSasEl.classList.add('topbar-sas--verifying');
+    topbarSasEl.textContent = 'verifying…';
+    topbarSasEl.title = 'Verifying room…';
+  }
 }
 
 function sasSetState(state) {
@@ -1352,13 +1748,18 @@ function startSasUpdates() {
   if (!sasRefreshTimer) sasRefreshTimer = setInterval(tick, SAS_REFRESH_MS);
 }
 
+/**
+ * Крипто-строка/счётчики сигналинга/build-хэш — дешёвые части секции
+ * «Соединение и приватность» (без getStats). Вызывается при открытии панели
+ * (openSettingsPanel) и с каждого тика единого 3-секундного поллера скоростей,
+ * пока панель открыта (см. PEER_STATS_REFRESH_MS/pollPeerStats выше) — своего
+ * таймера у секции нет. Список пиров сюда не входит — его рисует
+ * renderPeerConnectionsList, из тех же мест.
+ */
 function refreshConnectionSection() {
   renderCryptoInfo();
   renderServerCounters();
   renderSettingsBuildRow();
-  renderPeerConnectionsList().catch((err) => {
-    console.error('Не удалось обновить список соединений в настройках:', err);
-  });
 }
 
 // ---------- Устройства: селекты микрофона/камеры (видно всем участникам) ----------
@@ -1814,11 +2215,14 @@ function createRemotePeer(peerId, name, iceServers) {
 function removeRemotePeer(peerId) {
   const entry = peers.get(peerId);
   if (!entry) return;
+  if (maximizedTile === entry.tile) unmaximizeTile(); // пир ушёл — показывать крупно больше нечего
   entry.rtc.close();
   entry.tile.root.remove();
   peers.delete(peerId);
   peerNames.delete(peerId);
   peerMediaRefs.delete(peerId);
+  peerStatsHistory.delete(peerId); // иначе новое соединение с тем же peerId унаследует чужую точку отсчёта скорости
+  peerLastStats.delete(peerId); // тот же принцип — кеш скорости не должен пережить peerId
   bus.removePeer(peerId);
   cleanupMicAudio(peerId);
   for (const [streamId, ownerPeerId] of cameraStreamOwner) {
@@ -1850,6 +2254,16 @@ function removeRemotePeer(peerId) {
  * незачем, останавливаем их сразу.
  */
 function teardownMeshMediaChat(reason) {
+  // Свой камера-трек ниже останавливается напрямую (не через showTileVideo/
+  // кнопку камеры) — если в этот момент был максимизирован именно свой
+  // тайл, exitMaximizeIfHidden тут не сработает сама, поэтому сворачиваем
+  // явно (иначе останется зависший чёрный оверлей после terminal-teardown).
+  unmaximizeTile();
+  // Единый поллер скоростей (см. startPeerStatsPolling) переживал бы этот
+  // teardown сам — тикать на пустых peers дёшево, но комната больше не
+  // восстановится (см. комментарий функции выше), поэтому останавливаем явно,
+  // как и roomTimerInterval (см. stopRoomTimer в signaling.on('room-expired')).
+  stopPeerStatsPolling();
   for (const peerId of Array.from(peers.keys())) {
     removeRemotePeer(peerId);
   }
@@ -1918,7 +2332,14 @@ function cancelScreenOwnerGrace() {
 
 function showJoinModal() {
   joinModalEl.classList.remove('hidden');
+  // Предзаполняем сгенерированным именем (см. static/namegen.js: userName())
+  // — жмёшь «Войти» и всё, спрашивать не обязательно. Пользователь может
+  // стереть поле → как и раньше, останется анонимом (onJoinModalSubmit:
+  // trim() + `|| null`). !value — на случай, если поле уже что-то содержит
+  // (не должно к этому моменту, но не перетираем на всякий случай).
+  if (!joinNameInputEl.value) joinNameInputEl.value = NameGen.userName();
   joinNameInputEl.focus();
+  joinNameInputEl.select();
 }
 
 function hideJoinModal() {
@@ -1960,7 +2381,10 @@ async function init() {
   }
 
   // Анонимность (см. docs/privacy.md, «Anonymity»): имя спрашивается заново при КАЖДОМ заходе
-  // этой модалкой — никакого localStorage. join-room уходит только после
+  // этой модалкой — никакого localStorage. Поле предзаполнено сгенерированным
+  // именем (см. showJoinModal: NameGen.userName()), чтобы можно было просто
+  // нажать «Войти» без ввода, но пользователь может стереть его — тогда
+  // останется анонимом, как и раньше. join-room уходит только после
   // клика «Войти» (см. onJoinModalSubmit). При авто-reconnect модалка не
   // показывается повторно — имя уже в памяти вкладки (myName), см.
   // attemptReconnectOnce/sendJoinAndWait ниже.
@@ -2078,6 +2502,10 @@ function registerSignalingHandlers(iceServers) {
         getGuestChatAllowed: () => (roomSettings ? roomSettings.guestChat : true),
       });
       startSasUpdates();
+      // Единый поллер скоростей (см. PEER_STATS_REFRESH_MS/pollPeerStats) —
+      // стартует при входе в комнату и тикает всю сессию, независимо от
+      // числа пиров и открытости панели настроек.
+      startPeerStatsPolling();
       return;
     }
 
@@ -2715,6 +3143,7 @@ cameraButton.addEventListener('click', async () => {
     if (ownTile) {
       ownTile.videoEl.classList.toggle('hidden', !camTrack.enabled);
       ownTile.placeholderEl.classList.toggle('hidden', camTrack.enabled);
+      exitMaximizeIfHidden(ownTile, camTrack.enabled);
     }
     broadcastStreamEnabled(camStream, 'camera', camTrack.enabled);
   }

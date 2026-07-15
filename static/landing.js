@@ -18,6 +18,18 @@
 // вычищает их из адресной строки. Из `k` room.js выводит ключи, которыми
 // шифруется всё, что проходит через серверный релей (SDP/ICE/имя участника/
 // fallback-чат) — см. docs/e2e-encryption.md, «Key Model».
+//
+// Третий (необязательный) параметр фрагмента — `n` — имя комнаты, введённое
+// в #room-name-input (предзаполнен NameGen.roomName(), см. static/namegen.js;
+// свободно редактируется). Это имя видит ТОЛЬКО создатель комнаты: оно
+// кладётся ПОСЛЕДНИМ параметром того же фрагмента (#lt=...&k=...&n=...) и
+// точно так же, как lt, не уходит на сервер и вычищается room.js из адресной
+// строки при первом парсинге (history.replaceState). В отличие от `k`, оно
+// НЕ участвует в buildShareLink() (room.js) — invite-ссылка для гостей
+// собирается заново только из `k`, так что гости имя создателя никогда не
+// видят. Побочный эффект вычистки из адресной строки, симметричный
+// одноразовому `lt`: после F5 у создателя имя комнаты пропадает (шапка/
+// заголовок вернутся к дефолту) — осознанный trade-off, а не баг.
 
 'use strict';
 
@@ -26,6 +38,12 @@ const messageEl = document.getElementById('landing-message');
 const buildFooterEl = document.getElementById('landing-build-footer');
 const buildShortEl = document.getElementById('landing-build-short');
 const buildFullEl = document.getElementById('landing-build-full');
+const roomNameInputEl = document.getElementById('room-name-input');
+
+// Предзаполняем красивым сгенерированным именем (см. static/namegen.js) —
+// пользователь может им и ограничиться (просто нажать Create room), либо
+// стереть/отредактировать перед созданием комнаты.
+roomNameInputEl.value = NameGen.roomName();
 
 function showMessage(text, isError = true) {
   messageEl.textContent = text;
@@ -51,7 +69,25 @@ createButton.addEventListener('click', async () => {
     }
     const roomKey = RoomCrypto.generateRoomKey();
     const roomKeyB64 = RoomCrypto.bytesToBase64url(roomKey);
-    location.href = `/r/${data.roomId}#lt=${encodeURIComponent(data.leaderToken)}&k=${roomKeyB64}`;
+
+    // maxlength=40 режет по UTF-16-единицам, а не по code point —
+    // вставка/автозамена может располовинить суррогатную пару эмодзи и
+    // оставить одинокий суррогат. toWellFormed() (там, где есть) чинит это
+    // штатно; на движках без него — ручная regex-вычистка одиноких
+    // суррогатов (высокий без низкого следом / низкий без высокого перед).
+    const rawRoomName = roomNameInputEl.value.trim();
+    const roomName = rawRoomName
+      ? (typeof rawRoomName.toWellFormed === 'function'
+          ? rawRoomName.toWellFormed()
+          : rawRoomName.replace(
+              /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/g,
+              '$1',
+            ))
+      : '';
+
+    location.href =
+      `/r/${data.roomId}#lt=${encodeURIComponent(data.leaderToken)}&k=${roomKeyB64}` +
+      (roomName ? `&n=${encodeURIComponent(roomName)}` : '');
   } catch (err) {
     console.error('Failed to create room:', err);
     showMessage('Failed to create room. Check your connection and try again.');

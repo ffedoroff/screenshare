@@ -190,8 +190,10 @@ want to invite. No separate invitation flow, email, or calendar integration
 exists or is needed.
 
 **Step 3 — Join**: Anyone who opens the link is asked for a display name (and
-nothing else) and joins the meeting. If the leader has turned on the waiting
-room, the new arrival instead waits until the leader admits or declines them.
+nothing else) and joins the meeting — the field is pre-filled with a friendly
+generated suggestion, which they may keep, edit, or clear. If the leader has
+turned on the waiting room, the new arrival instead waits until the leader
+admits or declines them.
 
 **Step 4 — Meet**: All participants see and hear each other. Any participant
 can mute/unmute their own audio or video at will. Any participant (subject to
@@ -270,8 +272,9 @@ someone; a QR code covers the common case of inviting a nearby device.
 
 - [x] `p1` - **ID**: `cpt-chat-fr-join-meeting`
 
-Anyone opening a meeting link MUST be asked only for a display name (freely
-editable, not validated against any identity) before joining. No other
+Anyone opening a meeting link MUST be asked only for a display name
+(pre-filled with a locally generated suggestion, freely editable, not
+validated against any identity) before joining. No other
 information, account, or credential MUST be required. If the meeting has
 already reached its participant limit, the arrival MUST be told the meeting
 is full rather than silently failing.
@@ -340,12 +343,12 @@ modern chat surface.
 - [x] `p1` - **ID**: `cpt-chat-fr-file-share`
 
 Participants MUST be able to attach and send files, images, and audio clips
-through chat, up to a defined size ceiling per file. Images under a smaller
-size threshold SHOULD download and preview automatically for recipients;
-larger files and other file types MUST offer an explicit download action.
-A recipient who cannot reach the sender directly MUST see the attachment
-marked as unavailable rather than have the product silently proxy the file's
-bytes through the service operator's infrastructure (see
+through chat, up to a defined size ceiling per file. Every attachment,
+regardless of type or size, MUST require an explicit download action from
+the recipient — nothing is fetched over the wire on their behalf until they
+ask for it. A recipient who cannot reach the sender directly MUST see the
+attachment marked as unavailable rather than have the product silently
+proxy the file's bytes through the service operator's infrastructure (see
 `cpt-chat-nfr-privacy`).
 
 **Rationale**: Sharing a screenshot, a small document, or a voice note is a
@@ -590,10 +593,11 @@ sharing) is not restricted.
 **Main Flow**:
 
 1. A participant attaches a small image to a chat message and sends it
-2. Recipients who are directly reachable receive the image automatically
-   downloaded and previewed inline
-3. A participant attaches a larger document; recipients see a card with a
-   manual download action and use it to retrieve the file
+2. Recipients who are directly reachable see a card with the image's name
+   and size and a download action; clicking it retrieves and previews the
+   image inline
+3. A participant attaches a larger document; recipients see the same kind
+   of card and use its download action to retrieve the file
 
 **Postconditions**: The file has moved directly between the participants'
 devices; the service operator never had access to its bytes.

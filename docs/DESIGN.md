@@ -90,8 +90,10 @@ a single mutex; a server restart or a reaper sweep erases it completely. See
 - [x] `p1` - **ID**: `cpt-chat-principle-anonymous`
 
 The product MUST NOT use cookies, `localStorage`, or any other
-cross-session identifier. A display name is supplied fresh per join and
-lives only in the tab's memory. See [`privacy.md`](privacy.md).
+cross-session identifier. A display name is supplied fresh per join — the
+join modal pre-fills a locally generated suggestion, but nothing is
+persisted or remembered between visits — and lives only in the tab's memory.
+See [`privacy.md`](privacy.md).
 
 #### Encrypted Signaling, Not Just Encrypted Media
 

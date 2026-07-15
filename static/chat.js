@@ -69,6 +69,15 @@
 // историческое текстовое сообщение (см. mergeHistory). Сам файл (File-объект)
 // живёт только у отправителя, в памяти вкладки (fileSendMap: fileId -> File)
 // — сервер и буфер истории носят только метаданные, не содержимое.
+// Своя карточка у отправителя — сразу 'done': раз File уже целиком у нас
+// (fileSendMap), нет причины ждать никакого P2P-обмена ради собственного
+// превью/Download — objectUrl создаётся из этого же File локально, синхронно,
+// в handleFilesSelected (в отличие от получателя, который получает objectUrl
+// только в beginReceivingFile.onclose, после реальной передачи байт по
+// отдельному каналу, см. ниже). Статусы отдачи ('sending'/'sent' из
+// beginSendingFile, по одной раздаче на каждого запросившего получателя) на
+// это готовое состояние карточки не влияют — см. renderFileCardBody, там
+// проверка идёт по наличию objectUrl, а не по текущему status.
 //
 // Получатель, чтобы реально скачать файл, шлёт АДРЕСНЫЙ (не broadcast)
 // конверт отправителю:
@@ -226,10 +235,11 @@ const ChatPanel = (() => {
   // autoGrowTextInput).
   const MAX_INPUT_LINES = 13;
   // Та же граница, что и в style.css (@media (max-width: 640px)) — мобильный
-  // UX волны 11 (полноэкранный чат, тап-активация действий сообщения,
-  // мобильный тулбар форматирования, см. isMobileLayout/applyVisualViewportSizing
-  // ниже) переключается ровно по ней, чтобы JS-состояние и CSS-разметка не
-  // расходились на границе ширины.
+  // UX волны 11 (полноэкранный чат, тап-активация действий сообщения, см.
+  // isMobileLayout/applyVisualViewportSizing ниже) переключается ровно по
+  // ней, чтобы JS-состояние и CSS-разметка не расходились на границе
+  // ширины. Тулбар форматирования (см. updateFormatToolbarVisibility) на
+  // эту границу больше не завязан — он общий для всех layout.
   const MOBILE_BREAKPOINT_QUERY = '(max-width: 640px)';
 
   // --- Передача файлов (Ф3) ---
@@ -237,7 +247,6 @@ const ChatPanel = (() => {
   const FILE_CHUNK_SIZE = 16 * 1024; // 16КБ на чанк
   const FILE_BUFFERED_LOW_THRESHOLD = 256 * 1024; // bufferedamountlow срабатывает ниже этого
   const FILE_BUFFERED_HIGH_WATERMARK = 1024 * 1024; // ждём слива, если накопилось больше
-  const AUTO_DOWNLOAD_IMAGE_MAX_BYTES = 2 * 1024 * 1024; // авто-скачивание картинок ≤2МБ
   const FILE_REQUEST_TIMEOUT_MS = 8000; // сколько ждём открытия файлового канала после запроса
 
   // Статичная, не зависящая от пользовательских данных разметка — безопасна
@@ -407,10 +416,11 @@ const ChatPanel = (() => {
   /**
    * Мобильный layout прямо сейчас (та же граница, что и style.css: см.
    * MOBILE_BREAKPOINT_QUERY выше) — используется, чтобы JS-поведение
-   * (тап-активация действий сообщения, VisualViewport-подгонка панели,
-   * видимость мобильного тулбара форматирования) применялось РОВНО там же,
-   * где CSS переключает вёрстку на полноэкранный мобильный вид, а не по
-   * отдельному, потенциально рассинхронизированному порогу. matchMedia
+   * (тап-активация действий сообщения, VisualViewport-подгонка панели)
+   * применялось РОВНО там же, где CSS переключает вёрстку на полноэкранный
+   * мобильный вид, а не по отдельному, потенциально рассинхронизированному
+   * порогу. Тулбар форматирования сюда больше не относится (общий для всех
+   * layout, см. updateFormatToolbarVisibility). matchMedia
    * недоступен только в совсем экзотических/тестовых окружениях без DOM —
    * тогда просто считаем layout десктопным (безопасный дефолт: ничего не
    * меняется относительно поведения до этой волны).
@@ -964,10 +974,11 @@ const ChatPanel = (() => {
     // десктопе (компактный поповер у сообщения) — единая точка входа, без
     // отдельного hover-состояния.
     let activePopoverMsgId = null;
-    // Мобильный тулбар форматирования (волна 11) — принудительно открыт
-    // кнопкой «Aa» (см. formatToggleButton ниже); помимо этого тулбар также
-    // показывается САМ, пока в textInput есть непустое выделение (см.
-    // updateFormatToolbarVisibility/document 'selectionchange').
+    // Тулбар форматирования (волна 11, общий для всех layout) —
+    // принудительно открыт кнопкой «Aa» (см. formatToggleButton ниже);
+    // помимо этого тулбар также показывается САМ, пока в textInput есть
+    // непустое выделение (см. updateFormatToolbarVisibility/document
+    // 'selectionchange').
     let formatToolbarForcedOpen = false;
 
     // --- Состояние передачи файлов (Ф3) ---
@@ -1360,7 +1371,19 @@ const ChatPanel = (() => {
       card.textContent = '';
       const state = fileStates.get(msg.fileId) || { status: 'offer', progress: 0 };
 
-      if (state.status === 'done' && state.objectUrl) {
+      // Наличие objectUrl — самодостаточный признак «есть готовый Blob,
+      // показываем превью/Download», НЕЗАВИСИМО от текущего state.status.
+      // Это важно для своей (own) карточки: handleFilesSelected сразу
+      // проставляет ей status:'done' с objectUrl из собственного File, но
+      // status при этом может позже несколько раз смениться на 'sending'/
+      // 'sent' — beginSendingFile отдаёт файл каждому запросившему получателю
+      // отдельно и каждый раз перезатирает status (см. setFileStatus). Если
+      // здесь проверять status==='done', такая раздача откатывала бы готовую
+      // карточку отправителя обратно к «только заголовок». objectUrl в
+      // fileStates при этом не трогается (beginSendingFile его не передаёт
+      // в extra), так что проверка по нему одна и та же для своей и чужой
+      // (полученной) карточки.
+      if (state.objectUrl) {
         renderFileDoneBody(card, msg, state);
         return;
       }
@@ -1396,9 +1419,12 @@ const ChatPanel = (() => {
         return;
       }
 
-      // status === 'offer' (или 'sent'/начальное состояние без записи) —
-      // ничего не запрошено/отправлено ещё: своя карточка — просто
-      // информация, чужая — кнопка «Скачать» (либо пояснение недоступности).
+      // status === 'offer' (начальное состояние без записи, ничего ещё не
+      // запрошено) — чужая карточка: кнопка «Скачать» (либо пояснение
+      // недоступности). Своя карточка сюда практически не попадает: у own
+      // fileStates.objectUrl проставляется синхронно в handleFilesSelected,
+      // то есть выше уже сработал ранний return по objectUrl; `own` здесь
+      // подстраховкой на случай, если состояние почему-то не создалось.
       if (own) return;
 
       if (!getPeerIds().includes(msg.from)) {
@@ -2209,21 +2235,16 @@ const ChatPanel = (() => {
         unreadCount += 1;
         updateUnreadBadge();
       }
-      maybeAutoDownloadImage(envelope);
-    }
-
-    /** Картинки ≤2МБ скачиваются сами, без клика — только для ЖИВОГО оффера (не для реплея истории у опоздавшего). */
-    function maybeAutoDownloadImage(msg) {
-      if (msg.from === peerId) return;
-      const mime = msg.mime || '';
-      if (!mime.startsWith('image/')) return;
-      if (!(msg.size <= AUTO_DOWNLOAD_IMAGE_MAX_BYTES)) return;
-      requestFileDownload(msg);
     }
 
     /**
-     * Получатель жмёт «Скачать» (или авто для картинок) — шлём адресный
-     * file-request отправителю и ждём, что он откроет файловый DataChannel.
+     * Получатель жмёт «Скачать» — шлём адресный file-request отправителю и
+     * ждём, что он откроет файловый DataChannel. Никакого автоскачивания нет
+     * ни для одного mime-типа (в т.ч. картинок) — до клика получателя
+     * карточка любого файла показывает только имя и размер (см.
+     * renderFileCardBody, статус 'offer'), байты не запрашиваются сами по
+     * себе ни у живого оффера, ни при реплее истории (mergeHistory просто
+     * вставляет сообщение в буфер, тут ничего не вызывается).
      * Идемпотентно: повторный вызов, пока уже что-то происходит/готово, — no-op.
      */
     function requestFileDownload(msg) {
@@ -2446,6 +2467,18 @@ const ChatPanel = (() => {
 
         const fileId = genId();
         fileSendMap.set(fileId, file);
+        // Своя карточка не должна ждать никакого P2P-обмена, чтобы показать
+        // превью/Download — File уже лежит у нас целиком (fileSendMap выше),
+        // поэтому создаём objectUrl из него локально и сразу переводим
+        // fileStates в 'done', тем же полем, что и у получателя после
+        // beginReceivingFile.onclose (см. renderFileDoneBody). Само сообщение
+        // ещё не вставлено в messages/DOM (insertMessage/renderAll — ниже),
+        // поэтому setFileStatus здесь просто прогревает fileStates: её
+        // собственная попытка перерисовать карточку молча no-op'ается
+        // (findFileOfferByFileId ничего не найдёт), а актуальный вид
+        // подхватится чуть ниже первым же renderAll(true) — см.
+        // renderFileCardBody (проверка по state.objectUrl, а не status).
+        setFileStatus(fileId, 'done', { objectUrl: URL.createObjectURL(file), blobSize: file.size, progress: 1 });
 
         lamportClock += 1;
         const envelope = {
@@ -2758,8 +2791,9 @@ const ChatPanel = (() => {
     });
 
     // --- Десктопные горячие клавиши форматирования (см. заголовок файла) ---
-    // Мобильный тулбар (по выделению/по кнопке «Aa») — см. блок ниже, после
-    // handleFormattingShortcut, переиспользует ЭТИ ЖЕ функции-обёртки.
+    // Тулбар форматирования (по выделению/по кнопке «Aa», общий для всех
+    // layout) — см. блок ниже, после handleFormattingShortcut, переиспользует
+    // ЭТИ ЖЕ функции-обёртки.
     /**
      * Обернуть текущее выделение textInput парой маркеров (**, __, ~~, ||,
      * `); нет выделения — вставить пустую пару и поставить курсор МЕЖДУ
@@ -2835,30 +2869,29 @@ const ChatPanel = (() => {
       }
     }
 
-    // --- Мобильный тулбар форматирования (волна 11) ---
+    // --- Тулбар форматирования (волна 11; десктоп — см. фикс ниже) ---
     //
-    // Набирать "**"/"||" руками на телефоне неудобно — десктопные горячие
-    // клавиши (Cmd/Ctrl+B/I/Shift+X/P/M/K, см. выше) на мобильной
-    // виртуальной клавиатуре либо недоступны, либо неочевидны. Два триггера
-    // показа ОДНОГО и того же тулбара (переиспользует wrapSelectionWithMarkers/
-    // insertLinkMarkdown — ту же логику, что и десктопные хоткеи, никакого
-    // отдельного форматирующего кода):
-    //   1) «по выделению» — выделили текст в textarea на мобильном layout —
-    //      тулбар появляется сам (см. document 'selectionchange' ниже);
-    //   2) «по кнопке» — кнопка «Aa» рядом с инпутом (см. formatToggleButton,
-    //      видна только на мобильном layout, см. style.css) открывает тот же
-    //      тулбар вручную (работает и без выделения — тогда кнопки вставляют
-    //      пустую пару маркеров с курсором между ними, тот же фоллбэк
-    //      поведения, что и у десктопных хоткеев без выделения).
+    // Набирать "**"/"||" руками неудобно везде, не только на телефоне — на
+    // десктопе горячие клавиши (Cmd/Ctrl+B/I/Shift+X/P/M/K, см. выше) есть,
+    // но без этого тулбара (или самой кнопки «Aa») были ПОЛНОСТЬЮ
+    // недискаверабельны: ни намёка на то, что форматирование существует,
+    // если не знать про хоткеи заранее. Тулбар теперь общий для всех
+    // layout, два триггера показа ОДНОГО и того же тулбара (переиспользует
+    // wrapSelectionWithMarkers/insertLinkMarkdown — ту же логику, что и
+    // хоткеи, никакого отдельного форматирующего кода):
+    //   1) «по выделению» — выделили текст в textarea — тулбар появляется
+    //      сам (см. document 'selectionchange' ниже);
+    //   2) «по кнопке» — кнопка «Aa» рядом с инпутом (см. formatToggleButton)
+    //      открывает тот же тулбар вручную (работает и без выделения —
+    //      тогда кнопки вставляют пустую пару маркеров с курсором между
+    //      ними, тот же фоллбэк поведения, что и у хоткеев без выделения).
     // Оба состояния независимы и складываются через ИЛИ — см.
     // updateFormatToolbarVisibility: тулбар виден, если открыт вручную (Aa)
-    // ИЛИ прямо сейчас есть непустое выделение, и только на мобильном layout
-    // (десктоп продолжает жить на горячих клавишах, без этого тулбара).
+    // ИЛИ прямо сейчас есть непустое выделение.
     function updateFormatToolbarVisibility() {
-      const mobile = isMobileLayout();
       const hasSelection =
-        mobile && document.activeElement === textInput && textInput.selectionStart !== textInput.selectionEnd;
-      const shouldShow = mobile && (formatToolbarForcedOpen || hasSelection);
+        document.activeElement === textInput && textInput.selectionStart !== textInput.selectionEnd;
+      const shouldShow = formatToolbarForcedOpen || hasSelection;
       formatToolbar.classList.toggle('hidden', !shouldShow);
       formatToggleButton.classList.toggle('chat-format-toggle-button--on', formatToolbarForcedOpen);
       formatToggleButton.setAttribute('aria-pressed', String(formatToolbarForcedOpen));
@@ -2872,16 +2905,13 @@ const ChatPanel = (() => {
 
     // 'selectionchange' — глобальное DOM-событие (не у конкретного элемента):
     // фильтруем по activeElement внутри updateFormatToolbarVisibility. Ловит
-    // и выделение свайпом/долгим тапом на телефоне, и программные изменения
-    // выделения (в т.ч. textInput.setSelectionRange из самих же
-    // wrapSelectionWithMarkers/insertLinkMarkdown после применения
-    // форматирования — выделение схлопывается в курсор, hasSelection
-    // становится false, и тулбар сам скрывается, если не закреплён кнопкой
-    // «Aa»).
-    document.addEventListener('selectionchange', () => {
-      if (!isMobileLayout()) return;
-      updateFormatToolbarVisibility();
-    });
+    // и выделение свайпом/долгим тапом на телефоне, и мышью на десктопе, и
+    // программные изменения выделения (в т.ч. textInput.setSelectionRange
+    // из самих же wrapSelectionWithMarkers/insertLinkMarkdown после
+    // применения форматирования — выделение схлопывается в курсор,
+    // hasSelection становится false, и тулбар сам скрывается, если не
+    // закреплён кнопкой «Aa»).
+    document.addEventListener('selectionchange', updateFormatToolbarVisibility);
 
     // Кнопки тулбара: mousedown с preventDefault — чтобы тап по кнопке НЕ
     // забирал фокус (и вместе с ним выделение) у textarea ДО того, как

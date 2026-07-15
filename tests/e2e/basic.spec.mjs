@@ -305,19 +305,60 @@ async function main() {
     const vasyaPage = await vasyaContext.newPage();
 
     let roomId = null;
-    const roomCreatedOk = await step('Вася: главная страница -> создаёт комнату -> вводит имя в модалке входа комнаты -> становится лидером (корона)', async () => {
+    // Имя комнаты (см. static/index.html/landing.js: #room-name-input,
+    // static/namegen.js: NameGen.roomName()) — видит ТОЛЬКО создатель (Вася),
+    // используется ниже и в шаге про попап «Поделиться»/приватность.
+    const ROOM_NAME = 'Моя комната';
+    const roomCreatedOk = await step('Вася: главная страница -> редактирует предзаполненное имя комнаты -> создаёт комнату -> вводит имя в модалке входа комнаты -> становится лидером (корона)', async () => {
       await vasyaPage.goto(server.baseUrl);
+
+      // Инпут имени комнаты предзаполнен сгенерированным именем (эмодзи + 2
+      // английских слова, см. NameGen.roomName()) — прежде чем его перебить
+      // своим значением, проверяем сам факт предзаполнения и что оно
+      // укладывается в maxlength=40 (иначе браузер сам обрежет значение при
+      // fill, и последующая сверка в шапке разойдётся с тем, что реально
+      // ввели).
+      const prefilledRoomName = await vasyaPage.inputValue('#room-name-input');
+      assert.ok(prefilledRoomName, 'инпут #room-name-input на лендинге должен быть предзаполнен сгенерированным именем');
+      assert.ok(
+        prefilledRoomName.length > 0 && prefilledRoomName.length <= 40,
+        `предзаполненное имя комнаты должно быть непустым и не длиннее 40 символов, получено (${prefilledRoomName.length}): "${prefilledRoomName}"`
+      );
+      await vasyaPage.fill('#room-name-input', ROOM_NAME);
+
       await vasyaPage.click('#create-room-button');
       await vasyaPage.waitForURL(/\/r\/[^/]+/, { timeout: 10_000 });
-      // Лендинг больше не спрашивает имя (анонимность — см. static/landing.js) —
-      // роль извлекается из /r/<id>#lt=<token>. Фрагмент не матчим "$": он
-      // может быть уже вычищен к этому моменту через history.replaceState
-      // (см. static/room.js), а может ещё нет — регэксп безразличен к обоим случаям.
+      // Лендинг больше не спрашивает имя участника (анонимность — см.
+      // static/landing.js) — роль извлекается из /r/<id>#lt=<token>. Фрагмент
+      // не матчим "$": он может быть уже вычищен к этому моменту через
+      // history.replaceState (см. static/room.js), а может ещё нет — регэксп
+      // безразличен к обоим случаям.
       const match = vasyaPage.url().match(/\/r\/([^/#]+)/);
       assert.ok(match, `не удалось извлечь roomId из URL: ${vasyaPage.url()}`);
       roomId = match[1];
       await joinRoom(vasyaPage, 'Вася');
       await waitForOverlayHidden(vasyaPage);
+
+      // Имя комнаты у создателя — в заголовке вкладки и в .room-logo шапки
+      // (см. static/room.js: initialRoomName, рендерится синхронно ещё до
+      // init()); фрагмент к этому моменту вычищен до одного #k= — n (как и
+      // одноразовый lt) из адресной строки убран сразу при первом парсинге.
+      const title = await vasyaPage.title();
+      assert.ok(
+        title.includes(ROOM_NAME),
+        `заголовок вкладки создателя должен содержать имя комнаты "${ROOM_NAME}", получено: "${title}"`
+      );
+      const roomLogoText = await vasyaPage.locator('.room-logo').textContent();
+      assert.equal(
+        roomLogoText,
+        ROOM_NAME,
+        `.room-logo у создателя должен показывать имя комнаты, получено: "${roomLogoText}"`
+      );
+      const hashAfterJoin = await vasyaPage.evaluate(() => location.hash);
+      assert.ok(
+        !hashAfterJoin.includes('n='),
+        `фрагмент должен быть вычищен от n= после первого парсинга (остаётся только #k=), получено: "${hashAfterJoin}"`
+      );
 
       // Создатель предъявил leaderToken из фрагмента ссылки — стал лидером:
       // корона на своём тайле.
@@ -377,6 +418,26 @@ async function main() {
       await joinRoom(olyaPage, 'Оля');
       await waitForOverlayHidden(petyaPage);
       await waitForOverlayHidden(olyaPage);
+
+      // Приватность имени комнаты (см. static/landing.js/room.js): guestRoomUrl
+      // собрана из одного #k= (roomUrlWithKey), в ней никогда не было `n=` —
+      // заголовок вкладки и .room-logo у гостей должны остаться дефолтными
+      // («Room — video call» / «Video call», см. static/room.html), а не
+      // именем "Моя комната", которое ввёл Вася на лендинге.
+      for (const [label, page] of [['Петя', petyaPage], ['Оля', olyaPage]]) {
+        const guestTitle = await page.title();
+        assert.equal(
+          guestTitle,
+          'Room — video call',
+          `у ${label} заголовок вкладки должен быть дефолтным (гость имени комнаты не видит), получено: "${guestTitle}"`
+        );
+        const guestRoomLogo = await page.locator('.room-logo').textContent();
+        assert.equal(
+          guestRoomLogo,
+          'Video call',
+          `у ${label} .room-logo должен быть дефолтным (гость имени комнаты не видит), получено: "${guestRoomLogo}"`
+        );
+      }
 
       // waitForMeshSettled ждёт и тайлы, и что у всех троих обе mesh-связи
       // (шина + сигналинг) реально дошли до connected — см. helpers.mjs.
@@ -442,6 +503,22 @@ async function main() {
       for (const [label, code] of codes) {
         assert.equal(code, first, `у ${label} код SAS должен совпадать с остальными ("${code}" != "${first}")`);
       }
+
+      // Тот же SAS дублируется в топ-баре главного окна (см. static/room.js:
+      // renderTopbarSas/#topbar-sas) — виден без открытия чата; сверяем и
+      // класс -ok, и что текст совпадает с уже проверенным .chat-sas-emoji.
+      for (const [label, page] of pages) {
+        await waitForClassOnSelector(page, '#topbar-sas', 'topbar-sas--ok', true, 20000);
+        const topbarHidden = await page.evaluate(() => document.getElementById('topbar-sas')?.classList.contains('hidden'));
+        assert.equal(topbarHidden, false, `у ${label} #topbar-sas должен быть видим после успешной верификации`);
+        const topbarText = await page.locator('#topbar-sas').textContent();
+        const chatSasText = await page.locator('.chat-sas-emoji').textContent();
+        assert.equal(
+          topbarText,
+          chatSasText,
+          `у ${label} текст #topbar-sas должен совпадать с .chat-sas-emoji ("${topbarText}" != "${chatSasText}")`
+        );
+      }
     });
 
     // --- Вася включает камеру ---
@@ -454,6 +531,100 @@ async function main() {
     });
     if (!camOk) {
       skip('микрофон/спикинг', 'камера Васи не заработала');
+    }
+
+    // --- Клик по тайлу — максимизация "на всю страницу" (см. static/room.js:
+    // maximizeTile/unmaximizeTile/onMaximizedTileKeydown, класс .tile--maximized
+    // в static/style.css: position:fixed; inset:0). Проверяем на живом видео
+    // Васи в тайле у Пети (camOk выше) — и отдельно на тайле Оли без видео. ---
+    if (camOk) {
+      await step(
+        'У Пети клик по тайлу Васи (видео живое) — тайл максимизируется на всю страницу; повторный клик и Esc — снимают; клик по тайлу без видео — ничего',
+        async () => {
+          const viewport = petyaPage.viewportSize();
+          assert.ok(viewport, 'у страницы Пети должен быть известен размер вьюпорта');
+          const viewportArea = viewport.width * viewport.height;
+
+          // 1) Клик по тайлу Васи (видео видно) — появляется .tile--maximized,
+          // тайл реально растянут почти на весь вьюпорт (position:fixed, inset:0).
+          await petyaPage.click(vasyaTileSel);
+          await waitForClassOnSelector(petyaPage, vasyaTileSel, 'tile--maximized', true, 3000);
+          const maximizedBox = await petyaPage.locator(vasyaTileSel).boundingBox();
+          assert.ok(maximizedBox, 'не удалось получить boundingBox максимизированного тайла Васи');
+          assert.ok(
+            maximizedBox.width * maximizedBox.height >= viewportArea * 0.95,
+            `максимизированный тайл должен занимать почти весь вьюпорт (${viewport.width}x${viewport.height}), получено ${maximizedBox.width}x${maximizedBox.height}`
+          );
+
+          // 2) Повторный клик по тому же тайлу — снимает максимизацию, тайл
+          // возвращается в обычный грид (заметно меньше вьюпорта).
+          await petyaPage.click(vasyaTileSel);
+          await waitForClassOnSelector(petyaPage, vasyaTileSel, 'tile--maximized', false, 3000);
+          const gridBox = await petyaPage.locator(vasyaTileSel).boundingBox();
+          assert.ok(gridBox, 'не удалось получить boundingBox тайла Васи после снятия максимизации');
+          assert.ok(
+            gridBox.width * gridBox.height < viewportArea * 0.5,
+            `тайл после снятия максимизации должен вернуться к обычному размеру грида (заметно меньше вьюпорта ${viewport.width}x${viewport.height}), получено ${gridBox.width}x${gridBox.height}`
+          );
+
+          // 3) Снова клик (максимизация), потом Esc — тоже снимает.
+          await petyaPage.click(vasyaTileSel);
+          await waitForClassOnSelector(petyaPage, vasyaTileSel, 'tile--maximized', true, 3000);
+          await petyaPage.keyboard.press('Escape');
+          await waitForClassOnSelector(petyaPage, vasyaTileSel, 'tile--maximized', false, 3000);
+
+          // 4) Клик по тайлу БЕЗ видео (у Оли камера в этом сценарии не
+          // включается вовсе) — максимизация не должна произойти (см. в
+          // createTile: клик по тайлу с video.hidden — no-op).
+          const olyaTileSel = await tileSelector('Оля');
+          await petyaPage.click(olyaTileSel);
+          await sleep(300);
+          const olyaMaximized = await petyaPage.evaluate(
+            (sel) => document.querySelector(sel)?.classList.contains('tile--maximized'),
+            olyaTileSel
+          );
+          assert.equal(olyaMaximized, false, 'клик по тайлу без видео не должен максимизировать его');
+        }
+      );
+    } else {
+      skip('клик по тайлу Васи — максимизация на всю страницу', 'камера Васи не заработала');
+    }
+
+    // --- Бейджи скорости на тайлах (см. static/room.js: updateTileSpeedBadges,
+    // PEER_STATS_REFRESH_MS=3000) — единый поллер тикает независимо от того,
+    // открыты ли настройки. На тайле Васи у Пети бейдж должен показать ЕГО
+    // ВХОДЯЩУЮ скорость (медиа камеры Васи реально течёт, раз camOk) — формат
+    // «… B/s»/«… KB/s»/«<1 KB/s» (см. formatSpeedBadge), значит регэксп
+    // /B\/s$/ подходит под все варианты. На СВОЁМ тайле Пети — суммарная
+    // ИСХОДЯЩАЯ скорость по всем пирам (Вася+Оля) с префиксом «↑»: у Пети в
+    // этом сценарии камера ещё не включена, но нулевой трафик тайл не
+    // показывает как "нет скорости" — скорость посчитана (0 или больше) уже
+    // после первого снимка счётчиков, и минимум СЛУЖЕБНЫЙ DataChannel-обмен
+    // (bus: SAS commit/reveal, stream-info) идёт даже без камеры/микрофона —
+    // computePeerConnectionStats берёт transport-стату, а она покрывает ВЕСЬ
+    // DTLS-трафик, не только медиа (см. findTransportBytes). Ждём с запасом
+    // на ~2-3 тика поллера (3с каждый).
+    if (camOk) {
+      await step(
+        'У Пети на тайле Васи появляется бейдж входящей скорости, на своём тайле — исходящей (с «↑»)',
+        async () => {
+          await petyaPage.waitForFunction(
+            (sel) => /B\/s$/.test(document.querySelector(`${sel} .tile-speed`)?.textContent || ''),
+            vasyaTileSel,
+            { polling: 500, timeout: 10_000 }
+          );
+          await waitForClassOnSelector(petyaPage, `${vasyaTileSel} .tile-speed`, 'hidden', false, 1000);
+
+          await petyaPage.waitForFunction(
+            () => (document.querySelector('.tile--own .tile-speed')?.textContent || '').startsWith('↑'),
+            undefined,
+            { polling: 500, timeout: 10_000 }
+          );
+          await waitForClassOnSelector(petyaPage, '.tile--own .tile-speed', 'hidden', false, 1000);
+        }
+      );
+    } else {
+      skip('бейджи скорости на тайлах', 'камера Васи не заработала');
     }
 
     // --- Настройки: селекты устройств наполняются (fake-флаги дают fake-устройства) ---
@@ -480,7 +651,7 @@ async function main() {
 
     // --- Настройки: секция «Соединение и приватность» (видна ВСЕМ) ---
     await step(
-      'В настройках есть секция «Соединение и приватность»: строка шифрования содержит AES-256-GCM/256 бит, режим соединения с устаканившимся пиром в итоге «напрямую (P2P)», счётчик сигналинга через сервер > 0',
+      'В настройках есть секция «Соединение и приватность»: строка шифрования содержит AES-256-GCM/256 бит, режим соединения с устаканившимся пиром в итоге «напрямую (P2P)», счётчик сигналинга через сервер > 0, у каждого пира есть строка статы трафика (и со временем — скорость, раз камера Васи включена)',
       async () => {
         await vasyaPage.click('#settings-button');
         await vasyaPage.waitForSelector('#settings-panel:not(.hidden)', { timeout: 3000 });
@@ -490,9 +661,10 @@ async function main() {
         assert.ok(cryptoText.includes('256'), `строка шифрования должна содержать "256" (бит ключа): ${cryptoText}`);
 
         // Режим соединения с уже устаканившимся (waitForMeshSettled выше)
-        // mesh-пиром должен в итоге стать «напрямую (P2P)» — секция
-        // обновляется раз в 5с, пока открыта (см. static/room.js:
-        // CONNECTION_SECTION_REFRESH_MS), поэтому поллим с запасом до 10с.
+        // mesh-пиром должен в итоге стать «напрямую (P2P)» — список пиров
+        // рисуется из кеша единого поллера скоростей, который тикает раз в
+        // PEER_STATS_REFRESH_MS=3000 (см. static/room.js: pollPeerStats),
+        // поэтому поллим с запасом до 10с.
         await vasyaPage.waitForFunction(
           () => {
             const rows = Array.from(document.querySelectorAll('#settings-peers-list .settings-peer-row'));
@@ -507,6 +679,55 @@ async function main() {
           Number(signalingCountText) > 0,
           `счётчик сигналинга через сервер должен быть > 0 (bootstrap-обмен offer/answer/ice неизбежен), получено ${signalingCountText}`
         );
+
+        // Ф(пер-пир статистика, см. static/room.js: computePeerConnectionStats/
+        // formatPeerStatsLine/renderPeerConnectionsList): у каждой строки пира
+        // рядом с .settings-peer-label теперь .settings-peer-stats — непустая
+        // строка, содержащая и ↓, и ↑ (это верно и для самого первого тика —
+        // накопленный итог "∑ ↓ … ↑ …", и для скорости "↓ …/s ↑ …/s").
+        const statsTexts = await vasyaPage.evaluate(() =>
+          Array.from(document.querySelectorAll('#settings-peers-list .settings-peer-row')).map(
+            (row) => row.querySelector('.settings-peer-stats')?.textContent || ''
+          )
+        );
+        assert.ok(statsTexts.length > 0, 'в списке пиров должна быть хотя бы одна строка (Петя+Оля)');
+        for (const text of statsTexts) {
+          assert.ok(
+            text.includes('↓') && text.includes('↑'),
+            `строка .settings-peer-stats должна содержать "↓" и "↑", получено: "${text}"`
+          );
+        }
+
+        // Поллер скоростей тикает раз в PEER_STATS_REFRESH_MS=3000, ВСЕГДА
+        // (не только пока открыта панель, см. static/room.js: pollPeerStats)
+        // — камера Васи уже включена (см. camOk выше), трафик к Пете/Оле
+        // точно идёт, поэтому рано или поздно строка переключается с
+        // накопленного итога на СКОРОСТЬ ("↓ …B/s ↑ …B/s"). Ждём с запасом на
+        // несколько тиков (15с) плюс сам интервал поллинга.
+        if (camOk) {
+          await vasyaPage.waitForFunction(
+            () => {
+              const rows = Array.from(document.querySelectorAll('#settings-peers-list .settings-peer-row'));
+              return rows.some((row) => /[KMB]?B\/s/.test(row.querySelector('.settings-peer-stats')?.textContent || ''));
+            },
+            undefined,
+            { polling: 500, timeout: 15_000 }
+          );
+
+          // RTT — опциональная часть строки (currentRoundTripTime может не
+          // отдаться браузером), но если она есть — сверяем формат "· N ms".
+          const statsTextsAfterTicks = await vasyaPage.evaluate(() =>
+            Array.from(document.querySelectorAll('#settings-peers-list .settings-peer-row')).map(
+              (row) => row.querySelector('.settings-peer-stats')?.textContent || ''
+            )
+          );
+          for (const text of statsTextsAfterTicks) {
+            const rttMatch = text.match(/· (\d+) ms$/);
+            if (rttMatch) {
+              assert.ok(Number(rttMatch[1]) >= 0, `RTT в строке статы должен быть неотрицательным числом, получено: "${text}"`);
+            }
+          }
+        }
 
         await vasyaPage.click('#settings-panel-close');
       }
@@ -712,18 +933,31 @@ async function main() {
     }
 
     if (camOk) {
-      await step('Вася выключает камеру — у Пети появляется заглушка вместо видео', async () => {
-        await vasyaPage.click('#camera-button');
-        await petyaPage.waitForFunction(
-          (sel) => {
-            const video = document.querySelector(`${sel} video`);
-            const placeholder = document.querySelector(`${sel} .tile-placeholder`);
-            return !!video && !!placeholder && video.classList.contains('hidden') && !placeholder.classList.contains('hidden');
-          },
-          vasyaTileSel,
-          { polling: 100, timeout: 8000 }
-        );
-      });
+      await step(
+        'Вася выключает камеру — у Пети появляется заглушка вместо видео; если тайл Васи был максимизирован — авто-выход из максимизации',
+        async () => {
+          // Авто-выход (см. static/room.js: exitMaximizeIfHidden, вызывается
+          // из showTileVideo при скрытии video конкретного тайла) — сначала
+          // максимизируем тайл Васи у Пети ещё раз, чтобы было из чего выходить
+          // (после предыдущего шага он уже был снят снова).
+          await petyaPage.click(vasyaTileSel);
+          await waitForClassOnSelector(petyaPage, vasyaTileSel, 'tile--maximized', true, 3000);
+
+          await vasyaPage.click('#camera-button');
+          await petyaPage.waitForFunction(
+            (sel) => {
+              const video = document.querySelector(`${sel} video`);
+              const placeholder = document.querySelector(`${sel} .tile-placeholder`);
+              return !!video && !!placeholder && video.classList.contains('hidden') && !placeholder.classList.contains('hidden');
+            },
+            vasyaTileSel,
+            { polling: 100, timeout: 8000 }
+          );
+          // Видео скрылось — максимизация должна сняться сама, без повторного
+          // клика/Esc (иначе у Пети остался бы чёрный fixed-оверлей без картинки).
+          await waitForClassOnSelector(petyaPage, vasyaTileSel, 'tile--maximized', false, 3000);
+        }
+      );
     } else {
       skip('Вася выключает камеру', 'камера не была успешно включена ранее');
     }
@@ -758,6 +992,11 @@ async function main() {
         `ссылка в попапе должна быть вида /r/${roomId}#k=<ключ> (без #lt), получено: ${linkText}`
       );
       assert.ok(!linkText.includes('lt='), `ссылка «Поделиться» не должна нести leaderToken: ${linkText}`);
+      // Приватность имени комнаты (см. static/room.js: buildShareLink) —
+      // invite-ссылка собрана заново из одного #k=, `n=` в неё в принципе не
+      // попадает (выше это уже доказано регэкспом с "$" сразу после ключа,
+      // здесь — та же проверка явно, тем же стилем, что и lt= выше).
+      assert.ok(!linkText.includes('n='), `ссылка «Поделиться» не должна нести имя комнаты (n=): ${linkText}`);
 
       // #k в ссылке — это РЕАЛЬНЫЙ ключ комнаты (тот же, что вывел сам Вася
       // при входе, см. vasyaRoomKey выше), а не случайный мусор — сверяем
@@ -765,6 +1004,23 @@ async function main() {
       // stream-info-фрейм в bootstrap-окне и сломал бы следующую проверку).
       const linkKey = linkText.trim().split('#k=')[1];
       assert.equal(linkKey, vasyaRoomKey, `#k в ссылке «Поделиться» должен совпадать с реальным ключом комнаты (получено ${linkKey})`);
+
+      // Приватность имени комнаты (Ш1): #n= никогда не уходит на сервер (см.
+      // static/landing.js/room.js) — сверяем по факту через шпион ВСЕХ
+      // фреймов серверного WS, установленный на странице Васи в самом начале
+      // сценария (installSignalingFrameSpy): ни сырая строка имени комнаты,
+      // ни её encodeURIComponent-вариант не должны встретиться ни в одном
+      // фрейме, отправленном за всё время сценария до этого момента (join,
+      // offer/answer/ice, stream-info, чат-сообщения и т.д.).
+      const vasyaFramesRaw = JSON.stringify(await allFramesSentOn(vasyaPage));
+      assert.ok(
+        !vasyaFramesRaw.includes(ROOM_NAME),
+        `имя комнаты "${ROOM_NAME}" не должно встречаться ни в одном WS-фрейме Васи`
+      );
+      assert.ok(
+        !vasyaFramesRaw.includes(encodeURIComponent(ROOM_NAME)),
+        `URL-encoded имя комнаты не должно встречаться ни в одном WS-фрейме Васи`
+      );
 
       await vasyaPage.click('#share-popup-close');
       // Не page.waitForSelector('#share-popup.hidden') — по умолчанию он ждёт
@@ -1007,6 +1263,41 @@ async function main() {
             () => document.querySelectorAll('.chat-message-text script').length
           );
           assert.equal(scriptTagCount, 0, 'тег <script> не должен появиться как реальный DOM-элемент');
+
+          // --- (а-1) ДЕСКТОП: тулбар форматирования — не только хоткеи ---
+          // Регрессионный тест на баг «на десктопе пропала возможность
+          // форматирования, кнопки нет»: кнопка «Aa» и тулбар (по выделению
+          // текста) обязаны быть видны и на десктопном layout, а не только
+          // на мобильном (см. static/chat.js: updateFormatToolbarVisibility,
+          // static/style.css: .chat-format-toggle-button). aPage здесь —
+          // обычный десктопный контекст (viewport по умолчанию, заведомо
+          // ≥1024px), никакого isMobile.
+          const aDesktopViewport = aPage.viewportSize();
+          assert.ok(
+            aDesktopViewport && aDesktopViewport.width >= 1024,
+            `контекст Ани должен быть десктопным (≥1024px), получено: ${JSON.stringify(aDesktopViewport)}`
+          );
+          const aChat = await getChatDom(aPage);
+          await aChat.textInput.fill('desktop toolbar check');
+          const aFormatButtonVisible = await aPage.locator('.chat-format-toggle-button').isVisible();
+          assert.ok(aFormatButtonVisible, 'кнопка «Aa» должна быть видна на десктопном layout, а не только на мобильном');
+          await aPage.evaluate(() => {
+            const el = document.querySelector('.chat-text-input');
+            el.focus();
+            el.setSelectionRange(0, el.value.length);
+            document.dispatchEvent(new Event('selectionchange'));
+          });
+          await aPage.locator('.chat-format-toolbar:not(.hidden)').waitFor({
+            state: 'visible',
+            timeout: 2000,
+          });
+          await aPage.click('.chat-format-btn--bold');
+          const aValueAfterBold = await aChat.textInput.inputValue();
+          assert.equal(
+            aValueAfterBold,
+            '**desktop toolbar check**',
+            `клик по «Bold» в десктопном тулбаре должен обернуть выделение в **...**, получено: ${aValueAfterBold}`
+          );
 
           // --- (a-2) Ф4: курсив __...__, спойлер ||...|| (скрыт -> клик -> .revealed),
           //     инлайн-код `...` (маркеры внутри НЕ разбираются), именованная
@@ -1656,14 +1947,16 @@ async function main() {
     // файловый DataChannel, в отличие от текста/реакций, не имеет серверного
     // фоллбэка вовсе, поэтому гонка "канал шины ещё не открылся" тут не
     // должна маскироваться удачным таймингом). Женя отправляет картинку
-    // ~50КБ (а) — авто-скачивание, инлайн-превью у Захара; затем "файл"
-    // ~300КБ text/plain (б) — Захар жмёт «Скачать», ждём исчезновения
-    // прогресса и сверяем итоговый Blob побайтово. Иван заходит ПОЗЖЕ, уже
-    // после отправки обоих файлов (в) — видит карточки из истории (не
-    // живьём) и всё ещё может их запросить, пока Женя (исходный отправитель)
-    // в комнате.
+    // ~50КБ (а) — у Захара до клика по карточке видно только имя и размер
+    // (никакого автоскачивания, в т.ч. для картинок — файлы не должны
+    // скачиваться у получателя сами), клик «Скачать» -> прогресс -> инлайн-
+    // превью; затем "файл" ~300КБ text/plain (б) — тот же ручной путь, ждём
+    // исчезновения прогресса и сверяем итоговый Blob побайтово. Иван заходит
+    // ПОЗЖЕ, уже после отправки обоих файлов (в) — видит карточки из истории
+    // (не живьём) и всё ещё может их запросить, пока Женя (исходный
+    // отправитель) в комнате.
     await step(
-      'Передача файлов: авто-скачивание картинки, ручное скачивание файла с прогрессом и сверкой размера, опоздавший скачивает из истории, инлайн-плееры audio/video (Ф4, раздел B)',
+      'Передача файлов: до клика — только имя и размер (без автоскачивания), ручное скачивание с прогрессом и сверкой размера, опоздавший скачивает из истории, инлайн-плееры audio/video (Ф4, раздел B)',
       async () => {
         const res = await fetch(`${server.baseUrl}/api/rooms`, { method: 'POST' });
         assert.ok(res.ok, `POST /api/rooms ответил статусом ${res.status}`);
@@ -1693,14 +1986,93 @@ async function main() {
           await openChatPanel(ePage);
           await openChatPanel(fPage);
 
-          // --- (а) картинка ~50КБ: авто-скачивание у Захара, инлайн-превью ---
+          // --- (а) картинка ~50КБ: у Захара до клика по карточке только имя
+          //     и размер, ручное скачивание -> инлайн-превью ---
           const pngBuffer = makeTestPngBuffer({ width: 112, height: 112 });
           await attachFilesToChat(ePage, [{ name: 'photo.png', mimeType: 'image/png', buffer: pngBuffer }]);
+
+          // Фикс собственного файла отправителя (см. static/chat.js:
+          // handleFilesSelected/renderFileDoneBody) — Женя должен увидеть
+          // СВОЮ карточку сразу в done-виде (превью + рабочий Download из
+          // ЛОКАЛЬНОГО objectURL), не дожидаясь никакого обмена с Захаром.
+          const eOwnFileCard = ePage
+            .locator('.chat-message--file.chat-message--own', { hasText: 'photo.png' })
+            .locator('.chat-file-card');
+          await eOwnFileCard.locator('.chat-file-image').waitFor({ state: 'visible', timeout: 5000 });
+          const eOwnImageSrc = await eOwnFileCard.locator('.chat-file-image').getAttribute('src');
+          assert.ok(
+            eOwnImageSrc && eOwnImageSrc.startsWith('blob:'),
+            `превью у отправителя должно ссылаться на локальный blob:, получено: "${eOwnImageSrc}"`
+          );
+          const eOwnDownloadHrefBefore = await eOwnFileCard.locator('.chat-file-download-link').getAttribute('href');
+          assert.ok(
+            eOwnDownloadHrefBefore && eOwnDownloadHrefBefore.startsWith('blob:'),
+            `ссылка Download у отправителя должна вести на локальный blob:, получено: "${eOwnDownloadHrefBefore}"`
+          );
+
+          // У Захара (получателя) карточка картинки должна остаться в offer-
+          // виде — только имя и размер, БЕЗ автоматической закачки байт: ни
+          // <img>-превью, ни единой blob:-ссылки. Ждём с небольшим запасом
+          // (не вечный таймаут, а окно, за которое раньше срабатывало
+          // автоскачивание картинок ≤2МБ), чтобы не спутать «автоскачивания
+          // больше нет» с «просто ещё не успело».
+          const fImageCard = fPage.locator('.chat-file-card', { hasText: 'photo.png' });
+          await fImageCard.locator('.chat-file-name').waitFor({ state: 'visible', timeout: 10_000 });
+          assert.equal(await fImageCard.locator('.chat-file-name').textContent(), 'photo.png');
+          const fImageOfferSizeText = await fImageCard.locator('.chat-file-size').textContent();
+          assert.ok(
+            fImageOfferSizeText && /B|KB|MB/.test(fImageOfferSizeText),
+            `в offer-виде у получателя должен быть виден человекочитаемый размер: ${fImageOfferSizeText}`
+          );
+          await fPage.waitForTimeout(1500); // окно, где раньше срабатывало авто-скачивание ≤2МБ
+          assert.equal(
+            await fImageCard.locator('.chat-file-image').count(),
+            0,
+            'до клика получателя картинка не должна скачиваться сама и показывать превью'
+          );
+          assert.equal(
+            await fImageCard.locator('a[href^="blob:"]').count(),
+            0,
+            'до клика получателя в карточке не должно быть ни одной blob:-ссылки'
+          );
+
+          // Клик по кнопке «Скачать» -> прогресс -> done-вид с превью (тот же
+          // ручной путь, что и для остальных типов файлов ниже).
+          const fImageDownloadButton = fImageCard.locator('.chat-file-download-button');
+          await fImageDownloadButton.waitFor({ state: 'visible', timeout: 5000 });
+          await fImageDownloadButton.click();
 
           await fPage.waitForFunction(
             () => (document.querySelector('.chat-file-image')?.naturalWidth || 0) > 0,
             undefined,
             { polling: 100, timeout: 10_000 }
+          );
+          const fImageSrc = await fImageCard.locator('.chat-file-image').getAttribute('src');
+          assert.ok(fImageSrc && fImageSrc.startsWith('blob:'), `src картинки должен быть blob-URL, получено: ${fImageSrc}`);
+          const fImageDownloadLink = fImageCard.locator('.chat-file-download-link--compact');
+          await fImageDownloadLink.waitFor({ state: 'visible', timeout: 5000 });
+          const fImageObjectUrl = await fImageDownloadLink.getAttribute('href');
+          const fImageBlobSize = await fPage.evaluate(async (url) => {
+            const blob = await (await fetch(url)).blob();
+            return blob.size;
+          }, fImageObjectUrl);
+          assert.equal(
+            fImageBlobSize,
+            pngBuffer.length,
+            `скачанная картинка должна совпадать по размеру с исходной (${pngBuffer.length}), получено ${fImageBlobSize}`
+          );
+
+          // После того как Захар получил файл (карточка получателя выше уже
+          // ушла в done — img.naturalWidth>0), карточка ОТПРАВИТЕЛЯ не должна
+          // деградировать обратно к «только заголовок»: статусы отдачи
+          // (sending/sent, см. beginSendingFile) не перетирают own-состояние
+          // с objectUrl (см. renderFileCardBody: проверка идёт по наличию
+          // state.objectUrl, а не по текущему status).
+          await eOwnFileCard.locator('.chat-file-image').waitFor({ state: 'visible', timeout: 3000 });
+          const eOwnDownloadHrefAfter = await eOwnFileCard.locator('.chat-file-download-link').getAttribute('href');
+          assert.ok(
+            eOwnDownloadHrefAfter && eOwnDownloadHrefAfter.startsWith('blob:'),
+            `после отдачи файла получателю карточка отправителя должна остаться в done-виде (Download на blob:), получено: "${eOwnDownloadHrefAfter}"`
           );
 
           // --- (б) "файл" ~300КБ (text/plain): у Захара карточка с кнопкой,
@@ -1766,8 +2138,7 @@ async function main() {
           }
 
           // --- (г) аудио: валидный WAV ~1.5с (см. helpers.mjs:
-          //     makeTestWavBuffer) — не авто-скачивается (порог ≤2МБ только
-          //     для картинок), Захар жмёт «Скачать» -> <audio controls>,
+          //     makeTestWavBuffer) — Захар жмёт «Скачать» -> <audio controls>,
           //     мета-строка (имя/размер/длительность из loadedmetadata),
           //     скачанный Blob совпадает по размеру. ---
           const wavBuffer = makeTestWavBuffer({ durationSeconds: 1.5 });
@@ -1876,6 +2247,51 @@ async function main() {
             console.log(
               `# [честно опущено] Chromium не вычислил duration для тестового WebM за отведённое время — проверка длительности видео пропущена (элемент <video>/src=blob/размер/кнопка «Скачать» уже проверены выше): ${err.message}`
             );
+          }
+
+          // --- Предзаполнение модалки входа именем (см. static/room.js:
+          //     showJoinModal, static/namegen.js: NameGen.userName()) —
+          //     новый участник (Клава) заходит в ТУ ЖЕ комнату и жмёт
+          //     «Войти» БЕЗ единой правки поля: joinRoom() тут не годится —
+          //     он безусловно затирает поле пустой строкой (см. helpers.mjs),
+          //     а нужно проверить именно предзаполнение, поэтому кликаем
+          //     #join-modal-button напрямую. Подпись тайла должна нести
+          //     сгенерированное имя целиком, а буква аватара — не «�» (см.
+          //     static/room.js: createTile, фикс графем-кластера). ---
+          const klavaContext = await browser.newContext();
+          try {
+            await installPcRegistry(klavaContext);
+            const klavaPage = await klavaContext.newPage();
+            await klavaPage.goto(fileRoomUrl);
+            await klavaPage.waitForSelector('#join-modal:not(.hidden)', { timeout: 10_000 });
+            const prefilledUserName = await klavaPage.inputValue('#join-name-input');
+            assert.ok(prefilledUserName, 'модалка входа должна быть предзаполнена сгенерированным именем');
+            assert.match(
+              prefilledUserName,
+              /^\p{Extended_Pictographic}/u,
+              `предзаполненное имя должно начинаться с эмодзи, получено: "${prefilledUserName}"`
+            );
+            await klavaPage.click('#join-modal-button');
+            await waitForOverlayHidden(klavaPage);
+
+            const ownLabel = await klavaPage.locator('.tile--own .tile-name').textContent();
+            assert.ok(
+              ownLabel && ownLabel.includes(prefilledUserName),
+              `подпись своего тайла должна содержать предзаполненное имя "${prefilledUserName}", получено: "${ownLabel}"`
+            );
+            const avatarLetter = await klavaPage.locator('.tile--own .tile-placeholder-letter').textContent();
+            // Первый графем-кластер предзаполненного имени — namegen.js даёт
+            // только одно-кодпойнтные эмодзи (без VS16/ZWJ), поэтому обычный
+            // спред строки (по code point, не по UTF-16 code unit) даёт тот
+            // же результат, что и фолбэк [...str][0] в static/room.js.
+            const expectedLetter = [...prefilledUserName][0];
+            assert.equal(
+              avatarLetter,
+              expectedLetter,
+              `буква-аватар должна быть первым графем-кластером имени ("${expectedLetter}"), получено: "${avatarLetter}" (не «�»)`
+            );
+          } finally {
+            await klavaContext.close();
           }
         } finally {
           await eContext.close();

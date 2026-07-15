@@ -30,8 +30,10 @@
 > (`deriveSas`, the `SAS_EMOJI` table, the commit hash helper),
 > [`../static/room.js`](../static/room.js) (the commit-reveal round state
 > machine, `sessionCertificate`, the `sas-commit`/`sas-reveal` bus handlers),
-> [`../static/chat.js`](../static/chat.js) (`setRoomSas` and the header
-> indicator). This document is the specification the code implements; where the
+> [`../static/chat.js`](../static/chat.js) (`setRoomSas` and the chat-panel
+> header indicator), and [`../static/room.js`](../static/room.js) again
+> (`renderRoomSas`, mirroring the same six emoji into the main window's top
+> bar). This document is the specification the code implements; where the
 > two disagree, the code is authoritative and this file is a bug.
 
 ## 1. Why This Exists — The Gap the Room Key Doesn't Close
@@ -470,11 +472,16 @@ the honest participants except by a `2^-36` blind guess.
 
 ## 9. UI States
 
-The SAS lives in the **chat header** (`setRoomSas` in
+The SAS lives in the **chat panel's header** (`setRoomSas` in
 [`../static/chat.js`](../static/chat.js)), a compact 🔐 badge whose tap expands
 an explanation of how to use it — including the instruction to compare *before*
 speaking, and a plain-text fallback (the fingerprint hex / a word rendering) for
-when two platforms draw the same emoji differently enough to cause doubt:
+when two platforms draw the same emoji differently enough to cause doubt. The
+same six emoji are also mirrored into the main window's **top bar**
+(`renderRoomSas` in [`../static/room.js`](../static/room.js), `#topbar-sas`),
+so verification doesn't require opening the chat panel first; the top-bar copy
+tracks the identical verifying/ok/mismatch states below, just without the
+tap-to-expand explanation:
 
 | State | When | Shown |
 |---|---|---|

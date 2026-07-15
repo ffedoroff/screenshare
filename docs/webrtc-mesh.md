@@ -200,6 +200,24 @@ The selected pair is read from the spec-defined
 `candidate-pair` flags (`selected` / `nominated` + `succeeded`) for browsers
 whose transport stats don't carry that field.
 
+The same `getStats()` call also yields round-trip time (the selected
+candidate pair's `currentRoundTripTime`) and byte counters (the `transport`
+record's `bytesSent`/`bytesReceived`, covering all DTLS traffic to that peer
+— media and data channels alike; a sum over `outbound-rtp`/`inbound-rtp` is
+the fallback on browsers with no `transport` record). A single recurring
+poller, ticking every `PEER_STATS_REFRESH_MS` (3s) for as long as the
+meeting runs — not just while the settings panel is open — does one
+`getStats()` per peer per tick, diffs the byte counters against the previous
+tick to get a throughput, and caches the result. Both the settings panel's
+per-peer row (`↓`/`↑` speed and RTT, or an accumulated `∑` total on the
+first tick before there's a previous sample to diff against) and the small
+speed badge overlaid on each tile in the video grid read that same cache —
+neither triggers its own `getStats()` call. A tile's badge shows the
+*incoming* rate for a remote peer's video, and the *sum of outgoing* rates
+across all peers for one's own tile (mesh sends a separate copy of one's
+own media to each participant, so no single per-peer rate represents "my"
+upload).
+
 ## 8. Screen Sharing
 
 Screen sharing is server-arbitrated room state, not a peer-to-peer

@@ -283,9 +283,15 @@ circumstance.
    proxying file bytes through the server (see
    [`PRD.md` §5.3](PRD.md#53-chat) and [`privacy.md`](privacy.md)).
 
-Limits: 25MB per file, 16KB per chunk. Images ≤2MB auto-download and preview
-inline for the recipient without a click; anything larger, or non-image,
-shows a card with an explicit download action.
+Limits: 25MB per file, 16KB per chunk. Downloading is always an explicit
+action — a fresh offer, of any mime type or size, renders as a card with
+just the file's name and size and a Download button; nothing is requested
+over the wire until the recipient clicks it (an earlier version auto-
+downloaded images ≤2MB with no click; that path was removed). The sender's
+own card is the one exception, and not really an exception at all: it goes
+straight to the same "done" body a recipient sees after downloading, because
+the sender already holds the full `File` locally and has nothing to
+request.
 
 ## 11. Rate Limiting
 

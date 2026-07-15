@@ -219,6 +219,16 @@ body {
   border-color: var(--accent);
 }
 
+/* Мелкая приглушённая подсказка под инпутом (напр. про приватность имени
+   комнаты — .name-input выше). .landing-card уже задаёт gap между своими
+   прямыми детьми, так что здесь нужен только нулевой собственный margin,
+   чтобы подсказка не добавляла лишний отступ сверх этого gap. */
+.field-hint {
+  margin: 0;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
 /* ---------- Build-хэш (форензический якорь, см. docs/security.md,
    «Published Build Hash») — ненавязчивый подвал лендинга. Комната переиспользует
    .build-verify-link/.build-full ниже для попапа «Поделиться» и настроек,
@@ -292,6 +302,14 @@ body {
   font-weight: 600;
   color: var(--text-muted);
   letter-spacing: 0.02em;
+  /* Имя комнаты (см. static/room.js: initialRoomName) может быть длинным —
+     колонка бара узкая (1fr), обрезаем в одну строку с многоточием. min-width:0
+     нужен самой ячейке грида: без него flex/block-ребёнок не сжимается уже
+     "content width", а тянет всю колонку шире положенного. */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
 }
 
 .room-top-bar-spacer {
@@ -350,6 +368,42 @@ body {
 .room-timer--critical {
   color: var(--danger-hover);
   border-color: var(--danger);
+}
+
+/* SAS «отпечаток комнаты» в топ-баре главного окна (см. static/room.js:
+   renderTopbarSas) — то же самое состояние, что и .chat-sas в шапке
+   чат-панели (см. static/chat.js: setRoomSas), просто дублируется сюда,
+   чтобы быть видимым без открытия чата. Та же пилюля, что у соседей
+   (.participant-count/.room-timer), состояния — по образцу .chat-sas--*. */
+.topbar-sas {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: var(--space-1) var(--space-3);
+  white-space: nowrap;
+  letter-spacing: 0.05em;
+}
+
+.topbar-sas--ok {
+  color: var(--text);
+}
+
+.topbar-sas--verifying {
+  color: var(--text-muted);
+  opacity: 0.85;
+  letter-spacing: 0;
+  text-transform: uppercase;
+  font-size: 0.72rem;
+}
+
+.topbar-sas--mismatch {
+  color: var(--danger-hover);
+  border-color: var(--danger);
+  background: rgba(229, 72, 77, 0.12);
+  letter-spacing: 0;
 }
 
 /* ---------- Комната: сцена и тайлы ---------- */
@@ -485,6 +539,53 @@ body {
   align-items: center;
   justify-content: center;
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  /* Клик тоглит максимизацию (см. static/room.js: createTile/maximizeTile) —
+     курсор везде pointer, а не только когда видео видно (:has(.tile-video
+     не -hidden) избыточно сложно для того же результата: клик по заглушке
+     просто ничего не делает, это не требует другого курсора). */
+  cursor: pointer;
+}
+
+/* ---------- Максимизация тайла на всю страницу (клик по тайлу с видео) ----------
+   Простой fixed-оверлей, а НЕ Fullscreen API: это тоггл «на всю страницу» (в
+   пределах вкладки), а не «на весь экран» — F11-подобный режим никто не
+   просил и он неожиданно вынес бы пользователя из браузерного окна.
+   Полноэкранный показ шаринга экрана (#screen-fullscreen-button,
+   requestFullscreenCompat) — другая сцена и другой (настоящий Fullscreen
+   API) механизм, они не конфликтуют: этот оверлей просто рисуется выше всего
+   по z-index и не претендует на top-layer браузера. */
+.tile--maximized {
+  position: fixed;
+  inset: 0;
+  z-index: 65; /* выше share-popup (60) — максимизированный тайл главнее любого попапа поверх него */
+  border-radius: 0;
+  border: none;
+  background: #000;
+  cursor: zoom-out;
+}
+
+.tile--maximized .tile-video {
+  /* В миниатюре cover обрезает кадр ради заполнения тайла — в полноэкранном
+     виде это неуместно, contain показывает видео целиком (чёрные поля по
+     краям при несовпадении соотношения сторон — ок). */
+  object-fit: contain;
+}
+
+.tile--maximized .tile-name {
+  left: calc(var(--space-3) + env(safe-area-inset-left));
+  bottom: calc(var(--space-3) + env(safe-area-inset-bottom));
+  font-size: 0.85rem;
+  padding: var(--space-1) var(--space-3);
+}
+
+.tile--maximized .tile-crown {
+  top: calc(var(--space-3) + env(safe-area-inset-top));
+  left: calc(var(--space-3) + env(safe-area-inset-left));
+}
+
+.tile--maximized .tile-mic-off {
+  top: calc(var(--space-3) + env(safe-area-inset-top));
+  right: calc(var(--space-3) + env(safe-area-inset-right));
 }
 
 .tile--speaking {
@@ -1608,13 +1709,15 @@ body {
   background: var(--bg-elevated);
 }
 
-/* ---------- Мобильный тулбар форматирования (см. chat.js:
+/* ---------- Тулбар форматирования (см. chat.js:
    updateFormatToolbarVisibility) ----------
-   Кнопка «Aa» сама по себе скрыта на десктопе (display:none здесь) — тулбар
-   там не нужен, форматирование — горячими клавишами (Cmd/Ctrl+B/I/…, см.
-   chat.js). Обе показываются только в @media (max-width:640px) ниже. */
+   Кнопка «Aa» и тулбар видны на ЛЮБОМ layout — десктоп дополнительно имеет
+   горячие клавиши (Cmd/Ctrl+B/I/…, см. chat.js), но без видимой кнопки
+   форматирование там было полностью недискаверабельно (баг: «нет кнопки —
+   нет форматирования»). На мобильном @media (max-width:640px) ниже только
+   донастраивает раскладку инпута — саму видимость кнопки больше не трогает. */
 .chat-format-toggle-button {
-  display: none;
+  display: flex;
   flex-shrink: 0;
   align-items: center;
   justify-content: center;
@@ -1784,8 +1887,7 @@ body {
    сверху вниз — order — это свойство самого элемента, оно продолжает
    действовать в любом флекс-контексте, в который элемент попадает).
    justify-content:flex-end прижимает колонку к низу — так, что ➤ всегда на
-   уровне низа textarea, а если Aa скрыта (десктоп, см. .chat-format-toggle-button
-   display:none выше по файлу) — 📎 и ➤ просто ближе друг к другу, без дыр. */
+   уровне низа textarea. */
 .chat-input-row--expanded {
   align-items: stretch;
 }
@@ -2122,7 +2224,8 @@ body {
   }
 
   .participant-count,
-  .room-timer {
+  .room-timer,
+  .topbar-sas {
     font-size: 0.72rem;
     padding: var(--space-1) var(--space-2);
   }
@@ -2263,12 +2366,6 @@ body {
     width: 20px;
     height: 20px;
   }
-
-  /* Кнопка «Aa» и тулбар форматирования — см. секцию выше в файле, здесь
-     только включаем видимость (на десктопе display:none). */
-  .chat-format-toggle-button {
-    display: flex;
-  }
 }
 
 @media (max-width: 480px) {
@@ -2388,6 +2485,34 @@ body {
   width: 14px;
   height: 14px;
   display: block;
+}
+
+/* ---------- Бейдж скорости на тайле (см. static/room.js: updateTileSpeedBadges) ---------- */
+/* Правый нижний угол — единственный свободный: левый нижний занят
+   .tile-name, оба верхних — короной лидера и индикатором «мик выключен»
+   (см. выше). Скрыт по умолчанию (createTile) — показывается только когда
+   для этого пира уже посчитана хотя бы одна скорость. pointer-events: none —
+   клик по тайлу тоглит максимизацию (см. static/room.js: createTile), бейдж
+   не должен его перехватывать. */
+.tile-speed {
+  position: absolute;
+  right: var(--space-2);
+  bottom: var(--space-2);
+  padding: 2px var(--space-2);
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(2px);
+  color: #fff;
+  border-radius: var(--radius);
+  font-size: 0.68rem;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+
+.tile--maximized .tile-speed {
+  right: calc(var(--space-3) + env(safe-area-inset-right));
+  bottom: calc(var(--space-3) + env(safe-area-inset-bottom));
+  font-size: 0.8rem;
+  padding: var(--space-1) var(--space-3);
 }
 
 /* ---------- Заявки лобби (только у лидера) ---------- */
@@ -2676,10 +2801,18 @@ body {
 
 .settings-peer-row {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: var(--space-2);
   min-height: 44px;
+  padding-block: 6px; /* воздух сверху/снизу теперь, когда строка двухэтажная (имя+режим / статы) */
   font-size: 0.88rem;
+}
+
+.settings-peer-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
 }
 
 .settings-peer-row--empty {
@@ -2688,11 +2821,16 @@ body {
 }
 
 /* Цветная точка режима соединения: зелёная — P2P, жёлтая — TURN-релей,
-   оранжевая — серверный fallback, серая — ещё устанавливается. */
+   оранжевая — серверный fallback, серая — ещё устанавливается.
+   margin-top — раньше точка центрировалась по единственной строке текста;
+   при двухэтажном контенте (имя+режим сверху, статы снизу) center по всей
+   высоте row тянет её вниз, поэтому выравниваем вручную по высоте первой
+   строки (align-items родителя теперь flex-start, см. .settings-peer-row). */
 .settings-peer-dot {
   flex-shrink: 0;
   width: 10px;
   height: 10px;
+  margin-top: 0.35em;
   border-radius: 50%;
   background: var(--text-muted);
 }
@@ -2714,6 +2852,16 @@ body {
 }
 
 .settings-peer-label {
+  overflow-wrap: anywhere;
+}
+
+/* Трафик in/out + RTT под именем пира (см. static/room.js: formatPeerStatsLine)
+   — приглушённая вторая строка, мельче основного текста, tabular-nums чтобы
+   цифры не «дрожали» по ширине на каждом тике обновления. */
+.settings-peer-stats {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
   overflow-wrap: anywhere;
 }
 

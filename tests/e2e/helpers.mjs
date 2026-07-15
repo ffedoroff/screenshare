@@ -471,11 +471,18 @@ export function installFakeVisualViewport(context) {
 // ВСЕХ сценариев теста: дождаться модалки, (опционально) ввести имя, кликнуть
 // «Войти». Создатель комнаты тоже проходит через неё — лендинг больше не
 // спрашивает имя, только создаёт комнату и редиректит на /r/<id>#lt=<token>.
+//
+// Поле #join-name-input теперь предзаполнено сгенерированным именем (см.
+// static/room.js: showJoinModal, NameGen.userName()) — без явного `name` тест
+// хочет войти анонимом, как и раньше, а не унести в комнату случайное
+// сгенерированное имя. Поэтому fill безусловный: `name ?? ''` затирает
+// предзаполнение пустой строкой, если имя не передано, и вписывает `name`,
+// если передано — тем самым сохраняется прежняя детерминированная семантика
+// joinRoom(page) во всех ~40 существующих вызовах (включая filler-страницы
+// resilience.spec.mjs и retry-путь waitForMeshSettled ниже).
 export async function joinRoom(page, name) {
   await page.waitForSelector('#join-modal:not(.hidden)', { timeout: 10_000 });
-  if (name) {
-    await page.fill('#join-name-input', name);
-  }
+  await page.fill('#join-name-input', name ?? '');
   await page.click('#join-modal-button');
 }
 
@@ -636,7 +643,9 @@ export async function waitForMeshSettled(pages, { tileCount, connectionsPerPage,
         // page.reload() — полная перезагрузка (не авто-reconnect внутри
         // вкладки) — модалка входа появляется заново (анонимность, см.
         // static/room.js), имя заново не важно для этой страховки — просто
-        // жмём «Войти» пустым именем, чтобы снова оказаться в комнате.
+        // жмём «Войти» без имени (joinRoom(page) без второго аргумента
+        // затирает предзаполнение NameGen.userName() пустой строкой, см.
+        // joinRoom выше), чтобы снова оказаться в комнате анонимом.
         await page.reload();
         await joinRoom(page);
         await waitForOverlayHidden(page);
