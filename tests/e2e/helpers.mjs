@@ -211,6 +211,16 @@ export function createServerController(port, extraEnv = {}) {
       env: {
         ...process.env,
         PORT: String(port),
+        // ROOM_CREATION_IP_LIMIT: прод-дефолт ужесточён до 3/60с (см.
+        // state::DEFAULT_ROOM_CREATION_IP_LIMIT в src/state.rs) — e2e-спеки
+        // (basic.spec.mjs, resilience.spec.mjs) создают/восстанавливают много
+        // комнат с одного и того же IP за прогон (см. там комментарии про
+        // ROOM_CREATION_IP_LIMIT), поэтому дефолтный env этого контроллера
+        // поднимает лимит далеко за пределы того, что прогон способен
+        // нафлудить — тот же приём, что у JOIN_ROOM_IP_LIMIT в
+        // basic.spec.mjs. `extraEnv` ниже может переопределить при
+        // необходимости.
+        ROOM_CREATION_IP_LIMIT: '100000',
         ...extraEnv,
       },
       stdio: ['ignore', 'pipe', 'pipe'],

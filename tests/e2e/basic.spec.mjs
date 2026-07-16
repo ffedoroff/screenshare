@@ -295,8 +295,13 @@ async function main() {
   let browser = null;
   // Комната, переданная из шага «Ш1: неверный t» шагу «Лимит длительности
   // созвона» — см. комментарий у roomIdForTimerTestReuse = wrongKeyRoomId
-  // ниже: экономим один POST /api/rooms (H2: ROOM_CREATION_IP_LIMIT — 10 за
-  // 60с с одного IP, а этот файл создаёт много комнат за один прогон).
+  // ниже: экономим один POST /api/rooms (H2: ROOM_CREATION_IP_LIMIT —
+  // прод-дефолт 3 за 60с с одного IP, см. state::DEFAULT_ROOM_CREATION_IP_LIMIT
+  // в src/state.rs; этот файл создаёт много комнат за один прогон, поэтому
+  // сервер здесь поднимается с ROOM_CREATION_IP_LIMIT=100000, см.
+  // tests/e2e/helpers.mjs::createServerController — но дисциплина
+  // переиспользования комнат ниже сохранена не только ради лимита, а и
+  // просто чтобы не плодить лишние комнаты).
   let roomIdForTimerTestReuse = null;
 
   try {
@@ -341,6 +346,17 @@ async function main() {
         prefilledRoomName.length > 0 && prefilledRoomName.length <= 40,
         `предзаполненное имя комнаты должно быть непустым и не длиннее 40 символов, получено (${prefilledRoomName.length}): "${prefilledRoomName}"`
       );
+
+      // Кнопка ↻ рядом с полем (см. static/index.html: .input-with-regen,
+      // static/landing.js: roomNameRegenButtonEl click) — перекатывает новое
+      // сгенерированное имя без сабмита формы.
+      await vasyaPage.click('#room-name-regen-button');
+      const regeneratedRoomName = await vasyaPage.inputValue('#room-name-input');
+      assert.ok(
+        regeneratedRoomName && regeneratedRoomName !== prefilledRoomName,
+        `клик по ↻ должен сгенерировать новое имя комнаты, было "${prefilledRoomName}", стало "${regeneratedRoomName}"`
+      );
+
       await vasyaPage.fill('#room-name-input', ROOM_NAME);
 
       await vasyaPage.click('#create-room-button');
@@ -2502,9 +2518,12 @@ async function main() {
           //     «Войти» БЕЗ единой правки поля: joinRoom() тут не годится —
           //     он безусловно затирает поле пустой строкой (см. helpers.mjs),
           //     а нужно проверить именно предзаполнение, поэтому кликаем
-          //     #join-modal-button напрямую. Подпись тайла должна нести
-          //     сгенерированное имя целиком, а буква аватара — не «�» (см.
-          //     static/room.js: createTile, фикс графем-кластера). ---
+          //     #join-modal-button напрямую. Заодно проверяем кнопку ↻ рядом
+          //     с полем. Подпись тайла должна нести предзаполненное имя БЕЗ
+          //     ведущего эмодзи (он дублирует круг-аватар, см.
+          //     static/room.js: tileDisplayName/stripLeadingAvatarEmoji), а
+          //     буква аватара — не «�» (см. static/room.js: createTile,
+          //     фикс графем-кластера). ---
           const klavaContext = await browser.newContext();
           try {
             await installPcRegistry(klavaContext);
@@ -2518,20 +2537,46 @@ async function main() {
               /^\p{Extended_Pictographic}/u,
               `предзаполненное имя должно начинаться с эмодзи, получено: "${prefilledUserName}"`
             );
+
+            // Кнопка ↻ рядом с полем модалки входа (см. static/room.html:
+            // .input-with-regen, static/room.js: joinNameRegenButtonEl click)
+            // — перекатывает новое NameGen.userName(); возвращаем поле к
+            // прежнему значению сразу после проверки, чтобы не потерять
+            // prefilledUserName как якорь для проверок подписи/буквы
+            // аватара ниже.
+            await klavaPage.click('#join-name-regen-button');
+            const regeneratedUserName = await klavaPage.inputValue('#join-name-input');
+            assert.ok(
+              regeneratedUserName && regeneratedUserName !== prefilledUserName,
+              `клик по ↻ должен сгенерировать новое имя, было "${prefilledUserName}", стало "${regeneratedUserName}"`
+            );
+            await klavaPage.fill('#join-name-input', prefilledUserName);
+
             await klavaPage.click('#join-modal-button');
             await waitForOverlayHidden(klavaPage);
 
-            const ownLabel = await klavaPage.locator('.tile--own .tile-name').textContent();
-            assert.ok(
-              ownLabel && ownLabel.includes(prefilledUserName),
-              `подпись своего тайла должна содержать предзаполненное имя "${prefilledUserName}", получено: "${ownLabel}"`
-            );
-            const avatarLetter = await klavaPage.locator('.tile--own .tile-placeholder-letter').textContent();
             // Первый графем-кластер предзаполненного имени — namegen.js даёт
             // только одно-кодпойнтные эмодзи (без VS16/ZWJ), поэтому обычный
             // спред строки (по code point, не по UTF-16 code unit) даёт тот
             // же результат, что и фолбэк [...str][0] в static/room.js.
             const expectedLetter = [...prefilledUserName][0];
+
+            // Подпись тайла (см. static/room.js: tileDisplayName/
+            // stripLeadingAvatarEmoji) больше НЕ несёт имя целиком: ведущий
+            // графем-кластер, если это эмодзи (а предзаполненное имя
+            // namegen.js почти всегда начинается с эмодзи — уже проверено
+            // регэкспом выше), вычищается из подписи как дублирующий
+            // круг-аватар. Раз
+            // после вычитания остаётся непустой остаток — ожидаем именно его
+            // (обрезанный по пробелам), а не имя целиком.
+            const expectedOwnLabel = prefilledUserName.slice(expectedLetter.length).trim() || prefilledUserName;
+            const ownLabel = await klavaPage.locator('.tile--own .tile-name').textContent();
+            assert.equal(
+              ownLabel,
+              expectedOwnLabel,
+              `подпись своего тайла должна быть предзаполненным именем без дублирующего ведущего эмодзи, ожидали "${expectedOwnLabel}", получено: "${ownLabel}"`
+            );
+            const avatarLetter = await klavaPage.locator('.tile--own .tile-placeholder-letter').textContent();
             assert.equal(
               avatarLetter,
               expectedLetter,
@@ -2635,8 +2680,9 @@ async function main() {
           // выше) — самый момент проверить лимит «третий не пройдёт», пока
           // счёт не вырос дальше в шагах (б) ниже (лобби, Тоня, Юра). Своей
           // комнаты этому кусочку не заводим и не тратим лишний POST
-          // /api/rooms — H2: ROOM_CREATION_IP_LIMIT (10 за 60с на IP), файл и
-          // так держит бюджет ровно в 10 (см. комментарий у
+          // /api/rooms — H2: ROOM_CREATION_IP_LIMIT (прод-дефолт 3 за 60с на
+          // IP, см. комментарий у roomIdForTimerTestReuse в начале файла про
+          // тестовый override), файл и так держит бюджет ровно в 10 (см. комментарий у
           // roomIdForTimerTestReuse ниже) — переиспользуем permRoomUrl/
           // permRoomId этого же шага. Серверный signaling-путь (валидация
           // 2..потолок, «снижение не выгоняет» и т.п.) уже покрыт
@@ -2891,7 +2937,8 @@ async function main() {
     // комната, тот же mobileContext) — а не отдельным step() с собственным
     // POST /api/rooms:
     // весь файл держит бюджет ровно в 10 созданий комнат за прогон (H2:
-    // ROOM_CREATION_IP_LIMIT — 10 за 60с с одного IP, см. roomIdForTimerTestReuse
+    // ROOM_CREATION_IP_LIMIT — прод-дефолт теперь 3 за 60с с одного IP, но
+    // тестовый сервер поднимает его через env, см. roomIdForTimerTestReuse
     // ниже), лишний POST здесь столкнул бы файл за лимит и обрушил бы
     // (429) последующие шаги. Десктопный собеседник подключается к ТОЙ ЖЕ
     // комнате обычным join по ссылке (это не создание комнаты, лимита не
@@ -3478,7 +3525,8 @@ async function main() {
         const { roomId: wrongKeyRoomId } = await res.json();
         // Переиспользуется следующим шагом (лимит длительности созвона) —
         // без лишнего POST /api/rooms: за один прогон файла их и так набегает
-        // много (см. H2: ROOM_CREATION_IP_LIMIT — 10 за 60с с одного IP, а
+        // много (см. H2: ROOM_CREATION_IP_LIMIT — прод-дефолт 3 за 60с с
+        // одного IP, тестовый сервер поднимает его через env, а
         // Node-фетчи и клик «Создать комнату» в браузере считаются с ОДНОГО
         // IP, localhost), новая комната этому шагу не нужна — участник там
         // solo, токен ссылки ни с кем не должен совпадать.
@@ -3571,25 +3619,32 @@ async function main() {
     // --- Лимит длительности созвона (3 часа, см. README.md и static/room.js:
     //     startRoomTimer/stopRoomTimer) ---
     //
-    // Контракт с бэкендом: `joined.expiresInSeconds` — остаток жизни комнаты
-    // на момент входа (реальный дефолт — 3 часа, см. src/state.rs::
-    // DEFAULT_MAX_ROOM_LIFETIME_SECONDS); `room-expired {}` рассылается всем,
-    // когда лимит истёк, сервер сам закрывает сокет следом (см. src/ws.rs).
-    // Гонять реальный тайм-лимит в 3 часа непрактично — вместо этого:
-    //   (а)/(б)/(в) подменяем состояние таймера прямым вызовом top-level
+    // Контракт с бэкендом теперь ДВА поля в `joined`: `expiresInSeconds`
+    // (остаток жизни комнаты — сервер по-прежнему сам считает и присылает
+    // его, `room-expired {}` рассылается всем и закрывает сокеты, когда он
+    // истекает, см. src/ws.rs) и аддитивное `roomAgeSeconds` (сколько прошло
+    // с момента входа ПЕРВОГО участника — см. src/ws.rs::room_age_seconds).
+    // Таймер в баре теперь показывает ИМЕННО последнее — count-up, а не
+    // обратный отсчёт до лимита — поэтому у него больше нет ни жёлтого/
+    // красного порога (был привязан к остатку, а не к прошедшему времени),
+    // ни зависимости от expiresInSeconds для отображения. Гонять реальный
+    // тайм-лимит в 3 часа непрактично — вместо этого:
+    //   (а)/(б) подменяем состояние таймера прямым вызовом top-level
     //       startRoomTimer(N) (room.js — классический script, функция видна
     //       из page.evaluate ровно как bus/ChatPanel в других тестах этого
-    //       файла) под разные N — норма/жёлтый (<=10 мин)/красный (<=60с);
-    //   (г) эмулируем сам сервер: signaling._dispatch({type:'room-expired'})
+    //       файла) — формат до/после часа и реальный ход времени вперёд;
+    //   (в) эмулируем сам сервер: signaling._dispatch({type:'room-expired'})
     //       — тот же приём прямой инъекции, что и у stream-info/invalid-link
-    //       выше — и проверяем финальный оверлей + отключение чата;
-    //   (д) последующее закрытие сокета (как это сделал бы сам сервер сразу
+    //       выше — и проверяем финальный оверлей + отключение чата (лимит
+    //       ЖИЗНИ комнаты никуда не делся — только его ОТОБРАЖЕНИЕ сменилось
+    //       с обратного отсчёта на «сколько уже длится»);
+    //   (г) последующее закрытие сокета (как это сделал бы сам сервер сразу
     //       после room-expired, см. src/ws.rs: reject=true) не должно
     //       перетереть этот оверлей «Соединением потеряно» — terminalState
     //       уже взведён (тот же приём, что у room-not-found/room-full/
     //       join-rejected, см. static/room.js: signaling.onClose).
     await step(
-      'Лимит длительности созвона: таймер в баре (норма/жёлтый/красный) + оверлей «Время истекло» по room-expired, не перетирается последующим закрытием сокета',
+      'Лимит длительности созвона: таймер в баре count-up (растёт со временем, без жёлтого/красного) + оверлей «Время истекло» по room-expired, не перетирается последующим закрытием сокета',
       async () => {
         // Переиспользуем комнату из шага «Ш1: неверный k» выше (см.
         // roomIdForTimerTestReuse) — экономим POST /api/rooms (H2-лимит на
@@ -3607,52 +3662,52 @@ async function main() {
           await waitForOverlayHidden(timerPage);
           await openChatPanel(timerPage);
 
-          // Сразу после joined (реальный expiresInSeconds ~3ч) таймер уже
-          // должен быть виден и не в предупредительном состоянии.
+          // Сразу после joined таймер уже должен быть виден. Комната к этому
+          // моменту существует лишь считаные секунды (создана предыдущим
+          // шагом того же прогона) — реальный roomAgeSeconds мал, поэтому
+          // формат должен быть M:SS (час ещё не набежал), а не Ч:ММ:СС —
+          // никаких классов warning/critical (см. static/style.css:
+          // .room-timer--warning/--critical убраны вместе с обратным
+          // отсчётом) больше не существует вовсе, поэтому здесь и дальше их
+          // не проверяем.
           await timerPage.waitForFunction(
             () => !document.getElementById('room-timer')?.classList.contains('hidden'),
             undefined,
             { polling: 100, timeout: 3000 }
           );
-          const initialState = await timerPage.evaluate(() => ({
-            text: document.getElementById('room-timer').textContent,
-            warning: document.getElementById('room-timer').classList.contains('room-timer--warning'),
-            critical: document.getElementById('room-timer').classList.contains('room-timer--critical'),
-          }));
-          assert.match(initialState.text, /^\d+:\d{2}:\d{2}$/, `формат таймера должен быть Ч:ММ:СС, получено: ${initialState.text}`);
-          assert.equal(initialState.warning, false, 'сразу после входа (лимит ~3ч) таймер не должен быть жёлтым');
-          assert.equal(initialState.critical, false, 'сразу после входа (лимит ~3ч) таймер не должен быть красным');
+          const initialText = await timerPage.evaluate(() => document.getElementById('room-timer').textContent);
+          assert.match(initialText, /^\d+:\d{2}$/, `формат таймера при малом прошедшем времени должен быть M:SS, получено: ${initialText}`);
 
-          // (а) норма: час с лишним — ни жёлтого, ни красного.
+          // (а) формат после часа прошедшего времени — H:MM:SS (тот же формат
+          // строкой, что и в старом обратном отсчёте — formatRoomTimer не
+          // отличает count-up от count-down, только считает секунды).
           await timerPage.evaluate(() => startRoomTimer(3700));
-          const normalState = await timerPage.evaluate(() => ({
-            text: document.getElementById('room-timer').textContent,
-            warning: document.getElementById('room-timer').classList.contains('room-timer--warning'),
-            critical: document.getElementById('room-timer').classList.contains('room-timer--critical'),
-          }));
-          assert.equal(normalState.text, '1:01:40', `таймер должен показывать 1:01:40, получено: ${normalState.text}`);
-          assert.equal(normalState.warning, false);
-          assert.equal(normalState.critical, false);
+          const normalText = await timerPage.evaluate(() => document.getElementById('room-timer').textContent);
+          assert.equal(normalText, '1:01:40', `таймер должен показывать 1:01:40, получено: ${normalText}`);
 
-          // (б) последние 10 минут — жёлтый.
-          await timerPage.evaluate(() => startRoomTimer(300));
-          const warningState = await timerPage.evaluate(() => ({
-            warning: document.getElementById('room-timer').classList.contains('room-timer--warning'),
-            critical: document.getElementById('room-timer').classList.contains('room-timer--critical'),
-          }));
-          assert.equal(warningState.warning, true, 'при остатке 5 минут таймер должен быть жёлтым (room-timer--warning)');
-          assert.equal(warningState.critical, false, 'при остатке 5 минут таймер НЕ должен быть красным');
+          // (б) count-up: таймер идёт ВВЕРХ — синхронизируем базу на 0 и
+          // поллингом (не блокирующим sleep — тиковый интервал таймера раз в
+          // секунду не обязательно фазово совпадает с моментом нашего
+          // сброса, см. static/room.js: startRoomTimer/updateRoomTimerDisplay)
+          // дожидаемся, что показанное значение реально выросло, а не
+          // осталось на 0:00 и не поехало назад.
+          await timerPage.evaluate(() => startRoomTimer(0));
+          const zeroText = await timerPage.evaluate(() => document.getElementById('room-timer').textContent);
+          assert.equal(zeroText, '0:00', `сразу после startRoomTimer(0) таймер должен показывать 0:00, получено: ${zeroText}`);
+          await timerPage.waitForFunction(
+            (prevText) => document.getElementById('room-timer')?.textContent !== prevText,
+            zeroText,
+            { polling: 100, timeout: 5000 }
+          );
+          const grownText = await timerPage.evaluate(() => document.getElementById('room-timer').textContent);
+          const grownSeconds = grownText.split(':').reduce((acc, part) => acc * 60 + Number(part), 0);
+          assert.ok(grownSeconds >= 1, `таймер должен вырасти (count-up), а не остаться на месте/уйти назад: было "${zeroText}", стало "${grownText}"`);
 
-          // (в) последняя минута — красный.
-          await timerPage.evaluate(() => startRoomTimer(30));
-          const criticalState = await timerPage.evaluate(() => ({
-            warning: document.getElementById('room-timer').classList.contains('room-timer--warning'),
-            critical: document.getElementById('room-timer').classList.contains('room-timer--critical'),
-          }));
-          assert.equal(criticalState.critical, true, 'при остатке 30с таймер должен быть красным (room-timer--critical)');
-
-          // (г) сервер решил, что время вышло — room-expired: финальный
-          // оверлей, таймер прячется, чат отключается.
+          // (в) сервер решил, что время вышло — room-expired: финальный
+          // оверлей, таймер прячется, чат отключается. Лимит ЖИЗНИ комнаты
+          // (expiresInSeconds) сервер по-прежнему считает сам и шлёт этот же
+          // сигнал независимо от того, что показывает бар — здесь просто
+          // эмулируем его приход.
           await timerPage.evaluate(() => {
             signaling._dispatch({ type: 'room-expired' });
           });
@@ -3666,7 +3721,7 @@ async function main() {
           assert.equal(afterExpiry.timerHidden, true, 'таймер должен скрыться после room-expired (stopRoomTimer)');
           assert.equal(afterExpiry.chatDisabled, true, 'инпут чата должен быть задизейблен после room-expired (teardownMeshMediaChat)');
 
-          // (д) терминальность: последующее закрытие сокета (как сделал бы
+          // (г) терминальность: последующее закрытие сокета (как сделал бы
           // сам сервер сразу за room-expired) не должно перетереть этот
           // оверлей баннером «Соединение потеряно».
           await timerPage.evaluate(() => signaling.ws.close());
@@ -3772,7 +3827,8 @@ async function main() {
             // с POST /api/rooms (тот же ROOM_CREATION_IP_LIMIT/room_creation_ips,
             // см. src/main.rs::restore_room) — а не отдельный счётчик. К этому
             // месту файла POST-запросов с реального (localhost) IP уже
-            // накопилось много (см. H2: ROOM_CREATION_IP_LIMIT — 10 за 60с) —
+            // накопилось много (см. H2: ROOM_CREATION_IP_LIMIT — прод-дефолт
+            // теперь 3 за 60с, тестовый сервер поднимает его через env) —
             // делить с ними бюджет этого PUT было бы гонкой с реальным
             // временем прогона (сколько из них уже выпало из скользящего
             // окна). Изолируем этот вызов СВОИМ CF-Connecting-IP (тот же

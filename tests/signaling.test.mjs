@@ -19,6 +19,13 @@ const PORT = 3311;
 const URL = `ws://localhost:${PORT}/ws`;
 const CONFIG_URL = `http://localhost:${PORT}/config`;
 const ROOMS_URL = `http://localhost:${PORT}/api/rooms`;
+// Management-порт (см. src/main.rs::spawn_metrics_server) основного тестового
+// сервера — `/metrics`, тот же паттерн, что у code-ranker-backend (отдельный
+// порт, дефолт 8081 в проде, но здесь фиксируем свой, не конфликтующий ни с
+// одним из портов остальных изолированных серверных процессов этого файла —
+// см. их список рядом с их собственными `spawnServer(...)` ниже).
+const MGMT_PORT = 3411;
+const METRICS_URL = `http://localhost:${MGMT_PORT}/metrics`;
 // TTL пустой комнаты для этого прогона — короткий, чтобы тест не ждал 120с.
 const EMPTY_ROOM_TTL_SECONDS = 2;
 // Разделы E2E v2 (25+) создают несколько комнат через createRoom() без
@@ -120,6 +127,16 @@ function startServer() {
     // минуту; сам лимит (реальный дефолт, БЕЗ переопределения) проверяется
     // отдельным изолированным серверным процессом — см. раздел «22d».
     JOIN_ROOM_IP_LIMIT: '100000',
+    // ROOM_CREATION_IP_LIMIT — прод-дефолт ужесточён до 3/60с (см.
+    // state::DEFAULT_ROOM_CREATION_IP_LIMIT), а этот файл гоняет через
+    // createRoom()/restoreRoom() многие десятки запросов с одного и того же
+    // фолбэк-IP за прогон (разделы 2/10/11/12/15/16/18/22/22b и др., см.
+    // комментарий про E2E_TEST_IP/RESTORE_ROOM_TEST_IP выше) — поднимаем
+    // лимит основного тестового процесса далеко за пределы этого; сам
+    // прод-дефолт (БЕЗ переопределения) проверяется отдельным изолированным
+    // серверным процессом — см. раздел «22e».
+    ROOM_CREATION_IP_LIMIT: '100000',
+    MGMT_PORT: String(MGMT_PORT),
   });
 }
 
@@ -189,10 +206,12 @@ function stopServer(proc) {
 // PUT /api/rooms/<roomId> — идемпотентное восстановление (см. src/main.rs::restore_room).
 // `ip` (опционально) — см. раздел 22c: PUT теперь тоже проверяет
 // ROOM_CREATION_IP_LIMIT (H2, §3.1) и делит бюджет с POST /api/rooms.
-async function restoreRoom(roomId, ip = undefined) {
+// `roomsUrl` (опционально, как у createRoom()) — для изолированных серверных
+// процессов на нестандартном порту (см. раздел 22b).
+async function restoreRoom(roomId, ip = undefined, roomsUrl = ROOMS_URL) {
   const opts = { method: 'PUT', headers: {} };
   if (ip !== undefined) opts.headers['CF-Connecting-IP'] = ip;
-  const res = await fetch(`${ROOMS_URL}/${encodeURIComponent(roomId)}`, opts);
+  const res = await fetch(`${roomsUrl}/${encodeURIComponent(roomId)}`, opts);
   let json = null;
   try { json = await res.json(); } catch { /* не JSON — ниже проверим статус */ }
   return { status: res.status, roomId: json && json.roomId, lifetimeSeconds: json && json.lifetimeSeconds };
@@ -381,6 +400,12 @@ async function runTests() {
   ok(Array.isArray(j1.pending) && j1.pending.length === 0, 'joined.pending — пустой список (заявок в лобби ещё нет)');
   ok(typeof j1.expiresInSeconds === 'number' && j1.expiresInSeconds > 0,
     `joined.expiresInSeconds присутствует и положителен, лимит длительности созвона (${j1.expiresInSeconds})`);
+  // Серверное поле таймера count-up (см. src/state.rs::Room::first_joined_at,
+  // src/ws.rs::room_age_seconds): для самого первого участника — всегда 0,
+  // сервер ставит first_joined_at непосредственно перед вычислением этого
+  // поля в том же самом вызове (admit_participant).
+  ok(typeof j1.roomAgeSeconds === 'number' && j1.roomAgeSeconds === 0,
+    `joined.roomAgeSeconds === 0 для первого участника (получено ${j1.roomAgeSeconds})`);
 
   // --- 4. Второй участник (с именем) входит: видит первого в peers ---
   console.log('4. второй участник: peers содержит первого, peer-joined приходит первому');
@@ -391,6 +416,11 @@ async function runTests() {
   ok(j2.screenOwner === null, 'screenOwner всё ещё null');
   ok(j2.leaderId === p1Id, 'второй участник (гость) видит лидером первого');
   ok(Array.isArray(j2.pending) && j2.pending.length === 0, 'joined.pending пуст для не-лидера, даже если бы там что-то было');
+  // Второй участник входит в ту же (уже не пустую) комнату — first_joined_at
+  // уже стоит с первого входа, roomAgeSeconds просто не отрицательный (та же
+  // монотонная база, что и у первого, разница на порядок меньше секунды).
+  ok(typeof j2.roomAgeSeconds === 'number' && j2.roomAgeSeconds >= 0,
+    `joined.roomAgeSeconds присутствует и не отрицателен у второго участника (${j2.roomAgeSeconds})`);
 
   const pj1 = await p1.next();
   // E (docs/research-minimize-state.md §3): сервер БОЛЬШЕ НЕ ХРАНИТ name —
@@ -959,59 +989,77 @@ async function runTests() {
     await stopServer(proc);
   }
 
-  // --- 22. Per-IP лимит создания комнат (H2, 429) ---
-  console.log('22. per-IP лимит создания комнат (429)');
+  // --- 22. Per-IP лимит создания комнат (H2, 429), РЕАЛЬНЫЙ прод-дефолт
+  // 3/60с (см. state::DEFAULT_ROOM_CREATION_IP_LIMIT) — ужесточён с прежних
+  // 10/60с. Основной тестовый процесс (см. startServer()) держит этот лимит
+  // поднятым через env далеко за пределы того, что этот файл способен
+  // нафлудить, поэтому сам лимит проверяем на ОТДЕЛЬНОМ изолированном
+  // серверном процессе с явным ROOM_CREATION_IP_LIMIT=3 — заодно этот же тест
+  // проверяет и саму configurability лимита через env (см. main.rs::ROOM_CREATION_IP_LIMIT). ---
+  console.log('22. per-IP лимит создания комнат, дефолт ужесточён до 3/60с (429)');
   {
-    // Один и тот же CF-Connecting-IP на все запросы — свой собственный
-    // бюджет, отдельный от фолбэк-IP всех остальных createRoom() без
-    // заголовка в этом файле (см. комментарий у createRoom()).
+    const port = 3316;
+    const proc = spawnServer(port, { ROOM_CREATION_IP_LIMIT: '3' });
+    await waitForReady(`http://localhost:${port}/config`, proc);
+    const roomsUrl = `http://localhost:${port}/api/rooms`;
+
     const ip = '203.0.113.5';
     let allCreated = true;
-    for (let i = 0; i < 10; i++) {
-      const r = await createRoom(undefined, ROOMS_URL, ip);
+    for (let i = 0; i < 3; i++) {
+      const r = await createRoom(undefined, roomsUrl, ip);
       if (r.status !== 201) allCreated = false;
     }
-    ok(allCreated, '10 создания комнат за окно с одного IP — все в пределах лимита (201)');
+    ok(allCreated, '3 создания комнат за окно с одного IP — все в пределах лимита 3/60с (201)');
 
-    const eleventh = await createRoom(undefined, ROOMS_URL, ip);
-    ok(eleventh.status === 429, `11-е создание за окно с того же IP -> 429 (status=${eleventh.status})`);
+    const fourth = await createRoom(undefined, roomsUrl, ip);
+    ok(fourth.status === 429, `4-е создание за окно с того же IP -> 429 при лимите 3 (status=${fourth.status})`);
 
     // Другой IP — свой собственный, независимый бюджет.
     const otherIp = '203.0.113.6';
-    const otherIpResult = await createRoom(undefined, ROOMS_URL, otherIp);
+    const otherIpResult = await createRoom(undefined, roomsUrl, otherIp);
     ok(otherIpResult.status === 201, `создание с ДРУГОГО IP не задето лимитом первого (status=${otherIpResult.status})`);
+
+    await stopServer(proc);
   }
 
-  // --- 22b. Per-IP лимит на PUT /api/rooms/{id} — делит бюджет с POST (H2, §3.1) ---
-  console.log('22b. per-IP лимит на PUT /api/rooms/{id}, общий с POST (429)');
+  // --- 22b. Per-IP лимит на PUT /api/rooms/{id} — делит бюджет с POST (H2,
+  // §3.1), тот же ужесточённый лимит 3/60с. Свой отдельный изолированный
+  // серверный процесс (как в разделе 22 — общий бюджет POST/PUT нельзя
+  // проверить на основном тестовом процессе, у которого лимит поднят env). ---
+  console.log('22b. per-IP лимит на PUT /api/rooms/{id}, общий с POST, лимит 3/60с (429)');
   {
+    const port = 3317;
+    const proc = spawnServer(port, { ROOM_CREATION_IP_LIMIT: '3' });
+    await waitForReady(`http://localhost:${port}/config`, proc);
+    const roomsUrl = `http://localhost:${port}/api/rooms`;
+
     const ip = '203.0.113.61';
-    // 4 создания через POST + 6 восстановлений через PUT = 10 запросов за
-    // окно с одного IP — РАЗНЫМИ путями одного и того же бюджета
+    // 1 создание через POST + 2 восстановления через PUT = 3 запроса за окно
+    // с одного IP — РАЗНЫМИ путями одного и того же бюджета
     // (ROOM_CREATION_IP_LIMIT), доказывает, что бюджет общий.
     let allOk = true;
-    for (let i = 0; i < 4; i++) {
-      const r = await createRoom(undefined, ROOMS_URL, ip);
-      if (r.status !== 201) allOk = false;
-    }
-    for (let i = 0; i < 6; i++) {
+    const first = await createRoom(undefined, roomsUrl, ip);
+    if (first.status !== 201) allOk = false;
+    for (let i = 0; i < 2; i++) {
       const freshId = `pb${String(i).padStart(6, '0')}`; // валидный формат ^[a-z0-9]{8}$, заведомо не существовал
-      const r = await restoreRoom(freshId, ip);
+      const r = await restoreRoom(freshId, ip, roomsUrl);
       if (r.status !== 201) allOk = false;
     }
-    ok(allOk, '4 POST + 6 PUT = 10 запросов за окно с одного IP — все в пределах общего лимита (201)');
+    ok(allOk, '1 POST + 2 PUT = 3 запроса за окно с одного IP — все в пределах общего лимита 3/60с (201)');
 
-    const eleventhPut = await restoreRoom('pbeleven', ip);
-    ok(eleventhPut.status === 429,
-      `11-й запрос (PUT) с тем же IP -> 429, общий с POST бюджет исчерпан (status=${eleventhPut.status})`);
-    const eleventhPost = await createRoom(undefined, ROOMS_URL, ip);
-    ok(eleventhPost.status === 429,
-      `POST с тем же IP тоже отклонён — бюджет действительно общий (status=${eleventhPost.status})`);
+    const fourthPut = await restoreRoom('pbfourth', ip, roomsUrl);
+    ok(fourthPut.status === 429,
+      `4-й запрос (PUT) с тем же IP -> 429, общий с POST бюджет (3) исчерпан (status=${fourthPut.status})`);
+    const fourthPost = await createRoom(undefined, roomsUrl, ip);
+    ok(fourthPost.status === 429,
+      `POST с тем же IP тоже отклонён — бюджет действительно общий (status=${fourthPost.status})`);
 
     // Другой IP — свой собственный бюджет, не задет.
     const otherIp = '203.0.113.62';
-    const otherPut = await restoreRoom('pbother1', otherIp);
+    const otherPut = await restoreRoom('pbother1', otherIp, roomsUrl);
     ok(otherPut.status === 201, `PUT с ДРУГОГО IP не задет чужим лимитом (status=${otherPut.status})`);
+
+    await stopServer(proc);
   }
 
   // --- 22c. Per-IP лимит на прямой join-room в комнату (H2, §3.2 — главная
@@ -1455,6 +1503,49 @@ async function runTests() {
     leader.ws.close();
     p6.ws.close();
     eighth.peer.ws.close();
+  }
+
+  // --- 33. Метрики Prometheus (src/metrics.rs, src/main.rs::spawn_metrics_server) ---
+  console.log('33. /metrics на management-порту: HELP/TYPE + гейджи реагируют на реальное состояние');
+  {
+    // Пре-регистрация (crate::metrics::describe(), см. main.rs) — HELP/TYPE
+    // должны быть на месте даже до этого прогона (сервер уже отработал
+    // разделы 1-32 к этому моменту, так что события заведомо уже были, но
+    // сама пре-регистрация проверяется по наличию строк # HELP/# TYPE, а не
+    // по факту первого события).
+    const res = await fetch(METRICS_URL);
+    ok(res.ok, `GET ${METRICS_URL} отвечает 200`);
+    const before = await res.text();
+    for (const name of ['chat_rooms', 'chat_participants', 'chat_pending', 'chat_rooms_created_total', 'chat_websocket_connections']) {
+      ok(before.includes(`# TYPE ${name} `), `/metrics содержит "# TYPE ${name}" (пре-регистрация, describe())`);
+    }
+
+    // Создаём комнату и подключаем участника — гейджи `chat_rooms`/
+    // `chat_participants` обновляются периодическим семплером в
+    // `state::reap_rooms` (раз в REAPER_INTERVAL=1с, см. её комментарий),
+    // поэтому ждём чуть больше тика, прежде чем сверять значения.
+    const { roomId: metricsRoomId } = await createRoom(undefined, ROOMS_URL, E2E_TEST_IP);
+    const { peer: metricsPeer } = await join(metricsRoomId);
+    await sleep(1300);
+
+    const after = await (await fetch(METRICS_URL)).text();
+    const gaugeValue = (text, name) => {
+      const m = text.match(new RegExp(`^${name}\\s+(\\S+)$`, 'm'));
+      return m ? Number(m[1]) : NaN;
+    };
+    ok(gaugeValue(after, 'chat_rooms') >= 1, `chat_rooms >= 1 после создания комнаты (${gaugeValue(after, 'chat_rooms')})`);
+    ok(gaugeValue(after, 'chat_participants') >= 1,
+      `chat_participants >= 1 после входа участника (${gaugeValue(after, 'chat_participants')})`);
+    ok(gaugeValue(after, 'chat_websocket_connections') >= 1,
+      `chat_websocket_connections >= 1 при открытом WS (${gaugeValue(after, 'chat_websocket_connections')})`);
+    // Счётчик — монотонно неубывающий; к этому моменту разделы 1-32 уже
+    // создали много комнат, так что просто сверяем "заметно больше нуля",
+    // а не точное число (точное число раздельно от прочих разделов не
+    // изолировано и было бы хрупким тестом).
+    ok(gaugeValue(after, 'chat_rooms_created_total') > 10,
+      `chat_rooms_created_total заметно больше нуля к этому моменту прогона (${gaugeValue(after, 'chat_rooms_created_total')})`);
+
+    metricsPeer.ws.close();
   }
 }
 

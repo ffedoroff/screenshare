@@ -495,6 +495,35 @@ async function main() {
       }
       await waitParticipantCount(olyaPage, 6, 15_000);
 
+      // Фиксированная сетка тайлов (см. п.6 задания и static/room.js:
+      // computeTileGridColumns/layoutTilesGrid — десктоп: 3×2 на 6 тайлах) не
+      // должна вызывать скролл сцены: это тот самый баг (best-fit раскладка
+      // плюс max-width грида, см. комментарий у layoutTilesGrid), который
+      // чинили в этом батче. olyaContext — десктопный вьюпорт по умолчанию
+      // (без explicit viewport/isMobile, в отличие от мобильного смоука в
+      // basic.spec.mjs), поэтому проверка именно здесь бьёт по десктопной
+      // раскладке.
+      const gridOverflow = await olyaPage.evaluate(() => {
+        const grid = document.getElementById('tiles-grid');
+        return grid
+          ? {
+              scrollWidth: grid.scrollWidth,
+              clientWidth: grid.clientWidth,
+              scrollHeight: grid.scrollHeight,
+              clientHeight: grid.clientHeight,
+            }
+          : null;
+      });
+      assert.ok(gridOverflow, '#tiles-grid должен быть в DOM при 6 участниках');
+      assert.ok(
+        gridOverflow.scrollWidth <= gridOverflow.clientWidth + 1,
+        `#tiles-grid не должен скроллиться по ширине на 6 тайлах: ${JSON.stringify(gridOverflow)}`
+      );
+      assert.ok(
+        gridOverflow.scrollHeight <= gridOverflow.clientHeight + 1,
+        `#tiles-grid не должен скроллиться по высоте на 6 тайлах: ${JSON.stringify(gridOverflow)}`
+      );
+
       const seventhContext = await browser.newContext();
       const seventhPage = await seventhContext.newPage();
       await seventhPage.goto(roomUrl);

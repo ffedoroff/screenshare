@@ -23,7 +23,19 @@ spec:
     type: Recreate
   selector: { matchLabels: { app: chat } }
   template:
-    metadata: { labels: { app: chat } }
+    metadata:
+      labels: { app: chat }
+      # Prometheus kubernetes_sd_config (role: pod) autodiscovery — тот же
+      # паттерн, что у code-ranker-backend (см.
+      # code-ranker-private/deploy/kubesolo/manifests/deployment.yaml) и
+      # simple-deploy/standards/observability/metrics.md, §«Автодискавери
+      # таргетов». Скрейпит ОТДЕЛЬНЫЙ management-порт (8081, см. `mgmt`
+      # ниже), никогда основной 8080 (WS-сигналинг/статика, за
+      # Service/Ingress) — /metrics НЕ выставлен наружу.
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8081"
+        prometheus.io/path: "/metrics"
     spec:
       terminationGracePeriodSeconds: 30       # graceful drain; приложение ловит SIGTERM (src/main.rs)
       containers:
@@ -32,6 +44,11 @@ spec:
         imagePullPolicy: IfNotPresent
         env:
         - { name: PORT, value: "8080" }
+        # Management-порт (см. src/main.rs::spawn_metrics_server) — только
+        # `/metrics`, тот же паттерн/дефолт (8081), что у code-ranker-backend.
+        # Сознательно НЕ в service.yaml (см. её комментарий): scrape идёт
+        # напрямую по подовому IP через аннотации выше, а не через Service.
+        - { name: MGMT_PORT, value: "8081" }
         - { name: STATIC_DIR, value: "/app/static" }
         # Ш2 (разнесение доверия — см. README.md «Топология Ш2»): фронт уезжает
         # на Cloudflare Pages (chat.fedorov.it), этот сервер отвечает и на
@@ -53,7 +70,12 @@ spec:
         # приложение живёт на одном STUN, как раньше.
         envFrom:
         - secretRef: { name: turn-creds, optional: true }
-        ports: [ { containerPort: 8080 } ]
+        # 8080 — WS-сигналинг/статика (в Service, см. service.yaml); 8081 —
+        # management (только /metrics пока — /healthz остаётся на 8080, там
+        # его уже читают пробы ниже, переносить не было причины).
+        ports:
+        - { name: http, containerPort: 8080 }
+        - { name: mgmt, containerPort: 8081 }
         readinessProbe: { httpGet: { path: /healthz, port: 8080 }, periodSeconds: 3 }
         livenessProbe:  { httpGet: { path: /healthz, port: 8080 }, initialDelaySeconds: 10, periodSeconds: 10 }
         resources:

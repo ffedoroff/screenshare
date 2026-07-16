@@ -39,6 +39,7 @@
 //! локалка и нынешний прод (статика и API ещё на одном хосте) ведут себя
 //! ровно как раньше.
 
+mod metrics;
 mod protocol;
 mod state;
 mod ws;
@@ -56,6 +57,7 @@ use axum::routing::{get, post, put};
 use axum::Router;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use hmac::{Hmac, KeyInit, Mac};
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use serde_json::json;
 use sha1::Sha1;
 use tracing::{info, warn};
@@ -65,7 +67,7 @@ use crate::protocol::RoomSettings;
 use crate::state::{
     check_ip_rate_limit, extract_client_ip, AppState, Room, DEFAULT_JOIN_ROOM_IP_LIMIT,
     DEFAULT_MAX_PARTICIPANTS, DEFAULT_MAX_ROOMS, DEFAULT_MAX_ROOM_LIFETIME_SECONDS,
-    ROOM_CREATION_IP_LIMIT, ROOM_CREATION_IP_WINDOW,
+    DEFAULT_ROOM_CREATION_IP_LIMIT, ROOM_CREATION_IP_WINDOW,
 };
 
 /// Каталог со статикой фронтенда. Настраивается через env `STATIC_DIR` (в
@@ -137,6 +139,22 @@ pub(crate) static JOIN_ROOM_IP_LIMIT: LazyLock<usize> = LazyLock::new(|| {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_JOIN_ROOM_IP_LIMIT)
+});
+
+/// Per-IP лимит на `POST /api/rooms` (и делящий с ним бюджет `PUT
+/// /api/rooms/{id}`, см. `restore_room`) — H2, DoS-защита. Прод-дефолт
+/// ужесточён до 3/60с (см. подробное обоснование у
+/// `state::DEFAULT_ROOM_CREATION_IP_LIMIT`): создание комнаты — редкое для
+/// легитимного пользователя действие, в отличие от `JOIN_ROOM_IP_LIMIT` выше.
+/// Configurable через env `ROOM_CREATION_IP_LIMIT` по той же причине, что и
+/// `JOIN_ROOM_IP_LIMIT` — тестируемость (signaling.test.mjs и e2e-тесты
+/// создают много комнат с одного IP за прогон и упёрлись бы в жёсткий
+/// прод-дефолт). `LazyLock` — тот же приём, что у `JOIN_ROOM_IP_LIMIT` выше.
+pub(crate) static ROOM_CREATION_IP_LIMIT: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("ROOM_CREATION_IP_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_ROOM_CREATION_IP_LIMIT)
 });
 
 /// CORS вручную, без tower-http: у нас всего три кросс-оригин HTTP-пути
@@ -214,6 +232,20 @@ async fn main() {
                 .unwrap_or_else(|_| "info,screenshare=debug".into()),
         )
         .init();
+
+    // Prometheus-метрики (см. src/metrics.rs) — тот же паттерн/крейт, что у
+    // code-ranker-backend (см. `code-ranker-private/backend/src/main.rs`):
+    // отдельный management-сервер на своём порту с `/metrics`, НЕ на основном
+    // 8080 и НЕ в Service/ingress (см. deploy/manifests/deployment.yaml) —
+    // тот же `MGMT_PORT`, что у code-ranker, дефолт 8081. Устанавливаем
+    // recorder и поднимаем listener ДО остального (роли/комнаты/основной
+    // сервер) — если что-то в инициализации ниже упадёт, лучше уже видеть
+    // это в метриках/логах management-порта, чем не иметь вообще ничего.
+    let prometheus = PrometheusBuilder::new()
+        .install_recorder()
+        .expect("не удалось установить Prometheus recorder");
+    metrics::describe();
+    spawn_metrics_server(prometheus).await;
 
     let rooms = Arc::new(Mutex::new(HashMap::new()));
 
@@ -363,6 +395,69 @@ async fn shutdown_signal(shutdown_tx: state::ShutdownSignal) {
 /// См. `shutdown_signal`.
 const SHUTDOWN_FLUSH_GRACE: Duration = Duration::from_millis(500);
 
+/// Поднимает management-сервер (пока только `/metrics`) на СВОЁМ,
+/// ОТДЕЛЬНОМ от основного порту — тот же паттерн, что у `code-ranker-backend`
+/// (см. `code-ranker-private/backend/src/main.rs`): `/metrics` не примешан к
+/// основному 8080 (который стоит за `Service`/`Ingress`, см.
+/// `deploy/manifests/service.yaml`/`ingress.yaml`) — management-порт в
+/// `Service` сознательно НЕ проброшен (см. `deploy/manifests/deployment.yaml`),
+/// Prometheus скрейпит его напрямую по IP пода через `kubernetes_sd_config` +
+/// аннотации `prometheus.io/scrape|port|path` на самом поде (см. тот же
+/// манифест, `simple-deploy/standards/observability/metrics.md`, §
+/// «Автодискавери таргетов»).
+///
+/// В отличие от `/healthz` (который остаётся на основном порту 8080 — этот
+/// эндпоинт уже используется readiness/liveness-пробами в
+/// `deploy/manifests/deployment.yaml`, трогать их не было причины) —
+/// `/metrics` заводится заново, только на management-порту, ничего
+/// существующего не переносим и не ломаем.
+///
+/// НЕ участвует в graceful shutdown основного сервера (`shutdown_signal`
+/// ниже): это внутренний scrape-эндпоинт без пользовательского состояния —
+/// обрывать его отдельной церемонией незачем, он просто перестаёт отвечать
+/// вместе с завершением процесса.
+///
+/// Ошибка bind (порт занят/недоступен) — не фатальна для всего процесса:
+/// метрики — вспомогательная возможность, а не то, ради чего вообще
+/// существует сервер (WS-сигналинг/статика) — логируем и продолжаем без них,
+/// а не паникуем.
+async fn spawn_metrics_server(handle: PrometheusHandle) {
+    let mgmt_port: u16 = std::env::var("MGMT_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8081);
+    let mgmt_router = Router::new().route(
+        "/metrics",
+        get(move || {
+            let handle = handle.clone();
+            async move { render_metrics(handle) }
+        }),
+    );
+    let addr = format!("0.0.0.0:{mgmt_port}");
+    match tokio::net::TcpListener::bind(&addr).await {
+        Ok(listener) => {
+            info!("management-сервер (метрики) слушает http://localhost:{mgmt_port}");
+            tokio::spawn(async move {
+                if let Err(e) = axum::serve(listener, mgmt_router).await {
+                    tracing::error!("management-сервер упал: {e}");
+                }
+            });
+        }
+        Err(e) => {
+            tracing::error!("не удалось занять management-порт {addr}: {e} — метрики недоступны, основной сервер продолжает без них");
+        }
+    }
+}
+
+/// Prometheus-экспозиция (`text/plain; version=0.0.4`) — рендерится по
+/// запросу из установленного при старте recorder'а (см. `main()`), без
+/// собственного буфера/кэша: `PrometheusHandle::render()` сам достаточно
+/// дёшев для нашего масштаба (единицы метрик, без обвеса гистограммами RED —
+/// см. `crate::metrics`).
+fn render_metrics(handle: PrometheusHandle) -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], handle.render())
+}
+
 /// `POST /api/rooms`: создать новую ПУСТУЮ комнату (протокол v2 — комната
 /// заводится отдельно от входа в неё, чтобы создатель успел скопировать и
 /// открыть ссылку). Тело запроса опционально и сейчас не используется
@@ -395,7 +490,7 @@ async fn create_room(
     // запросов за ROOM_CREATION_IP_WINDOW с одного IP (см. её комментарий в
     // state.rs про то, почему бюджет отдельный от лобби).
     let ip = extract_client_ip(&headers, Some(peer_addr));
-    if !check_ip_rate_limit(&state.room_creation_ips, &ip, ROOM_CREATION_IP_LIMIT, ROOM_CREATION_IP_WINDOW) {
+    if !check_ip_rate_limit(&state.room_creation_ips, &ip, *ROOM_CREATION_IP_LIMIT, ROOM_CREATION_IP_WINDOW) {
         warn!(%ip, "превышен per-IP лимит создания комнат — 429");
         return (StatusCode::TOO_MANY_REQUESTS, "too many rooms created, slow down").into_response();
     }
@@ -433,9 +528,13 @@ async fn create_room(
             settings: RoomSettings::default(),
             pending: HashMap::new(),
             created_at: Instant::now(),
+            first_joined_at: None,
         },
     );
     drop(rooms_guard);
+    // `::metrics` (ведущие `::`) — внешний крейт `metrics`, а не наш модуль
+    // `crate::metrics` (см. `mod metrics;` ниже) — оба называются одинаково.
+    ::metrics::counter!(crate::metrics::ROOMS_CREATED_TOTAL).increment(1);
     info!(room = %room_id, "комната создана (пустая)");
 
     (
@@ -502,7 +601,7 @@ async fn restore_room(
     // без создания) — простая единая точка проверки для всего хендлера,
     // не только для «настоящей» ветки создания.
     let ip = extract_client_ip(&headers, Some(peer_addr));
-    if !check_ip_rate_limit(&state.room_creation_ips, &ip, ROOM_CREATION_IP_LIMIT, ROOM_CREATION_IP_WINDOW) {
+    if !check_ip_rate_limit(&state.room_creation_ips, &ip, *ROOM_CREATION_IP_LIMIT, ROOM_CREATION_IP_WINDOW) {
         warn!(%ip, "превышен per-IP лимит создания/восстановления комнат — 429 (PUT)");
         return (StatusCode::TOO_MANY_REQUESTS, "too many rooms created, slow down").into_response();
     }
@@ -539,9 +638,17 @@ async fn restore_room(
             // а не какого-то исходного создания (память о нём не переживает
             // рестарт сервера) — см. комментарий у Room::created_at.
             created_at: Instant::now(),
+            // Как и created_at — рестарт не переживает, отсчёт возраста
+            // комнаты для roomAgeSeconds начнётся заново с первого входа
+            // после восстановления (см. комментарий у Room::first_joined_at).
+            first_joined_at: None,
         },
     );
     drop(rooms_guard);
+    // Реальное создание записи (в отличие от идемпотентной 200-ветки выше,
+    // которая ничего не создаёт и здесь не оказывается) — считается в
+    // chat_rooms_created_total наравне с POST /api/rooms.
+    ::metrics::counter!(crate::metrics::ROOMS_CREATED_TOTAL).increment(1);
     info!(room = %room_id, "комната восстановлена после рестарта (PUT /api/rooms/{{id}})");
 
     (

@@ -99,6 +99,7 @@ if (initialRoomName) {
 // --- DOM ---
 const joinModalEl = document.getElementById('join-modal');
 const joinNameInputEl = document.getElementById('join-name-input');
+const joinNameRegenButtonEl = document.getElementById('join-name-regen-button');
 const joinModalButtonEl = document.getElementById('join-modal-button');
 const toastEl = document.getElementById('toast');
 const overlayEl = document.getElementById('overlay');
@@ -305,20 +306,23 @@ let screenOwnerGraceTimer = null;
 // version-skew баннера, см. docs/signaling-protocol.md, «GET /version.json»).
 let lastKnownVersion = null;
 
-// --- Лимит длительности созвона (3 часа, см. docs/security.md, «Meeting
-// Duration Ceiling») ---
+// --- Таймер длительности созвона (см. docs/security.md, «Meeting Duration
+// Ceiling») ---
 //
-// Сервер сам считает и присылает остаток жизни комнаты в `joined.expiresInSeconds`
-// (см. src/ws.rs::room_expires_in_seconds) — на КАЖДОМ joined, и при первом
-// входе, и при реконнекте (после реконнекта остаток мог заметно измениться,
-// если реконнект был долгим, поэтому дедлайн всегда пересчитывается заново из
-// свежего значения, а не переживает реконнект как есть, см. startRoomTimer).
-// Когда время истекает, сервер сам рассылает `room-expired` всем участникам
-// (и ожидающим в лобби) и закрывает сокет — см. signaling.on('room-expired')
-// в registerSignalingHandlers ниже.
-const ROOM_TIMER_WARNING_MS = 10 * 60 * 1000; // последние 10 минут — жёлтый
-const ROOM_TIMER_CRITICAL_MS = 60 * 1000; // последняя минута — красный
-let roomExpiresAtMs = null; // Date.now() на момент joined + expiresInSeconds*1000, null до первого joined
+// Раньше показывали ОСТАТОК до серверного лимита (expiresInSeconds) с
+// подсветкой жёлтым/красным по мере приближения к концу. Теперь вместо этого
+// показываем count-up: время, ПРОШЕДШЕЕ с момента входа ПЕРВОГО участника
+// комнаты. Сервер присылает это как `joined.roomAgeSeconds` (аддитивное поле,
+// целые секунды, 0 у самого первого вошедшего, см. src/ws.rs) — значение
+// ОБЩЕЕ для всех участников комнаты (не «сколько лично я тут сижу»), поэтому
+// у опоздавшего участника таймер сразу показывает актуальный возраст комнаты,
+// а не 0. `expiresInSeconds` сервер всё ещё присылает (лимит жизни комнаты
+// никуда не делся — по его истечении сервер шлёт `room-expired`, см.
+// signaling.on('room-expired') ниже), но для отображения он больше не
+// используется, поэтому и жёлтой/красной «критичности» тут больше нет — она
+// была привязана именно к остатку до лимита, а не к прошедшему времени.
+let roomAgeBaseSeconds = null; // roomAgeSeconds из последнего joined, null до первого joined
+let roomAgeBaseAtMs = null; // Date.now() в момент получения этого joined — от него считаем "+ прошло с тех пор"
 let roomTimerInterval = null;
 
 // Лимит числа участников комнаты — сервер присылает ЭФФЕКТИВНЫЙ лимит в
@@ -354,29 +358,40 @@ let maxParticipants = 6;
 // остаётся на дефолтном фолбэке 6 до первого joined без своего лимита.
 let knownServerMaxParticipants = 6;
 
-/** Ч:ММ:СС из миллисекунд (не может быть отрицательным — вызывающая сторона зажимает снизу в 0). */
-function formatRoomTimer(remainingMs) {
-  const totalSeconds = Math.max(0, Math.floor(remainingMs / 1000));
+/**
+ * M:SS из миллисекунд, а после часа — H:MM:SS (не может быть отрицательным —
+ * вызывающая сторона зажимает снизу в 0).
+ */
+function formatRoomTimer(elapsedMs) {
+  const totalSeconds = Math.max(0, Math.floor(elapsedMs / 1000));
   const hours = Math.floor(totalSeconds / 3600);
   const minutes = Math.floor((totalSeconds % 3600) / 60);
   const seconds = totalSeconds % 60;
-  return `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+  }
+  return `${minutes}:${String(seconds).padStart(2, '0')}`;
 }
 
-/** Раз в секунду — пересчитать остаток и перекрасить пилюлю таймера по порогам (см. ROOM_TIMER_*_MS). */
+/** Раз в секунду — пересчитать прошедшее время комнаты и обновить пилюлю таймера. */
 function updateRoomTimerDisplay() {
-  if (roomExpiresAtMs === null) return;
-  const remainingMs = roomExpiresAtMs - Date.now();
-  roomTimerEl.textContent = formatRoomTimer(remainingMs);
-  roomTimerEl.classList.toggle('room-timer--warning', remainingMs <= ROOM_TIMER_WARNING_MS && remainingMs > ROOM_TIMER_CRITICAL_MS);
-  roomTimerEl.classList.toggle('room-timer--critical', remainingMs <= ROOM_TIMER_CRITICAL_MS);
+  if (roomAgeBaseSeconds === null) return;
+  const elapsedMs = roomAgeBaseSeconds * 1000 + (Date.now() - roomAgeBaseAtMs);
+  roomTimerEl.textContent = formatRoomTimer(elapsedMs);
   roomTimerEl.classList.remove('hidden');
 }
 
-/** Вызывается на КАЖДОМ joined (первый вход и реконнект) — пересчитывает дедлайн из свежего expiresInSeconds. */
-function startRoomTimer(expiresInSeconds) {
-  if (typeof expiresInSeconds !== 'number' || !Number.isFinite(expiresInSeconds)) return;
-  roomExpiresAtMs = Date.now() + expiresInSeconds * 1000;
+/**
+ * Вызывается на КАЖДОМ joined (первый вход и реконнект) — пересинхронизирует
+ * базу отсчёта из свежего roomAgeSeconds. Значение монотонно растёт на
+ * сервере, поэтому здесь просто берём его как новую базу (а не пытаемся
+ * «продолжить» старую) — после долгого реконнекта это подтянет таймер вперёд
+ * на реальный прошедший срок, а не оставит его отставшим.
+ */
+function startRoomTimer(roomAgeSeconds) {
+  if (typeof roomAgeSeconds !== 'number' || !Number.isFinite(roomAgeSeconds)) return;
+  roomAgeBaseSeconds = roomAgeSeconds;
+  roomAgeBaseAtMs = Date.now();
   updateRoomTimerDisplay();
   if (!roomTimerInterval) {
     roomTimerInterval = setInterval(updateRoomTimerDisplay, 1000);
@@ -389,7 +404,8 @@ function stopRoomTimer() {
     clearInterval(roomTimerInterval);
     roomTimerInterval = null;
   }
-  roomExpiresAtMs = null;
+  roomAgeBaseSeconds = null;
+  roomAgeBaseAtMs = null;
   roomTimerEl.classList.add('hidden');
 }
 
@@ -917,59 +933,113 @@ function hueFromPeerId(peerId) {
   return Math.abs(hash) % 360;
 }
 
-// ---------- Best-fit раскладка грида тайлов ----------
-//
-// Цель (см. задание): тайлы должны занимать максимум доступного места сцены
-// с сохранением фиксированной пропорции 16:9 (см. .tile: aspect-ratio в
-// static/style.css), а не жить в узком фиксированном диапазоне ширины
-// колонки (было: grid-template-columns: repeat(auto-fit, minmax(220px,260px))
-// — тайлы почти никогда не росли больше 260px, даже если сцена огромна).
-//
-// Алгоритм: перебираем число колонок 1..N (N — число тайлов), для каждого
-// варианта считаем МАКСИМАЛЬНЫЙ размер тайла с аспектом 16:9, который влезает
-// и по ширине (containerWidth, поделённой на колонки с учётом зазоров), и по
-// высоте (containerHeight, поделённой на получившееся число строк) —
-// сначала пробуем «упереться» в ширину колонки, и если высота при таком
-// масштабе не влезает в строку — масштабируем по высоте вместо ширины (тайл
-// всегда останется 16:9, лишнее место просто остаётся пустым по краю). Из
-// всех вариантов cols выбираем тот, что даёт МАКСИМАЛЬНУЮ площадь одного
-// тайла — это и есть «лучше всего заполняет сцену».
-//
-// Результат применяется ОДНИМ инлайн grid-template-columns с явной шириной
-// колонки в px (а не через --tile-w/--tile-h переменные) — этого достаточно:
-// .tile уже имеет aspect-ratio: 16/9 в CSS, поэтому высота тайла следует из
-// проставленной ширины трека автоматически, без отдельного управления
-// высотой. Единственный побочный эффект — этот инлайн-стиль имеет более
-// высокий приоритет, чем любые CSS-правила grid-template-columns (в т.ч.
-// .tiles-grid--solo и мобильный @media), так что best-fit сознательно
-// подменяет их собой везде, где он применяется (то есть везде, кроме
-// --compact/--spotlight — см. layoutTilesGrid).
-const TILE_ASPECT_RATIO = 16 / 9;
+/**
+ * Первый графемный кластер строки — буква аватара берёт именно кластер, а не
+ * charAt(0)/[0]: на имени, начинающемся с эмодзи (см. static/namegen.js:
+ * userName()), charAt(0) вернул бы половину суррогатной пары. Intl.Segmenter
+ * — точный способ; фолбэк [...str][0] берёт первую код-точку целиком
+ * (корректно для однокодпойнтных эмодзи ANIMALS, см. namegen.js).
+ * Используется и в createTile, и в updatePeerTileName/updateOwnTileLabel —
+ * три места, где раньше этот код был продублирован дословно.
+ */
+function firstGraphemeOf(str) {
+  if (!str) return null;
+  return typeof Intl !== 'undefined' && Intl.Segmenter
+    ? [...new Intl.Segmenter().segment(str)][0]?.segment
+    : [...str][0];
+}
 
 /**
- * Перебор числа колонок — возвращает { cols, tileWidth, tileHeight } с
- * максимальной площадью тайла, либо null, если контейнер/список тайлов пуст.
+ * Подпись тайла показывает просто имя (см. п.5 задания), но круг-аватар уже
+ * несёт первый графемный кластер имени как отдельную крупную картинку — если
+ * этот кластер оказывается эмодзи (см. namegen.js: userName() почти всегда
+ * начинается с эмодзи), подпись дублировала бы его же текстом рядом с
+ * кругом. \p{Extended_Pictographic} — надёжная проверка «это эмодзи», а не
+ * первая буква обычного имени (иначе, например, имя "Alice" лишилось бы "A").
+ * Если после вычитания кластера ничего не остаётся (имя — один эмодзи без
+ * слова) — возвращаем исходную строку, чтобы подпись не была пустой.
  */
-function computeBestFitTileLayout(containerWidth, containerHeight, tileCount, gapPx) {
+function stripLeadingAvatarEmoji(trimmedName, grapheme) {
+  if (!trimmedName || !grapheme) return trimmedName;
+  if (!/\p{Extended_Pictographic}/u.test(grapheme)) return trimmedName;
+  const rest = trimmedName.slice(grapheme.length).trim();
+  return rest || trimmedName;
+}
+
+/** Имя для показа под аватаром/в углу тайла — просто имя, без "Guest"-плейсхолдера, если и так есть. */
+function tileDisplayName(trimmedName, grapheme) {
+  return trimmedName ? stripLeadingAvatarEmoji(trimmedName, grapheme) : 'Guest';
+}
+
+// ---------- Раскладка грида тайлов: фиксированная сетка под лимит 6 ----------
+//
+// Комната по умолчанию ограничена 6 участниками (см. knownServerMaxParticipants
+// выше) — по заданию (п.6) раскладка для 1..6 тайлов ФИКСИРОВАННАЯ и
+// предсказуемая (не «лучшее из перебора N вариантов колонок», как было
+// раньше в computeBestFitTileLayout — тот перебор давал переменное число
+// колонок в зависимости от формы сцены, из-за чего результат было сложно
+// уместить одновременно и по ширине, и по высоте без скролла): десктоп —
+// 1→1, 2→2, 3→3, 4→2×2, 5-6→3×2; мобильный портрет (см. @media (max-width:
+// 640px) в static/style.css) — всегда 2 колонки (кроме одиночного тайла).
+//
+// Сам тайл всё равно масштабируется под аспект 16:9 и вписывается МАКСИМУМ
+// возможного размера — но теперь по ЯВНО зафиксированному числу колонок/строк,
+// а не подбором. Оба грид-трека (и grid-template-columns, И
+// grid-template-rows) проставляются инлайн в px — раньше высота строк
+// отдавалась на откуп CSS-фоллбэку `grid-auto-rows: minmax(0, 1fr)`, что при
+// недетерминированной (auto) высоте самого #tiles-grid могло не совпасть с
+// реально проверенным по высоте расчётом. Явные grid-template-rows убирают
+// эту неоднозначность: итоговая высота грида гарантированно равна
+// rows*tileHeight + gaps, т.е. ровно тому, что было проверено на fit по
+// высоте сцены (см. также фикс .room-page: height вместо min-height в
+// static/style.css — вторая половина того же бага со скроллом).
+const TILE_ASPECT_RATIO = 16 / 9;
+
+// Тот же брейкпоинт, что и мобильный @media в static/style.css — раскладка
+// колонок должна совпадать с тем, что реально видит пользователь.
+const MOBILE_TILES_MEDIA_QUERY = '(max-width: 640px)';
+
+/**
+ * Число колонок для фиксированной раскладки под tileCount (см. комментарий
+ * выше). Больше 6 тайлов — нестандартная серверная конфигурация с
+ * увеличенным лимитом участников — не описана заданием отдельно; берём
+ * общий разумный fallback ceil(sqrt(n)), чтобы сетка не расползалась в одну
+ * строку/колонку, а не потому, что это «правильная» раскладка для такого
+ * случая.
+ */
+function computeTileGridColumns(tileCount, isMobile) {
+  if (tileCount <= 1) return 1;
+  if (isMobile) return 2;
+  if (tileCount === 2) return 2;
+  if (tileCount === 3) return 3;
+  if (tileCount === 4) return 2;
+  if (tileCount <= 6) return 3;
+  return Math.ceil(Math.sqrt(tileCount));
+}
+
+/**
+ * Максимальный размер тайла 16:9, вписанный ОДНОВРЕМЕННО и по ширине
+ * (containerWidth, поделённой на cols с учётом зазоров), и по высоте
+ * (containerHeight, поделённой на rows) — возвращает { cols, rows,
+ * tileWidth, tileHeight } либо null, если контейнер/список тайлов пуст.
+ */
+function computeFixedTileLayout(containerWidth, containerHeight, tileCount, gapPx, isMobile) {
   if (tileCount <= 0 || containerWidth <= 0 || containerHeight <= 0) return null;
-  let best = null;
-  for (let cols = 1; cols <= tileCount; cols++) {
-    const rows = Math.ceil(tileCount / cols);
-    const cellWidth = (containerWidth - gapPx * (cols - 1)) / cols;
-    const cellHeight = (containerHeight - gapPx * (rows - 1)) / rows;
-    if (cellWidth <= 0 || cellHeight <= 0) continue;
-    let tileWidth = cellWidth;
-    let tileHeight = tileWidth / TILE_ASPECT_RATIO;
-    if (tileHeight > cellHeight) {
-      // Ширина колонки позволила бы тайл выше строки — масштабируем по
-      // высоте вместо этого (аспект 16:9 сохраняется в любом случае).
-      tileHeight = cellHeight;
-      tileWidth = tileHeight * TILE_ASPECT_RATIO;
-    }
-    const area = tileWidth * tileHeight;
-    if (!best || area > best.area) best = { cols, tileWidth, tileHeight, area };
+  const cols = computeTileGridColumns(tileCount, isMobile);
+  const rows = Math.ceil(tileCount / cols);
+  const cellWidth = (containerWidth - gapPx * (cols - 1)) / cols;
+  const cellHeight = (containerHeight - gapPx * (rows - 1)) / rows;
+  if (cellWidth <= 0 || cellHeight <= 0) return null;
+  let tileWidth = cellWidth;
+  let tileHeight = tileWidth / TILE_ASPECT_RATIO;
+  if (tileHeight > cellHeight) {
+    // Ширина колонки позволила бы тайл выше строки — масштабируем по высоте
+    // вместо этого (аспект 16:9 сохраняется в любом случае, лишнее место по
+    // ширине просто остаётся пустым по краю за счёт justify-content: center).
+    tileHeight = cellHeight;
+    tileWidth = tileHeight * TILE_ASPECT_RATIO;
   }
-  return best;
+  return { cols, rows, tileWidth, tileHeight };
 }
 
 /**
@@ -1004,25 +1074,46 @@ function computeAvailableGridBox() {
 }
 
 /**
- * Пересчитать и применить best-fit раскладку — вызывается при изменении
+ * Пересчитать и применить фиксированную раскладку — вызывается при изменении
  * числа тайлов (см. updateSoloState, вызывается из updateParticipantCount),
  * при тоггле --compact (showScreenStageContainer/hideScreenStage — через тот
- * же updateSoloState) и на resize окна (см. слушатель ниже). Не трогает
- * --compact (лента при шаринге экрана — своя flex-раскладка с фиксированной
- * шириной тайла, см. static/style.css) и --spotlight (лента максимизации —
- * тоже своя CSS-раскладка, см. updateSpotlightMode) — там best-fit был бы не
- * к месту и конфликтовал бы с их собственной геометрией.
+ * же updateSoloState) и на resize окна (см. слушатель ниже; ресайз — в т.ч.
+ * поворот телефона, что меняет isMobile здесь ни при чём — брейкпоинт по
+ * ширине, а не ориентации, но пересчитать всё равно нужно, ширина меняется
+ * тоже). Не трогает --compact (лента при шаринге экрана — своя flex-раскладка
+ * с фиксированной шириной тайла, см. static/style.css) и --spotlight (лента
+ * максимизации — тоже своя CSS-раскладка, см. updateSpotlightMode) — там
+ * фиксированная сетка была бы не к месту и конфликтовала бы с их собственной
+ * геометрией.
  */
 function layoutTilesGrid() {
   if (tilesGridEl.classList.contains('tiles-grid--compact')) return;
   if (tilesGridEl.classList.contains('tiles-grid--spotlight')) return;
   const tileCount = tilesGridEl.children.length;
   if (tileCount === 0) return;
-  const { width, height } = computeAvailableGridBox();
+  const { width: stageWidth, height } = computeAvailableGridBox();
+  // #tiles-grid сама ограничена `max-width: 1200px` в CSS (см. static/style.css)
+  // — на широких десктопных экранах сцена (.room-stage) шире этого предела,
+  // и без учёта этого предела здесь JS насчитал бы колонки под ПОЛНУЮ ширину
+  // сцены, а сам грид отрисовался бы уже (max-width подрезал бы его box), из-за
+  // чего явно проставленные grid-template-columns не влезли бы в
+  // фактический clientWidth грида — горизонтальный скролл ИМЕННО этого рода
+  // и был найден смоук-тестом (см. п.6 задания: 1280×800, 6 тайлов).
+  const cssMaxWidth = parseFloat(getComputedStyle(tilesGridEl).maxWidth);
+  const width = Number.isFinite(cssMaxWidth) ? Math.min(stageWidth, cssMaxWidth) : stageWidth;
   const gapPx = parseFloat(getComputedStyle(tilesGridEl).columnGap) || 0;
-  const best = computeBestFitTileLayout(width, height, tileCount, gapPx);
-  if (!best) return;
-  tilesGridEl.style.gridTemplateColumns = `repeat(${best.cols}, ${Math.floor(best.tileWidth)}px)`;
+  const isMobile = window.matchMedia(MOBILE_TILES_MEDIA_QUERY).matches;
+  const layout = computeFixedTileLayout(width, height, tileCount, gapPx, isMobile);
+  if (!layout) return;
+  const tileWidthPx = Math.floor(layout.tileWidth);
+  const tileHeightPx = Math.floor(layout.tileHeight);
+  tilesGridEl.style.gridTemplateColumns = `repeat(${layout.cols}, ${tileWidthPx}px)`;
+  // grid-template-rows (не auto-rows: minmax(0, 1fr) из CSS-фоллбэка) —
+  // именно этого не хватало раньше: без явной высоты строк итоговая высота
+  // грида не была гарантированно ограничена проверенным по высоте расчётом
+  // (см. комментарий над computeFixedTileLayout и фикс .room-page в
+  // static/style.css — вторая половина того же бага со скроллом на десктопе).
+  tilesGridEl.style.gridTemplateRows = `repeat(${layout.rows}, ${tileHeightPx}px)`;
 }
 
 // Ресайз окна (поворот телефона, изменение размера окна десктоп-браузера,
@@ -1045,11 +1136,10 @@ function createTile(peerId, name, isOwn) {
     video.classList.add('tile-video--mirror');
   }
 
-  // Заглушка без видео: аватар-круг (буква/эмодзи) + имя КРУПНО под ним (см.
-  // требование «в 2 раза крупнее» — .tile-placeholder-avatar/-letter в
-  // static/style.css). .tile-placeholder — теперь просто flex-контейнер на
-  // весь тайл, круг с градиентом переехал в отдельный .tile-placeholder-avatar
-  // (раньше градиент/форма круга жили прямо на .tile-placeholder).
+  // Заглушка без видео: аватар-круг (буква/эмодзи, теперь заметно крупнее и
+  // строго круглый — см. .tile-placeholder-avatar в static/style.css) + имя
+  // КРУПНО под ним. .tile-placeholder — просто flex-контейнер на весь тайл,
+  // круг с градиентом — отдельный .tile-placeholder-avatar.
   const placeholder = document.createElement('div');
   placeholder.className = 'tile-placeholder';
 
@@ -1058,19 +1148,25 @@ function createTile(peerId, name, isOwn) {
   const hue = hueFromPeerId(peerId);
   avatar.style.background = `linear-gradient(135deg, hsl(${hue}, 70%, 45%), hsl(${(hue + 45) % 360}, 70%, 32%))`;
 
+  // Корона лидера НАД кругом-аватаром (см. п.4 задания) — абсолютно
+  // позиционирована относительно самого круга (avatar: position: relative,
+  // см. static/style.css), а не относительно всего тайла: так она остаётся
+  // прямо по центру над кругом при любом размере тайла (best-fit/сетка) без
+  // отдельного пересчёта в JS. Это ОТДЕЛЬНЫЙ элемент от .tile-crown в
+  // .tile-name ниже — та корона видна только во время видео (угол плашки с
+  // именем), эта — только на заглушке без видео; обе переключаются вместе в
+  // setLeaderIndicator, т.к. видео/заглушка никогда не показываются
+  // одновременно.
+  const placeholderCrown = document.createElement('span');
+  placeholderCrown.className = 'tile-crown tile-crown--placeholder hidden';
+  placeholderCrown.setAttribute('aria-hidden', 'true');
+  placeholderCrown.innerHTML = CROWN_ICON_SVG; // статичная разметка, не пользовательские данные
+  avatar.appendChild(placeholderCrown);
+
   const letter = document.createElement('span');
   letter.className = 'tile-placeholder-letter';
   const trimmedName = (name || '').trim();
-  // Первый графем-кластер, а не charAt(0): на имени, начинающемся с эмоджи
-  // (см. static/namegen.js: userName()), charAt(0) вернул бы половину
-  // суррогатной пары («�»). Intl.Segmenter — точный способ; фолбэк [...str][0]
-  // берёт первую код-точку целиком (корректно для однокодпойнтных эмодзи
-  // ANIMALS, см. namegen.js). toUpperCase() на эмодзи — no-op, это ок.
-  const firstGrapheme = trimmedName
-    ? (typeof Intl !== 'undefined' && Intl.Segmenter
-        ? [...new Intl.Segmenter().segment(trimmedName)][0]?.segment
-        : [...trimmedName][0])
-    : null;
+  const firstGrapheme = firstGraphemeOf(trimmedName);
   letter.textContent = firstGrapheme ? firstGrapheme.toUpperCase() : '?';
   avatar.appendChild(letter);
   placeholder.appendChild(avatar);
@@ -1081,9 +1177,9 @@ function createTile(peerId, name, isOwn) {
 
   // Угловая подпись (видна только когда идёт видео — см. setTileVideoVisible
   // ниже: на заглушке имя уже крупно показано по центру, дублировать его в
-  // углу незачем). Корона лидера теперь ВНУТРИ этой же плашки, инлайн перед
-  // именем (раньше была отдельным абсолютно позиционированным элементом в
-  // верхнем левом углу — там же, где теперь и имя, см. static/style.css).
+  // углу незачем). Корона лидера — инлайн перед именем в этой же плашке
+  // (видео-режим, см. комментарий у placeholderCrown выше про решение для
+  // заглушки).
   const label = document.createElement('div');
   label.className = 'tile-name hidden';
 
@@ -1097,7 +1193,11 @@ function createTile(peerId, name, isOwn) {
   labelText.className = 'tile-name-text';
   label.appendChild(labelText);
 
-  const labelValue = isOwn ? `You${trimmedName ? ` (${trimmedName})` : ''}` : (trimmedName || 'Guest');
+  // Просто имя, КРУПНЕЕ (см. п.5 задания) — без обёртки «You (...)» и без
+  // слова-роли «leader» (лидерство и так видно по короне); своё имя не
+  // отличается от чужого текстом. Ведущий эмодзи, дублирующий круг-аватар,
+  // вычищается (см. tileDisplayName/stripLeadingAvatarEmoji выше).
+  const labelValue = tileDisplayName(trimmedName, firstGrapheme);
   labelText.textContent = labelValue;
   placeholderName.textContent = labelValue;
 
@@ -1140,6 +1240,7 @@ function createTile(peerId, name, isOwn) {
     placeholderNameEl: placeholderName,
     letterEl: letter, // E2E v2: буква аватара обновляется отдельно от создания тайла, см. updatePeerTileName (имя приходит позже, отдельным name-announce)
     crownEl: crown,
+    placeholderCrownEl: placeholderCrown, // корона над кругом-аватаром заглушки (см. п.4 задания) — переключается синхронно с crownEl в setLeaderIndicator
     micOffEl: micOff,
     speedEl: speed,
   };
@@ -1183,15 +1284,11 @@ function updatePeerTileName(peerId, name) {
   entry.name = name || null;
   const tile = entry.tile;
   const trimmedName = (name || '').trim();
-  const labelValue = trimmedName || 'Guest';
+  const firstGrapheme = firstGraphemeOf(trimmedName);
+  const labelValue = tileDisplayName(trimmedName, firstGrapheme);
   tile.root.dataset.name = name || '';
   tile.labelTextEl.textContent = labelValue;
   tile.placeholderNameEl.textContent = labelValue;
-  const firstGrapheme = trimmedName
-    ? (typeof Intl !== 'undefined' && Intl.Segmenter
-        ? [...new Intl.Segmenter().segment(trimmedName)][0]?.segment
-        : [...trimmedName][0])
-    : null;
   tile.letterEl.textContent = firstGrapheme ? firstGrapheme.toUpperCase() : '?';
 }
 
@@ -1289,7 +1386,7 @@ function updateSoloState() {
   tilesGridEl.classList.toggle('tiles-grid--solo', solo);
   inviteCtaEl.classList.toggle('hidden', !solo);
   // Число тайлов и/или режим --compact могли измениться — пересчитать
-  // best-fit раскладку (см. layoutTilesGrid ниже; она сама не делает ничего
+  // раскладку грида (см. layoutTilesGrid ниже; она сама не делает ничего
   // в --compact/--spotlight, у них своя CSS-логика).
   layoutTilesGrid();
 }
@@ -1300,23 +1397,43 @@ function isPeerLeader(peerId) {
   return leaderId !== null && peerId === leaderId;
 }
 
-/** Обновить корону на тайлах (своём и всех текущих peers) под новый leaderId + подпись своего тайла. */
+/**
+ * Обновить корону на тайлах (своём и всех текущих peers) под новый leaderId +
+ * подпись своего тайла. Каждый тайл несёт ДВЕ короны (см. createTile) —
+ * crownEl (угол плашки с именем, видна во время видео) и placeholderCrownEl
+ * (над кругом-аватаром заглушки, видна без видео) — переключаются вместе,
+ * т.к. видео/заглушка взаимоисключающи (см. setTileVideoVisible), но чтобы
+ * не завязываться на то, какая из них сейчас видна, просто держим обе в
+ * актуальном состоянии всегда.
+ */
 function setLeaderIndicator(newLeaderId) {
   leaderId = newLeaderId || null;
   isLeader = myPeerId !== null && myPeerId === leaderId;
-  if (ownTile) ownTile.crownEl.classList.toggle('hidden', leaderId !== myPeerId);
+  if (ownTile) {
+    const iAmLeader = leaderId === myPeerId;
+    ownTile.crownEl.classList.toggle('hidden', !iAmLeader);
+    ownTile.placeholderCrownEl.classList.toggle('hidden', !iAmLeader);
+  }
   for (const [peerId, entry] of peers) {
-    entry.tile.crownEl.classList.toggle('hidden', leaderId !== peerId);
+    const peerIsLeader = leaderId === peerId;
+    entry.tile.crownEl.classList.toggle('hidden', !peerIsLeader);
+    entry.tile.placeholderCrownEl.classList.toggle('hidden', !peerIsLeader);
   }
   updateOwnTileLabel();
 }
 
-/** «Вы (имя)» + « (лидер)», если лидер — сам. Пересчитывается при любой смене leaderId. Пишем и в угловую подпись, и в подпись под аватаром заглушки — обе несут один и тот же текст (см. createTile). */
+/**
+ * Просто имя (см. п.5 задания) — без обёртки «Вы (...)» и без слова-роли
+ * «лидер» (лидерство показывает корона, см. setLeaderIndicator, а не текст).
+ * Пересчитывается при любой смене имени/leaderId. Пишем и в угловую подпись,
+ * и в подпись под аватаром заглушки — обе несут один и тот же текст (см.
+ * createTile).
+ */
 function updateOwnTileLabel() {
   if (!ownTile) return;
   const trimmedName = (myName || '').trim();
-  let text = `You${trimmedName ? ` (${trimmedName})` : ''}`;
-  if (isLeader) text += ' (Leader)';
+  const firstGrapheme = firstGraphemeOf(trimmedName);
+  const text = tileDisplayName(trimmedName, firstGrapheme);
   ownTile.labelTextEl.textContent = text;
   ownTile.placeholderNameEl.textContent = text;
 }
@@ -2980,6 +3097,16 @@ joinNameInputEl.addEventListener('keydown', (event) => {
   }
 });
 
+// Кнопка «сгенерировать заново» рядом с полем имени (см. showJoinModal) —
+// перекатывает новое NameGen.userName() и возвращает фокус в поле с
+// выделением текста, как при первом открытии модалки, чтобы можно было
+// сразу начать печатать поверх, если сгенерированное имя не понравилось.
+joinNameRegenButtonEl.addEventListener('click', () => {
+  joinNameInputEl.value = NameGen.userName();
+  joinNameInputEl.focus();
+  joinNameInputEl.select();
+});
+
 async function init() {
   // E2E v2: токен ссылки (`t`/`e`) обязателен ДО показа чего-либо связанного
   // с реальным входом — без него нет смысла даже спрашивать имя, всё равно
@@ -3064,17 +3191,17 @@ async function connectAndJoin() {
 }
 
 function registerSignalingHandlers(iceServers) {
-  signaling.on('joined', ({ peerId, peers: otherPeers, screenOwner, leaderId: joinedLeaderId, settings, pending, expiresInSeconds, maxParticipants: joinedMaxParticipants }) => {
+  signaling.on('joined', ({ peerId, peers: otherPeers, screenOwner, leaderId: joinedLeaderId, settings, pending, roomAgeSeconds, maxParticipants: joinedMaxParticipants }) => {
     // Реконнект ждёт именно этот ответ (см. sendJoinAndWait) — репортуем ему
     // исход в дополнение к обычной обработке ниже (при первом входе
     // pendingJoinResolve никогда не взведён).
     if (pendingJoinResolve) pendingJoinResolve('joined');
 
-    // Лимит длительности созвона: пересчитываем дедлайн из свежего
-    // expiresInSeconds на КАЖДОМ joined — и при первом входе, и при
+    // Таймер длительности созвона (count-up): пересинхронизируем базу отсчёта
+    // из свежего roomAgeSeconds на КАЖДОМ joined — и при первом входе, и при
     // реконнекте (см. startRoomTimer выше и docs/security.md, «Meeting
     // Duration Ceiling»).
-    startRoomTimer(expiresInSeconds);
+    startRoomTimer(roomAgeSeconds);
 
     // Потолок участников — берём с сервера на КАЖДОМ joined (аддитивное
     // поле, см. maxParticipants выше); если его нет (старый сервер), не

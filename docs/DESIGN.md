@@ -8,6 +8,7 @@
 - [2. Principles & Constraints](#2-principles--constraints)
   - [2.1 Design Principles](#21-design-principles)
   - [2.2 Constraints](#22-constraints)
+  - [2.3 Observability](#23-observability)
 - [3. Component Model](#3-component-model)
 - [4. Technology Stack](#4-technology-stack)
 - [5. Where to Find What](#5-where-to-find-what)
@@ -131,6 +132,21 @@ database), which in turn means the backend runs as exactly one replica.
 See [`self-hosting.md`](self-hosting.md) for the consequence this has on
 deploys (no rolling update / no horizontal scaling).
 
+### 2.3 Observability
+
+The backend exposes Prometheus metrics on a separate management port
+(`GET /metrics`, `MGMT_PORT`, default `8081` — deliberately **not** the main
+signaling port, so the scrape endpoint never shares a listener with
+user-facing traffic; see [`self-hosting.md` §6](self-hosting.md#6-environment-variables)
+and [`signaling-protocol.md` §2.8](signaling-protocol.md#28-get-metrics-management-port)).
+The metrics are aggregate gauges/counters only — current room/participant/
+pending-lobby counts and a lifetime room-creation counter (see
+[`../src/metrics.rs`](../src/metrics.rs)) — never a room id, peer id, or any
+other identifier as a label, which keeps this consistent with the
+minimal-server-state principle in [§2.1](#21-design-principles) and the
+guarantees in [`privacy.md`](privacy.md). A ready-made Grafana dashboard
+ships at [`../deploy/monitoring/grafana-dashboard-chat.yaml`](../deploy/monitoring/grafana-dashboard-chat.yaml).
+
 ## 3. Component Model
 
 | Component | Responsibility | Where specified |
@@ -164,6 +180,7 @@ deploys (no rolling update / no horizontal scaling).
 | Human-checkable MITM protection: the commit-before-reveal SAS (emoji) protocol | [`sas-verification.md`](sas-verification.md) |
 | Running your own instance: single-binary vs. split deployment, reverse proxy/TLS, TURN, environment variables | [`self-hosting.md`](self-hosting.md) |
 | What the server can and cannot see, retention/TTL behavior | [`privacy.md`](privacy.md) |
+| Prometheus metrics, management port, Grafana dashboard | [`self-hosting.md` §7.4](self-hosting.md#74-metrics--dashboard), [`signaling-protocol.md` §2.8](signaling-protocol.md#28-get-metrics-management-port) |
 
 ## 6. Traceability
 

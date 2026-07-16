@@ -11,6 +11,7 @@
   - [2.5 `GET /healthz`](#25-get-healthz)
   - [2.6 `GET /version.json`](#26-get-versionjson)
   - [2.7 `GET /ws` (WebSocket upgrade)](#27-get-ws-websocket-upgrade)
+  - [2.8 `GET /metrics` (management port)](#28-get-metrics-management-port)
 - [3. WebSocket: Client → Server](#3-websocket-client--server)
 - [4. WebSocket: Server → Client](#4-websocket-server--client)
 - [5. Relay Semantics](#5-relay-semantics)
@@ -149,6 +150,17 @@ see [`self-hosting.md`](self-hosting.md) for when that matters (a
 single-origin deployment does not need it and leaves the check disabled by
 default).
 
+### 2.8 `GET /metrics` (management port)
+
+Prometheus text-format exposition (`text/plain; version=0.0.4`), served on a
+**separate** management port (`MGMT_PORT`, default `8081`) — not on the main
+signaling port, and not reachable through the same load-balancer path as
+`/ws`/`/api/*`. See [`self-hosting.md` §7.4](self-hosting.md#74-metrics--dashboard)
+for the exposed metric names and what each one counts, and
+[`../src/metrics.rs`](../src/metrics.rs) for the source of truth. Every
+metric is a plain aggregate gauge/counter — no room id, peer id, or other
+per-entity label is ever attached (see [`privacy.md`](privacy.md)).
+
 ## 3. WebSocket: Client → Server
 
 | type | Fields | Purpose |
@@ -184,7 +196,7 @@ in the room.
 
 | type | Fields | Sent To |
 |---|---|---|
-| `joined` | `peerId`, `peers: [{peerId, name, epub}]` (other current participants; `name` always `null` — the server no longer stores it at all, see [§3](#3-websocket-client--server)), `screenOwner?`, `leaderId`, `settings`, `pending: [{peerId, name, epub}]` (non-empty **only** for the leader), `expiresInSeconds`, `maxParticipants` (the room's *effective* ceiling — `settings.maxParticipants ?? MAX_PARTICIPANTS`, see [`permissions-and-leader.md` §5](permissions-and-leader.md#5-room-settings)) | The newly admitted participant |
+| `joined` | `peerId`, `peers: [{peerId, name, epub}]` (other current participants; `name` always `null` — the server no longer stores it at all, see [§3](#3-websocket-client--server)), `screenOwner?`, `leaderId`, `settings`, `pending: [{peerId, name, epub}]` (non-empty **only** for the leader), `expiresInSeconds` (no longer used by the frontend for display — kept on the wire for backward compatibility, see the note below the table), `roomAgeSeconds` (additive field: seconds since the room's very first participant joined — `0` for that first joiner; shared by everyone in the room, so a late joiner sees the room's real elapsed age rather than `0`; survives being emptied and refilled within the empty-room TTL, but not a server restart, see [`../src/state.rs`](../src/state.rs) `Room::first_joined_at`), `maxParticipants` (the room's *effective* ceiling — `settings.maxParticipants ?? MAX_PARTICIPANTS`, see [`permissions-and-leader.md` §5](permissions-and-leader.md#5-room-settings)) | The newly admitted participant |
 | `peer-joined` | `peerId`, `name?` (always `null` — the server never stores this field, kept in the wire shape only for backward compatibility, see [§3](#3-websocket-client--server)), `epub?` | Everyone else already in the room |
 | `peer-left` | `peerId` | Everyone else in the room |
 | `offer` | `fromPeerId`, `sdp` | The addressed target peer |
@@ -205,6 +217,18 @@ in the room.
 | `room-expired` | — | Everyone in the room *and* everyone waiting: the room outlived its maximum lifetime; the server closes the socket immediately after |
 | `error` | `message` | The sender of a malformed, oversized, rate-limited, or permission-denied message |
 | `name-announce` | `from` (the true transport sender, never self-declared), `payload` | The target peer named in the client's `name-announce { to, payload }` — relayed opaquely, see [§3](#3-websocket-client--server) |
+
+> **`expiresInSeconds` vs. `roomAgeSeconds`.** The server still computes and
+> sends both on every `joined` (first join and reconnect alike) — the meeting
+> duration ceiling itself hasn't changed, only what the frontend's timer pill
+> shows. `expiresInSeconds` (remaining time until the ceiling) used to drive a
+> countdown display with a warning/critical color threshold; the frontend now
+> instead shows a count-**up** built from `roomAgeSeconds` (elapsed time since
+> the room's first participant joined), with no color thresholds at all — see
+> `startRoomTimer`/`formatRoomTimer` in [`../static/room.js`](../static/room.js).
+> `expiresInSeconds` is kept on the wire only for backward compatibility with
+> any client that still reads it; `room-expired` still fires exactly when the
+> real ceiling is hit, independent of either field's display use.
 
 ## 5. Relay Semantics
 

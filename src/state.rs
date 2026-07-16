@@ -60,9 +60,25 @@ pub const DEFAULT_MAX_ROOMS: usize = 500;
 /// не задан: 3 часа. См. docs/security.md, «Meeting Duration Ceiling».
 pub const DEFAULT_MAX_ROOM_LIFETIME_SECONDS: u64 = 10800;
 
-/// Per-IP лимит на `POST /api/rooms` (H2): не более этого числа запросов за
-/// окно с одного IP.
-pub const ROOM_CREATION_IP_LIMIT: usize = 10;
+/// Per-IP лимит на `POST /api/rooms` (и, деля с ним бюджет, `PUT
+/// /api/rooms/{id}` — см. `main.rs::restore_room`): не более этого числа
+/// запросов за окно с одного IP. Прод-дефолт — 3/60с (сознательно жёстко:
+/// создание комнаты — редкое для легитимного пользователя действие, в
+/// отличие от, скажем, join-room; см. также `PENDING_JOIN_IP_LIMIT` ниже про
+/// то, почему у соседних по смыслу лимитов бюджеты раздельные).
+///
+/// Значение читается из env `ROOM_CREATION_IP_LIMIT` в `main.rs`
+/// (`crate::ROOM_CREATION_IP_LIMIT`, тот же `LazyLock`-приём, что у
+/// `crate::JOIN_ROOM_IP_LIMIT`) — configurability здесь, как и у
+/// `JOIN_ROOM_IP_LIMIT`, ради тестируемости: signaling.test.mjs и e2e-тесты
+/// создают много комнат с одного IP (localhost) за прогон и легко упёрлись бы
+/// в жёсткий прод-дефолт 3/60с — тестовые серверы поднимают лимит через env
+/// далеко за пределы того, что файл способен нафлудить, а сам прод-дефолт
+/// проверяется отдельным изолированным серверным процессом с реальным
+/// значением (см. соответствующий раздел signaling.test.mjs).
+/// `ROOM_CREATION_IP_WINDOW`, в отличие от лимита, не configurable — окно
+/// менять не просили, поднятого лимита у тестовых серверов достаточно.
+pub const DEFAULT_ROOM_CREATION_IP_LIMIT: usize = 3;
 pub const ROOM_CREATION_IP_WINDOW: Duration = Duration::from_secs(60);
 
 /// Per-IP лимит на попадание в лобби (M3): своя, отдельная от
@@ -92,10 +108,9 @@ pub const PENDING_JOIN_IP_WINDOW: Duration = Duration::from_secs(60);
 ///
 /// Значение читается из env `JOIN_ROOM_IP_LIMIT` в `main.rs`
 /// (`crate::JOIN_ROOM_IP_LIMIT`, тот же `LazyLock`-приём, что у
-/// `crate::MAX_PARTICIPANTS`) — в отличие от «соседних» лимитов этого файла
-/// (`ROOM_CREATION_IP_LIMIT`/`PENDING_JOIN_IP_LIMIT`, оба захардкожены)
-/// configurability здесь осознанно НЕ ради прод-гибкости, а ради
-/// тестируемости: HTTP-эндпоинты (`POST`/`PUT /api/rooms`) тестовый клиент
+/// `crate::MAX_PARTICIPANTS`) — в отличие от `PENDING_JOIN_IP_LIMIT` ниже
+/// (по-прежнему захардкожен) configurability здесь осознанно НЕ ради
+/// прод-гибкости, а ради тестируемости: HTTP-эндпоинты (`POST`/`PUT /api/rooms`) тестовый клиент
 /// может изолировать по IP через заголовок `CF-Connecting-IP` на каждый
 /// отдельный запрос (см. `createRoom()` в tests/signaling.test.mjs), а
 /// WS-хендшейк глобальным `WebSocket` рантайма (без сторонних пакетов)
@@ -201,6 +216,22 @@ pub struct Room {
     /// «продлевает» жизнь комнаты на рестарте, тот же trade-off, что и у
     /// `emptied_at`/TTL пустой комнаты.
     pub created_at: Instant,
+    /// Момент входа ПЕРВОГО за всю жизнь комнаты участника — источник
+    /// серверного поля `Joined::room_age_seconds` (таймер «сколько длится
+    /// созвон» count-up на фронте, см. `crate::ws::room_age_seconds`).
+    /// `None`, пока в комнату ещё никто не вошёл; ставится РОВНО ОДИН РАЗ
+    /// (см. `crate::ws::admit_participant`) и больше никогда не меняется —
+    /// даже если комната полностью опустеет и снова заполнится в пределах
+    /// TTL пустой комнаты, отсчёт возраста продолжается от исходного первого
+    /// входа, а не обнуляется: с точки зрения пользователя это та же самая
+    /// (не пересозданная) комната, и «сколько мы уже тут» — разумно мерить от
+    /// первого реального появления кого-либо, а не от того, что кто-то
+    /// временно вышел и вернулся. Как и `created_at`, рестарт сервера этот
+    /// момент не переживает — комната пересоздаётся (`PUT
+    /// /api/rooms/{id}`) с чистого листа, и отсчёт возраста начинается заново
+    /// с первого входа после рестарта — тот же trade-off, что уже описан у
+    /// `created_at`/`emptied_at` (эфемерное состояние, ничего страшного).
+    pub first_joined_at: Option<Instant>,
 }
 
 impl Room {
@@ -304,6 +335,19 @@ pub fn generate_room_id() -> String {
 /// (`HashMap::retain`), лок держится только на время самого прохода, без
 /// `.await` внутри критической секции (рассылка `send_to` — это просто
 /// `UnboundedSender::send`, не блокирует и не ждёт).
+///
+/// Заодно (после `retain`, тем же самым локом — см. обоснование ниже)
+/// пересчитывает и выставляет гейджи `chat_rooms`/`chat_participants`/
+/// `chat_pending` (см. `crate::metrics`). Выбор именно ЗДЕСЬ, а не на
+/// каждый `create_room`/`join-room`/`cleanup_peer`: реапер и так раз в
+/// `REAPER_INTERVAL` берёт лок на всё множество комнат и линейно проходит
+/// его целиком — досчитать суммы `participants.len()`/`pending.len()` по
+/// уже открытым записям стоит буквально ничего дополнительно, а обновлять
+/// три гейджа на каждое отдельное подключение/отключение означало бы
+/// лишний `metrics::gauge!` (атомарная операция, но их много) на куда более
+/// горячем пути и не даёт видимой пользы: Prometheus всё равно скрейпит раз
+/// в несколько секунд, секундная задержка обновления от `REAPER_INTERVAL`
+/// (1с) для дашборда не заметна.
 pub async fn reap_rooms(rooms: SharedRooms, empty_ttl: Duration, max_lifetime: Duration) {
     let mut interval = tokio::time::interval(REAPER_INTERVAL);
     loop {
@@ -327,6 +371,16 @@ pub async fn reap_rooms(rooms: SharedRooms, empty_ttl: Duration, max_lifetime: D
             }
             !expired_empty
         });
+
+        let mut participants_total = 0usize;
+        let mut pending_total = 0usize;
+        for room in rooms_guard.values() {
+            participants_total += room.participants.len();
+            pending_total += room.pending.len();
+        }
+        ::metrics::gauge!(crate::metrics::ROOMS).set(rooms_guard.len() as f64);
+        ::metrics::gauge!(crate::metrics::PARTICIPANTS).set(participants_total as f64);
+        ::metrics::gauge!(crate::metrics::PENDING).set(pending_total as f64);
     }
 }
 

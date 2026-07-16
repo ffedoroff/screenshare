@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="theme-color" content="#0f1114" />
   <title>Room — video call</title>
-  <link rel="stylesheet" href="/static/style.css?v=10" />
+  <link rel="stylesheet" href="/static/style.css?v=11" />
   <link rel="manifest" href="/static/manifest.webmanifest" />
   <link rel="apple-touch-icon" href="/static/icon-192.png" />
 </head>
@@ -23,14 +23,21 @@
     <div id="join-modal" class="join-modal">
       <div class="join-modal-card">
         <h2>Join the room</h2>
-        <input
-          id="join-name-input"
-          class="name-input"
-          type="text"
-          placeholder="Your name (optional)"
-          maxlength="40"
-          autocomplete="off"
-        />
+        <!-- Инпут имени + кнопка «сгенерировать заново» (см. static/room.js:
+             showJoinModal/joinNameRegenButtonEl) — та же пара, что на
+             лендинге у имени комнаты (static/index.html/landing.js), только
+             тянет NameGen.userName(). -->
+        <div class="input-with-regen">
+          <input
+            id="join-name-input"
+            class="name-input"
+            type="text"
+            placeholder="Your name (optional)"
+            maxlength="40"
+            autocomplete="off"
+          />
+          <button id="join-name-regen-button" type="button" class="regen-button" aria-label="Generate new name" title="Generate new name">↻</button>
+        </div>
         <button id="join-modal-button" class="start-button">Join</button>
       </div>
     </div>
@@ -51,9 +58,10 @@
       <span class="room-logo">Video call</span>
       <div class="room-top-bar-center">
         <span id="participant-count" class="participant-count">Participants: 1 / 6</span>
-        <!-- Лимит длительности созвона (см. static/room.js: startRoomTimer) —
-             обратный отсчёт Ч:ММ:СС до expiresInSeconds из joined; скрыт до
-             первого joined (см. static/style.css: .room-timer). -->
+        <!-- Таймер длительности созвона (см. static/room.js: startRoomTimer) —
+             count-up M:SS (после часа — H:MM:SS) от roomAgeSeconds из joined
+             (время с подключения ПЕРВОГО участника комнаты, общее для всех);
+             скрыт до первого joined (см. static/style.css: .room-timer). -->
         <span id="room-timer" class="room-timer hidden"></span>
         <!-- SAS «отпечаток комнаты» (5 эмодзи, см. static/crypto.js: deriveSas,
              static/room.js: renderTopbarSas) — единственное место в UI, где
@@ -410,14 +418,14 @@
     </div>
   </div>
 
-  <script src="/static/config.js?v=10"></script>
-  <script src="/static/crypto.js?v=10"></script>
-  <script src="/static/namegen.js?v=10"></script>
-  <script src="/static/vendor/qrcode.js?v=10"></script>
-  <script src="/static/common.js?v=10"></script>
-  <script src="/static/bus.js?v=10"></script>
-  <script src="/static/rtc.js?v=10"></script>
-  <script src="/static/chat.js?v=10"></script>
-  <script src="/static/room.js?v=12"></script>
+  <script src="/static/config.js?v=11"></script>
+  <script src="/static/crypto.js?v=11"></script>
+  <script src="/static/namegen.js?v=11"></script>
+  <script src="/static/vendor/qrcode.js?v=11"></script>
+  <script src="/static/common.js?v=11"></script>
+  <script src="/static/bus.js?v=11"></script>
+  <script src="/static/rtc.js?v=11"></script>
+  <script src="/static/chat.js?v=11"></script>
+  <script src="/static/room.js?v=14"></script>
 </body>
 </html>

@@ -81,6 +81,17 @@ The server does see, and cannot avoid seeing:
   content.
 - The timing of connections, joins, leaves, and relayed messages.
 - The bare fact that a given set of peer ids is sharing a room.
+- Aggregate operational counts — how many rooms/participants/waiting-lobby
+  entries exist right now, and how many rooms have been created over the
+  process's lifetime — exposed as Prometheus metrics on a separate
+  management port (see [`self-hosting.md` §7.4](self-hosting.md#74-metrics--dashboard)
+  and [`../src/metrics.rs`](../src/metrics.rs)). These are plain sums, never
+  broken down by room id, peer id, or any other identifier — a metric can
+  tell an operator "3 rooms, 7 participants right now," never *which* rooms
+  or *who*. This doesn't add anything beyond what's already true of the
+  server's in-memory state below; it's the same minimal bookkeeping,
+  surfaced as numbers for capacity/health monitoring rather than kept
+  invisible.
 
 None of this reveals what was said, shown, or shared — but it is genuine
 metadata the architecture cannot hide, since the server has to route

@@ -92,6 +92,27 @@ struct PeerCtx {
     peer_id: String,
 }
 
+/// RAII-гейдж `chat_websocket_connections` (см. `crate::metrics`):
+/// инкремент в `new()` (на апгрейд WS), гарантированный декремент в `Drop` —
+/// тот же приём, что описан в `crate::metrics::WEBSOCKET_CONNECTIONS` и у
+/// `code_ranker_sse_clients` в code-ranker-backend (RAII, а не парный
+/// ручной инкремент/декремент, чтобы ранний `return`/паника в
+/// `handle_socket` не оставляли гейдж однажды навсегда завышенным).
+struct WsConnectionGaugeGuard;
+
+impl WsConnectionGaugeGuard {
+    fn new() -> Self {
+        ::metrics::gauge!(crate::metrics::WEBSOCKET_CONNECTIONS).increment(1.0);
+        Self
+    }
+}
+
+impl Drop for WsConnectionGaugeGuard {
+    fn drop(&mut self) {
+        ::metrics::gauge!(crate::metrics::WEBSOCKET_CONNECTIONS).decrement(1.0);
+    }
+}
+
 /// Скользящее окно rate-limit одного соединения — общее на все релеи суммарно
 /// (`RELAY_RATE_LIMIT`). В структуре (а не голым полем), чтобы легко было
 /// вернуть сюда дополнительные окна, если понадобятся.
@@ -143,6 +164,15 @@ pub async fn ws_handler(
 /// через mpsc-канал: другие задачи кладут в канал, а писать в сокет может
 /// только эта задача (select ниже) — так исключаются гонки записи.
 async fn handle_socket(mut socket: WebSocket, state: AppState, ip: String) {
+    // `chat_websocket_connections` (см. `crate::metrics`): инкремент/декремент
+    // напрямую здесь, а не периодическим семплером (как у
+    // `chat_rooms`/`chat_participants`/`chat_pending`, см. `state::reap_rooms`)
+    // — это соединение, а не комната, отдельного лока на общее состояние тут
+    // нет, и событие (connect/disconnect) редкое относительно самих
+    // WS-сообщений, так что лишнего contention не добавляет. `guard()`
+    // возвращает decrement при `Drop` (в т.ч. на любом раннем `return`/панике
+    // ниже по функции) — не полагаемся на явный декремент в конце.
+    let _ws_gauge_guard = WsConnectionGaugeGuard::new();
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
     // Комната/пир этого соединения; None до join-room.
     let mut me: Option<PeerCtx> = None;
@@ -556,6 +586,15 @@ fn admit_participant(
         .collect();
     let screen_owner = room.screen_owner.clone();
 
+    // Серверное поле таймера (см. `crate::state::Room::first_joined_at`):
+    // ставится РОВНО ОДИН РАЗ, в момент входа первого за всю жизнь комнаты
+    // участника (комната ещё пуста прямо сейчас, ДО вставки ниже, и метка
+    // ещё не стояла) — дальше не трогается, даже если комната опустеет и
+    // снова заполнится в пределах TTL пустой комнаты.
+    if room.participants.is_empty() && room.first_joined_at.is_none() {
+        room.first_joined_at = Some(Instant::now());
+    }
+
     room.participants.insert(
         peer_id.clone(),
         Participant { tx: tx.clone(), epub: epub.clone(), joined_at: Instant::now() },
@@ -599,6 +638,7 @@ fn admit_participant(
         settings: room.settings.clone(),
         pending,
         expires_in_seconds: room_expires_in_seconds(room),
+        room_age_seconds: room_age_seconds(room),
         // D: эффективный лимит комнаты (лидерский, если задан, иначе
         // серверный потолок), см. `Room::effective_max_participants`.
         max_participants: room.effective_max_participants(),
@@ -692,6 +732,7 @@ fn reconnect_participant(room: &mut Room, room_id: &str, peer_id: &str, tx: Peer
         settings: room.settings.clone(),
         pending,
         expires_in_seconds: room_expires_in_seconds(room),
+        room_age_seconds: room_age_seconds(room),
         max_participants: room.effective_max_participants(),
     });
 }
@@ -916,6 +957,21 @@ fn room_expires_in_seconds(room: &Room) -> u64 {
         .checked_sub(room.created_at.elapsed())
         .unwrap_or(Duration::ZERO)
         .as_secs()
+}
+
+/// Сколько секунд прошло с момента входа ПЕРВОГО за всю жизнь комнаты
+/// участника (см. `Room::first_joined_at`) — источник серверного поля
+/// `Joined::room_age_seconds` для клиентского таймера count-up. `0`, если
+/// `first_joined_at` почему-то ещё не выставлен (не должно происходить в
+/// момент отправки `Joined` — оба места, где строится это сообщение,
+/// `admit_participant`/`reconnect_participant`, вызываются уже ПОСЛЕ того,
+/// как участник гарантированно вставлен в `room.participants`, а значит и
+/// метка гарантированно выставлена — см. вызов в `admit_participant`), но
+/// деградируем в `0`, а не в панику, на случай рассинхрона инвариантов.
+fn room_age_seconds(room: &Room) -> u64 {
+    room.first_joined_at
+        .map(|t| t.elapsed().as_secs())
+        .unwrap_or(0)
 }
 
 /// `epub` (E2E v2): непустая строка после trim, не длиннее `EPUB_MAX_CHARS`

@@ -15,6 +15,7 @@
   - [7.1 Single Replica, In-Memory State](#71-single-replica-in-memory-state)
   - [7.2 Surviving a Restart/Redeploy](#72-surviving-a-restartredeploy)
   - [7.3 Health Checks](#73-health-checks)
+  - [7.4 Metrics & Dashboard](#74-metrics--dashboard)
 - [8. Keeping Deployment Private (Two-Repo Pattern)](#8-keeping-deployment-private-two-repo-pattern)
 
 <!-- /toc -->
@@ -222,6 +223,8 @@ hard guarantee rather than an operational habit.
 | `MAX_ROOMS` | no | `500` | Global ceiling on simultaneous rooms — see [`security.md` §4](security.md#4-h2--denial-of-service-limits) |
 | `MAX_PARTICIPANTS` | no | `6` | Ceiling on participants in one room. Not a protocol limit or a server cost — it's a recommended default for the mesh topology: every participant sends media directly to every other one, so raising this only grows *each client's* own outgoing bandwidth/CPU (n-1 copies to send), never the server's — the server only ever relays signaling either way |
 | `JOIN_ROOM_IP_LIMIT` | no | `20` (per 60s) | Per-IP rate limit on direct `join-room` (anti-DoS: without it, one IP could open `MAX_PARTICIPANTS` connections and fill a room it doesn't own, locking out legitimate guests who have the link) — see [`security.md` §4](security.md#4-h2--denial-of-service-limits) |
+| `ROOM_CREATION_IP_LIMIT` | no | `3` (per 60s) | Per-IP rate limit on `POST /api/rooms` and `PUT /api/rooms/{roomId}` (they share the same budget) — deliberately tight: creating a room is a rare action for a legitimate user, unlike joining one — see [`security.md` §4](security.md#4-h2--denial-of-service-limits) |
+| `MGMT_PORT` | no | `8081` | Port for the **separate** management server that serves `GET /metrics` (Prometheus text exposition) — never the main `PORT`/signaling listener, and not meant to be reachable through the same public path; see [§7.4](#74-metrics--dashboard) |
 | `CORS_ORIGIN` | no | unset (CORS off entirely) | The frontend's origin, if running the split topology ([§1.2](#12-split-origin-frontend--signaling-separated)); also enables `Origin` validation on the WebSocket upgrade |
 | `TURN_URL` | no | unset | TURN server address, e.g. `turn:your-server:3478` |
 | `TURN_STATIC_SECRET` | no (recommended if using TURN) | unset | Shared secret for computing short-lived TURN credentials — see [§5](#5-turn-optional) |
@@ -271,6 +274,35 @@ not a bug to route around.
 whatever liveness/readiness probe your runtime environment expects. There is
 no separate startup dependency (no database, no external service) to wait
 on.
+
+### 7.4 Metrics & Dashboard
+
+The backend exposes Prometheus metrics on its own management port (`MGMT_PORT`,
+default `8081` — see [§6](#6-environment-variables)), deliberately separate
+from the main `PORT` that serves `/ws`/`/api/*`/the frontend: `GET /metrics`
+on the management port is meant to be scraped directly (e.g. by
+`kubernetes_sd_config` + `prometheus.io/scrape|port|path` pod annotations, as
+in [`../deploy/manifests/deployment.yaml`](../deploy/manifests/deployment.yaml)),
+not exposed through whatever public reverse proxy/`Service` fronts the main
+port. If your orchestrator doesn't do Prometheus pod-annotation discovery,
+point your scrape config at `http://<host>:<MGMT_PORT>/metrics` directly
+instead.
+
+Everything exposed is a plain aggregate gauge/counter — current room count,
+current participant count, current waiting-lobby count, and a lifetime
+room-creation counter (see [`../src/metrics.rs`](../src/metrics.rs) for the
+exact names and help text) — never a room id, peer id, or any other
+per-entity label; this is consistent with the privacy posture in
+[`privacy.md`](privacy.md).
+
+A ready-made Grafana dashboard (a `ConfigMap` picked up by a sidecar
+provisioner watching `/var/lib/grafana/dashboards`) lives at
+[`../deploy/monitoring/grafana-dashboard-chat.yaml`](../deploy/monitoring/grafana-dashboard-chat.yaml).
+Apply it the same way as any other manifest in this repo:
+
+```bash
+kubectl apply -f deploy/monitoring/grafana-dashboard-chat.yaml
+```
 
 ## 8. Keeping Deployment Private (Two-Repo Pattern)
 

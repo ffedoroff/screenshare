@@ -24,6 +24,46 @@ kubectl apply -f deploy/manifests/ingress.yaml
 «Вариант 2») — отдельно ничего в дашборде Cloudflare заводить не нужно, DNS и
 туннель контроллер создаёт по самому `Ingress`.
 
+## Метрики (Prometheus + Grafana)
+
+`deployment.yaml` (применённый по шагам выше) уже несёт всё нужное для
+скрейпа — второй порт `mgmt` (8081, `/metrics`) и аннотации
+`prometheus.io/scrape|port|path` на поде (тот же паттерн, что у
+`code-ranker-backend`, см. `src/main.rs::spawn_metrics_server`,
+`simple-deploy/standards/observability/metrics.md`). Отдельно применять
+для этого ничего не нужно — Prometheus (`kubernetes_sd_config`, роль `pod`)
+подхватывает новый под сам, без правки своего конфига.
+
+Grafana-дашборд — отдельный ConfigMap, НЕ входит в список выше и применяется
+так же вручную, админом:
+
+```bash
+kubectl apply -f deploy/monitoring/grafana-dashboard-chat.yaml
+```
+
+Этого одного `apply` НЕДОСТАТОЧНО, чтобы дашборд появился в Grafana: сам под
+`grafana` (ns `monitoring`) монтирует дашборды через `projected volume`
+(`ConfigMap` на каждый дашборд — см. `grafana-dashboard-code-ranker`,
+`grafana-dashboard-store`), список источников которого сегодня прописан ТОЛЬКО
+в самом Deployment `grafana`, не в манифесте этого репозитория (монитор в
+принципе не входит в состав `chat` — общий для всего кластера). Значит, после
+`apply` выше нужно ЕЩЁ РАЗ, руками, добавить
+`configMap.name: grafana-dashboard-chat` в
+`spec.template.spec.volumes[].projected.sources` Deployment'а `grafana` (ns
+`monitoring`), например:
+
+```bash
+kubectl -n monitoring edit deployment grafana
+# в volumes: - name: dashboards -> projected.sources: добавить
+#   - configMap: { name: grafana-dashboard-chat }
+kubectl -n monitoring rollout restart deployment grafana
+```
+
+Провижининг-сайдкар (`grafana-dashboards-provider`, `updateIntervalSeconds:
+30`) сам подхватывает файл после этого — пересоздавать под ещё раз для
+каждого будущего обновления самого JSON внутри `grafana-dashboard-chat`
+(в отличие от первого добавления источника) уже не требуется.
+
 ## Как устроен CI-деплой
 
 Push в `main` → `.github/workflows/deploy-prod.yml`:

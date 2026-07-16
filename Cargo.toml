@@ -25,3 +25,9 @@ hmac = { version = "0.13.0", default-features = false }
 sha1 = { version = "0.11.0", default-features = false }
 # credential в iceServers — base64(HMAC-SHA1(...)), как ждёт turn-rs.
 base64 = "0.22.1"
+# Prometheus-метрики (см. src/metrics.rs, src/main.rs::management_router) — тот
+# же крейт/паттерн, что у code-ranker-backend (отдельный management-порт,
+# PrometheusBuilder::install_recorder() + PrometheusHandle::render() на
+# /metrics), см. simple-deploy/standards/observability/metrics.md.
+metrics = "0.23"
+metrics-exporter-prometheus = { version = "0.15", default-features = false }

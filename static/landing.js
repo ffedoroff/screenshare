@@ -51,11 +51,19 @@ const buildFooterEl = document.getElementById('landing-build-footer');
 const buildShortEl = document.getElementById('landing-build-short');
 const buildFullEl = document.getElementById('landing-build-full');
 const roomNameInputEl = document.getElementById('room-name-input');
+const roomNameRegenButtonEl = document.getElementById('room-name-regen-button');
 
 // Предзаполняем красивым сгенерированным именем (см. static/namegen.js) —
 // пользователь может им и ограничиться (просто нажать Create room), либо
 // стереть/отредактировать перед созданием комнаты.
 roomNameInputEl.value = NameGen.roomName();
+
+// Кнопка «сгенерировать заново» рядом с инпутом — просто перекатывает новое
+// имя комнаты (см. static/namegen.js: roomName()). type="button" в разметке —
+// клик не сабмитит ничего (тут и формы-то нет, но на всякий случай явно).
+roomNameRegenButtonEl.addEventListener('click', () => {
+  roomNameInputEl.value = NameGen.roomName();
+});
 
 function showMessage(text, isError = true) {
   messageEl.textContent = text;
