@@ -21,6 +21,14 @@ const CONFIG_URL = `http://localhost:${PORT}/config`;
 const ROOMS_URL = `http://localhost:${PORT}/api/rooms`;
 // TTL пустой комнаты для этого прогона — короткий, чтобы тест не ждал 120с.
 const EMPTY_ROOM_TTL_SECONDS = 2;
+// Разделы E2E v2 (25+) создают несколько комнат через createRoom() без
+// собственного отдельного серверного процесса — все они бы иначе делили ОДИН
+// и тот же фолбэк-IP-бюджет (см. комментарий у createRoom() про
+// `CF-Connecting-IP`) с уже накопленными вызовами createRoom() из более
+// ранних разделов (2/10/11/12/15/16/18) и легко упёрлись бы в
+// ROOM_CREATION_IP_LIMIT (H2, 10/60с). Свой собственный IP из зарезервированного
+// под тесты диапазона (TEST-NET-3) — свой отдельный бюджет, как и у раздела 22.
+const E2E_TEST_IP = '203.0.113.99';
 
 let passed = 0, failed = 0;
 
@@ -135,7 +143,15 @@ async function createRoom(body, roomsUrl = ROOMS_URL, ip = undefined) {
   const res = await fetch(roomsUrl, opts);
   let json = null;
   try { json = await res.json(); } catch { /* не JSON — ниже проверим статус */ }
-  return { status: res.status, roomId: json && json.roomId, leaderToken: json && json.leaderToken };
+  return {
+    status: res.status,
+    roomId: json && json.roomId,
+    leaderToken: json && json.leaderToken,
+    // E2E v2 (см. src/main.rs::create_room): срок жизни комнаты в секундах,
+    // тот же MAX_ROOM_LIFETIME_SECONDS сервера — нужен клиенту, чтобы зашить
+    // его в expiry ссылки при её генерации.
+    lifetimeSeconds: json && json.lifetimeSeconds,
+  };
 }
 
 // Остановить дополнительный серверный процесс (см. spawnServer) и дождаться
@@ -155,7 +171,16 @@ async function restoreRoom(roomId) {
   const res = await fetch(`${ROOMS_URL}/${encodeURIComponent(roomId)}`, { method: 'PUT' });
   let json = null;
   try { json = await res.json(); } catch { /* не JSON — ниже проверим статус */ }
-  return { status: res.status, roomId: json && json.roomId };
+  return { status: res.status, roomId: json && json.roomId, lifetimeSeconds: json && json.lifetimeSeconds };
+}
+
+// E2E v2: заглушка эфемерного публичного ключа (`epub`) для теста — сервер
+// его не парсит вовсе (опак, как sdp/candidate), поэтому реальная
+// ECDH-математика тут не нужна, важен только сам факт прозрачной доставки
+// строки нужного порядка длины (~87 симв. у настоящего base64url P-256 raw
+// ключа, см. docs/research-p2p-key-handoff.md §6.5–6.6).
+function fakeEpub(label) {
+  return `epub-${label}-` + 'x'.repeat(70);
 }
 
 // Простой uuid v4 генератор для тестового клиента (совпадать с крипто-стойким не обязано).
@@ -197,12 +222,15 @@ function connect(wsUrl = URL) {
 // Подключиться и войти в комнату одним шагом; возвращает { peer, joined }.
 // `peerId` (опционально) — см. src/protocol.rs::ClientMessage::JoinRoom и
 // раздел 5b ниже. `leaderToken` (опционально) — см. раздел 15 (система прав).
-async function join(roomId, name, wsUrl = URL, peerId = undefined, leaderToken = undefined) {
+// `epub` (опционально, E2E v2) — см. раздел 25: эфемерный публичный ключ,
+// сервер его не парсит, только релеит остальным.
+async function join(roomId, name, wsUrl = URL, peerId = undefined, leaderToken = undefined, epub = undefined) {
   const peer = await connect(wsUrl);
   const msg = { type: 'join-room', roomId };
   if (name !== undefined) msg.name = name;
   if (peerId !== undefined) msg.peerId = peerId;
   if (leaderToken !== undefined) msg.leaderToken = leaderToken;
+  if (epub !== undefined) msg.epub = epub;
   peer.send(msg);
   const joined = await peer.next();
   return { peer, joined };
@@ -628,6 +656,12 @@ async function runTests() {
     for (let i = 0; i < 6; i++) {
       const { peer, joined: j } = await join(fullRoomId, `участник${i}`);
       ok(j.type === 'joined', `участник №${i + 1} вошёл`);
+      if (i === 0) {
+        // MAX_PARTICIPANTS не задан этому серверному процессу -> дефолт 6
+        // (см. DEFAULT_MAX_PARTICIPANTS в src/state.rs) — joined несёт его
+        // явно (аддитивное поле, см. src/protocol.rs::ServerMessage::Joined).
+        ok(j.maxParticipants === 6, `joined.maxParticipants === 6 без env MAX_PARTICIPANTS (получено ${j.maxParticipants})`);
+      }
       // peer-joined всем предыдущим участникам этой же комнаты.
       await Promise.all(members.map((m) => m.peer.next()));
       members.push({ peer, joined: j });
@@ -853,6 +887,13 @@ async function runTests() {
     ok(jrAgain.type === 'join-request' && jrAgain.peerId === jr4.peerId && jrAgain.name === 'Ждущий4',
       'непустой pending пересылается новому лидеру заново (join-request)');
 
+    // E2E v2: смена лидера, пока pending ждёт, шлёт ЕМУ СВЕЖИЙ waiting с
+    // новым лидером (см. раздел 26/27) — здесь просто дренируем это
+    // сообщение, само поведение целиком проверяется в разделе 27.
+    const freshWaiting = await guest4.next();
+    ok(freshWaiting.type === 'waiting' && freshWaiting.leaderPeerId === guest1Id,
+      'смена лидера -> ожидающему тоже приходит свежий waiting с новым лидером');
+
     // Комната опустевает целиком -> все ещё живые ожидающие получают join-rejected.
     guest1.ws.close();
     const rejAll = await guest4.next();
@@ -933,12 +974,262 @@ async function runTests() {
     await stopServer(proc);
   }
 
+  // --- 23b. Потолок числа участников (env MAX_PARTICIPANTS) ---
+  console.log('23b. потолок числа участников (MAX_PARTICIPANTS)');
+  {
+    const port = 3314;
+    const proc = spawnServer(port, { MAX_PARTICIPANTS: '2' });
+    await waitForReady(`http://localhost:${port}/config`, proc);
+    const roomsUrl = `http://localhost:${port}/api/rooms`;
+    const wsUrl = `ws://localhost:${port}/ws`;
+
+    const { roomId: capRoomId } = await createRoom(undefined, roomsUrl);
+    const { peer: p1, joined: j1 } = await join(capRoomId, 'Первый', wsUrl);
+    ok(j1.maxParticipants === 2, `joined.maxParticipants === 2 при MAX_PARTICIPANTS=2 (получено ${j1.maxParticipants})`);
+
+    const { peer: p2, joined: j2 } = await join(capRoomId, 'Второй', wsUrl);
+    ok(j2.type === 'joined', 'второй участник входит при MAX_PARTICIPANTS=2 (лимит ещё не достигнут)');
+    await p1.next(); // peer-joined первому
+
+    const third = await connect(wsUrl);
+    third.send({ type: 'join-room', roomId: capRoomId });
+    const m = await third.next();
+    ok(m.type === 'room-full', `3-й участник получил room-full при MAX_PARTICIPANTS=2 (получено ${m.type})`);
+    await third.closed;
+
+    p1.ws.close();
+    p2.ws.close();
+    await stopServer(proc);
+  }
+
   // --- 24. Security-заголовки на API-ответах (M2) ---
   console.log('24. security-заголовки на /config');
   {
     const res = await fetch(CONFIG_URL);
     ok(res.headers.get('x-content-type-options') === 'nosniff', 'X-Content-Type-Options: nosniff на /config');
     ok(res.headers.get('referrer-policy') === 'no-referrer', 'Referrer-Policy: no-referrer на /config');
+  }
+
+  // === E2E v2 («вариант E», см. docs/research-p2p-key-handoff.md §6.5–6.6) ===
+
+  // --- 25. epub: join-room -> joined.peers[].epub / peer-joined.epub / join-request.epub; кап валидации ---
+  console.log('25. epub в joined.peers[] / peer-joined / валидация длины');
+  {
+    const { roomId: eRoomId, leaderToken: eLeaderToken } = await createRoom(undefined, ROOMS_URL, E2E_TEST_IP);
+    const epubA = fakeEpub('A');
+    const { peer: eA, joined: jA } = await join(eRoomId, 'A', URL, undefined, eLeaderToken, epubA);
+    ok(jA.leaderId === jA.peerId, 'A с leaderToken становится лидером');
+
+    const epubB = fakeEpub('B');
+    const { peer: eB, joined: jB } = await join(eRoomId, 'B', URL, undefined, undefined, epubB);
+    ok(jB.peers.length === 1 && jB.peers[0].peerId === jA.peerId && jB.peers[0].epub === epubA,
+      'joined.peers[] содержит epub первого участника');
+    const pjA1 = await eA.next();
+    ok(pjA1.type === 'peer-joined' && pjA1.peerId === jB.peerId && pjA1.epub === epubB,
+      'peer-joined содержит epub нового участника');
+
+    // Без epub вовсе (обратная совместимость со старым/v1 клиентом).
+    const { peer: eC, joined: jC } = await join(eRoomId, 'C');
+    ok(jC.type === 'joined', 'вход без epub не отклоняется целиком (обратная совместимость)');
+    ok(jC.peers.some((p) => p.peerId === jA.peerId && p.epub === epubA)
+      && jC.peers.some((p) => p.peerId === jB.peerId && p.epub === epubB),
+      'joined.peers[] корректно содержит epub предыдущих участников');
+    const [pjA2, pjB2] = await Promise.all([eA.next(), eB.next()]);
+    ok(pjA2.epub === null && pjB2.epub === null, 'peer-joined без epub у отправителя -> epub null');
+
+    // epub длиннее EPUB_MAX_CHARS (200) — сервер не парсит содержимое, но
+    // каппит длину: невалидно длинный epub отбрасывается целиком (не
+    // обрезается — обрезанный ключ бессмысленен), как если бы его не было.
+    const { peer: eD, joined: jD } = await join(eRoomId, 'D', URL, undefined, undefined, 'z'.repeat(250));
+    ok(jD.type === 'joined', 'вход с epub длиннее 200 символов не отклоняется целиком');
+    ok(jD.peers.find((p) => p.peerId === jC.peerId).epub === null, 'у C изначально не было epub — так и осталось null у D');
+    const [pjA3, pjB3, pjC3] = await Promise.all([eA.next(), eB.next(), eC.next()]);
+    ok(pjA3.epub === null && pjB3.epub === null && pjC3.epub === null,
+      'epub длиннее 200 символов -> peer-joined.epub null (сервер каппит невалидную длину)');
+
+    // Пустая строка epub — тоже невалидна (требуется непустая строка).
+    const { peer: eE, joined: jE } = await join(eRoomId, 'E', URL, undefined, undefined, '');
+    ok(jE.type === 'joined', 'вход с пустым epub не отклоняется целиком');
+    const [pjA4, pjB4, pjC4, pjD4] = await Promise.all([eA.next(), eB.next(), eC.next(), eD.next()]);
+    ok(pjA4.epub === null && pjB4.epub === null && pjC4.epub === null && pjD4.epub === null,
+      'пустая строка epub -> peer-joined.epub null');
+
+    eA.ws.close(); eB.ws.close(); eC.ws.close(); eD.ws.close(); eE.ws.close();
+  }
+
+  // --- 26. waiting: leaderPeerId + leaderEpub; join-request.epub ---
+  console.log('26. waiting содержит leaderPeerId/leaderEpub, join-request содержит epub');
+  {
+    const { roomId: wRoomId, leaderToken: wLeaderToken } = await createRoom(undefined, ROOMS_URL, E2E_TEST_IP);
+    const leaderEpub = fakeEpub('Leader26');
+    const { peer: wLeader, joined: wLeaderJoined } = await join(wRoomId, 'Лидер', URL, undefined, wLeaderToken, leaderEpub);
+    updateSettings(wLeader, defaultSettings({ lobbyEnabled: true }));
+    await wLeader.next(); // settings-changed
+
+    const wGuest = await connect();
+    const guestEpub = fakeEpub('Guest26');
+    wGuest.send({ type: 'join-room', roomId: wRoomId, name: 'Гость', epub: guestEpub });
+    const waitMsg = await wGuest.next();
+    ok(waitMsg.type === 'waiting' && waitMsg.leaderPeerId === wLeaderJoined.peerId && waitMsg.leaderEpub === leaderEpub,
+      'waiting содержит leaderPeerId и leaderEpub текущего лидера');
+    const jr = await wLeader.next();
+    ok(jr.type === 'join-request' && jr.epub === guestEpub, 'join-request содержит epub ожидающего');
+
+    wGuest.ws.close();
+    await wLeader.next(); // join-request-cancelled
+    wLeader.ws.close();
+  }
+
+  // --- 27. Смена лидера при непустом pending -> каждому pending СВЕЖИЙ waiting с новым лидером ---
+  console.log('27. смена лидера с висящими pending -> свежий waiting');
+  {
+    const { roomId: fwRoomId, leaderToken: fwLeaderToken } = await createRoom(undefined, ROOMS_URL, E2E_TEST_IP);
+    const leaderEpub1 = fakeEpub('L1-27');
+    const { peer: fwLeader, joined: fwLeaderJoined } = await join(fwRoomId, 'L1', URL, undefined, fwLeaderToken, leaderEpub1);
+
+    // Второй участник входит ОБЫЧНЫМ путём, пока лобби ещё выключено — иначе
+    // (при уже включённом лобби) он сам попал бы в pending, а не в
+    // участники, и не смог бы стать кандидатом на нового лидера (кандидаты —
+    // только полноценные участники, см. `cleanup_peer`).
+    const secondEpub = fakeEpub('L2-27');
+    const { peer: fwSecond, joined: fwSecondJoined } = await join(fwRoomId, 'L2', URL, undefined, undefined, secondEpub);
+    await fwLeader.next(); // peer-joined
+
+    // Теперь включаем лобби — settings-changed уходит обоим текущим участникам.
+    updateSettings(fwLeader, defaultSettings({ lobbyEnabled: true }));
+    await Promise.all([fwLeader.next(), fwSecond.next()]); // settings-changed
+
+    // Ожидающий подаёт заявку, пока L1 ещё лидер.
+    const fwPending = await connect();
+    const pendingEpub = fakeEpub('Pending27');
+    fwPending.send({ type: 'join-room', roomId: fwRoomId, name: 'Ждущий', epub: pendingEpub });
+    const wait1 = await fwPending.next();
+    ok(wait1.leaderPeerId === fwLeaderJoined.peerId && wait1.leaderEpub === leaderEpub1,
+      'первый waiting указывает на исходного лидера L1');
+    const jr1 = await fwLeader.next(); // join-request
+    ok(jr1.type === 'join-request' && jr1.epub === pendingEpub, 'первый join-request содержит epub ожидающего');
+
+    // Лидер уходит -> L2 становится лидером -> pending получает СВЕЖИЙ waiting.
+    fwLeader.ws.close();
+    const [lc, wait2] = await Promise.all([fwSecond.next(), fwPending.next()]);
+    ok(lc.type === 'leader-changed' && lc.leaderId === fwSecondJoined.peerId, 'leader-changed новому лидеру L2');
+    ok(wait2.type === 'waiting' && wait2.leaderPeerId === fwSecondJoined.peerId && wait2.leaderEpub === secondEpub,
+      'pending получает свежий waiting с новым лидером (L2) и его epub');
+    const jr2 = await fwSecond.next();
+    ok(jr2.type === 'join-request' && jr2.peerId === jr1.peerId && jr2.epub === pendingEpub,
+      'join-request пересылается новому лидеру заново, с тем же peerId и epub ожидающего');
+
+    fwPending.ws.close();
+    await fwSecond.next(); // join-request-cancelled
+    fwSecond.ws.close();
+  }
+
+  // --- 28. name-announce: участник -> участник доставляется ---
+  console.log('28. name-announce участник->участник');
+  {
+    const { roomId: naRoomId } = await createRoom(undefined, ROOMS_URL, E2E_TEST_IP);
+    const { peer: naA, joined: jNaA } = await join(naRoomId, 'A');
+    const { peer: naB, joined: jNaB } = await join(naRoomId, 'B');
+    await naA.next(); // peer-joined B
+
+    naA.send({ type: 'name-announce', to: jNaB.peerId, payload: 'cipherblob-A-to-B' });
+    const recv = await naB.next();
+    ok(recv.type === 'name-announce' && recv.from === jNaA.peerId && recv.payload === 'cipherblob-A-to-B',
+      'name-announce участник->участник доставлен с корректным from');
+
+    naA.ws.close();
+    await naB.next(); // peer-left
+    naB.ws.close();
+  }
+
+  // --- 29. name-announce: pending -> лидер доставляется; pending -> НЕ-лидер запрещён ---
+  console.log('29. name-announce pending->лидер доставляется, pending->НЕ-лидер запрещён');
+  {
+    const { roomId: naRoomId2, leaderToken } = await createRoom(undefined, ROOMS_URL, E2E_TEST_IP);
+    const { peer: leader, joined: leaderJoined } = await join(naRoomId2, 'Лидер', URL, undefined, leaderToken);
+    const { peer: other, joined: otherJoined } = await join(naRoomId2, 'Другой'); // обычный участник, не лидер
+    await leader.next(); // peer-joined
+
+    updateSettings(leader, defaultSettings({ lobbyEnabled: true }));
+    await Promise.all([leader.next(), other.next()]); // settings-changed обоим
+
+    const pending = await connect();
+    pending.send({ type: 'join-room', roomId: naRoomId2, name: 'Ждущий' });
+    await pending.next(); // waiting
+    await leader.next(); // join-request
+
+    // pending -> лидер: доставляется.
+    pending.send({ type: 'name-announce', to: leaderJoined.peerId, payload: 'pending-to-leader' });
+    const toLeader = await leader.next();
+    ok(toLeader.type === 'name-announce' && toLeader.from && toLeader.payload === 'pending-to-leader',
+      'name-announce pending->лидер доставлен');
+
+    // pending -> не-лидер: явный отказ (не гонка/тихий дроп — нарушение прав), сокет не рвётся.
+    pending.send({ type: 'name-announce', to: otherJoined.peerId, payload: 'pending-to-nonleader' });
+    const errMsg = await pending.next();
+    ok(errMsg.type === 'error', `name-announce pending->не-лидер отклонён явной ошибкой (${errMsg.message})`);
+    sendBeacon(leader, otherJoined.peerId, { kind: 'text', text: 'маячок-после-name-announce-not-leader' });
+    const beacon = await other.next();
+    ok(isBeaconMsg(beacon) && beacon.info.text === 'маячок-после-name-announce-not-leader',
+      'сокет остальных участников жив, чужой name-announce им не пришёл');
+
+    pending.ws.close();
+    await leader.next(); // join-request-cancelled
+    leader.ws.close();
+    await other.next(); // leader-changed (other становится единственным оставшимся лидером)
+    await other.next(); // peer-left ушедшего лидера
+    other.ws.close();
+  }
+
+  // --- 30. name-announce: лимит размера payload (H2, 2KB) ---
+  console.log('30. name-announce: лимит размера payload (2KB)');
+  {
+    const { roomId: bigRoomId } = await createRoom(undefined, ROOMS_URL, E2E_TEST_IP);
+    const { peer: bigA, joined: jBigA } = await join(bigRoomId, 'A');
+    const { peer: bigB, joined: jBigB } = await join(bigRoomId, 'B');
+    await bigA.next(); // peer-joined
+
+    const bigPayload = 'x'.repeat(2 * 1024 + 1); // на 1 байт больше лимита
+    bigA.send({ type: 'name-announce', to: jBigB.peerId, payload: bigPayload });
+    const errMsg = await bigA.next();
+    ok(errMsg.type === 'error', `name-announce payload >2KB -> error отправителю (${errMsg.message})`);
+
+    // Доказываем недоставку: следующий валидный name-announce доходит как маячок.
+    bigA.send({ type: 'name-announce', to: jBigB.peerId, payload: 'маячок-после-oversize-name-announce' });
+    const beacon = await bigB.next();
+    ok(beacon.type === 'name-announce' && beacon.payload === 'маячок-после-oversize-name-announce',
+      'name-announce >2KB не доставлен; следующий валидный дошёл как есть');
+
+    // Payload размером ровно в лимит (2KB) — проходит целиком.
+    const okPayload = 'y'.repeat(2 * 1024);
+    bigA.send({ type: 'name-announce', to: jBigB.peerId, payload: okPayload });
+    const okMsg = await bigB.next();
+    ok(okMsg.type === 'name-announce' && okMsg.payload.length === okPayload.length,
+      'name-announce размером ровно 2KB доставлен целиком');
+
+    bigA.ws.close();
+    await bigB.next(); // peer-left
+    bigB.ws.close();
+  }
+
+  // --- 31. lifetimeSeconds в POST /api/rooms и PUT /api/rooms/{id} ---
+  console.log('31. lifetimeSeconds в POST/PUT /api/rooms');
+  {
+    const { status, lifetimeSeconds } = await createRoom(undefined, ROOMS_URL, E2E_TEST_IP);
+    ok(status === 201 && typeof lifetimeSeconds === 'number' && lifetimeSeconds > 0,
+      `POST /api/rooms возвращает lifetimeSeconds (получено ${lifetimeSeconds})`);
+    // Дефолт без MAX_ROOM_LIFETIME_SECONDS — 3ч (10800с), см.
+    // DEFAULT_MAX_ROOM_LIFETIME_SECONDS в src/state.rs.
+    ok(lifetimeSeconds === 10800, `дефолтный lifetimeSeconds — 10800с/3ч (получено ${lifetimeSeconds})`);
+
+    // PUT — то же поле, для симметрии API (см. спецификацию E2E v2 §2): обе ветки идемпотентности.
+    const freshId2 = 'lt9k2m7q'; // валидный формат, заведомо не существовал
+    const created = await restoreRoom(freshId2);
+    ok(created.status === 201 && created.lifetimeSeconds === 10800,
+      `PUT восстановления несуществующей комнаты возвращает lifetimeSeconds (${created.lifetimeSeconds})`);
+    const already = await restoreRoom(freshId2);
+    ok(already.status === 200 && already.lifetimeSeconds === 10800,
+      `PUT уже существующей комнаты тоже возвращает lifetimeSeconds (${already.lifetimeSeconds})`);
   }
 }
 

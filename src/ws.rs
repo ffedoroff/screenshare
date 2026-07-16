@@ -1,4 +1,4 @@
-//! Обработка WebSocket-соединений: сигналинг-релей, чат и жизненный цикл комнат.
+//! Обработка WebSocket-соединений: сигналинг-релей и жизненный цикл комнат.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::protocol::{ClientMessage, PeerInfo, PendingInfo, RoomSettings, ServerMessage};
 use crate::state::{
     check_ip_rate_limit, extract_client_ip, generate_peer_id, send_to, AppState, IpRateLimitMap,
-    PendingParticipant, Participant, PeerTx, Room, SharedRooms, MAX_PARTICIPANTS, MAX_PENDING,
+    PendingParticipant, Participant, PeerTx, Room, SharedRooms, MAX_PENDING,
     PENDING_JOIN_IP_LIMIT, PENDING_JOIN_IP_WINDOW,
 };
 
@@ -37,6 +37,25 @@ use crate::state::{
 /// у верхней границы `maxlength` инпута (см. static/room.html).
 const CHAT_NAME_MAX_CHARS: usize = 512;
 
+/// E2E v2 (см. docs/research-p2p-key-handoff.md §6.5–6.6): максимальная длина
+/// `epub` (эфемерный публичный ключ пира, ECDH P-256, base64url raw) в
+/// символах. Сервер его НЕ парсит (опак, как `sdp`) — только каппит размер:
+/// реальный `epub` укладывается в ~87 симв. (65 байт raw в base64url), 200 —
+/// щедрый запас на будущую смену кривой/формата без немедленной правки
+/// сервера. Слишком длинное значение — не обрезаем (обрезанный ключ
+/// бессмысленен и всё равно не даст вывести правильный shared secret), а
+/// целиком отбрасываем как если бы клиент не прислал `epub` вовсе (см.
+/// `sanitize_epub`).
+const EPUB_MAX_CHARS: usize = 200;
+
+/// E2E v2: максимальный размер `payload` одного `name-announce` в байтах —
+/// зашифрованное имя (base64: iv + AES-256-GCM ciphertext), с большим
+/// запасом даже для длинных имён у верхней границы `maxlength` инпута (см.
+/// static/room.html) — 2KB заведомо избыточен для одного имени, но не
+/// открывает канал перекачки произвольных объёмов данных под видом анонса
+/// имени.
+const NAME_ANNOUNCE_MAX_BYTES: usize = 2 * 1024;
+
 /// H2 (DoS-защита): максимальный размер сериализованного payload одного
 /// релея offer/answer/ice-candidate/stream-info (`sdp`/`candidate`/`info`
 /// соответственно) в байтах. Сервер эти поля не разбирает (опаковый JSON),
@@ -45,17 +64,17 @@ const CHAT_NAME_MAX_CHARS: usize = 512;
 const RELAY_MAX_BYTES: usize = 16 * 1024;
 
 /// H2 (DoS-защита): скользящее окно rate-limit НА ВСЕ релеи одного
-/// соединения суммарно — offer/answer/ice-candidate/stream-info И chat
-/// (адресный fallback) вместе, единым счётчиком. Обоснование объединения (а
-/// не отдельного счётчика на каждый тип): вектор атаки один и тот же
-/// (флудить сообщениями с одного соединения) независимо от того, какой
-/// именно тип релея используется — раздельные счётчики позволили бы
-/// обойти лимит одного типа, просто чередуя типы сообщений. `chat` у себя
-/// ДОПОЛНИТЕЛЬНО подчиняется более строгому специфическому лимиту
-/// (`CHAT_RATE_LIMIT`, 10/10с) — этот общий лимит (100/10с) шире и в первую
-/// очередь защищает от флуда ICE-кандидатами (их бывает много легитимно при
-/// установке соединения — 100 за 10с должно перекрывать нормальный
-/// trickle-ICE с запасом).
+/// соединения суммарно — offer/answer/ice-candidate/stream-info вместе,
+/// единым счётчиком. Обоснование объединения (а не отдельного счётчика на
+/// каждый тип): вектор атаки один и тот же (флудить сообщениями с одного
+/// соединения) независимо от того, какой именно тип релея используется —
+/// раздельные счётчики позволили бы обойти лимит одного типа, просто
+/// чередуя типы сообщений. Чат в этот счётчик не входит вовсе — сервер в
+/// чате не участвует, он ходит только по mesh RTCDataChannel напрямую между
+/// участниками (см. `crate::protocol`, docs/chat.md §12). Этот лимит
+/// (100/10с) в первую очередь защищает от флуда ICE-кандидатами (их бывает
+/// много легитимно при установке соединения — 100 за 10с должно перекрывать
+/// нормальный trickle-ICE с запасом).
 const RELAY_RATE_LIMIT: usize = 100;
 const RELAY_RATE_WINDOW: Duration = Duration::from_secs(10);
 
@@ -272,12 +291,13 @@ fn handle_message(
     pending_join_ips: &IpRateLimitMap,
 ) -> Flow {
     match msg {
-        ClientMessage::JoinRoom { room_id, name, peer_id, leader_token } => {
+        ClientMessage::JoinRoom { room_id, name, peer_id, leader_token, epub } => {
             if me.is_some() {
                 send_to(tx, err("already in a room"));
                 return Flow::Continue;
             }
             let name = sanitize_name(name);
+            let epub = sanitize_epub(epub);
 
             let mut rooms_guard = rooms.lock().unwrap();
             let Some(room) = rooms_guard.get_mut(&room_id) else {
@@ -329,15 +349,36 @@ fn handle_message(
                 }
                 room.pending.insert(
                     peer_id.clone(),
-                    PendingParticipant { tx: tx.clone(), name: name.clone(), joined_at: Instant::now() },
+                    PendingParticipant {
+                        tx: tx.clone(),
+                        name: name.clone(),
+                        epub: epub.clone(),
+                        joined_at: Instant::now(),
+                    },
                 );
                 info!(room = %room_id, peer = %peer_id, "участник ждёт одобрения в лобби");
-                send_to(tx, ServerMessage::Waiting {});
-                if let Some(leader_id) = room.leader_id.clone() {
+                // Инвариант: до этой точки `!becomes_leader` при попадании в
+                // лобби означает, что в комнате уже точно есть лидер (см.
+                // ветку выше: `becomes_leader` иначе стал бы `true` сам —
+                // "если в комнате прямо сейчас нет лидера... лидером
+                // становится первый вошедший"), поэтому `room.leader_id`
+                // здесь всегда `Some`. `unwrap_or_default()` — не паника на
+                // случай, если этот инвариант когда-нибудь нарушится.
+                let leader_id = room.leader_id.clone();
+                let leader_epub = leader_id
+                    .as_ref()
+                    .and_then(|id| room.participants.get(id))
+                    .and_then(|p| p.epub.clone());
+                send_to(tx, ServerMessage::Waiting {
+                    leader_peer_id: leader_id.clone().unwrap_or_default(),
+                    leader_epub,
+                });
+                if let Some(leader_id) = leader_id {
                     if let Some(leader) = room.participants.get(&leader_id) {
                         send_to(&leader.tx, ServerMessage::JoinRequest {
                             peer_id: peer_id.clone(),
                             name: name.clone(),
+                            epub: epub.clone(),
                         });
                     }
                 }
@@ -346,12 +387,12 @@ fn handle_message(
                 return Flow::Continue;
             }
 
-            if room.participants.len() >= MAX_PARTICIPANTS {
+            if room.participants.len() >= *crate::MAX_PARTICIPANTS {
                 send_to(tx, ServerMessage::RoomFull);
                 return Flow::Continue;
             }
 
-            admit_participant(room, &room_id, peer_id.clone(), name.clone(), tx.clone(), becomes_leader);
+            admit_participant(room, &room_id, peer_id.clone(), name.clone(), epub.clone(), tx.clone(), becomes_leader);
 
             drop(rooms_guard);
             *me = Some(PeerCtx { room_id: room_id.clone(), peer_id });
@@ -432,6 +473,10 @@ fn handle_message(
         }
 
         ClientMessage::Leave => return Flow::Stop,
+
+        ClientMessage::NameAnnounce { to, payload } => {
+            handle_name_announce(to, payload, me, tx, rooms, rate_limits);
+        }
     }
     Flow::Continue
 }
@@ -447,6 +492,7 @@ fn admit_participant(
     room_id: &str,
     peer_id: String,
     name: Option<String>,
+    epub: Option<String>,
     tx: PeerTx,
     becomes_leader: bool,
 ) {
@@ -454,13 +500,13 @@ fn admit_participant(
     let peers: Vec<PeerInfo> = room
         .participants
         .iter()
-        .map(|(id, p)| PeerInfo { peer_id: id.clone(), name: p.name.clone() })
+        .map(|(id, p)| PeerInfo { peer_id: id.clone(), name: p.name.clone(), epub: p.epub.clone() })
         .collect();
     let screen_owner = room.screen_owner.clone();
 
     room.participants.insert(
         peer_id.clone(),
-        Participant { tx: tx.clone(), name: name.clone(), joined_at: Instant::now() },
+        Participant { tx: tx.clone(), name: name.clone(), epub: epub.clone(), joined_at: Instant::now() },
     );
     // Вход в опустевшую-но-живую комнату снимает отметку TTL.
     room.emptied_at = None;
@@ -480,6 +526,7 @@ fn admit_participant(
             send_to(&p.tx, ServerMessage::PeerJoined {
                 peer_id: peer_id.clone(),
                 name: name.clone(),
+                epub: epub.clone(),
             });
         }
     }
@@ -500,6 +547,7 @@ fn admit_participant(
         settings: room.settings.clone(),
         pending,
         expires_in_seconds: room_expires_in_seconds(room),
+        max_participants: *crate::MAX_PARTICIPANTS,
     });
 
     // Истории чата сервер новичку больше не шлёт: чат целиком на mesh
@@ -515,7 +563,7 @@ fn pending_sorted_by_arrival(room: &Room) -> Vec<PendingInfo> {
     items.sort_by_key(|(_, p)| p.joined_at);
     items
         .into_iter()
-        .map(|(id, p)| PendingInfo { peer_id: id.clone(), name: p.name.clone() })
+        .map(|(id, p)| PendingInfo { peer_id: id.clone(), name: p.name.clone(), epub: p.epub.clone() })
         .collect()
 }
 
@@ -569,7 +617,7 @@ fn handle_update_settings(
 /// `room.pending`. Переносит ожидающего в участники (тем же `tx`/`name`),
 /// шлёт ему полноценный `joined` и остальным `peer-joined`. Если комната
 /// успела заполниться, пока заявка ждала — отклоняем её отдельно (не даём
-/// превысить `MAX_PARTICIPANTS`).
+/// превысить `crate::MAX_PARTICIPANTS`).
 fn handle_approve(target: String, me: &Option<PeerCtx>, tx: &PeerTx, rooms: &SharedRooms) {
     let Some(ctx) = me else {
         send_to(tx, err("not in a room"));
@@ -587,14 +635,14 @@ fn handle_approve(target: String, me: &Option<PeerCtx>, tx: &PeerTx, rooms: &Sha
         send_to(tx, err("no such pending join request"));
         return;
     };
-    if room.participants.len() >= MAX_PARTICIPANTS {
+    if room.participants.len() >= *crate::MAX_PARTICIPANTS {
         send_to(&pending.tx, ServerMessage::RoomFull);
         send_to(tx, err("room is full, cannot approve"));
         return;
     }
 
     let room_id = ctx.room_id.clone();
-    admit_participant(room, &room_id, target, pending.name, pending.tx, false);
+    admit_participant(room, &room_id, target, pending.name, pending.epub, pending.tx, false);
 }
 
 /// `reject {peerId}`: только лидер, только по действующей заявке. Ожидающему
@@ -742,6 +790,23 @@ fn sanitize_name(name: Option<String>) -> Option<String> {
     Some(trimmed.chars().take(CHAT_NAME_MAX_CHARS).collect())
 }
 
+/// `epub` (E2E v2): непустая строка после trim, не длиннее `EPUB_MAX_CHARS`
+/// символов — иначе (пусто, отсутствует вовсе, слишком длинная) `None`.
+/// Сервер содержимое НЕ парсит (опак, как `sdp`/`candidate`) — единственная
+/// его забота — не пропустить откровенно неадекватный размер. В отличие от
+/// `sanitize_name` — НЕ обрезаем слишком длинное значение, а отбрасываем
+/// целиком: обрезанный публичный ключ не будет соответствовать ни одному
+/// валидному ключу, так что "почти правильный, но обрезанный" эфемерный
+/// эпаб бесполезен и только маскирует ошибку клиента.
+fn sanitize_epub(epub: Option<String>) -> Option<String> {
+    let raw = epub?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > EPUB_MAX_CHARS {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
 /// Доставить сообщение пиру `target` в комнате отправителя (любому другому
 /// участнику — топология симметричная, mesh).
 /// Неизвестный targetPeerId тихо игнорируется: это штатная гонка — пир мог
@@ -770,6 +835,79 @@ where
         Some(p) => send_to(&p.tx, build(ctx.peer_id.clone())),
         None => debug!(target = %target, "релей на неизвестный peerId — игнорируем"),
     }
+}
+
+/// `name-announce` (E2E v2, см. комментарий модуля `protocol.rs`): релей
+/// зашифрованного анонса имени пиру `to`. В отличие от `relay()` выше,
+/// отправителем МОЖЕТ быть не только полноценный участник, но и ожидающий в
+/// лобби (`Room::pending`) — единственный случай во всём протоколе, когда
+/// pending может САМ инициировать релей, а не только пассивно получать
+/// `waiting`/`join-rejected` и т.п. Права:
+///   - участник комнаты → любому другому участнику той же комнаты (как
+///     обычный `relay()`); неизвестный `to` — тихо игнорируем (та же гонка,
+///     что и в `relay()` — целевой пир мог уже отвалиться);
+///   - ожидающий в лобби → ТОЛЬКО текущему лидеру комнаты (у него и так нет
+///     видимости других участников) — иное `to` не гонка, а нарушение прав,
+///     поэтому явный `error` отправителю (тот же паттерн, что у
+///     `update-settings`/`approve`/`reject` от не-лидера), а не тихий дроп;
+///   - ни участник, ни pending (сокет уже выпал из комнаты в обоих смыслах,
+///     не должно происходить в штатной работе) — `error`, как у `relay()`.
+///
+/// Каппы (H2, DoS-защита): общий relay rate-limit (тот же счётчик, что у
+/// offer/answer/ICE/stream-info) и `NAME_ANNOUNCE_MAX_BYTES` на размер
+/// `payload` — в этом порядке, по тем же соображениям, что у
+/// `relay_payload_too_large` в `handle_message`.
+fn handle_name_announce(
+    to: String,
+    payload: String,
+    me: &Option<PeerCtx>,
+    tx: &PeerTx,
+    rooms: &SharedRooms,
+    rate_limits: &mut RateLimits,
+) {
+    if !check_relay_rate_limit(&mut rate_limits.relay_times) {
+        send_to(tx, err("too many messages, slow down"));
+        return;
+    }
+    if payload.len() > NAME_ANNOUNCE_MAX_BYTES {
+        send_to(tx, err("payload too large (max 2KB)"));
+        return;
+    }
+    let Some(ctx) = me else {
+        send_to(tx, err("not in a room"));
+        return;
+    };
+    let rooms_guard = rooms.lock().unwrap();
+    let Some(room) = rooms_guard.get(&ctx.room_id) else {
+        debug!(room = %ctx.room_id, "name-announce в уже удалённую комнату — игнорируем");
+        return;
+    };
+
+    if room.participants.contains_key(&ctx.peer_id) {
+        match room.participants.get(&to) {
+            Some(p) => send_to(&p.tx, ServerMessage::NameAnnounce { from: ctx.peer_id.clone(), payload }),
+            None => debug!(target = %to, "name-announce на неизвестный peerId — игнорируем"),
+        }
+        return;
+    }
+
+    if room.pending.contains_key(&ctx.peer_id) {
+        if room.leader_id.as_deref() == Some(to.as_str()) {
+            match room.leader_id.as_ref().and_then(|id| room.participants.get(id)) {
+                Some(leader) => send_to(&leader.tx, ServerMessage::NameAnnounce { from: ctx.peer_id.clone(), payload }),
+                // Лидер значится в `room.leader_id`, но не найден среди
+                // участников — на практике не должно происходить (уход
+                // лидера снимает `leader_id` синхронно, см. `cleanup_peer`),
+                // но не паникуем на рассинхроне инвариантов.
+                None => debug!(leader = %to, "name-announce лидеру, которого не оказалось среди участников — игнорируем"),
+            }
+        } else {
+            send_to(tx, err("pending participants can only send name-announce to the room leader"));
+        }
+        return;
+    }
+
+    send_to(tx, err("not in a room"));
 }
 
 /// Убрать пира из комнаты и уведомить остальных. Пир мог быть либо полным
@@ -817,14 +955,32 @@ fn cleanup_peer(ctx: &PeerCtx, rooms: &SharedRooms) {
                     send_to(&p.tx, msg.clone());
                 }
                 // Заявки лобби наследуются новым лидером — пересылаем их ему
-                // заново (в порядке подачи), он их ещё не видел.
+                // заново (в порядке подачи), он их ещё не видел. Заодно (E2E
+                // v2, см. `ServerMessage::Waiting`) каждому висящему pending
+                // шлём СВЕЖИЙ `waiting` с новым лидером и его `epub` — старый
+                // ключ, выведенный на прежнего лидера, для нового не годится,
+                // а без свежего `waiting` pending не узнает, кому переслать
+                // `name-announce`.
                 if !room.pending.is_empty() {
+                    let new_leader_epub = room
+                        .participants
+                        .get(&new_leader_id)
+                        .and_then(|p| p.epub.clone());
+                    let waiting_msg = ServerMessage::Waiting {
+                        leader_peer_id: new_leader_id.clone(),
+                        leader_epub: new_leader_epub,
+                    };
+                    for p in room.pending.values() {
+                        send_to(&p.tx, waiting_msg.clone());
+                    }
+
                     let pending = pending_sorted_by_arrival(room);
                     if let Some(new_leader) = room.participants.get(&new_leader_id) {
                         for p in pending {
                             send_to(&new_leader.tx, ServerMessage::JoinRequest {
                                 peer_id: p.peer_id,
                                 name: p.name,
+                                epub: p.epub,
                             });
                         }
                     }

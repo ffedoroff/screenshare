@@ -17,6 +17,17 @@
 //! Протокол v4 (система прав): комната теперь имеет лидера (`leaderId`) и
 //! `settings` (права гостей), опционально wait room (`lobby_enabled`) —
 //! подробности модели см. docs/permissions-and-leader.md.
+//!
+//! E2E-модель v2 («вариант E», см. docs/research-p2p-key-handoff.md §6.5–6.6):
+//! аддитивно к вышестоящим версиям. Каждый пир на вкладке генерирует
+//! эфемерную ECDH-пару и присылает публичную часть (`epub`) в `join-room` —
+//! сервер её не парсит (опак, как `sdp`/`candidate`), только каппит длину
+//! (см. `crate::ws::sanitize_epub`) и релеит остальным через `peers[]`/
+//! `peer-joined`/`join-request`/`waiting.leaderEpub`, чтобы пиры могли вывести
+//! попарные ключи (forward secrecy). Имя участника теперь ходит ОТДЕЛЬНЫМ
+//! зашифрованным сообщением `name-announce` (а не полем `name` в
+//! `join-room`/`peer-joined` — то поле v2-клиенты всегда шлют/видят `null`,
+//! но оставлено в схеме как опак для обратной совместимости с v1).
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -86,6 +97,13 @@ pub enum ClientMessage {
         /// отдаёт лидерство первому вошедшему (см. docs/permissions-and-leader.md).
         #[serde(default)]
         leader_token: Option<String>,
+        /// E2E v2: эфемерный публичный ключ пира на эту вкладку (ECDH P-256,
+        /// base64url raw, ~87 симв.) — опак для сервера, только релеится
+        /// остальным (см. комментарий модуля выше). Обязателен по факту у
+        /// v2-клиентов, но поле `Option`, чтобы старый клиент (без него) не
+        /// ломал протокол — additive-only.
+        #[serde(default)]
+        epub: Option<String>,
     },
     /// SDP-оффер любому другому пиру своей комнаты.
     Offer { target_peer_id: String, sdp: Value },
@@ -119,6 +137,15 @@ pub enum ClientMessage {
     Reject { peer_id: String },
     /// Явный выход (эквивалентен закрытию сокета).
     Leave,
+    /// E2E v2: зашифрованный анонс имени конкретному пиру `to` — сервер
+    /// содержимое `payload` не разбирает (опак, как `sdp`), только релеит
+    /// цели как `ServerMessage::NameAnnounce`. Права (см.
+    /// `crate::ws::handle_name_announce`): обычный участник — любому
+    /// участнику своей комнаты; ожидающий в лобби — ТОЛЬКО текущему лидеру
+    /// (у него нет доступа к остальным участникам вовсе). Каппы: `payload` ≤
+    /// 2KB, учитывается в общем relay rate-limit (том же, что у
+    /// offer/answer/ICE/stream-info).
+    NameAnnounce { to: String, payload: String },
 }
 
 /// Сообщения сервер → клиент.
@@ -148,9 +175,24 @@ pub enum ServerMessage {
         /// время истечения — у клиента нет способа сопоставить `Instant`
         /// сервера со своими часами.
         expires_in_seconds: u64,
+        /// Потолок числа участников в комнате (env `MAX_PARTICIPANTS`,
+        /// рекомендуемый дефолт 6 — см. `crate::MAX_PARTICIPANTS` в
+        /// `main.rs`) — аддитивное поле, чтобы клиент показывал «Participants:
+        /// N / <это значение>», а не захардкоженную «/ 6» (см.
+        /// `static/room.js`). Старые клиенты это поле просто не читают —
+        /// не меняет их поведения (у них было захардкожено 6, что и остаётся
+        /// дефолтом сервера).
+        max_participants: usize,
     },
-    /// Остальным участникам комнаты: подключился новый участник.
-    PeerJoined { peer_id: String, name: Option<String> },
+    /// Остальным участникам комнаты: подключился новый участник. `name`
+    /// сервер всё так же слепо релеит как получил от клиента (у v2-клиентов
+    /// это всегда `null` — имя теперь ходит отдельным `name-announce`, см.
+    /// комментарий модуля выше); `epub` — его эфемерный публичный ключ.
+    PeerJoined {
+        peer_id: String,
+        name: Option<String>,
+        epub: Option<String>,
+    },
     /// Остальным участникам комнаты: участник ушёл.
     PeerLeft { peer_id: String },
     /// Целевому пиру: оффер от другого пира.
@@ -193,9 +235,24 @@ pub enum ServerMessage {
     Error { message: String },
     /// Ожидающему в лобби (см. `RoomSettings::lobby_enabled`): заявка на вход
     /// принята сервером, ждём решения лидера (`approve`/`reject`).
-    Waiting {},
-    /// Лидеру: новая заявка на вход в комнату с включённым лобби.
-    JoinRequest { peer_id: String, name: Option<String> },
+    /// `leader_peer_id`/`leader_epub` (E2E v2) — текущий лидер комнаты и его
+    /// эфемерный публичный ключ (nullable — лидер мог не прислать `epub`,
+    /// например старый клиент), чтобы ожидающий мог зашифровать ему
+    /// `name-announce`. При смене лидера, пока заявка ещё висит, сервер
+    /// шлёт ожидающему СВЕЖИЙ `waiting` с новым лидером (см.
+    /// `crate::ws::cleanup_peer`) — старый ключ к новому лидеру не подходит.
+    Waiting {
+        leader_peer_id: String,
+        leader_epub: Option<String>,
+    },
+    /// Лидеру: новая заявка на вход в комнату с включённым лобби. `epub` —
+    /// эфемерный публичный ключ ожидающего (E2E v2), нужен лидеру, чтобы
+    /// расшифровать его `name-announce`.
+    JoinRequest {
+        peer_id: String,
+        name: Option<String>,
+        epub: Option<String>,
+    },
     /// Лидеру: ожидающий отвалился (закрыл вкладку/сокет), не дождавшись
     /// решения — заявка снята сама собой.
     JoinRequestCancelled { peer_id: String },
@@ -215,21 +272,30 @@ pub enum ServerMessage {
     /// сервер сам закрывает сокет сразу вслед за этим сообщением (см.
     /// `handle_socket`).
     RoomExpired {},
+    /// Целевому пиру: анонс имени от другого пира (релей `name-announce`, см.
+    /// `ClientMessage::NameAnnounce`) — `payload` опаковый шифртекст, сервер
+    /// его не разбирает, только подставляет `from`.
+    NameAnnounce { from: String, payload: String },
 }
 
-/// Один другой участник комнаты в списке `Joined::peers`.
+/// Один другой участник комнаты в списке `Joined::peers`. `epub` (E2E v2) —
+/// его эфемерный публичный ключ.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PeerInfo {
     pub peer_id: String,
     pub name: Option<String>,
+    pub epub: Option<String>,
 }
 
 /// Один ожидающий одобрения в лобби — в списке `Joined::pending` (только для
-/// лидера) и в поле `JoinRequest`.
+/// лидера); `JoinRequest` — отдельный вариант `ServerMessage` с теми же по
+/// смыслу полями (не переиспользует эту структуру напрямую, но несёт то же
+/// `epub`). `epub` (E2E v2) — эфемерный публичный ключ ожидающего.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingInfo {
     pub peer_id: String,
     pub name: Option<String>,
+    pub epub: Option<String>,
 }

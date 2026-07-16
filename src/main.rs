@@ -2,23 +2,24 @@
 //!
 //! Backend делает ровно три вещи (по спецификации):
 //!   1. Signaling-релей поверх WebSocket (`/ws`) — см. `ws.rs`. Текстовый чат
-//!      комнаты сюда почти не попадает: он идёт напрямую между участниками
-//!      по mesh RTCDataChannel (см. `static/chat.js`), сервер лишь релеит
-//!      адресный fallback, если шина до конкретного пира ещё не открыта, и
-//!      не хранит ни байта из содержимого чата.
+//!      комнаты сюда вообще не попадает: он идёт исключительно напрямую
+//!      между участниками по mesh RTCDataChannel (см. `static/chat.js`,
+//!      docs/chat.md §12) — сервер в этом пути не участвует и не видит ни
+//!      байта из содержимого чата.
 //!   2. Раздача статики фронтенда (`/`, `/r/{id}`, `/static/...`).
 //!   3. Крошечный `/config` с ICE-серверами из переменных окружения.
 //!
 //! Медиа через сервер по-прежнему не проходит.
 //!
 //! Ш1 (E2E-шифрование, см. static/crypto.js): сервер релеит sdp/candidate/
-//! info/имя участника/fallback-чат уже ЗАШИФРОВАННЫМИ клиентом (ключ комнаты
-//! — секрет только фрагмента ссылки, сервер его никогда не видел и не
-//! видит) — с точки зрения этого файла и `ws.rs` ничего не изменилось, они
-//! как релеили опаковый JSON/строку, так и продолжают. QR-код (раньше
-//! `GET /qr.svg`) теперь рендерится ЛОКАЛЬНО в браузере (см.
-//! `static/vendor/qrcode.js`, `static/room.js`), чтобы ссылка с секретным
-//! `#k` не уходила на сервер ради картинки — этот эндпоинт удалён целиком.
+//! info/имя участника уже ЗАШИФРОВАННЫМИ клиентом попарными ключами,
+//! выведенными из секрета `t`/`e` фрагмента ссылки (сервер его никогда не
+//! видел и не видит) — с точки зрения этого файла и `ws.rs` ничего не
+//! изменилось, они как релеили опаковый JSON/строку, так и продолжают.
+//! QR-код (раньше `GET /qr.svg`) теперь рендерится ЛОКАЛЬНО в браузере (см.
+//! `static/vendor/qrcode.js`, `static/room.js`), чтобы ссылка с секретными
+//! `#t`/`#e` не уходила на сервер ради картинки — этот эндпоинт удалён
+//! целиком.
 //!
 //! Приватность: на диске не остаётся ничего — ни IP/портов клиентов (в
 //! tracing-логах фигурируют только room/peer id), ни содержимого чата
@@ -62,8 +63,9 @@ use uuid::Uuid;
 
 use crate::protocol::RoomSettings;
 use crate::state::{
-    check_ip_rate_limit, extract_client_ip, AppState, Room, DEFAULT_MAX_ROOMS,
-    DEFAULT_MAX_ROOM_LIFETIME_SECONDS, ROOM_CREATION_IP_LIMIT, ROOM_CREATION_IP_WINDOW,
+    check_ip_rate_limit, extract_client_ip, AppState, Room, DEFAULT_MAX_PARTICIPANTS,
+    DEFAULT_MAX_ROOMS, DEFAULT_MAX_ROOM_LIFETIME_SECONDS, ROOM_CREATION_IP_LIMIT,
+    ROOM_CREATION_IP_WINDOW,
 };
 
 /// Каталог со статикой фронтенда. Настраивается через env `STATIC_DIR` (в
@@ -104,6 +106,22 @@ pub(crate) static MAX_ROOM_LIFETIME: LazyLock<Duration> = LazyLock::new(|| {
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_MAX_ROOM_LIFETIME_SECONDS);
     Duration::from_secs(secs)
+});
+
+/// Потолок числа участников в комнате одновременно (см. `docs/self-hosting.md`,
+/// §6): env `MAX_PARTICIPANTS`, дефолт 6 (`DEFAULT_MAX_PARTICIPANTS`). Это
+/// РЕКОМЕНДУЕМЫЙ дефолт полноценной mesh-топологии, не жёсткий лимит
+/// протокола — комната полный WebRTC-mesh (каждый шлёт медиа каждому
+/// напрямую), поэтому расти сверх дефолта можно, но растёт исходящий трафик
+/// КАЖДОГО клиента (n-1 копий) — сервера самого это не касается, он лишь
+/// релеит сигналинг. `LazyLock` (как `MAX_ROOM_LIFETIME` выше) читает env
+/// один раз при первом обращении; используется в `ws.rs` при проверке
+/// room-full (`join-room` и `approve`).
+pub(crate) static MAX_PARTICIPANTS: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("MAX_PARTICIPANTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_PARTICIPANTS)
 });
 
 /// CORS вручную, без tower-http: у нас всего три кросс-оригин HTTP-пути
@@ -302,6 +320,14 @@ async fn shutdown_signal() {
 /// стать лидером комнаты — токен сгорает при первом же успешном предъявлении
 /// (совпавшем с хранимым). Если никто не предъявит токен, лидером станет
 /// первый вошедший как обычно.
+///
+/// Также возвращает `lifetimeSeconds` — тот же `MAX_ROOM_LIFETIME`, которым
+/// сервер ограничивает длительность созвона (см. `MAX_ROOM_LIFETIME`,
+/// docs/security.md, «Meeting Duration Ceiling»). Нужен клиенту E2E v2 (см.
+/// docs/research-p2p-key-handoff.md §6.5–6.6): срок действия ссылки (`e` в
+/// фрагменте URL) зашивается в деривацию ключей клиентом при создании
+/// комнаты, а не подсматривается заново при каждом входе — поэтому клиент
+/// должен узнать лимит именно в момент создания.
 async fn create_room(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
@@ -356,7 +382,11 @@ async fn create_room(
 
     (
         StatusCode::CREATED,
-        Json(json!({ "roomId": room_id, "leaderToken": leader_token })),
+        Json(json!({
+            "roomId": room_id,
+            "leaderToken": leader_token,
+            "lifetimeSeconds": MAX_ROOM_LIFETIME.as_secs(),
+        })),
     )
         .into_response()
 }
@@ -377,6 +407,11 @@ async fn create_room(
 ///     заданным, а не случайным id) — `201`;
 ///   - комната уже есть (не важно, пуста или с участниками) — ничего не
 ///     трогаем, просто подтверждаем — `200`.
+///
+/// В обоих успешных случаях (`200`/`201`) ответ дополнительно несёт то же
+/// `lifetimeSeconds`, что `POST /api/rooms` — для симметрии API; на практике
+/// клиенту E2E v2 оно тут не нужно (срок `e` уже зашит в адресной строке при
+/// восстановлении того же таба, см. docs/research-p2p-key-handoff.md §6.5–6.6).
 ///
 /// Про безопасность восстановления по известному id: комнаты в этом проекте
 /// эфемерны и не имеют отдельного контроля доступа — единственный секрет это
@@ -399,7 +434,11 @@ async fn restore_room(
     let mut rooms_guard = state.rooms.lock().unwrap();
     if rooms_guard.contains_key(&room_id) {
         drop(rooms_guard);
-        return (StatusCode::OK, Json(json!({ "roomId": room_id }))).into_response();
+        return (
+            StatusCode::OK,
+            Json(json!({ "roomId": room_id, "lifetimeSeconds": MAX_ROOM_LIFETIME.as_secs() })),
+        )
+            .into_response();
     }
     // H2 (DoS-защита): тот же глобальный потолок, что в create_room, под тем
     // же локом — восстановление НЕсуществующей комнаты тоже создаёт запись.
@@ -429,7 +468,11 @@ async fn restore_room(
     drop(rooms_guard);
     info!(room = %room_id, "комната восстановлена после рестарта (PUT /api/rooms/{{id}})");
 
-    (StatusCode::CREATED, Json(json!({ "roomId": room_id }))).into_response()
+    (
+        StatusCode::CREATED,
+        Json(json!({ "roomId": room_id, "lifetimeSeconds": MAX_ROOM_LIFETIME.as_secs() })),
+    )
+        .into_response()
 }
 
 /// Проба готовности/живости для k8s: если процесс отвечает на HTTP — он жив.

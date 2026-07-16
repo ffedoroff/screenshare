@@ -17,10 +17,12 @@ fully ephemeral — nothing is stored anywhere once the meeting ends.
 - **Peer-to-peer text chat** with formatting, replies, reactions, message
   edit/delete, and file/image/audio transfer — sent directly between
   participants, never stored on the server.
-- **End-to-end encrypted** — the room key lives only in the link fragment
-  (`#k`), never reaches the server; signaling, names, and fallback chat are
-  AES-256-GCM. A compromised server can neither read the traffic nor tamper
-  with it.
+- **End-to-end encrypted, with forward secrecy** — the link carries a token
+  that only *authenticates*; it never encrypts anything and never reaches the
+  server. Every tab derives its own ephemeral, per-peer AES-256-GCM keys for
+  signaling and names, so a link that leaks *after* the call is over can't
+  decrypt what was relayed *during* it. A compromised server can neither read
+  the traffic nor tamper with it.
 - **Moderation** — one participant is the room leader (waiting room / admit
   guests, toggle guest chat / audio / video / screen).
 - **Anonymous & ephemeral** — no cookies, no localStorage; rooms, names, and

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="theme-color" content="#0f1114" />
   <title>Room — video call</title>
-  <link rel="stylesheet" href="/static/style.css?v=9" />
+  <link rel="stylesheet" href="/static/style.css?v=10" />
   <link rel="manifest" href="/static/manifest.webmanifest" />
   <link rel="apple-touch-icon" href="/static/icon-192.png" />
 </head>
@@ -250,15 +250,15 @@
         <h2 id="share-popup-title">Share the room</h2>
         <!-- QR рендерится ЛОКАЛЬНО в браузере (см. static/vendor/qrcode.js,
              static/room.js: renderShareQr) — никакого похода на сервер за
-             картинкой: ссылка комнаты (включая секретный #k) не должна
-             покидать вкладку ради QR. -->
+             картинкой: ссылка комнаты (включая PSK-токен #t и expiry #e,
+             см. docs/e2e-encryption.md) не должна покидать вкладку ради QR. -->
         <div id="share-popup-qr" class="share-popup-qr" role="img" aria-label="QR code with the room link"></div>
         <div id="share-popup-link" class="share-popup-link"></div>
         <!-- Хэш опубликованной статики — ОТДЕЛЬНОЙ строкой текста, для
              сверки (форензический якорь, см. docs/security.md, «Published
              Build Hash»). НЕ часть ссылки/QR выше — те несут только
-             `<origin>/r/<id>#k=<key>` (см. static/room.js: buildShareLink/
-             renderShareQr). Скрыт, пока /build-hash.json не подтянулся или
+             `<origin>/r/<id>#t=<token>&e=<expiry>` (см. static/room.js:
+             buildShareLink/renderShareQr). Скрыт, пока /build-hash.json не подтянулся или
              недоступен (dev/self-hosted, см. static/room.js: loadBuildHash).
              Формат — как в подвале лендинга (static/index.html): короткий
              хэш + раскрывающийся полный + ссылка «verify» на GitHub Releases
@@ -400,14 +400,14 @@
     </div>
   </div>
 
-  <script src="/static/config.js?v=9"></script>
-  <script src="/static/crypto.js?v=9"></script>
-  <script src="/static/namegen.js?v=9"></script>
-  <script src="/static/vendor/qrcode.js?v=9"></script>
-  <script src="/static/common.js?v=9"></script>
-  <script src="/static/bus.js?v=9"></script>
-  <script src="/static/rtc.js?v=9"></script>
-  <script src="/static/chat.js?v=9"></script>
-  <script src="/static/room.js?v=9"></script>
+  <script src="/static/config.js?v=10"></script>
+  <script src="/static/crypto.js?v=10"></script>
+  <script src="/static/namegen.js?v=10"></script>
+  <script src="/static/vendor/qrcode.js?v=10"></script>
+  <script src="/static/common.js?v=10"></script>
+  <script src="/static/bus.js?v=10"></script>
+  <script src="/static/rtc.js?v=10"></script>
+  <script src="/static/chat.js?v=10"></script>
+  <script src="/static/room.js?v=11"></script>
 </body>
 </html>

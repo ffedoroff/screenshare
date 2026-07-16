@@ -44,20 +44,32 @@ addressed `chat`/`envelope` fallback was removed (see
 **additive**: an older client that doesn't know a newer field or message type
 keeps working (see [§8](#8-versioning--backward-compatibility)).
 
+The E2E v2 key model (see [`e2e-encryption.md`](e2e-encryption.md)) adds a
+further additive layer: every participant carries an ephemeral public key
+(`epub`), relayed alongside `join-room`/`joined`/`peer-joined`/`join-request`/
+`waiting` so peers can derive pairwise encryption keys; and display names no
+longer travel as a plaintext-shaped `name` field at all — a v2 client always
+sends/sees `name: null` there and instead announces its name, encrypted, via
+a dedicated `name-announce` message (see [§3](#3-websocket-client--server)
+and [§4](#4-websocket-server--client)).
+
 All WebSocket messages are JSON with a `type` field
 (`#[serde(tag = "type", rename_all = "kebab-case")]` in Rust). The server
-does not parse the *content* of `sdp` / `candidate` / `info` — these are
-opaque JSON values it only routes between peers; since the end-to-end
-encryption phase (see [`e2e-encryption.md`](e2e-encryption.md)), these fields
-and the participant's `name` are opaque ciphertext even before considering
-that the server doesn't inspect them.
+does not parse the *content* of `sdp` / `candidate` / `info` / `epub` /
+`name-announce`'s `payload` — these are opaque JSON values (or opaque
+strings) it only routes between peers; since the end-to-end encryption
+phase (see [`e2e-encryption.md`](e2e-encryption.md)), the signaling fields
+and the participant's name are opaque ciphertext even before considering
+that the server doesn't inspect them. `epub` is the one exception that's
+opaque but **not** ciphertext — it's a public key, harmless for the server
+to see (see [`privacy.md` §2](privacy.md#2-what-the-server-does-see)).
 
 ## 2. HTTP Endpoints
 
 | Method + Path | Request Body | Response | Purpose |
 |---|---|---|---|
-| `POST /api/rooms` | none (an optional `{"name": "..."}` is accepted and ignored) | `201 {"roomId": "<8 chars>", "leaderToken": "<uuid>"}`, or `429` (per-IP room-creation rate limit), or `503` (room count ceiling) | Create a new, empty room. Participants join it separately via `join-room` over WebSocket. |
-| `PUT /api/rooms/{roomId}` | none | `201 {"roomId": ...}` (didn't exist — created), `200 {"roomId": ...}` (already existed), `400` (malformed id), `503` (room count ceiling) | Idempotent restore of a room after a server restart (see [`self-hosting.md`](self-hosting.md)). Issues no `leaderToken` — the restored room's leader is whoever joins first. |
+| `POST /api/rooms` | none (an optional `{"name": "..."}` is accepted and ignored) | `201 {"roomId": "<8 chars>", "leaderToken": "<uuid>", "lifetimeSeconds": <u64>}`, or `429` (per-IP room-creation rate limit), or `503` (room count ceiling) | Create a new, empty room. Participants join it separately via `join-room` over WebSocket. |
+| `PUT /api/rooms/{roomId}` | none | `201 {"roomId": ..., "lifetimeSeconds": <u64>}` (didn't exist — created), `200 {"roomId": ..., "lifetimeSeconds": <u64>}` (already existed), `400` (malformed id), `503` (room count ceiling) | Idempotent restore of a room after a server restart (see [`self-hosting.md`](self-hosting.md)). Issues no `leaderToken` — the restored room's leader is whoever joins first. |
 | `GET /r/{roomId}` | — | `200` HTML (`room.html`) | Short link that serves the room page; the frontend reads `roomId` from the URL itself. |
 | `GET /config` | — | `200 {"iceServers": [...]}` | ICE server list for the frontend: a public STUN server always, plus a TURN server if configured (with short-lived HMAC credentials — see [`webrtc-mesh.md`](webrtc-mesh.md) and [`self-hosting.md`](self-hosting.md)). |
 | `GET /healthz` | — | `200 "ok"` | Liveness/readiness probe. |
@@ -70,13 +82,18 @@ fragment), so the link is never sent to the server just to produce an image.
 
 ### 2.1 `POST /api/rooms`
 
-Creates a new, empty room and returns its `roomId` and a one-time
-`leaderToken`. The creator presents that token in their own `join-room` to
-become the room's leader (see [`permissions-and-leader.md`](permissions-and-leader.md));
-the token is consumed on first successful presentation. A room with zero
-participants is kept alive for a configurable grace period in case the
-creator hasn't navigated to it yet; a background reaper removes it if no one
-joins in time.
+Creates a new, empty room and returns its `roomId`, a one-time
+`leaderToken`, and `lifetimeSeconds` (the server's own
+`MAX_ROOM_LIFETIME_SECONDS`, see [`security.md` §8](security.md#8-meeting-duration-ceiling)).
+The creator presents `leaderToken` in their own `join-room` to become the
+room's leader (see [`permissions-and-leader.md`](permissions-and-leader.md));
+the token is consumed on first successful presentation. `lifetimeSeconds` is
+used client-side to compute the link's expiry `e`, baked into the E2E key
+derivation (see [`e2e-encryption.md` §2.2](e2e-encryption.md#22-expiry-e--a-cryptographic-boundary-not-a-runtime-check));
+a client that doesn't find this field (an older server) falls back to a
+hardcoded default. A room with zero participants is kept alive for a
+configurable grace period in case the creator hasn't navigated to it yet; a
+background reaper removes it if no one joins in time.
 
 Rate-limited per source IP (separately from the lobby-join limit — see
 [`security.md`](security.md)), and gated by a global room-count ceiling.
@@ -90,7 +107,10 @@ process restarts (all room state is in-memory — see [`privacy.md`](privacy.md)
 Restoring a room by an already-known id grants no additional access: the
 room id itself is the only access control a room has, and whoever already
 had the link could reach the same outcome by creating a fresh room with a
-different id. `roomId` must match `^[a-z0-9]{8}$`.
+different id. `roomId` must match `^[a-z0-9]{8}$`. `lifetimeSeconds` is
+returned for symmetry with `POST /api/rooms`, but the client doesn't actually
+need it here on a recovery path — its link's `e` is already fixed in the URL
+fragment from when the room was originally created.
 
 ### 2.3 `GET /r/{roomId}`
 
@@ -128,7 +148,7 @@ default).
 
 | type | Fields | Purpose |
 |---|---|---|
-| `join-room` | `roomId`, `name?` (opaque ciphertext string — see [`e2e-encryption.md`](e2e-encryption.md)), `peerId?` (the client's *previous* peer id, presented when reconnecting after a signaling drop), `leaderToken?` (one-time token from `POST /api/rooms`) | Join an existing room. If the presented `leaderToken` matches the one stored for the room, the joiner becomes leader and the token is burned. If the room has the waiting room enabled and the joiner isn't becoming leader, they're placed in the pending queue instead of admitted immediately (see [`permissions-and-leader.md`](permissions-and-leader.md)). |
+| `join-room` | `roomId`, `name?` (always `null` from a v2 client — kept in the schema only for backward compatibility, see [`e2e-encryption.md`](e2e-encryption.md)), `peerId?` (the client's *previous* peer id, presented when reconnecting after a signaling drop), `leaderToken?` (one-time token from `POST /api/rooms`), `epub?` (E2E v2: the tab's ephemeral ECDH public key, base64url raw; opaque to the server, only relayed — effectively required from a v2 client, but `Option` so an older client without it still works) | Join an existing room. If the presented `leaderToken` matches the one stored for the room, the joiner becomes leader and the token is burned. If the room has the waiting room enabled and the joiner isn't becoming leader, they're placed in the pending queue instead of admitted immediately (see [`permissions-and-leader.md`](permissions-and-leader.md)). |
 | `offer` | `targetPeerId`, `sdp` | An SDP offer to any other participant in the room; payload capped at 16KB. |
 | `answer` | `targetPeerId`, `sdp` | An SDP answer to any other participant; same cap. |
 | `ice-candidate` | `targetPeerId`, `candidate` | A trickled ICE candidate to any peer; same cap. |
@@ -139,6 +159,7 @@ default).
 | `approve` | `peerId` | Admit a pending arrival from the waiting room. Leader only. |
 | `reject` | `peerId` | Decline a pending arrival. Leader only. |
 | `leave` | — | Explicit exit, equivalent to closing the socket. |
+| `name-announce` | `to` (target peerId), `payload` (opaque ciphertext string, encrypted under the sender/recipient pair's `K_pair_meta` — see [`e2e-encryption.md`](e2e-encryption.md)) | E2E v2: announce (or re-announce) the sender's display name to one specific peer. Rights: an ordinary participant may target any other participant in the same room; a pending arrival in the waiting room may target **only the current leader** (it has no visibility into anyone else). Capped at 2KB, counted against the same shared relay rate limit as offer/answer/ICE/`stream-info`. |
 
 `RoomSettings` (see [`permissions-and-leader.md`](permissions-and-leader.md)
 for the full model):
@@ -151,8 +172,8 @@ for the full model):
 
 | type | Fields | Sent To |
 |---|---|---|
-| `joined` | `peerId`, `peers: [{peerId, name}]` (other current participants), `screenOwner?`, `leaderId`, `settings`, `pending: [{peerId, name}]` (non-empty **only** for the leader), `expiresInSeconds` | The newly admitted participant |
-| `peer-joined` | `peerId`, `name?` | Everyone else already in the room |
+| `joined` | `peerId`, `peers: [{peerId, name, epub}]` (other current participants), `screenOwner?`, `leaderId`, `settings`, `pending: [{peerId, name, epub}]` (non-empty **only** for the leader), `expiresInSeconds` | The newly admitted participant |
+| `peer-joined` | `peerId`, `name?` (always `null` from a v2 peer — see [§3](#3-websocket-client--server)), `epub?` | Everyone else already in the room |
 | `peer-left` | `peerId` | Everyone else in the room |
 | `offer` | `fromPeerId`, `sdp` | The addressed target peer |
 | `answer` | `fromPeerId`, `sdp` | The addressed target peer |
@@ -161,8 +182,8 @@ for the full model):
 | `share-started` | `peerId` | Everyone in the room, including the initiator (one render path for all) — also the **only** signal a preempted former holder gets: it recognizes `peerId` isn't its own and, if its local capture is still live, stops it (see [`permissions-and-leader.md`](permissions-and-leader.md)) |
 | `share-rejected` | `busyPeerId?` (kept in the wire shape for backward compatibility; the server never populates it any more — see [§7.1](permissions-and-leader.md#71-screen-sharing--server-enforced)), `reason?` (`"forbidden"` on a permission denial, the only case this message is sent for now) | Only the requester of `share-start` |
 | `share-stopped` | `peerId` | Everyone in the room — on explicit stop, on the holder disconnecting, or when the leader revokes `guestScreen` mid-share |
-| `waiting` | — | A new arrival, instead of `joined`, while they're in the waiting room |
-| `join-request` | `peerId`, `name?` | The leader — a new (or re-delivered, after a leader change) pending arrival |
+| `waiting` | `leaderPeerId`, `leaderEpub?` (E2E v2: the current leader's ephemeral public key, so the waiting arrival can encrypt a `name-announce` to them — nullable, e.g. if the leader is on an older client) | A new arrival, instead of `joined`, while they're in the waiting room. **Re-sent** with the new leader's `leaderPeerId`/`leaderEpub` if the leader changes while this arrival is still pending — the old `leaderEpub` derives a pairwise key with a leader who's no longer there. |
+| `join-request` | `peerId`, `name?` (always `null` from a v2 pending arrival — their name arrives separately via `name-announce`), `epub?` (the pending arrival's ephemeral public key, needed by the leader to decrypt that `name-announce`) | The leader — a new (or re-delivered, after a leader change) pending arrival |
 | `join-request-cancelled` | `peerId` | The leader — a waiting arrival disconnected before a decision |
 | `join-rejected` | — | A waiting arrival who was declined (or whose room emptied out before a decision); the server closes their socket immediately after |
 | `settings-changed` | `settings` | Everyone in the room — the leader changed room settings |
@@ -171,6 +192,7 @@ for the full model):
 | `room-not-found` | — | A joiner when the room doesn't exist (never created, or already reaped) |
 | `room-expired` | — | Everyone in the room *and* everyone waiting: the room outlived its maximum lifetime; the server closes the socket immediately after |
 | `error` | `message` | The sender of a malformed, oversized, rate-limited, or permission-denied message |
+| `name-announce` | `from` (the true transport sender, never self-declared), `payload` | The target peer named in the client's `name-announce { to, payload }` — relayed opaquely, see [§3](#3-websocket-client--server) |
 
 ## 5. Relay Semantics
 

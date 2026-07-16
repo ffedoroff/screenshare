@@ -48,9 +48,11 @@
 // Ш1 (E2E-шифрование, см. static/crypto.js): offer/answer/ice-candidate ВСЕГДА
 // идут через серверный сигналинг-релей (это как раз то сообщение, которым
 // P2P-соединение только устанавливается — по определению не может пойти по
-// ещё не существующей шине), поэтому sdp/candidate шифруются под K_sig
-// безусловно, на каждый такой обмен — см. sigCrypto в конструкторе и
-// handleDescription/handleCandidate ниже. Сама P2P-шина (DataChannel 'bus')
+// ещё не существующей шине), поэтому sdp/candidate шифруются безусловно, на
+// каждый такой обмен, под ПОПАРНЫМ ключом K_pair_sig этой конкретной пары
+// участников (E2E v2 — эфемерные ECDH-ключи + PSK-токен `t` из ссылки, см.
+// docs/e2e-encryption.md; больше не единый room-wide K_sig) — см. sigCrypto
+// в конструкторе и handleDescription/handleCandidate ниже. Сама P2P-шина (DataChannel 'bus')
 // и медиатреки НЕ шифруются этим слоем — WebRTC обязан гнать их поверх DTLS,
 // это уже полноценный E2E между двумя конкретными пирами, второй прикладной
 // слой шифрования той же пары ничего не добавил бы к безопасности.
@@ -222,8 +224,8 @@ class RtcPeer {
         const offer = { type: pc.localDescription.type, sdp: pc.localDescription.sdp };
         // Ф3: шина к этому пиру уже открыта и pc в порядке -> гоним offer по
         // ней напрямую (см. заголовок файла); иначе — прежний серверный путь
-        // с шифрованием под K_sig (сервер видит только непрозрачный
-        // {v,iv,ct} вместо настоящего SDP и его DTLS-отпечатков, см.
+        // с шифрованием под попарным K_pair_sig этой пары (сервер видит только
+        // непрозрачный {v,iv,ct} вместо настоящего SDP и его DTLS-отпечатков, см.
         // заголовок static/crypto.js).
         if (!this._trySendBusSignal('offer', offer)) {
           const encSdp = await this.sigCrypto.encrypt(offer);
@@ -268,10 +270,11 @@ class RtcPeer {
   /**
    * Приём SDP-описания от удалённого пира ЧЕРЕЗ СЕРВЕРНЫЙ РЕЛЕЙ — offer ИЛИ
    * answer, разбираются по description.type. `encryptedDescription` —
-   * зашифрованный блоб {v,iv,ct} (см. K_sig в static/crypto.js) —
-   * расшифровывается ПЕРВЫМ делом, до какой-либо иной обработки; отказ
-   * расшифровки почти всегда значит, что у одной из сторон неверный ключ
-   * комнаты (см. onCryptoFailure). Сама обработка (perfect negotiation) —
+   * зашифрованный блоб {v,iv,ct} под попарным K_pair_sig этой пары (см.
+   * derivePairKeys в static/crypto.js) — расшифровывается ПЕРВЫМ делом, до
+   * какой-либо иной обработки; отказ расшифровки почти всегда значит, что у
+   * одной из сторон неверный/несовпадающий токен ссылки `t`/`e` (см.
+   * onCryptoFailure). Сама обработка (perfect negotiation) —
    * в _applyRemoteDescription, общей с приёмом по шине (см. handleBusSignal).
    */
   async handleDescription(encryptedDescription) {

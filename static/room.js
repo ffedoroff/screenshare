@@ -13,42 +13,55 @@
 'use strict';
 
 // --- Анонимность: leaderToken из фрагмента ссылки (см. static/landing.js —
-// POST /api/rooms -> редирект на /r/<id>#lt=<token>&k=<key>&n=<имя>) читается
-// ДО ВСЕГО остального. Из адресной строки вычищается ТОЛЬКО одноразовый #lt
-// (после первого join он сожжён сервером и бесполезен, светить его незачем).
-// `#n` (имя комнаты) вычищать не нужно — оно теперь ЧАСТЬ инвайт-ссылки (см.
-// ниже) и остаётся в адресной строке у всех участников.
+// POST /api/rooms -> редирект на /r/<id>#lt=<token>&t=<token>&e=<expiry>&n=<имя>)
+// читается ДО ВСЕГО остального. Из адресной строки вычищается ТОЛЬКО
+// одноразовый #lt (после первого join он сожжён сервером и бесполезен,
+// светить его незачем). `#t`/`#e`/`#n` вычищать не нужно — они ЧАСТЬ
+// инвайт-ссылки (см. ниже) и остаются в адресной строке у всех участников
+// (в частности — переживают F5, см. init/initCryptoIdentity).
 //
-// Ключ комнаты #k СОЗНАТЕЛЬНО ОСТАЁТСЯ в адресной строке: ссылка = ключ по
-// самой модели (ей и делятся), а сохранение k в URL позволяет пережить F5 —
-// иначе перезагрузка выбрасывала бы из комнаты («ссылка неполная»), при том
-// что хранить ключ в storage запрещено (полная анонимность). Тот же паттерн
-// у Excalidraw. Фрагмент никогда не уходит на сервер сам по себе.
+// E2E v2 («вариант E», см. docs/research-p2p-key-handoff.md §6.5–6.6 и
+// static/crypto.js): `t` — статический PSK-токен ссылки (16 байт,
+// base64url) — он НИКОГДА не шифрует трафик сам, только аутентифицирует.
+// `e` — момент истечения ссылки (unix-секунды, base36) — часть вывода
+// K_auth, подделать нельзя (см. static/crypto.js). Оба ОСТАЮТСЯ в адресной
+// строке СОЗНАТЕЛЬНО: ссылка = секрет по самой модели (ей и делятся), а
+// сохранение t/e в URL позволяет пережить F5 — иначе перезагрузка выбрасывала
+// бы из комнаты («ссылка неполная»), при том что хранить секрет в storage
+// запрещено (полная анонимность). Тот же паттерн у Excalidraw. Фрагмент
+// никогда не уходит на сервер сам по себе.
 //
-// Ключ комнаты (Ш1, E2E-шифрование, см. static/crypto.js): `k` парсится ЗДЕСЬ
-// ЖЕ — до того, как страница успела показать что-либо, и до какого-либо
-// обращения к сигналингу; от него выводятся sigKey (сигналинг) и metaKey
-// (имя участника) — см. deriveRoomKeys. Оба неизменны на всю жизнь комнаты.
+// Реальные ключи шифрования (K_pair_sig/K_pair_meta на каждую пару
+// участников) — ЭФЕМЕРНЫЕ: выводятся заново каждой вкладкой при входе из
+// собственной одноразовой пары ECDH P-256 + K_auth(t,e), см.
+// initCryptoIdentity ниже и static/crypto.js. `t`/`e` парсятся ЗДЕСЬ ЖЕ — до
+// того, как страница успела показать что-либо, и до какого-либо обращения к
+// сигналингу.
 //
 // `n` — имя комнаты, которое ввёл СОЗДАТЕЛЬ на лендинге (см. static/landing.js,
 // static/namegen.js). Раньше жило только в одноразовом #lt-фрагменте и
 // пропадало у создателя после первого F5, а гости его не видели вовсе.
 // Теперь `n` — ЧАСТЬ инвайт-ссылки (buildShareLink кладёт его туда) и
-// остаётся в адресной строке (`#k=...&n=...`) у ВСЕХ, кто зашёл по ссылке —
-// имя комнаты видят все участники, оно переживает F5. Ключевой инвариант не
-// изменился: сервер фрагмент не видит (он никогда не уходит по сети), так что
-// название комнаты и для сервера остаётся неизвестным. Битый percent-encoding
-// (напр. от ручного редактирования URL) не должен ронять страницу —
-// decodeURIComponent в try/catch, при ошибке имя просто отсутствует (null).
-const { initialLeaderToken, roomKeyBase64url, initialRoomName } = (() => {
+// остаётся в адресной строке (`#t=...&e=...&n=...`) у ВСЕХ, кто зашёл по
+// ссылке — имя комнаты видят все участники, оно переживает F5. Ключевой
+// инвариант не изменился: сервер фрагмент не видит (он никогда не уходит по
+// сети), так что название комнаты и для сервера остаётся неизвестным. Битый
+// percent-encoding (напр. от ручного редактирования URL) не должен ронять
+// страницу — decodeURIComponent в try/catch, при ошибке имя просто
+// отсутствует (null).
+const { initialLeaderToken, linkTokenBase64url, linkExpiry, initialRoomName } = (() => {
   const hash = location.hash;
   const ltMatch = hash.match(/(?:^|[&#])lt=([^&]+)/);
-  const kMatch = hash.match(/(?:^|[&#])k=([^&]+)/);
+  const tMatch = hash.match(/(?:^|[&#])t=([^&]+)/);
+  const eMatch = hash.match(/(?:^|[&#])e=([^&]+)/);
   const nMatch = hash.match(/(?:^|[&#])n=([^&]+)/);
   const lt = ltMatch ? decodeURIComponent(ltMatch[1]) : null;
-  // `k` — base64url, состоит только из URL-safe символов (A-Za-z0-9-_) —
-  // decodeURIComponent не нужен (и вреден не был бы, но не нужен).
-  const k = kMatch ? kMatch[1] : null;
+  // `t` (base64url) и `e` (base36) состоят только из URL-safe символов —
+  // decodeURIComponent не нужен (и вреден не был бы, но не нужен). Дальнейшая
+  // валидация формата — в initCryptoIdentity (см. ниже), не здесь: здесь
+  // только чистое извлечение из фрагмента.
+  const t = tMatch ? tMatch[1] : null;
+  const e = eMatch ? eMatch[1] : null;
   let n = null;
   if (nMatch) {
     try {
@@ -59,16 +72,17 @@ const { initialLeaderToken, roomKeyBase64url, initialRoomName } = (() => {
   }
   if (lt) {
     // Пересобираем фрагмент без lt (одноразовый секрет — светить его в
-    // адресной строке незачем), сохраняя k и n. `n` берём из уже
+    // адресной строке незачем), сохраняя t/e/n. `n` берём из уже
     // раскодированного `n` и энкодим заново (а не переносим nMatch[1] как
     // есть) — так гарантированно нет ни двойного кодирования, ни устаревшего
     // percent-encoding из невалидного/ручного URL.
     const parts = [];
-    if (k) parts.push(`k=${k}`);
+    if (t) parts.push(`t=${t}`);
+    if (e) parts.push(`e=${e}`);
     if (n) parts.push(`n=${encodeURIComponent(n)}`);
     history.replaceState(null, '', location.pathname + location.search + (parts.length ? `#${parts.join('&')}` : ''));
   }
-  return { initialLeaderToken: lt, roomKeyBase64url: k, initialRoomName: n };
+  return { initialLeaderToken: lt, linkTokenBase64url: t, linkExpiry: e, initialRoomName: n };
 })();
 
 // --- Локальный рендер имени комнаты (видно ВСЕМ участникам, зашедшим по
@@ -188,16 +202,26 @@ if (!screenShareSupported) {
   screenButton.classList.add('hidden');
 }
 
-// --- Ш1: криптографические ключи комнаты (см. static/crypto.js) ---
-// Выводятся один раз при старте страницы из roomKeyBase64url (см. init/
-// deriveRoomKeys ниже) — null, пока вывод не завершился (или не начинался).
-let sigKey = null; // K_sig — sdp/candidate/info в серверном релее
-let metaKey = null; // K_meta — отображаемое имя участника в join-room
+// --- E2E v2: криптографическая идентичность вкладки (см. static/crypto.js) ---
+// Выводятся ОДИН раз при старте страницы (см. init/initCryptoIdentity ниже),
+// ДО join-room — null, пока вывод не завершился (или не начинался). В отличие
+// от room-wide v1 (единый K_sig/K_meta на всю комнату), здесь это ЛИЧНЫЕ
+// материалы вкладки, из которых для КАЖДОГО пира отдельно выводится своя
+// пара ключей (см. pairKeysCache ниже) — ни один ключ шифрования сам по себе
+// общий для комнаты.
+let myEphemeralKeyPair = null; // {publicKey, privateKey} — ECDH P-256, одноразовая на вкладку (PFS)
+let myEpub = null; // base64url(raw) экспорт публичной половины — это и летит на проводе как `epub`
+let kAuthBytes = null; // K_auth (см. static/crypto.js: deriveAuthKey) — HKDF-salt для ВСЕХ попарных ключей
+// Кеш попарных ключей: peerId -> Promise<{sigKey, metaKey}> — наполняется
+// лениво, как только становится известен `epub` этого пира (joined.peers[]/
+// peer-joined/join-request/waiting.leaderEpub — см. cachePairKeys), чистится
+// при уходе пира (см. removeRemotePeer).
+const pairKeysCache = new Map();
 // Взводится один раз на первую же неудачную расшифровку входящего
-// (SDP/ICE/stream-info с серверного релея) — почти всегда значит, что ключ
-// комнаты неверный (см. handleCryptoFailureOnce). Отдельно от terminalState,
-// чтобы не показать оверлей дважды при параллельных отказах нескольких
-// пиров сразу.
+// (SDP/ICE/stream-info/name-announce с серверного релея) — почти всегда
+// значит, что токен ссылки (`t`/`e`) неверный или несовпадающий у сторон
+// (см. handleCryptoFailureOnce). Отдельно от terminalState, чтобы не
+// показать оверлей дважды при параллельных отказах нескольких пиров сразу.
 let cryptoFailureHandled = false;
 
 // --- Общее состояние комнаты/сигналинга ---
@@ -295,6 +319,14 @@ const ROOM_TIMER_WARNING_MS = 10 * 60 * 1000; // последние 10 мину�
 const ROOM_TIMER_CRITICAL_MS = 60 * 1000; // последняя минута — красный
 let roomExpiresAtMs = null; // Date.now() на момент joined + expiresInSeconds*1000, null до первого joined
 let roomTimerInterval = null;
+
+// Потолок числа участников — сервер присылает его сам в `joined.maxParticipants`
+// (см. src/protocol.rs::ServerMessage::Joined, env `MAX_PARTICIPANTS` на
+// сервере, рекомендуемый дефолт 6 — см. docs/self-hosting.md, §6). 6 здесь —
+// ТОЛЬКО фолбэк на случай совсем старого сервера без этого поля (аддитивное,
+// см. joined-обработчик ниже) — реальное значение приходит на каждом joined,
+// как и roomExpiresAtMs выше.
+let maxParticipants = 6;
 
 /** Ч:ММ:СС из миллисекунд (не может быть отрицательным — вызывающая сторона зажимает снизу в 0). */
 function formatRoomTimer(remainingMs) {
@@ -467,43 +499,79 @@ overlayActionButtonEl.addEventListener('click', () => {
   }
 });
 
-// ---------- Ш1: криптографические ключи комнаты ----------
+// ---------- E2E v2: криптографическая идентичность вкладки ----------
+
+const LINK_TOKEN_BYTES = 16; // должно совпадать с RoomCrypto TOKEN_BYTES
+const LINK_EXPIRY_GRACE_SECONDS = 120; // толеранс к рассинхрону часов клиента/сервера (см. static/landing.js: +300 сверх lifetimeSeconds на сервере)
 
 /**
- * Вывести sigKey/metaKey/эпоху 0 контентных ключей из roomKeyBase64url (см.
- * верх файла). Возвращает false при ЛЮБОЙ проблеме: `k` отсутствует в
- * ссылке, не декодируется как base64url, декодируется не в 32 байта, либо
- * сам HKDF/AES-GCM отказался (WebCrypto недоступен и т.п.) — вызывающая
- * сторона (см. init ниже) трактует false как «ссылка неполная».
+ * Разобрать и провалидировать `t`/`e` из фрагмента ссылки (см. верх файла),
+ * вывести K_auth и сгенерировать одноразовую эфемерную пару вкладки — ВСЁ
+ * ДО join-room (см. init ниже). Возвращает:
+ *   - 'invalid' — `t`/`e` отсутствуют или битые (не декодируются, `t` не
+ *     ровно 16 байт, `e` не base36), либо сам WebCrypto отказался
+ *     (недоступен и т.п.) — трактуется как «ссылка неполная»;
+ *   - 'expired' — формат валиден, но `now > e + LINK_EXPIRY_GRACE_SECONDS` —
+ *     терминальный оверлей «Link expired» (см. showLinkExpiredOverlay);
+ *   - 'ok' — можно идти в join-room.
+ * Заодно генерирует myPeerId (см. ниже, «Почему peerId выбирает клиент»).
  */
-async function deriveRoomKeys() {
-  if (!roomKeyBase64url) return false;
-  let rawKey;
+async function initCryptoIdentity() {
+  if (!linkTokenBase64url || !linkExpiry) return 'invalid';
+
+  let tokenBytes;
   try {
-    rawKey = RoomCrypto.base64urlToBytes(roomKeyBase64url);
+    tokenBytes = RoomCrypto.base64urlToBytes(linkTokenBase64url);
   } catch (err) {
-    console.error('Не удалось декодировать ключ комнаты из ссылки:', err);
-    return false;
+    console.error('Не удалось декодировать токен ссылки:', err);
+    return 'invalid';
   }
+  if (tokenBytes.length !== LINK_TOKEN_BYTES) return 'invalid';
+
+  if (!/^[0-9a-z]+$/.test(linkExpiry)) return 'invalid'; // base36 lowercase, см. static/landing.js
+  const expirySeconds = parseInt(linkExpiry, 36);
+  if (!Number.isFinite(expirySeconds) || expirySeconds <= 0) return 'invalid';
+  // Проверка ТОЛЬКО здесь, при входе — не в рантайме (см. верх файла и
+  // docs/security.md): рассинхрон часов посреди живого звонка не должен его
+  // рвать, жизнь комнаты и так ограничена сервером (room-expired).
+  if (Math.floor(Date.now() / 1000) > expirySeconds + LINK_EXPIRY_GRACE_SECONDS) return 'expired';
+
   try {
-    const keys = await RoomCrypto.deriveKeys(rawKey);
-    sigKey = keys.sig;
-    metaKey = keys.meta;
-    return true;
+    kAuthBytes = await RoomCrypto.deriveAuthKey(tokenBytes, linkExpiry);
+    myEphemeralKeyPair = await RoomCrypto.generateEphemeralKeyPair();
+    myEpub = await RoomCrypto.exportEpub(myEphemeralKeyPair.publicKey);
   } catch (err) {
-    console.error('Не удалось вывести криптографические ключи комнаты:', err);
-    return false;
+    console.error('Не удалось инициализировать криптографическую идентичность вкладки:', err);
+    return 'invalid';
   }
+
+  // Почему peerId выбирает КЛИЕНТ (а не только сервер, как раньше): пока
+  // участник ждёт в лобби (см. signaling.on('waiting') ниже), он должен
+  // прислать лидеру name-announce, зашифрованный под попарным ключом,
+  // транскрипт которого включает peerId ОБЕИХ сторон (см.
+  // static/crypto.js: derivePairKeys) — а lobby-путь сервера (см.
+  // src/ws.rs) не сообщает ожидающему его собственный peerId до одобрения
+  // (Waiting несёт только leaderPeerId/leaderEpub). Решение: генерируем
+  // peerId САМИ (UUID v4 — тот же алфавит, что и generate_peer_id() на
+  // сервере) и посылаем его в join-room ЯВНО с самого первого входа (не
+  // только при реконнекте, как было раньше) — сервер принимает
+  // предъявленный peerId, если это валидный UUID и он свободен в комнате
+  // (см. src/ws.rs::handle_join_room), что на практике всегда так для
+  // свежесгенерированного UUID. Один и тот же myPeerId живёt всю сессию
+  // вкладки (включая все реконнекты), как и myEphemeralKeyPair.
+  myPeerId = crypto.randomUUID();
+
+  return 'ok';
 }
 
-/** Оверлей «ссылка неполная» — вход без валидного `k` ИЛИ первая же неудачная расшифровка входящего (см. handleCryptoFailureOnce) трактуются одинаково: с этим ключом (или без него) в комнате всё равно ничего не заработает. */
+/** Оверлей «ссылка неполная» — вход без валидных `t`/`e` ИЛИ первая же неудачная расшифровка входящего (см. handleCryptoFailureOnce) трактуются одинаково: с этим токеном (или без него) в комнате всё равно ничего не заработает. */
 function showInvalidLinkOverlay() {
   terminalState = true;
   // join-modal видна ПО УМОЛЧАНИЮ (в разметке room.html у неё нет класса
   // .hidden — её прячет/показывает только JS, см. showJoinModal/hideJoinModal
   // ниже) и её z-index ВЫШЕ, чем у #overlay (см. static/style.css) — если её
   // явно не спрятать здесь, она осталась бы поверх этого оверлея (и
-  // технически кликабельной) в сценарии «ключ невалиден ещё до входа»,
+  // технически кликабельной) в сценарии «токен невалиден ещё до входа»,
   // когда showJoinModal() вообще не успел выполниться.
   hideJoinModal();
   showOverlay({
@@ -513,46 +581,126 @@ function showInvalidLinkOverlay() {
   });
 }
 
+/** Терминальный оверлей «ссылка истекла» — `e` из фрагмента в прошлом (с запасом LINK_EXPIRY_GRACE_SECONDS), см. initCryptoIdentity. Отдельно от showInvalidLinkOverlay: сообщение честнее («эта ссылка БЫЛА рабочей, но срок вышел», а не «ссылка сломана»). */
+function showLinkExpiredOverlay() {
+  terminalState = true;
+  hideJoinModal();
+  showOverlay({
+    title: 'Link expired',
+    text: 'Ask a participant for a fresh link.',
+    actionLabel: 'Go home',
+  });
+}
+
 /**
  * Первая неудачная расшифровка входящего с серверного релея (SDP/ICE/
- * stream-info — см. static/rtc.js: onCryptoFailure, и signaling.on('stream-info')
- * ниже) — почти наверняка означает, что ключ комнаты у нас неверный
- * (испорчен при копировании, урезан и т.п.): с правильным ключом GCM-тег
- * почти никогда не собьётся сам по себе. Показываем тот же оверлей, что и
- * при отсутствующем `k` — с точки зрения пользователя разница не важна,
- * результат один и тот же («эта ссылка не работает, нужна новая»).
+ * stream-info/name-announce — см. static/rtc.js: onCryptoFailure, и
+ * signaling.on('stream-info'/'name-announce') ниже) — почти наверняка
+ * означает, что токен ссылки (`t`/`e`) у нас не совпадает с тем, что у
+ * собеседника (испорчен при копировании, разные ссылки после MITM-подмены и
+ * т.п.): с совпадающим токеном GCM-тег почти никогда не собьётся сам по
+ * себе (см. static/crypto.js, «Почему PSK-в-salt даёт аутентификацию»).
+ * Показываем тот же оверлей, что и при отсутствующем/битом `t`/`e` — с точки
+ * зрения пользователя разница не важна, результат один и тот же («эта ссылка
+ * не работает, нужна новая»).
  */
 function handleCryptoFailureOnce(err) {
   if (cryptoFailureHandled || terminalState) return;
   cryptoFailureHandled = true;
-  console.error('Похоже, ключ комнаты неверен (не удалось расшифровать входящее сообщение):', err);
+  console.error('Похоже, токен ссылки неверен (не удалось расшифровать входящее сообщение):', err);
   showInvalidLinkOverlay();
   if (signaling) signaling.close();
 }
 
-/** Зашифровать собственное имя (см. K_meta) для поля `name` в join-room — см. src/protocol.rs::ClientMessage::JoinRoom, поле остаётся String на проводе. */
-function encryptMyName() {
+/**
+ * Получить (лениво вывести, если ещё не выводили) попарные ключи для
+ * `peerId` — см. static/crypto.js: derivePairKeys. `epubStr` обязателен
+ * ПЕРВЫЙ раз, когда мы узнаём об этом пире (joined.peers[]/peer-joined/
+ * join-request/waiting.leaderEpub) — дальше кеш переиспользуется без него.
+ * ВАЖНО: сам `pairKeysCache.set(promise)` — СИНХРОННЫЙ (деривация ключей
+ * асинхронна, но промис ложится в кеш сразу): к моменту, когда сервер на
+ * том же WS доставит первый релей от этого пира, запись в кеше уже есть —
+ * guard'ы по pairKeysCache.has() (см. signaling.on('stream-info'/
+ * 'name-announce')) никогда не глотают сообщения от честного пира.
+ * Промис-отказ у УЖЕ закешированной пары (невалидный epub, WebCrypto
+ * отказалась) — дальше по коду трактуется как криптографический отказ (см.
+ * encryptSigFor/decryptSigFrom) — «не тихо игнорить».
+ */
+function cachePairKeys(peerId, epubStr) {
+  if (!pairKeysCache.has(peerId)) {
+    const promise = !epubStr
+      ? Promise.reject(new Error(`cachePairKeys: no epub known for peer ${peerId}`))
+      : RoomCrypto.derivePairKeys({
+          myPriv: myEphemeralKeyPair.privateKey,
+          theirEpubStr: epubStr,
+          myPeerId,
+          theirPeerId: peerId,
+          myEpubStr: myEpub,
+          roomId,
+          expiryString: linkExpiry,
+          kAuthBytes,
+        });
+    pairKeysCache.set(peerId, promise);
+  }
+  return pairKeysCache.get(peerId);
+}
+
+/** Тот же кеш, но без epub — для мест, где пара ДОЛЖНА уже быть закеширована заранее (см. createRemotePeer/sendStreamInfoTo/signaling.on('stream-info')). Неизвестный peerId — отказ (см. cachePairKeys). */
+function getPairKeys(peerId) {
+  return pairKeysCache.get(peerId) || Promise.reject(new Error(`getPairKeys: no pair keys cached for peer ${peerId}`));
+}
+
+/** Зашифровать SDP/ICE/stream-info под попарным K_pair_sig для конкретного `peerId` — см. static/rtc.js: sigCrypto, и sendStreamInfoTo ниже. */
+async function encryptSigFor(peerId, obj) {
+  const { sigKey } = await getPairKeys(peerId);
+  return RoomCrypto.encryptJson(sigKey, obj);
+}
+
+/** Расшифровать SDP/ICE/stream-info от конкретного `peerId` под попарным K_pair_sig — любая ошибка (неизвестный epub, неверный ключ, битый конверт) прокидывается вызывающей стороне как есть (см. static/rtc.js: onCryptoFailure, и signaling.on('stream-info') ниже). */
+async function decryptSigFrom(peerId, blob) {
+  const { sigKey } = await getPairKeys(peerId);
+  return RoomCrypto.decryptJson(sigKey, blob);
+}
+
+/** Зашифровать собственное имя под попарным K_pair_meta конкретного `peerId` — payload для `name-announce` (см. src/protocol.rs::ClientMessage::NameAnnounce). */
+async function encryptNameAnnouncePayload(peerId) {
+  const { metaKey } = await getPairKeys(peerId);
   return RoomCrypto.encryptToBase64(metaKey, { name: myName || null });
 }
 
-/**
- * Расшифровать имя ДРУГОГО участника (K_meta) — используется для peers из
- * joined/peer-joined/join-request. Любая проблема (отсутствует, невалидный
- * блоб, неверный ключ) -> null, что везде по коду трактуется как «Гость»
- * (см. displayName в static/chat.js и label тайла в createTile ниже) —
- * намеренно мягкий отказ: одно нерасшифровавшееся имя не должно ронять всю
- * остальную комнату (в отличие от отказа расшифровки SDP, см.
- * handleCryptoFailureOnce выше).
- */
-async function decryptPeerName(cipherName) {
-  if (!cipherName) return null;
+/** Отправить `name-announce` пиру/лидеру `peerId` — ничего не шлём, если своё имя пусто (аноним и так показан как «Guest» у всех, дополнительное сообщение не добавляет информации). Отказ (напр. пара ещё не закеширована) — не роняем комнату, только логируем: это НАШЕ исходящее действие, а не подозрительное входящее. */
+async function sendNameAnnounceTo(peerId) {
+  if (!myName) return;
   try {
-    const obj = await RoomCrypto.decryptFromBase64(metaKey, cipherName);
-    return obj && typeof obj.name === 'string' && obj.name ? obj.name : null;
+    const payload = await encryptNameAnnouncePayload(peerId);
+    signaling.send('name-announce', { to: peerId, payload });
   } catch (err) {
-    console.warn('Не удалось расшифровать имя участника — показываем «Гость»:', err);
-    return null;
+    console.error(`Не удалось отправить name-announce пиру ${peerId}:`, err);
   }
+}
+
+/** sendNameAnnounceTo для целого списка peerId — см. signaling.on('joined')/reconnect ниже («переотправить всем идемпотентно»). */
+function broadcastNameAnnounceTo(peerIds) {
+  if (!myName) return;
+  for (const peerId of peerIds) sendNameAnnounceTo(peerId);
+}
+
+/**
+ * Расшифровать payload входящего `name-announce` от `fromPeerId` под его
+ * попарным K_pair_meta. Любая ошибка (невалидный epub отправителя, неверный
+ * ключ, битый конверт) прокидывается как есть — вызывающая сторона
+ * (signaling.on('name-announce') ниже; отправители без установленной пары
+ * отфильтрованы там ЕЩЁ ДО вызова — см. guard по pairKeysCache.has())
+ * трактует ЛЮБУЮ ошибку здесь как криптографический отказ (см.
+ * handleCryptoFailureOnce): в отличие от v1, где нерасшифровавшееся имя тихо
+ * превращалось в «Гость», здесь честный отправитель с правильным `t`/`e`
+ * ВСЕГДА расшифровывается успешно — отказ означает подмену/рассинхрон
+ * токена, а не безобидную порчу одного поля.
+ */
+async function decryptNameAnnouncePayload(fromPeerId, payload) {
+  const { metaKey } = await getPairKeys(fromPeerId);
+  const obj = await RoomCrypto.decryptFromBase64(metaKey, payload);
+  return obj && typeof obj.name === 'string' && obj.name ? obj.name : null;
 }
 
 // SAS v2 (см. docs/sas-verification.md, стейт-машина ниже). fromPeerId —
@@ -964,6 +1112,7 @@ function createTile(peerId, name, isOwn) {
     labelEl: label,
     labelTextEl: labelText,
     placeholderNameEl: placeholderName,
+    letterEl: letter, // E2E v2: буква аватара обновляется отдельно от создания тайла, см. updatePeerTileName (имя приходит позже, отдельным name-announce)
     crownEl: crown,
     micOffEl: micOff,
     speedEl: speed,
@@ -991,6 +1140,33 @@ function createTile(peerId, name, isOwn) {
   });
 
   return tileObj;
+}
+
+/**
+ * E2E v2: обновить УЖЕ созданный тайл удалённого пира новым именем, пришедшим
+ * через `name-announce` (см. signaling.on('name-announce')) — тайл создаётся
+ * РАНЬШЕ (с плейсхолдером «Guest», см. createTile выше), потому что epub/имя
+ * теперь приходят отдельно (имя даже отдельным сообщением от epub/peerId).
+ * Обновляет и угловую подпись, и подпись под аватаром-заглушкой, и первую
+ * букву аватара — то есть все три места, где createTile изначально
+ * проставляет `labelValue`/первую графему.
+ */
+function updatePeerTileName(peerId, name) {
+  const entry = peers.get(peerId);
+  if (!entry) return; // пир уже ушёл, пока летело сообщение — не редкость при живом релее
+  entry.name = name || null;
+  const tile = entry.tile;
+  const trimmedName = (name || '').trim();
+  const labelValue = trimmedName || 'Guest';
+  tile.root.dataset.name = name || '';
+  tile.labelTextEl.textContent = labelValue;
+  tile.placeholderNameEl.textContent = labelValue;
+  const firstGrapheme = trimmedName
+    ? (typeof Intl !== 'undefined' && Intl.Segmenter
+        ? [...new Intl.Segmenter().segment(trimmedName)][0]?.segment
+        : [...trimmedName][0])
+    : null;
+  tile.letterEl.textContent = firstGrapheme ? firstGrapheme.toUpperCase() : '?';
 }
 
 /**
@@ -1070,7 +1246,7 @@ function setTileMicOffIndicator(tile, micOff) {
 
 function updateParticipantCount() {
   const total = 1 + peers.size;
-  participantCountEl.textContent = `Participants: ${total} / 6`;
+  participantCountEl.textContent = `Participants: ${total} / ${maxParticipants}`;
   updateSoloState();
   // Состав мог измениться, пока кто-то максимизирован — лента спотлайта
   // должна появиться/пропасть синхронно (см. updateSpotlightMode).
@@ -1374,6 +1550,7 @@ function buildJoinRequestCardEl(req) {
   rejectButton.addEventListener('click', () => {
     signaling.send('reject', { peerId: req.peerId });
     removePendingRequest(req.peerId);
+    pairKeysCache.delete(req.peerId); // отклонён окончательно — пара больше не нужна (см. removeRemotePeer)
   });
 
   actions.appendChild(acceptButton);
@@ -1396,6 +1573,14 @@ function addPendingRequest(peerId, name) {
 
 function removePendingRequest(peerId) {
   pendingRequests = pendingRequests.filter((r) => r.peerId !== peerId);
+  renderJoinRequests();
+}
+
+/** E2E v2: обновить имя уже показанной заявки на вход по пришедшему name-announce (см. signaling.on('name-announce')) — до этого карточка показывает «Guest» (см. buildJoinRequestCardEl). Не найден среди pendingRequests (это не ожидающий, а обычный участник) — тихий no-op. */
+function setPendingRequestName(peerId, name) {
+  const req = pendingRequests.find((r) => r.peerId === peerId);
+  if (!req) return;
+  req.name = name || null;
   renderJoinRequests();
 }
 
@@ -2203,18 +2388,21 @@ wireSettingToggle(settingGuestScreenInput, 'guestScreen');
  * раньше (fallback: пока mesh только устанавливается, шины ещё нет).
  * Формат сообщения на приёме единый для обоих путей — см. handleStreamInfo.
  *
- * Ш1 (E2E-шифрование): по шине `info` уходит КАК ЕСТЬ (P2P DataChannel уже
- * E2E за счёт DTLS, см. static/crypto.js/rtc.js) — а вот серверный fallback
- * шифрует `info` целиком под K_sig, сервер видит только {v,iv,ct}.
+ * E2E v2: по шине `info` уходит КАК ЕСТЬ (P2P DataChannel уже E2E за счёт
+ * DTLS, см. static/crypto.js/rtc.js) — а вот серверный fallback шифрует
+ * `info` целиком под попарный K_pair_sig ЭТОГО `peerId`, сервер видит только
+ * {v,iv,ct}.
  */
 function sendStreamInfoTo(peerId, info) {
   if (bus.isOpen(peerId)) {
     bus.sendToPeer(peerId, { kind: 'stream-info', info });
   } else {
-    RoomCrypto.encrypt(sigKey, info).then((encInfo) => {
-      signaling.send('stream-info', { targetPeerId: peerId, info: encInfo });
-      ConnStats.incSignalingRelay();
-    });
+    encryptSigFor(peerId, info)
+      .then((encInfo) => {
+        signaling.send('stream-info', { targetPeerId: peerId, info: encInfo });
+        ConnStats.incSignalingRelay();
+      })
+      .catch((err) => console.error(`Не удалось зашифровать stream-info для ${peerId}:`, err));
   }
 }
 
@@ -2514,12 +2702,14 @@ function createRemotePeer(peerId, name, iceServers) {
     // если генерация не удалась — тогда браузер сам выпустит сертификат, а SAS
     // просто не покажется.
     certificate: sessionCertificate,
-    // Ш1 (E2E-шифрование): offer/answer/ice-candidate к ЭТОМУ пиру всегда
-    // идут через серверный сигналинг-релей — RtcPeer шифрует/расшифровывает
-    // их сам под K_sig (см. static/rtc.js), room.js только выдаёт функции.
+    // E2E v2: offer/answer/ice-candidate к ЭТОМУ пиру всегда идут через
+    // серверный сигналинг-релей — RtcPeer шифрует/расшифровывает их сам под
+    // ПОПАРНЫЙ K_pair_sig этого peerId (см. static/rtc.js, static/crypto.js),
+    // room.js только выдаёт функции. Пара уже должна быть в кеше к этому
+    // моменту (см. cachePairKeys — вызывается ДО createRemotePeer везде).
     sigCrypto: {
-      encrypt: (obj) => RoomCrypto.encrypt(sigKey, obj),
-      decrypt: (blob) => RoomCrypto.decrypt(sigKey, blob),
+      encrypt: (obj) => encryptSigFor(peerId, obj),
+      decrypt: (blob) => decryptSigFrom(peerId, blob),
     },
     onCryptoFailure: handleCryptoFailureOnce,
     onTrack: (event) => handleRemoteTrack(peerId, event),
@@ -2569,6 +2759,7 @@ function removeRemotePeer(peerId) {
   entry.tile.root.remove();
   peers.delete(peerId);
   peerNames.delete(peerId);
+  pairKeysCache.delete(peerId); // E2E v2: пир ушёл — попарный ключ больше не нужен (см. static/crypto.js, PFS)
   peerMediaRefs.delete(peerId);
   peerStatsHistory.delete(peerId); // иначе новое соединение с тем же peerId унаследует чужую точку отсчёта скорости
   peerLastStats.delete(peerId); // тот же принцип — кеш скорости не должен пережить peerId
@@ -2718,14 +2909,19 @@ joinNameInputEl.addEventListener('keydown', (event) => {
 });
 
 async function init() {
-  // Ш1 (E2E-шифрование): ключ комнаты обязателен ДО показа чего-либо
-  // связанного с реальным входом — без него нет смысла даже спрашивать имя,
-  // всё равно ничего не заработает (см. docs/e2e-encryption.md,
-  // deriveRoomKeys выше). Та же семантика, что и при отказе расшифровки
-  // первого входящего сообщения (см. showInvalidLinkOverlay).
-  const keysOk = await deriveRoomKeys();
-  if (!keysOk) {
+  // E2E v2: токен ссылки (`t`/`e`) обязателен ДО показа чего-либо связанного
+  // с реальным входом — без него нет смысла даже спрашивать имя, всё равно
+  // ничего не заработает (см. docs/e2e-encryption.md, initCryptoIdentity
+  // выше). Та же семантика (для 'invalid'), что и при отказе расшифровки
+  // первого входящего сообщения (см. showInvalidLinkOverlay); 'expired' —
+  // отдельный терминальный оверлей (см. showLinkExpiredOverlay).
+  const status = await initCryptoIdentity();
+  if (status === 'invalid') {
     showInvalidLinkOverlay();
+    return;
+  }
+  if (status === 'expired') {
+    showLinkExpiredOverlay();
     return;
   }
 
@@ -2780,19 +2976,23 @@ async function connectAndJoin() {
   }
 
   registerSignalingHandlers(iceServersCache);
-  // Ш1: имя шифруется под K_meta ВСЕГДА (даже пустое/null) — присутствие
-  // самого поля больше не сигнализирует ничего, сервер и так его не читает
-  // (см. static/crypto.js: encryptToBase64).
-  const encName = await encryptMyName();
+  // E2E v2: `name` теперь ВСЕГДА null на проводе (имя ходит отдельным
+  // зашифрованным `name-announce`, см. src/protocol.rs и sendNameAnnounceTo/
+  // broadcastNameAnnounceTo выше) — `peerId`/`epub` — наша собственная
+  // идентичность вкладки (см. initCryptoIdentity), шлём её явно с самого
+  // первого входа (не только при реконнекте, см. комментарий там же «Почему
+  // peerId выбирает клиент»).
   signaling.send('join-room', {
     roomId,
-    name: encName,
+    name: null,
+    peerId: myPeerId,
+    epub: myEpub,
     ...(initialLeaderToken ? { leaderToken: initialLeaderToken } : {}),
   });
 }
 
 function registerSignalingHandlers(iceServers) {
-  signaling.on('joined', async ({ peerId, peers: otherPeers, screenOwner, leaderId: joinedLeaderId, settings, pending, expiresInSeconds }) => {
+  signaling.on('joined', ({ peerId, peers: otherPeers, screenOwner, leaderId: joinedLeaderId, settings, pending, expiresInSeconds, maxParticipants: joinedMaxParticipants }) => {
     // Реконнект ждёт именно этот ответ (см. sendJoinAndWait) — репортуем ему
     // исход в дополнение к обычной обработке ниже (при первом входе
     // pendingJoinResolve никогда не взведён).
@@ -2804,22 +3004,36 @@ function registerSignalingHandlers(iceServers) {
     // Duration Ceiling»).
     startRoomTimer(expiresInSeconds);
 
+    // Потолок участников — берём с сервера на КАЖДОМ joined (аддитивное
+    // поле, см. maxParticipants выше); если его нет (старый сервер), не
+    // трогаем текущий фолбэк. total пересчитается ниже через
+    // updateParticipantCount на своём обычном пути.
+    if (typeof joinedMaxParticipants === 'number' && Number.isFinite(joinedMaxParticipants)) {
+      maxParticipants = joinedMaxParticipants;
+    }
+
     if (!joinedOnce) {
       // --- Первый вход в комнату (не реконнект) ---
       joinedOnce = true;
-      myPeerId = peerId;
+      myPeerId = peerId; // почти всегда то же, что мы сами сгенерировали (см. initCryptoIdentity) — переприсваиваем на случай крайне редкой коллизии UUID
       hideOverlay();
 
       ownTile = createTile(peerId, myName, true);
 
-      // Ш1: имена остальных участников приходят зашифрованными под K_meta
-      // (см. src/protocol.rs::PeerInfo.name) — расшифровываем перед любым
-      // отображением; не расшифровалось -> «Гость» (см. decryptPeerName).
+      // E2E v2: имена остальных участников больше НЕ приходят в этом
+      // сообщении (PeerInfo.name всегда null у v2-клиентов, см.
+      // src/protocol.rs) — тайлы создаём с плейсхолдером «Guest» (см.
+      // createTile), настоящие имена приедут отдельными name-announce (см.
+      // ниже). Пары ключей кешируем СРАЗУ из epub — до createRemotePeer,
+      // чтобы sigCrypto (SDP/ICE/stream-info, см. createRemotePeer) сразу
+      // нашёл готовый ключ в кеше.
       for (const p of otherPeers) {
-        const decodedName = await decryptPeerName(p.name);
-        peerNames.set(p.peerId, decodedName);
-        createRemotePeer(p.peerId, decodedName, iceServers);
+        cachePairKeys(p.peerId, p.epub);
+        createRemotePeer(p.peerId, null, iceServers);
       }
+      // Анонсируем своё имя всем, кого уже видим (если оно не пусто) —
+      // «идемпотентно» переотправится и на реконнекте (см. ветку ниже).
+      broadcastNameAnnounceTo(otherPeers.map((p) => p.peerId));
 
       currentScreenOwnerPeerId = screenOwner || null;
       if (currentScreenOwnerPeerId && currentScreenOwnerPeerId !== myPeerId) {
@@ -2827,9 +3041,10 @@ function registerSignalingHandlers(iceServers) {
       }
 
       roomSettings = settings;
-      pendingRequests = await Promise.all(
-        (pending || []).map(async (p) => ({ peerId: p.peerId, name: await decryptPeerName(p.name) }))
-      );
+      pendingRequests = (pending || []).map((p) => {
+        cachePairKeys(p.peerId, p.epub);
+        return { peerId: p.peerId, name: null }; // «Guest», пока не придёт name-announce от этого pending
+      });
       setLeaderIndicator(joinedLeaderId);
       updateSettingsButtonVisibility();
       renderJoinRequests();
@@ -2872,19 +3087,33 @@ function registerSignalingHandlers(iceServers) {
     // сервер мог уже удалить нас и назначить нового лидера) — pending
     // видим заново, только если после реконнекта лидер снова мы.
     pendingRequests = isLeader
-      ? await Promise.all((pending || []).map(async (p) => ({ peerId: p.peerId, name: await decryptPeerName(p.name) })))
+      ? (pending || []).map((p) => {
+          cachePairKeys(p.peerId, p.epub);
+          return { peerId: p.peerId, name: null };
+        })
       : [];
     renderJoinRequests();
     applyGuestEnforcement();
-    await reconcileAfterReconnect(otherPeers, screenOwner);
+    reconcileAfterReconnect(otherPeers, screenOwner);
     refreshMediaRenderingForAllPeers();
+    updateParticipantCount(); // на случай, если maxParticipants выше сменился (сервер перезапустили с другим env)
+    // Реджойн (см. static/crypto.js, «PFS»): пара keys та же (myEphemeralKeyPair
+    // не менялся), но переотправляем name-announce всем — идемпотентно, на
+    // случай что кто-то из пиров тоже реконнектнулся и потерял состояние.
+    broadcastNameAnnounceTo(otherPeers.map((p) => p.peerId));
   });
 
-  signaling.on('waiting', () => {
+  signaling.on('waiting', ({ leaderPeerId, leaderEpub }) => {
     // Лобби (см. docs/permissions-and-leader.md, «The Waiting Room
     // (Lobby)»): вместо joined сначала приходит
     // это — ждём решения лидера. «Отменить» = leave + на главную (тот же
     // приём, что и у leaveButton ниже — intentionalDisconnect до leave).
+    // E2E v2: как только известен epub лидера — анонсируем ему своё имя (если
+    // оно не пусто), см. sendNameAnnounceTo. Сервер шлёт СВЕЖИЙ `waiting` при
+    // смене лидера, пока мы ждём (см. src/ws.rs) — этот обработчик срабатывает
+    // повторно и переотправляет анонс уже новому лидеру.
+    cachePairKeys(leaderPeerId, leaderEpub);
+    sendNameAnnounceTo(leaderPeerId);
     showOverlay({
       title: 'Waiting for approval…',
       text: myName ? `You joined as "${myName}"` : 'Waiting for the room leader to respond.',
@@ -2898,12 +3127,43 @@ function registerSignalingHandlers(iceServers) {
     });
   });
 
-  signaling.on('join-request', async ({ peerId, name }) => {
-    addPendingRequest(peerId, await decryptPeerName(name));
+  signaling.on('join-request', ({ peerId, epub }) => {
+    cachePairKeys(peerId, epub);
+    addPendingRequest(peerId, null); // «Guest», пока не придёт name-announce от этого pending (см. signaling.on('name-announce'))
   });
 
   signaling.on('join-request-cancelled', ({ peerId }) => {
     removePendingRequest(peerId);
+    pairKeysCache.delete(peerId); // ожидающий ушёл окончательно, не дожидаясь решения — пара больше не нужна
+  });
+
+  // E2E v2: анонс имени (см. src/protocol.rs::ServerMessage::NameAnnounce) —
+  // от обычного участника ЛЮБОМУ другому, или от pending ТОЛЬКО текущему
+  // лидеру (сервер сам это разграничивает, см. src/ws.rs::handle_name_announce).
+  //
+  // Сообщение от отправителя, с которым НЕТ установленной пары
+  // (pairKeysCache), тихо игнорируется с warn — это НЕ криптопровал: либо
+  // легальный in-flight от только что ушедшего пира (его пара уже почищена
+  // в removeRemotePeer/reject/join-request-cancelled — гонка «сообщение уже
+  // летело, когда пир ушёл» штатна для живого релея), либо мусорный peerId
+  // от сервера. Ни то ни другое не сигнал MITM — атакующему нечего выиграть
+  // сообщением, которое мы игнорируем, а настоящий MITM, портящий трафик
+  // ИЗВЕСТНОЙ пары, по-прежнему бьётся о GCM-провал ниже. Семантика
+  // «известный отправитель + не расшифровалось = терминальный оверлей»
+  // (handleCryptoFailureOnce) сохраняется без изменений — тот же принцип,
+  // что и у offer/answer/ice-candidate (там guard'ом служит peers.get).
+  signaling.on('name-announce', ({ from, payload }) => {
+    if (!pairKeysCache.has(from)) {
+      console.warn('name-announce от отправителя без установленной пары (ушёл/неизвестен) — игнорируем:', from);
+      return;
+    }
+    decryptNameAnnouncePayload(from, payload)
+      .then((name) => {
+        peerNames.set(from, name);
+        updatePeerTileName(from, name);
+        setPendingRequestName(from, name);
+      })
+      .catch((err) => handleCryptoFailureOnce(err));
   });
 
   signaling.on('join-rejected', () => {
@@ -2955,7 +3215,12 @@ function registerSignalingHandlers(iceServers) {
     terminalState = true;
     showOverlay({
       title: 'Room is full',
-      text: 'This room already has the maximum of 6 participants. Please try again later.',
+      // room-full приходит ДО joined (заявка отклонена, joined никогда не
+      // придёт этому сокету) — свежего joined.maxParticipants для ЭТОГО
+      // отказа нет и не будет, поэтому текст использует ту же переменную
+      // maxParticipants, что и остальной UI: значение с сервера, если мы
+      // сами когда-то успешно входили в эту сессию браузера, иначе фолбэк 6.
+      text: `This room already has the maximum of ${maxParticipants} participants. Please try again later.`,
     });
   });
 
@@ -2986,9 +3251,8 @@ function registerSignalingHandlers(iceServers) {
     teardownMeshMediaChat('Meeting time is up.');
   });
 
-  signaling.on('peer-joined', async ({ peerId, name }) => {
-    const decodedName = await decryptPeerName(name);
-    peerNames.set(peerId, decodedName);
+  signaling.on('peer-joined', ({ peerId, epub }) => {
+    cachePairKeys(peerId, epub);
     if (peers.has(peerId)) {
       // Уже знаем этого пира — mesh пережил обрыв сигналинга (наш или его),
       // это просто повторный peer-joined от его собственного реконнекта.
@@ -2996,8 +3260,11 @@ function registerSignalingHandlers(iceServers) {
       cancelPendingPeerRemoval(peerId);
       return;
     }
-    createRemotePeer(peerId, decodedName, iceServers);
+    // E2E v2: имя приедет отдельным name-announce (см. выше) — до этого
+    // тайл с плейсхолдером «Guest» (см. createTile).
+    createRemotePeer(peerId, null, iceServers);
     updateParticipantCount();
+    sendNameAnnounceTo(peerId); // «на peer-joined нового пира — name-announce ему»
   });
 
   signaling.on('peer-left', ({ peerId }) => {
@@ -3030,11 +3297,19 @@ function registerSignalingHandlers(iceServers) {
   // конкретному пиру ещё не открыта (в основном bootstrap-окно сразу после
   // входа в комнату); дальше основной путь — bus.onMessage выше, этот
   // обработчик становится редким (см. handleStreamInfo — общая точка входа).
-  // Ш1: `info` с этого пути приходит зашифрованным под K_sig (см.
-  // sendStreamInfoTo) — по шине (bus.onMessage выше) info остаётся
-  // как есть, не завёрнутым.
-  signaling.on('stream-info', ({ info }) => {
-    RoomCrypto.decrypt(sigKey, info)
+  // E2E v2: `info` с этого пути приходит зашифрованным под попарный
+  // K_pair_sig ИМЕННО отправителя `fromPeerId` (см. sendStreamInfoTo) — по
+  // шине (bus.onMessage выше) info остаётся как есть, не завёрнутым.
+  // Отправитель без установленной пары — тихий warn-скип, НЕ криптопровал:
+  // in-flight сообщение от только что ушедшего пира (пара уже почищена в
+  // removeRemotePeer) — штатная гонка живого релея, см. подробное
+  // обоснование у signaling.on('name-announce') выше.
+  signaling.on('stream-info', ({ fromPeerId, info }) => {
+    if (!pairKeysCache.has(fromPeerId)) {
+      console.warn('stream-info от отправителя без установленной пары (ушёл/неизвестен) — игнорируем:', fromPeerId);
+      return;
+    }
+    decryptSigFrom(fromPeerId, info)
       .then((plainInfo) => handleStreamInfo(plainInfo))
       .catch((err) => handleCryptoFailureOnce(err));
   });
@@ -3131,14 +3406,16 @@ function waitForJoinOutcome(timeoutMs) {
   });
 }
 
-/** Отправить join-room со своим прежним peerId (см. src/protocol.rs) и дождаться исхода. */
-async function sendJoinAndWait() {
+/** Отправить join-room со своим прежним peerId/epub (см. src/protocol.rs) и дождаться исхода. */
+function sendJoinAndWait() {
   const promise = waitForJoinOutcome(RECONNECT_JOIN_TIMEOUT_MS);
-  const encName = await encryptMyName(); // Ш1: то же самое K_meta-шифрование имени, что и при первом входе (см. connectAndJoin)
+  // E2E v2: `name` всегда null (см. connectAndJoin) — peerId/epub те же, что
+  // и при первом входе (не менялись, см. initCryptoIdentity).
   signaling.send('join-room', {
     roomId,
-    name: encName,
-    ...(myPeerId ? { peerId: myPeerId } : {}),
+    name: null,
+    peerId: myPeerId,
+    epub: myEpub,
   });
   return promise;
 }
@@ -3244,16 +3521,18 @@ function giveUpReconnect() {
  * свежем списке — не удаляем сразу, а даём грейс-период (см.
  * schedulePeerRemoval) на случай, что они просто ещё не успели ре-джойниться.
  */
-async function reconcileAfterReconnect(otherPeers, screenOwner) {
+function reconcileAfterReconnect(otherPeers, screenOwner) {
   const freshIds = new Set(otherPeers.map((p) => p.peerId));
 
   for (const p of otherPeers) {
-    const decodedName = await decryptPeerName(p.name); // Ш1: тот же K_meta, что и в joined/peer-joined
-    peerNames.set(p.peerId, decodedName);
+    cachePairKeys(p.peerId, p.epub); // тот же K_pair_meta/K_pair_sig, что и в joined/peer-joined (epub пира не меняется в течение его сессии)
     if (peers.has(p.peerId)) {
       cancelPendingPeerRemoval(p.peerId);
     } else {
-      createRemotePeer(p.peerId, decodedName, iceServersCache);
+      // Имя (если уже известно с ДО обрыва) сохранилось в peerNames — тайл
+      // создаём с ним, а не с плейсхолдером (иначе реконнект без грейс-
+      // периода истёкшего пира выглядел бы как «забыли» уже показанное имя).
+      createRemotePeer(p.peerId, peerNames.get(p.peerId) || null, iceServersCache);
     }
   }
 
@@ -3698,25 +3977,27 @@ function onSharePopupKeydown(event) {
 }
 
 /**
- * Ссылка «Поделиться» (Ш1): собирается ЗАНОВО из location.pathname + ключа
- * комнаты, запомненного при старте страницы (roomKeyBase64url, см. верх
- * файла) — НЕ из location.href, потому что leaderToken там в любом случае
- * никогда не было бы (он одноразовый и только для создателя). Вид:
- * `<origin>/r/<id>#k=<key>&n=<имя>` — БЕЗ lt. `n` добавляется только если имя
- * комнаты известно (initialRoomName) — так название комнаты едет в
- * инвайт-ссылке и становится видно всем, кто по ней перешёл (см. рендер
- * initialRoomName и парсинг фрагмента выше); сервер это имя всё равно не
- * увидит — фрагмент на сервер не уходит.
+ * Ссылка «Поделиться» (E2E v2): собирается ЗАНОВО из location.pathname +
+ * токена/срока действия, запомненных при старте страницы (linkTokenBase64url/
+ * linkExpiry, см. верх файла) — НЕ из location.href, потому что leaderToken
+ * там в любом случае никогда не было бы (он одноразовый и только для
+ * создателя). Вид: `<origin>/r/<id>#t=<token>&e=<expiry>&n=<имя>` — БЕЗ lt.
+ * `n` добавляется только если имя комнаты известно (initialRoomName) — так
+ * название комнаты едет в инвайт-ссылке и становится видно всем, кто по ней
+ * перешёл (см. рендер initialRoomName и парсинг фрагмента выше); сервер это
+ * имя всё равно не увидит — фрагмент на сервер не уходит. Все, кто зашёл по
+ * этой ссылке, аутентифицируются ОДНИМ и тем же `t`/`e` (как и раньше с `k`),
+ * но выводят СВОИ собственные попарные ключи (см. static/crypto.js).
  */
 function buildShareLink() {
   const namePart = initialRoomName ? `&n=${encodeURIComponent(initialRoomName)}` : '';
-  return `${location.origin}${location.pathname}#k=${roomKeyBase64url}${namePart}`;
+  return `${location.origin}${location.pathname}#t=${linkTokenBase64url}&e=${linkExpiry}${namePart}`;
 }
 
 /**
  * Отрисовать QR ЛОКАЛЬНО в браузере (см. static/vendor/qrcode.js —
  * kazuhikoarase/qrcode-generator, MIT) вместо похода на сервер: ссылка
- * комнаты несёт секретный ключ (#k) и не должна покидать вкладку ради
+ * комнаты несёт секретные `#t`/`#e` и не должна покидать вкладку ради
  * картинки. `qrcode(0, 'M')` — typeNumber=0 значит авто-подбор версии QR под
  * длину текста, 'M' — стандартный уровень коррекции ошибок. createSvgTag
  * строит SVG из чистых числовых координат (сам текст ссылки в разметку не

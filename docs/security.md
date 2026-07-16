@@ -50,10 +50,11 @@ and states known gaps plainly rather than implying full coverage.
 | A hostile origin reading camera/microphone/screen through an embedded frame | Mitigated | `Permissions-Policy` restricts capture APIs to `self` (M2, [§6](#6-m2--security-headers--csp)) |
 | A meeting running indefinitely, accumulating state forever | Mitigated | Hard maximum meeting lifetime, enforced by a background reaper regardless of live participants ([§8](#8-meeting-duration-ceiling)) |
 | A guest bypassing a chat/audio/video restriction via a modified client | **Not fully mitigated — cooperative only** | See [`permissions-and-leader.md` §7](permissions-and-leader.md#7-guest-permissions--how-theyre-actually-enforced) and [§9](#9-known-boundaries) below |
-| Recovering plaintext of a past meeting after the room key leaks | **Not mitigated** | No forward secrecy — `K_sig`/`K_meta` are derived from `k` once and never rotated (see [`e2e-encryption.md` §6](e2e-encryption.md#6-known-limitations)). Chat/media never touch the server (P2P, DTLS-E2E — nothing server-side to recover); the former content-key epoch rotation was removed with the chat fallback (see [`chat.md` §12](chat.md#12-no-server-fallback)) |
+| Recovering plaintext of a past meeting's relayed signaling after the link leaks **later** (after the meeting ended) | **Mitigated (forward secrecy)** | Encryption keys are derived from a fresh per-tab ephemeral ECDH keypair that's never persisted anywhere and dies with the tab; the link's static token `t` only ever authenticated, it never encrypted (see [`e2e-encryption.md` §2.3](e2e-encryption.md#23-ephemeral-per-tab-keys--pairwise-derivation-forward-secrecy)). Chat/media never touch the server either way (P2P, DTLS-E2E — nothing server-side to recover) |
+| A link leaking **during** the room's still-live session | **Not mitigated — inherent to the model** | Grants exactly the same access it always did: whoever has a working `t`/`e` can join and derive keys with every current participant ([§9](#9-known-boundaries)) |
 | A leaked/guessed room id or link granting access | Inherent to the model, mitigated by entropy | The link itself is the only credential; room ids are drawn from a large enough space that guessing one is impractical (see [`privacy.md`](privacy.md)) |
 | A compromised/malicious static-file host (Ш2 split-origin, [`self-hosting.md` §1.2](self-hosting.md#12-split-origin-frontend--signaling-separated)) silently serving tampered frontend JS | **Forensic checkpoint only, not preventive** | Reproducible SHA-256 of the deployed bundle, published to an independent channel (GitHub Release) the static host doesn't control (§10, [§10.4](#104-what-this-doesnt-protect-against) for exactly what this doesn't cover) |
-| An active MITM (malicious relay, or an attacker controlling link delivery) handing different room keys to different participants and bridging the halves | **Detected by human out-of-band comparison** | Commit-before-reveal SAS: five emoji per room that agree across honest participants unless bridged; residual attack is a `2^-30` blind guess (§11, [`sas-verification.md`](sas-verification.md)) |
+| An active MITM (malicious relay, or an attacker controlling link delivery) handing different link tokens (`t`) to different participants and bridging the halves | **Detected by human out-of-band comparison** | Commit-before-reveal SAS: five emoji per room that agree across honest participants unless bridged; residual attack is a `2^-30` blind guess (§11, [`sas-verification.md`](sas-verification.md)) |
 
 ## 3. H1 — Ephemeral TURN Credentials
 
@@ -120,14 +121,14 @@ non-blocking by construction.
   application at all.
 - **Relay payload size**: `offer`/`answer`/`ice-candidate`/`stream-info`
   payloads capped at 16KB serialized (the server doesn't parse `sdp` /
-  `candidate` / `info`, but must still bound their size); `chat` has its own,
-  tighter 8KB cap on the envelope.
+  `candidate` / `info`, but must still bound their size).
 - **Relay rate limit**: one shared sliding-window counter per connection
   covers **all** relay types combined (100 messages / 10 seconds) —
   deliberately not split per message type, since separate per-type counters
-  would let an attacker dodge the limit simply by alternating types. `chat`
-  additionally has its own, stricter limit (10 / 10 seconds) on top of the
-  shared one.
+  would let an attacker dodge the limit simply by alternating types. Chat
+  isn't part of this counter at all — it never touches the server (see
+  [`chat.md` §12](chat.md#12-no-server-fallback)); its only rate limit is the
+  client-side, cooperative one described there ([§11](chat.md#11-rate-limiting)).
 - **Room count ceiling**: a configurable maximum number of simultaneous
   rooms; `POST`/`PUT` room creation/restoration return `503` once reached,
   checked under the same lock as the insertion itself so a race between
@@ -216,11 +217,14 @@ Stated plainly, not buried:
   mechanism, even in principle, for the server to detect or prevent that
   without becoming a media/data relay itself — which would contradict the
   product's core privacy property (see [`PRD.md` §6.1](PRD.md#61-nfr-inclusions)).
-- **No forward secrecy.** `K_sig`/`K_meta` are derived from `k` once and never
-  rotated (see [`e2e-encryption.md` §6](e2e-encryption.md#6-known-limitations)).
-  The former content-key epoch rotation only ever protected the server-relayed
-  chat fallback and was removed with it (chat is P2P/DTLS only now) — see
-  [`chat.md` §12](chat.md#12-no-server-fallback).
+- **A link leaking *during* the room's live session is exactly as bad as it
+  ever was.** Forward secrecy (see
+  [`e2e-encryption.md` §2.3](e2e-encryption.md#23-ephemeral-per-tab-keys--pairwise-derivation-forward-secrecy))
+  protects a *past* session from a *later* link leak — it does nothing for a
+  *live* one. Anyone who obtains a working `t`/`e` while the room is still
+  running can join and derive keys with every current participant, same as
+  before forward secrecy existed. This is inherent to the link-is-the-credential
+  model, not a bug to fix.
 - **Per-IP rate limiting is not attacker-proof.** Client IP is inferred from
   proxy headers with a direct-connection fallback; a sufficiently motivated
   attacker behind a spoofable or absent proxy chain could evade it. The goal
@@ -341,9 +345,9 @@ claim).
 
 ### 10.3 Not in the Link, Not in the QR
 
-The room link (`<origin>/r/<id>#k=<key>`) and the QR code rendered from it
-(see [`e2e-encryption.md`](e2e-encryption.md) for what `#k` is) carry
-**only** the room URL — the build hash is never appended to either, and the
+The room link (`<origin>/r/<id>#t=<token>&e=<expiry>`) and the QR code rendered
+from it (see [`e2e-encryption.md`](e2e-encryption.md) for what `#t`/`#e` are)
+carry **only** the room URL — the build hash is never appended to either, and the
 QR-rendering code (`static/room.js`: `renderShareQr`/`buildShareLink`) is
 untouched by this feature. It's shown as a separate line of plain text next
 to the link and QR in the "Share" popup, precisely so that copying the link
@@ -379,14 +383,14 @@ Stated plainly, not buried:
 
 The end-to-end signaling encryption ([`e2e-encryption.md`](e2e-encryption.md))
 contains a passive server, and an active server that only relays: neither can
-read or forge what it carries without the room key `k`, and the browser refuses
-any DTLS connection whose certificate doesn't match the (authenticated) SDP.
-The one scenario that chain cannot cover is an active man-in-the-middle who
+read or forge what it carries without the link token `t`, and the browser
+refuses any DTLS connection whose certificate doesn't match the (authenticated)
+SDP. The one scenario that chain cannot cover is an active man-in-the-middle who
 **poisons the trust anchor itself** — the link. An attacker who controls link
 delivery, or who fully controls the relay and is willing to run an active
-bridge, can hand *different* room keys to different participants and stitch the
+bridge, can hand *different* tokens `t` to different participants and stitch the
 two encrypted halves together. Every ciphertext still decrypts cleanly, because
-each half is internally consistent; the cryptography worked, but against a key
+each half is internally consistent; the cryptography worked, but against a token
 the attacker chose.
 
 Because the product deliberately has no identity/PKI layer (see

@@ -2,7 +2,7 @@
 
 <!-- toc -->
 
-- [1. Why This Exists — The Gap the Room Key Doesn't Close](#1-why-this-exists--the-gap-the-room-key-doesnt-close)
+- [1. Why This Exists — The Gap the Link Token Doesn't Close](#1-why-this-exists--the-gap-the-link-token-doesnt-close)
 - [2. The Attack, Precisely](#2-the-attack-precisely)
 - [3. Why the Obvious SAS Is Broken (and Why More Emoji Won't Save It)](#3-why-the-obvious-sas-is-broken-and-why-more-emoji-wont-save-it)
 - [4. The Fix: Commit-Before-Reveal](#4-the-fix-commit-before-reveal)
@@ -36,29 +36,29 @@
 > removed). This document is the specification the code implements; where the
 > two disagree, the code is authoritative and this file is a bug.
 
-## 1. Why This Exists — The Gap the Room Key Doesn't Close
+## 1. Why This Exists — The Gap the Link Token Doesn't Close
 
 The end-to-end signaling encryption ([`e2e-encryption.md`](e2e-encryption.md))
 makes one guarantee very well: the **signaling server cannot read or tamper
 with** what it relays, because everything sensitive it carries (SDP, ICE
-candidates, names) is encrypted under keys derived from the room key `k`, and
-`k` lives only in the link fragment and never reaches the server (chat isn't
-even in this list — it never touches the server at all). The
-browser itself then refuses any DTLS connection whose certificate doesn't
+candidates, names) is encrypted under pairwise keys derived from the link
+token `t`, and `t` lives only in the link fragment and never reaches the
+server (chat isn't even in this list — it never touches the server at all).
+The browser itself then refuses any DTLS connection whose certificate doesn't
 match the fingerprint carried in that (authenticated) SDP. So a **passive**
 server, and an **active** server that only relays, are both fully contained:
-the media path is authenticated by possession of `k`.
+the media path is authenticated by possession of `t`.
 
 There is exactly one thing that chain does **not** cover, because the chain's
 entire root of trust is *the link itself*:
 
 > **What if the attacker controls how the link reaches you?**
 
-The room key is distributed by sharing a URL. If an adversary sits on that
+The link token is distributed by sharing a URL. If an adversary sits on that
 distribution channel — or fully controls the signaling relay and is willing to
-run an active bridge rather than merely relay — they can hand **different room
-keys to different participants** and stitch the two halves together in the
-middle. Each half is then perfectly, honestly encrypted… to the attacker. No
+run an active bridge rather than merely relay — they can hand **different
+tokens `t` to different participants** and stitch the two halves together in
+the middle. Each half is then perfectly, honestly encrypted… to the attacker. No
 ciphertext fails to decrypt, no browser DTLS check fires, because within each
 half everything is internally consistent. The cryptography did its job; the
 *trust anchor was poisoned before the cryptography began*.
@@ -77,10 +77,11 @@ of base64.
 Two honest participants, Alice and Bob. An active MITM, Mallory, who controls
 link distribution or the relay.
 
-1. Mallory gives Alice a link carrying `k_A` and Bob a link carrying `k_B`
-   (`k_A ≠ k_B`, both chosen by Mallory).
+1. Mallory gives Alice a link carrying `t_A` and Bob a link carrying `t_B`
+   (`t_A ≠ t_B`, both chosen by Mallory).
 2. Alice's browser sets up a WebRTC session that is really **Alice ↔ Mallory**,
-   encrypted under `k_A`. Bob's is really **Bob ↔ Mallory**, under `k_B`.
+   encrypted under keys derived from `t_A`. Bob's is really **Bob ↔ Mallory**,
+   under keys derived from `t_B`.
 3. Mallory decrypts everything from Alice, re-encrypts to Bob, and vice versa.
    She sees and can alter all media and chat.
 4. Alice and Bob each see a working call with the expected other person. No
@@ -95,21 +96,21 @@ ballgame, and it is where a naive design fails.
 
 ## 3. Why the Obvious SAS Is Broken (and Why More Emoji Won't Save It)
 
-The obvious construction is: `SAS = HKDF(k, sorted DTLS fingerprints) → emoji`.
+The obvious construction is: `SAS = HKDF(t, sorted DTLS fingerprints) → emoji`.
 It is **broken**, and it is worth documenting exactly why, because the failure
 is subtle and the instinctive fix (more emoji) does not work.
 
-Mallory controls, *independently on each leg*, both `k` (she issued the links)
+Mallory controls, *independently on each leg*, both `t` (she issued the links)
 and her own DTLS certificate (she generates it). So:
 
-- Alice displays `SAS_A = f(k_A, {fp_Alice, fp_Mallory→Alice})`.
-- Bob displays `SAS_B = f(k_B, {fp_Bob, fp_Mallory→Bob})`.
+- Alice displays `SAS_A = f(t_A, {fp_Alice, fp_Mallory→Alice})`.
+- Bob displays `SAS_B = f(t_B, {fp_Bob, fp_Mallory→Bob})`.
 
 Mallory doesn't need to hit a *fixed target* — she only needs `SAS_A == SAS_B`,
-any value. So she does a **birthday attack**: vary `k_A` to build a table of
-`SAS_A` values, vary `k_B` for a table of `SAS_B` values, look for any
+any value. So she does a **birthday attack**: vary `t_A` to build a table of
+`SAS_A` values, vary `t_B` for a table of `SAS_B` values, look for any
 collision. For an `n`-bit SAS this costs `~2^(n/2)` work instead of `2^n`, and
-varying `k` is just a cheap HKDF recomputation.
+varying `t` is just a cheap HKDF recomputation.
 
 For the 30-bit SAS this project uses (five emoji from a 64-symbol alphabet),
 birthday work is `~2^16 ≈ 6.5×10^4` HKDF evaluations — **well under a tenth
@@ -118,9 +119,9 @@ the humans have finished reading the emoji aloud. Concretely:
 
 | Attack path | Work | One CPU core |
 |---|---|---|
-| Grind `k` (HKDF), birthday | 2^16 | **~0.04 s** |
+| Grind `t` (HKDF), birthday | 2^16 | **~0.04 s** |
 | Grind certificates, birthday | 2^16 | ~seconds, embarrassingly parallel |
-| Grind `k` (HKDF), fixed-target preimage | 2^30 | ~12 min (but this isn't the attack Mallory needs) |
+| Grind `t` (HKDF), fixed-target preimage | 2^30 | ~12 min (but this isn't the attack Mallory needs) |
 
 Making the string longer barely helps while the grind exists: because birthday
 halves the exponent, reaching "years even on an ASIC" would need roughly **25
@@ -439,7 +440,7 @@ value to the actual media transport. No DTLS key access required.
 
 **Defends against:** a real-time active man-in-the-middle — including a fully
 malicious signaling relay, or an attacker who controls how the link reaches a
-participant — who hands different room keys to different participants and
+participant — who hands different tokens `t` to different participants and
 bridges the halves. Such an attacker cannot make the displayed SAS agree across
 the honest participants except by a `2^-30` blind guess.
 
@@ -447,7 +448,7 @@ the honest participants except by a `2^-30` blind guess.
 
 - **Whoever serves the frontend JavaScript — the single biggest boundary.** SAS
   runs *inside* the client code. Whoever ships that code can defeat it
-  completely and invisibly: read `k` directly, disable the check, or just paint
+  completely and invisibly: read `t` directly, disable the check, or just paint
   the *same* fake emoji in both victims' headers. In a single-origin deployment
   the signaling server also serves the JS, so **trusting the SAS means trusting
   the server operator** — the very party SAS is otherwise meant to guard
@@ -518,7 +519,7 @@ the absence of a code isn't quietly mistaken for success.
 | SAS length | 5 emoji = 30 bits | Ample once the grind is removed; matches ZRTP-class SAS strength |
 | Nonce size | 32 bytes | Commitment collisions/second-preimages infeasible |
 | Commitment | SHA-256("sas-commit-v2" ‖ roundId ‖ peerTag ‖ nonce) | Binding; domain-separated per round and author; hex inputs |
-| KDF | HKDF-SHA256, empty salt | Same primitive as the rest of the key schedule ([`e2e-encryption.md` §2.2](e2e-encryption.md#22-key-derivation-hkdf-sha256--two-aes-256-gcm-keys)) |
+| KDF | HKDF-SHA256, empty salt | Same primitive family as the rest of the key schedule ([`e2e-encryption.md` §2.3](e2e-encryption.md#23-ephemeral-per-tab-keys--pairwise-derivation-forward-secrecy)) — unlike `K_pair_sig`/`K_pair_meta`, which are salted with `K_auth`, the SAS derivation uses an empty salt since the nonces themselves already supply per-round randomness |
 | Round identity | SHA-256 of sorted (peerTag:fingerprint) | Coordinator-free; self-healing; **binds certificates** so a cert change can't be ground (§7.2) |
 | Canonical encoding | peerId hashed to fixed-width hex; hex-only fields | Injection-proof even if a malicious relay supplies crafted peer ids (§5.1) |
 | Transport | P2P bus only | Server learns nothing new from this feature |

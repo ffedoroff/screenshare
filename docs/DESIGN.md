@@ -170,7 +170,7 @@ deploys (no rolling update / no horizontal scaling).
 | PRD Requirement | Implemented In | Tech Doc |
 |------------------|-----------------|----------|
 | `cpt-chat-fr-create-meeting` | `POST /api/rooms` | [`signaling-protocol.md`](signaling-protocol.md) |
-| `cpt-chat-fr-share-link` | Client-generated room key in the URL fragment; QR rendered locally | [`e2e-encryption.md`](e2e-encryption.md) |
+| `cpt-chat-fr-share-link` | Client-generated auth token + expiry in the URL fragment; QR rendered locally | [`e2e-encryption.md`](e2e-encryption.md) |
 | `cpt-chat-fr-join-meeting` | `join-room` WebSocket message, room size cap | [`signaling-protocol.md`](signaling-protocol.md) |
 | `cpt-chat-fr-av-mute` | Local track enable/disable, no renegotiation | [`webrtc-mesh.md`](webrtc-mesh.md) |
 | `cpt-chat-fr-screen-share` | `share-start`/`share-stop`/`share-started`/`share-rejected`, server-held single-owner lock, last-wins preemption on conflict | [`signaling-protocol.md`](signaling-protocol.md), [`permissions-and-leader.md`](permissions-and-leader.md) |

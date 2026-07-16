@@ -85,8 +85,19 @@ While `lobbyEnabled` is `true`, any **non-leader** joining the room is not
 admitted immediately: the server places them in a separate pending list
 (distinct from the room's participant list — the participant ceiling
 doesn't count them, though the waiting list itself has its own, more
-generous cap), sends them `waiting`, and notifies the leader with
-`join-request {peerId, name}`.
+generous cap), sends them `waiting {leaderPeerId, leaderEpub}`, and notifies
+the leader with `join-request {peerId, epub}`.
+
+Neither message carries a plaintext name any more (E2E v2, see
+[`e2e-encryption.md`](e2e-encryption.md)): a pending arrival's name field is
+always `null` in `join-request`, and the leader's lobby card for them shows a
+generic "Guest" placeholder until the arrival separately sends a
+`name-announce` to the leader (encrypted under a key derived from the
+arrival's own `epub` and the `leaderEpub` it was handed) — the card updates
+in place once that decrypts. A pending arrival is otherwise not a
+participant: it cannot target `name-announce` at anyone *other* than the
+current leader (see [`signaling-protocol.md`](signaling-protocol.md)), since
+it has no visibility into who else is in the room.
 
 The leader resolves each request individually:
 
@@ -101,7 +112,11 @@ Additional rules:
   `join-request-cancelled`.
 - If the leader changes while requests are still pending, the **new**
   leader receives every pending request again (as fresh `join-request`
-  messages) — they haven't seen them yet.
+  messages) — they haven't seen them yet. Symmetrically, every **pending
+  arrival** still waiting receives a fresh `waiting` with the new leader's
+  `leaderPeerId`/`leaderEpub` (E2E v2) — its old `leaderEpub` derives a
+  pairwise key with a leader who is no longer there, so its client
+  re-sends its `name-announce` to the new leader using the new `leaderEpub`.
 - If the room empties out entirely while requests are still pending, every
   waiting arrival receives `join-rejected` and is disconnected — there is no
   one left to approve them, and the room itself proceeds into its normal

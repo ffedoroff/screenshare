@@ -10,26 +10,38 @@
 // этой же странице (см. там же — читается и сразу вычищается из адресной
 // строки через history.replaceState, прежде чем показать что-либо ещё).
 //
-// Ключ комнаты (Ш1, E2E-шифрование — см. static/crypto.js/room.js): здесь же,
-// рядом с leaderToken, генерируется случайный `k` (32 байта, base64url) и
-// кладётся ВТОРЫМ параметром того же фрагмента (#lt=...&k=...) — сервер его
-// не видит и вообще не участвует в его создании, это чисто клиентский
-// секрет. room.js парсит оба параметра фрагмента разом и точно так же
-// вычищает их из адресной строки. Из `k` room.js выводит ключи, которыми
-// шифруется всё, что проходит через серверный релей (SDP/ICE/имя участника/
-// fallback-чат) — см. docs/e2e-encryption.md, «Key Model».
+// E2E v2 («вариант E», см. docs/research-p2p-key-handoff.md §6.5–6.6 и
+// static/crypto.js): здесь же, рядом с leaderToken, генерируются ДВА
+// параметра нового фрагмента —
+//   - `t` — статический PSK-токен (16 случайных байт, base64url,
+//     RoomCrypto.generateRoomToken()). Он НИКОГДА не шифрует трафик сам —
+//     только аутентифицирует эфемерные попарные ключи, которые каждая
+//     вкладка выводит САМА при входе (см. static/room.js, static/crypto.js).
+//   - `e` — момент истечения ссылки, unix-секунды в base36:
+//     `floor(Date.now()/1000) + lifetimeSeconds + 300`. `lifetimeSeconds`
+//     берём из ответа `POST /api/rooms` (тот же `MAX_ROOM_LIFETIME_SECONDS`,
+//     которым сервер реально ограничивает жизнь комнаты — см. src/main.rs);
+//     если поля в ответе почему-то нет (старый сервер) — фолбэк 10800 (3ч).
+//     +300 — 5 минут запаса поверх серверного лимита на случай рассинхрона
+//     часов клиента и сервера (см. static/room.js — сравнение делается там,
+//     при входе, с тем же зазором). `e` зашивается в вывод K_auth (см.
+//     static/crypto.js: deriveAuthKey) — подделать/продлить его без `t`
+//     невозможно.
+// Ключа `k` больше нет — вся комната теперь без единого общего секрета
+// шифрования, только PSK-аутентификация + PFS (см. static/crypto.js).
+// room.js парсит `t`/`e` (и `n` ниже) разом из фрагмента.
 //
-// Третий (необязательный) параметр фрагмента — `n` — имя комнаты, введённое
+// Четвёртый (необязательный) параметр фрагмента — `n` — имя комнаты, введённое
 // в #room-name-input (предзаполнен NameGen.roomName(), см. static/namegen.js;
 // свободно редактируется). Это имя видят ВСЕ участники комнаты, а не только
 // создатель: оно кладётся ПОСЛЕДНИМ параметром того же фрагмента
-// (#lt=...&k=...&n=...), но, в отличие от одноразового `lt`, `n` НЕ вычищается
-// из адресной строки — room.js пересобирает фрагмент как `#k=...&n=...` (см.
-// там же) и точно так же кладёт `n` в buildShareLink(), так что invite-ссылка
-// несёт имя комнаты и любой гость, зашедший по ней, видит его в шапке/
-// заголовке вкладки — и оно переживает F5. Сервер `n`, как и `k`, всё равно
-// никогда не видит: фрагмент на сервер не уходит ни при обычной навигации,
-// ни в Referer.
+// (#lt=...&t=...&e=...&n=...), но, в отличие от одноразового `lt`, `n` НЕ
+// вычищается из адресной строки — room.js пересобирает фрагмент как
+// `#t=...&e=...&n=...` (см. там же) и точно так же кладёт `n` в
+// buildShareLink(), так что invite-ссылка несёт имя комнаты и любой гость,
+// зашедший по ней, видит его в шапке/заголовке вкладки — и оно переживает F5.
+// Сервер `n`, как и `t`/`e`, всё равно никогда не видит: фрагмент на сервер
+// не уходит ни при обычной навигации, ни в Referer.
 
 'use strict';
 
@@ -67,8 +79,18 @@ createButton.addEventListener('click', async () => {
     if (typeof data.leaderToken !== 'string' || !data.leaderToken) {
       throw new Error('response is missing leaderToken');
     }
-    const roomKey = RoomCrypto.generateRoomKey();
-    const roomKeyB64 = RoomCrypto.bytesToBase64url(roomKey);
+
+    // E2E v2: `t` — статический PSK-токен ссылки, `e` — момент истечения в
+    // base36 (см. комментарий шапки файла и static/crypto.js: deriveAuthKey).
+    // Фолбэк 10800с (3ч), если сервер почему-то не прислал lifetimeSeconds
+    // (см. src/main.rs::create_room) — тот же дефолт, что и у самого сервера
+    // (DEFAULT_MAX_ROOM_LIFETIME_SECONDS), так что оверлей «Link expired» на
+    // клиенте (см. static/room.js) не сработает раньше времени.
+    const roomToken = RoomCrypto.generateRoomToken();
+    const tokenB64 = RoomCrypto.bytesToBase64url(roomToken);
+    const lifetimeSeconds =
+      typeof data.lifetimeSeconds === 'number' && data.lifetimeSeconds > 0 ? data.lifetimeSeconds : 10800;
+    const expiryB36 = (Math.floor(Date.now() / 1000) + lifetimeSeconds + 300).toString(36);
 
     // maxlength=40 режет по UTF-16-единицам, а не по code point —
     // вставка/автозамена может располовинить суррогатную пару эмодзи и
@@ -86,7 +108,7 @@ createButton.addEventListener('click', async () => {
       : '';
 
     location.href =
-      `/r/${data.roomId}#lt=${encodeURIComponent(data.leaderToken)}&k=${roomKeyB64}` +
+      `/r/${data.roomId}#lt=${encodeURIComponent(data.leaderToken)}&t=${tokenB64}&e=${expiryB36}` +
       (roomName ? `&n=${encodeURIComponent(roomName)}` : '');
   } catch (err) {
     console.error('Failed to create room:', err);

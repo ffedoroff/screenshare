@@ -19,45 +19,100 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = path.resolve(__dirname, '../..');
 export const BINARY_PATH = path.join(REPO_ROOT, 'target/debug/screenshare');
 
-// --- Ш1 (E2E-шифрование, см. static/crypto.js): ключ комнаты в тестах ---
+// --- Ш1 (E2E-шифрование v2, см. static/crypto.js/docs/research-p2p-key-handoff.md
+//     §6.5–6.6): PSK-токен `t` + срок `e` в тестах ---
 //
-// Ключ комнаты `k` — чисто клиентский секрет (см. static/landing.js): в
-// реальном приложении его генерирует браузер при клике «Создать комнату» и
-// сервер о нём никогда не узнаёт. Когда сценарий заводит комнату НАПРЯМУЮ
-// через `POST /api/rooms` (в обход лендинга — так делает большинство
-// сценариев ниже, чтобы не гонять реальный клик по кнопке ради каждой новой
-// комнаты), ключ точно так же должен появиться на стороне теста — сервер
-// его не выдаст. `generateRoomKeyBase64url` — тот же формат, что и
-// `RoomCrypto.generateRoomKey()+bytesToBase64url()` (32 случайных байта,
-// base64url без паддинга — `Buffer.toString('base64url')` в Node даёт
-// побайтово то же самое).
+// Формат фрагмента ссылки теперь `#lt=<leaderToken>&t=<token>&e=<expiry>[&n=<roomName>]`
+// (см. static/landing.js/static/room.js) — `t` (16 случайных байт, base64url,
+// 22 символа) статически аутентифицирует комнату, `e` (unix-секунды истечения
+// в base36) зашивается в вывод K_auth. Оба чисто клиентские: реальный
+// браузер генерирует их при клике «Создать комнату» и сервер о них никогда
+// не узнаёт. Когда сценарий заводит комнату НАПРЯМУЮ через `POST /api/rooms`
+// (в обход лендинга — так делает большинство сценариев ниже, чтобы не
+// гонять реальный клик по кнопке ради каждой новой комнаты), `t`/`e`
+// точно так же должны появиться на стороне теста — сервер их не выдаст.
 
-/** Случайный ключ комнаты для тестового сценария, создающего комнату напрямую через POST /api/rooms (см. заголовок раздела выше). */
-export function generateRoomKeyBase64url() {
-  return nodeCrypto.randomBytes(32).toString('base64url');
+const TOKEN_BYTES = 16; // должно совпадать с LINK_TOKEN_BYTES в static/room.js / RoomCrypto.generateRoomToken()
+const DEFAULT_LINK_LIFETIME_SECONDS = 10800; // тот же дефолт, что и в static/landing.js (фолбэк без lifetimeSeconds в ответе POST /api/rooms)
+const LINK_EXPIRY_GRACE_SECONDS = 300; // +5 минут — тот же запас, что и static/landing.js: expiryB36
+
+/** Случайный PSK-токен ссылки (16 байт, base64url без паддинга, 22 символа) — тот же формат, что и `RoomCrypto.generateRoomToken()+bytesToBase64url()`. */
+export function generateRoomToken() {
+  return nodeCrypto.randomBytes(TOKEN_BYTES).toString('base64url');
 }
 
-/** Ссылка гостя: `<baseUrl>/r/<roomId>#k=<key>` — без leaderToken (гость лидером не становится). */
-export function roomUrlWithKey(baseUrl, roomId, key) {
-  return `${baseUrl}/r/${roomId}#k=${key}`;
+/** `e` (base36 unix-секунды) на `deltaSeconds` от текущего момента — отрицательное значение даёт УЖЕ истёкшую ссылку (см. тест «Link expired»). */
+export function expiryB36FromNow(deltaSeconds) {
+  return (Math.floor(Date.now() / 1000) + deltaSeconds).toString(36);
 }
 
-/** Ссылка создателя: `<baseUrl>/r/<roomId>#lt=<token>&k=<key>` — предъявляет leaderToken, становится лидером. */
-export function leaderUrlWithKey(baseUrl, roomId, leaderToken, key) {
-  return `${baseUrl}/r/${roomId}#lt=${encodeURIComponent(leaderToken)}&k=${key}`;
+/** Валидный (не истёкший) `e` по умолчанию — как посчитал бы static/landing.js для комнаты с дефолтным сроком жизни. */
+export function defaultValidExpiryB36(lifetimeSeconds = DEFAULT_LINK_LIFETIME_SECONDS) {
+  return expiryB36FromNow(lifetimeSeconds + LINK_EXPIRY_GRACE_SECONDS);
 }
 
 /**
- * Прочитать ключ комнаты (base64url) со СТРАНИЦЫ уже вошедшего участника —
- * top-level `const roomKeyBase64url` в static/room.js, тот же приём, что и
- * чтение `leaderId`/`myPeerId`/`roomSettings`/`bus` в существующих тестах
- * (обычный classic-script top-level scope, не модуль). Нужен там, где
- * комната заведена через реальный лендинг (ключ сгенерировал сам браузер,
- * тест его заранее не знает) — см. basic.spec.mjs, сценарий создания
- * комнаты кликом.
+ * Дефолтный `e` для данного токена — ДЕТЕРМИНИРОВАННЫЙ: один и тот же токен
+ * всегда получает один и тот же `e` в пределах прогона (кеш ниже).
+ *
+ * КРИТИЧНО для E2E v2: `e` зашит в деривацию K_auth (см. static/crypto.js),
+ * поэтому у всех участников ОДНОЙ комнаты `e` обязан совпадать до символа —
+ * иначе попарные ключи разойдутся и первый же SDP даст честный GCM-провал
+ * «Link is invalid». Реальные пользователи делят одну ссылку, у них `t`+`e`
+ * совпадают по построению; тесты же строили URL для каждой страницы отдельным
+ * вызовом, и два вызова через границу секунды получали разные `e` — источник
+ * плавающего падения мобильного смоука (падал десктопный участник).
  */
-export async function getRoomKeyFromPage(page) {
-  return page.evaluate(() => roomKeyBase64url);
+const defaultExpiryByToken = new Map();
+function defaultExpiryForToken(token) {
+  if (!defaultExpiryByToken.has(token)) {
+    defaultExpiryByToken.set(token, defaultValidExpiryB36());
+  }
+  return defaultExpiryByToken.get(token);
+}
+
+/**
+ * Собрать `t=...&e=...[&n=...]` — тело нового фрагмента ссылки (без `lt=`).
+ * `t`/`e`, если не переданы явно, генерируются валидными (см. выше); дефолтный
+ * `e` стабилен для одного `t` (см. defaultExpiryForToken) — участники одной
+ * комнаты, чьи URL построены независимыми вызовами с одним токеном, получают
+ * идентичный фрагмент, как если бы делили одну реальную ссылку.
+ */
+export function makeRoomFragment({ t, e, n } = {}) {
+  const tok = t ?? generateRoomToken();
+  const exp = e ?? defaultExpiryForToken(tok);
+  let frag = `t=${tok}&e=${exp}`;
+  if (n) frag += `&n=${encodeURIComponent(n)}`;
+  return frag;
+}
+
+/**
+ * Ссылка гостя: `<baseUrl>/r/<roomId>#t=<token>&e=<expiry>[&n=...]` — без
+ * leaderToken (гость лидером не становится). `token` — строка `t` (обычно
+ * generateRoomToken(), но допускается и заведомо невалидная строка — см.
+ * тест «Link is invalid» на битый формат). `extra` — необязательные `e`/`n`
+ * (по умолчанию валидный `e`, без имени комнаты).
+ */
+export function roomUrlWithKey(baseUrl, roomId, token, extra = {}) {
+  return `${baseUrl}/r/${roomId}#${makeRoomFragment({ t: token, ...extra })}`;
+}
+
+/** Ссылка создателя: `<baseUrl>/r/<roomId>#lt=<leaderToken>&t=<token>&e=<expiry>[&n=...]` — предъявляет leaderToken, становится лидером. */
+export function leaderUrlWithKey(baseUrl, roomId, leaderToken, token, extra = {}) {
+  return `${baseUrl}/r/${roomId}#lt=${encodeURIComponent(leaderToken)}&${makeRoomFragment({ t: token, ...extra })}`;
+}
+
+/**
+ * Прочитать `t`/`e` (base64url/base36 строки как они лежат во фрагменте) со
+ * СТРАНИЦЫ уже вошедшего участника — top-level `const linkTokenBase64url`/
+ * `linkExpiry` в static/room.js, тот же приём, что и чтение `leaderId`/
+ * `myPeerId`/`roomSettings`/`bus` в существующих тестах (обычный
+ * classic-script top-level scope, не модуль). Нужен там, где комната заведена
+ * через реальный лендинг (t/e сгенерировал сам браузер, тест их заранее не
+ * знает) — см. basic.spec.mjs, сценарий создания комнаты кликом.
+ */
+export async function getRoomFragmentFromPage(page) {
+  return page.evaluate(() => ({ t: linkTokenBase64url, e: linkExpiry }));
 }
 
 // Сколько ждём реальный getDisplayMedia в broadcaster-контексте, прежде чем
@@ -554,10 +609,19 @@ export async function waitForBusOpenToAllPeers(page, timeoutMs = 8000) {
   );
 }
 
-/** Оверлей «Ссылка неполная» (Ш1: нет валидного `k`, либо ключ неверен — см. static/room.js: showInvalidLinkOverlay). */
+/** Оверлей «Ссылка неполная» (Ш1: нет валидных `t`/`e`, либо токен неверен — см. static/room.js: showInvalidLinkOverlay). */
 export async function waitInvalidLinkOverlay(page, timeoutMs = 10_000) {
   await page.waitForFunction(
     () => document.getElementById('overlay-title')?.textContent === 'Link is invalid',
+    undefined,
+    { polling: 100, timeout: timeoutMs }
+  );
+}
+
+/** Оверлей «Ссылка истекла» (Ш1 v2: `e` из фрагмента в прошлом за пределами LINK_EXPIRY_GRACE_SECONDS — см. static/room.js: showLinkExpiredOverlay). */
+export async function waitLinkExpiredOverlay(page, timeoutMs = 10_000) {
+  await page.waitForFunction(
+    () => document.getElementById('overlay-title')?.textContent === 'Link expired',
     undefined,
     { polling: 100, timeout: timeoutMs }
   );

@@ -9,7 +9,8 @@
 //! содержат `.await` (отправка в `UnboundedSender` синхронна и не блокирует,
 //! а удаление устаревших комнат в реапере — тоже чисто синхронная операция
 //! над `HashMap`), поэтому обычный мьютекс проще и быстрее асинхронного, а
-//! contention при нашем масштабе (единицы комнат по ≤6 участников) пренебрежим.
+//! contention при нашем масштабе (единицы комнат по ≤`MAX_PARTICIPANTS`
+//! участников, по умолчанию 6) пренебрежим.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -23,9 +24,17 @@ use uuid::Uuid;
 
 use crate::protocol::{RoomSettings, ServerMessage};
 
-/// Максимум участников в комнате одновременно (протокол v2: симметричная
-/// комната, роли broadcaster/viewer больше не существует).
-pub const MAX_PARTICIPANTS: usize = 6;
+/// Потолок числа участников в комнате одновременно, если env
+/// `MAX_PARTICIPANTS` не задан (см. `crate::MAX_PARTICIPANTS` в `main.rs` —
+/// `LazyLock`, тот же приём, что у `MAX_ROOM_LIFETIME`/`MAX_ROOMS`). Это
+/// РЕКОМЕНДУЕМЫЙ дефолт, не жёсткий потолок протокола (протокол v2:
+/// симметричная комната, роли broadcaster/viewer больше не существует,
+/// участников может быть сколько угодно с точки зрения сервера) — 6 выбрано
+/// потому что комната — полный WebRTC-mesh (каждый шлёт медиа каждому
+/// напрямую), и это разумная зона комфорта по трафику/CPU НА СТОРОНЕ
+/// КЛИЕНТОВ (n-1 исходящих копий у каждого) — самого сервера это число не
+/// напрягает вовсе, он лишь релеит сигналинг. См. docs/self-hosting.md, §6.
+pub const DEFAULT_MAX_PARTICIPANTS: usize = 6;
 
 /// Максимум ожидающих одобрения в лобби одновременно (см.
 /// `RoomSettings::lobby_enabled`) — не участники комнаты, отдельный, более
@@ -73,24 +82,32 @@ pub type PeerTx = mpsc::UnboundedSender<ServerMessage>;
 /// Один участник комнаты: канал для рассылки ему сообщений + имя для чата +
 /// момент входа (для детерминированного выбора нового лидера — см.
 /// `Room::leader_id` — при уходе прежнего лидера им становится участник с
-/// самым ранним `joined_at`).
+/// самым ранним `joined_at`) + эфемерный публичный ключ (E2E v2, см.
+/// docs/research-p2p-key-handoff.md §6.5–6.6) — опак для сервера, хранится
+/// только чтобы отдать его остальным участникам (`peers[]`/`peer-joined`/
+/// `waiting.leaderEpub`), сам сервер его не парсит и не использует.
 pub struct Participant {
     pub tx: PeerTx,
     pub name: Option<String>,
+    pub epub: Option<String>,
     pub joined_at: Instant,
 }
 
 /// Один ожидающий одобрения в лобби (см. `RoomSettings::lobby_enabled`) — НЕ
-/// участник комнаты (не считается в `MAX_PARTICIPANTS`, живёт в отдельной
-/// карте `Room::pending` с отдельным лимитом `MAX_PENDING`).
+/// участник комнаты (не считается в `crate::MAX_PARTICIPANTS`, живёт в
+/// отдельной карте `Room::pending` с отдельным лимитом `MAX_PENDING`). `epub` — тот же
+/// смысл, что у `Participant::epub` (E2E v2) — отдаётся лидеру в
+/// `join-request`, чтобы он мог принять от ожидающего `name-announce`.
 pub struct PendingParticipant {
     pub tx: PeerTx,
     pub name: Option<String>,
+    pub epub: Option<String>,
     pub joined_at: Instant,
 }
 
-/// Комната: до `MAX_PARTICIPANTS` равноправных участников, соединяющихся
-/// mesh (сервер сам медиа не трогает — только сигналинг). Максимум один из
+/// Комната: до `crate::MAX_PARTICIPANTS` (env `MAX_PARTICIPANTS`, рекомендуемый
+/// дефолт 6 — см. `DEFAULT_MAX_PARTICIPANTS`) равноправных участников,
+/// соединяющихся mesh (сервер сам медиа не трогает — только сигналинг). Максимум один из
 /// участников может в моменте шарить экран (`screen_owner`).
 ///
 /// Права и лидер (см. docs/permissions-and-leader.md): ровно один участник —

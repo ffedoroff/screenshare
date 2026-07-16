@@ -8,7 +8,9 @@
   - [3.1 In-Memory State Only](#31-in-memory-state-only)
   - [3.2 Empty-Room TTL](#32-empty-room-ttl)
   - [3.3 Maximum Meeting Lifetime](#33-maximum-meeting-lifetime)
-  - [3.4 A Restart Erases Everything](#34-a-restart-erases-everything)
+  - [3.4 Link Validity Window (`e`)](#34-link-validity-window-e)
+  - [3.5 A Restart Erases Everything](#35-a-restart-erases-everything)
+  - [3.6 Retroactive Privacy: A Later Link Leak Doesn't Unlock the Past](#36-retroactive-privacy-a-later-link-leak-doesnt-unlock-the-past)
 - [4. Anonymity](#4-anonymity)
 - [5. The "Connection & Privacy" Panel](#5-the-connection--privacy-panel)
 
@@ -42,8 +44,11 @@ terms, the server never has access to:
   a fresh offer shows only a name and size, so a bystander glancing at the
   server's traffic timing learns nothing about which attachments anyone
   actually opened.
-- Participants' display names — encrypted client-side before being sent in
-  `join-room` (see [`e2e-encryption.md`](e2e-encryption.md)).
+- Participants' display names — never present in `join-room`/`peer-joined`
+  at all for a current client (that field is always `null`); a name instead
+  travels as a separate `name-announce` message, encrypted client-side under
+  a key specific to the sender/recipient pair, before it's sent (see
+  [`e2e-encryption.md`](e2e-encryption.md)).
 - A room's own name, if its creator gave it one — unlike a participant's
   name, it isn't merely encrypted before being sent, it is never sent to the
   server at all, encrypted or otherwise, even though every participant who
@@ -60,6 +65,15 @@ The server does see, and cannot avoid seeing:
 - Participants' IP addresses, at the transport level (though see below —
   they are not logged or retained).
 - The room id and each participant's peer id.
+- Each participant's **ephemeral public key** (`epub`) — the public half of
+  the per-tab ECDH keypair used to derive pairwise encryption keys (see
+  [`e2e-encryption.md` §2.3](e2e-encryption.md#23-ephemeral-per-tab-keys--pairwise-derivation-forward-secrecy)).
+  This is harmless to expose, and necessary: the server has to relay it
+  between participants so their tabs can derive encryption keys with each
+  other at all. It reveals nothing about a participant beyond "this tab
+  generated this public key for this session" — the matching private key
+  never leaves the tab, and the public key itself carries no identity or
+  content.
 - The timing of connections, joins, leaves, and relayed messages.
 - The bare fact that a given set of peer ids is sharing a room.
 
@@ -77,13 +91,14 @@ address.
 ### 3.1 In-Memory State Only
 
 There is no database and no on-disk storage anywhere in this project. All
-room state — participants, names (already ciphertext to the server, see
-[§1](#1-what-the-server-never-sees)), who is presenting — lives only in the
-signaling process's memory for as long as the process and the room both
-live. Chat content isn't even a field in that in-memory structure: the
-server holds no chat buffer at all, at any point, in any form (see
-[`chat.md`](chat.md) — history lives only in each participant's own tab
-memory).
+room state — participants, ephemeral public keys, who is presenting — lives
+only in the signaling process's memory for as long as the process and the
+room both live. Names aren't even a field in that in-memory structure to
+begin with — they never reach the server, in ciphertext or otherwise, except
+transiently as an opaque `name-announce` payload being relayed. Chat content
+isn't a field in that structure either: the server holds no chat buffer at
+all, at any point, in any form (see [`chat.md`](chat.md) — history lives
+only in each participant's own tab memory).
 
 ### 3.2 Empty-Room TTL
 
@@ -103,17 +118,57 @@ privacy property as much as a resource limit: it bounds, in the worst case,
 how long any given meeting's metadata can possibly persist in server memory,
 even if participants never explicitly leave.
 
-### 3.4 A Restart Erases Everything
+### 3.4 Link Validity Window (`e`)
+
+The link itself carries an expiry, `e` — a timestamp set once, at room
+creation, to the server's own maximum-lifetime setting plus a short grace
+window for clock skew (see [`e2e-encryption.md` §2.2](e2e-encryption.md#22-expiry-e--a-cryptographic-boundary-not-a-runtime-check)).
+A participant who tries to join with a link whose `e` is in the past sees a
+plain "Link expired" message rather than the generic "Link is invalid" one —
+an honest distinction, since the link *was* genuinely valid once. This is
+**not** a second, independent limit layered on top of [§3.3](#33-maximum-meeting-lifetime) — it
+tracks the same server-side lifetime the room itself is already bounded by —
+but it is enforced independently, as a cryptographic property of the link
+rather than something a server has to remember to check: `e` is baked into
+the key derivation itself, so a modified client cannot simply skip the
+expiry check and keep using an old link past its window (see
+[`e2e-encryption.md` §2.2](e2e-encryption.md#22-expiry-e--a-cryptographic-boundary-not-a-runtime-check)
+for exactly why).
+
+### 3.5 A Restart Erases Everything
 
 Because all state lives in one process's memory, a server restart —
 whether a deliberate redeploy or an unplanned crash — erases every room's
-participants and names outright, with nothing to recover them from. The
-mesh connections between browsers (media, chat) are unaffected by a
-signaling restart and keep working; only the signaling channel itself
-(new joins, screen-share arbitration, moderation) is briefly unavailable
-until the frontend's auto-reconnect flow re-establishes it — see
+participants and their ephemeral public keys outright, with nothing to
+recover them from. The mesh connections between browsers (media, chat) are
+unaffected by a signaling restart and keep working; only the signaling
+channel itself (new joins, screen-share arbitration, moderation) is briefly
+unavailable until the frontend's auto-reconnect flow re-establishes it — see
 [`self-hosting.md`](self-hosting.md) for the operational detail and what
 survives a redeploy from a user's perspective.
+
+### 3.6 Retroactive Privacy: A Later Link Leak Doesn't Unlock the Past
+
+This is new relative to the original design, and worth stating as its own
+promise rather than leaving it implicit: **a meeting link that leaks after
+the meeting is over does not let anyone decrypt what was relayed through the
+server while the meeting was happening.**
+
+The encryption keys used for signaling (SDP, ICE candidates — which carry
+participants' IP addresses — and names) are derived from a fresh, one-time
+keypair each tab generates for that session and never writes down anywhere
+(see [`e2e-encryption.md` §2.3](e2e-encryption.md#23-ephemeral-per-tab-keys--pairwise-derivation-forward-secrecy)).
+Those keys are gone the moment the tab closes. The link's static part (`t`)
+only ever *authenticated* the session — it was never, by itself, sufficient
+to decrypt anything — so someone who finds an old invite link months later,
+even with a full recording of the server's relay traffic from that meeting,
+gains nothing from it. This bound applies specifically to what the server
+relays; media and chat never touched the server at all and already had this
+property from WebRTC's own DTLS handshake.
+
+This does **not** mean a link is safe to leak while the meeting is still
+running — a link leaking *during* the room's live session grants exactly the
+same access it always did (see [`security.md` §9](security.md#9-known-boundaries)).
 
 ## 4. Anonymity
 
@@ -128,25 +183,27 @@ survives a redeploy from a user's perspective.
   anonymous, exactly as before; whatever is finally submitted still lives
   only in that tab's memory for the meeting's duration — it is never
   remembered between visits, and it never leaves the browser except as
-  ciphertext (see [`e2e-encryption.md`](e2e-encryption.md)).
+  ciphertext, addressed to one specific recipient at a time (see
+  [`e2e-encryption.md`](e2e-encryption.md)).
 - **A room's name is visible to every participant, but never becomes
   server-side state.** The creator's own link carries an optional, locally
   generated name (the same kind of client-side suggestion as above, e.g.
-  `🌿 Quiet Meadow`) in the URL fragment next to the room key, and it is
-  carried forward into the invite link the creator shares, so every guest
-  who follows that link sees the same name in their own tab's title and
-  header. The one-time leader token (`lt`) is still stripped from the
-  address bar immediately after being read — it's a single-use secret and
-  has nothing to gain from lingering — but the room name is not: it stays in
-  the fragment (`#k=...&n=...`) for everyone, which means it also survives a
-  reload for every participant, not just the creator. None of this changes
-  what the server sees: the fragment never leaves the browser on its own, so
-  the server has no access to the room's name regardless of how many
+  `🌿 Quiet Meadow`) in the URL fragment alongside the link token and expiry,
+  and it is carried forward into the invite link the creator shares, so
+  every guest who follows that link sees the same name in their own tab's
+  title and header. The one-time leader token (`lt`) is still stripped from
+  the address bar immediately after being read — it's a single-use secret
+  and has nothing to gain from lingering — but the rest of the fragment is
+  not: the link token `t`, the expiry `e`, and the room name `n` all stay in
+  the fragment (`#t=...&e=...&n=...`) for everyone, which means they also
+  survive a reload for every participant, not just the creator. None of this
+  changes what the server sees: the fragment never leaves the browser on its
+  own, so the server has no access to the room's name regardless of how many
   participants' tabs carry it.
-- Every identifier a client has during a meeting (its peer id, in
-  particular) is generated fresh for that session and held only in memory —
-  it is not derived from, or correlatable with, anything from a previous
-  visit.
+- Every identifier a client has during a meeting (its peer id and ephemeral
+  public key, in particular) is generated fresh for that session and held
+  only in memory — it is not derived from, or correlatable with, anything
+  from a previous visit.
 
 ## 5. The "Connection & Privacy" Panel
 
