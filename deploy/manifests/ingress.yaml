@@ -1,0 +1,25 @@
+# Публикация наружу через cloudflare-tunnel-ingress-controller (уже развёрнут
+# на кластере, обслуживает и другие проекты — см. simple-deploy/cloudflare/tunnel.md
+# «Вариант 2»). Контроллер сам заводит туннель и DNS-запись по этому Ingress —
+# отдельно в дашборде Cloudflare ничего создавать не нужно.
+#
+# Ш2 (разнесение доверия — см. README.md «Топология Ш2»): статика фронтенда
+# переезжает на Cloudflare Pages (проект «chat-web»), а этот backend остаётся
+# API/WS-хостом chat-api.fedorov.it. Переключение выполнено 2026-07-13:
+# chat.fedorov.it указывает CNAME'ом на Pages (chat-web-7ev.pages.dev),
+# правило для него из Ingress убрано (иначе туннель-контроллер боролся бы
+# за DNS-запись). Backend всё ещё умеет раздавать статику (безвредно,
+# доступна на chat-api) — вычистку можно сделать позже отдельным шагом.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: chat, namespace: chat-prod }
+spec:
+  ingressClassName: cloudflare-tunnel
+  rules:
+  - host: chat-api.fedorov.it
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service: { name: chat, port: { number: 80 } }

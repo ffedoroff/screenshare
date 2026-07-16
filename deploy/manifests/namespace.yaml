@@ -1,0 +1,4 @@
+# Namespace прод-окружения. Применяет админ один раз.
+apiVersion: v1
+kind: Namespace
+metadata: { name: chat-prod }

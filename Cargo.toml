@@ -1,0 +1,27 @@
+[package]
+name = "screenshare"
+version = "0.1.0"
+edition = "2021"
+description = "Браузерный шеринг экрана: mesh P2P WebRTC + Rust signaling-сервер"
+
+[dependencies]
+# Веб-фреймворк с встроенной поддержкой WebSocket
+axum = { version = "0.8", features = ["ws"] }
+# Асинхронный рантайм
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "fs", "sync", "signal"] }
+# Сериализация сообщений сигналинга
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Генерация peerId (и как источник энтропии для короткого roomId)
+uuid = { version = "1", features = ["v4"] }
+# Логирование
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# H1 (эфемерные TURN-креды, см. src/main.rs::ice_config): HMAC-SHA1 по
+# TURN_STATIC_SECRET в стиле TURN REST API (draft-uberti-behave-turn-rest-00,
+# совместимо с turn-rs `auth.static-auth-secret`) — минимальные фичи, без
+# std-рандома/OID/zeroize, они нам не нужны.
+hmac = { version = "0.13.0", default-features = false }
+sha1 = { version = "0.11.0", default-features = false }
+# credential в iceServers — base64(HMAC-SHA1(...)), как ждёт turn-rs.
+base64 = "0.22.1"

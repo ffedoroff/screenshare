@@ -1,0 +1,238 @@
+# Автодеплой prod при пуше в main. Доставка образа — без реестра, напрямую
+# на сервер по SSH (deployer в forced command импортирует образ в containerd
+# и катит `kubectl set image`). Подробности — deploy/README.md и
+# simple-deploy/kube/backend-deploy.md.
+#
+# Стандарты (simple-deploy/standards/delivery/*):
+#   - иммутабельный тег образа prod-<short-sha>, деплоится ровно github.sha;
+#   - деплой гейтится зелёными тестами (job test);
+#   - в образ впекаются APP_VERSION/GIT_COMMIT/BUILD_DATE (отдаются в /version.json);
+#   - откат = перезапуск run'а предыдущего коммита (gh run rerun <id>).
+#
+# Секреты репозитория: DEPLOY_SSH_KEY, DEPLOY_HOST, DEPLOY_PORT, DEPLOY_KNOWN_HOSTS,
+# (Ш2, опционально пока не заведены координатором) CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID
+name: deploy-prod
+on: { push: { branches: [main] } }
+concurrency: { group: deploy-prod, cancel-in-progress: false }
+permissions: { contents: read }
+jobs:
+  # Красные тесты не пускают деплой: протокол сигналинга гоняется целиком
+  # (тест сам собирает и поднимает сервер). Браузерный e2e — отдельным
+  # job `e2e` ниже (тоже гейтит деплой).
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - uses: Swatinem/rust-cache@v2
+      - name: Тесты протокола сигналинга (включает cargo build)
+        run: node tests/signaling.test.mjs
+
+  # Браузерный e2e-гейт: те же basic/resilience, что локально — стабы медиа
+  # синтетические по умолчанию, Chrome на ubuntu-раннере предустановлен.
+  # basic и resilience гоняются РАЗДЕЛЬНЫМИ запусками (отдельные node-процессы):
+  # при цепочке в одну команду resilience флачит — порты/контексты предыдущего
+  # сьюта не успевают освободиться; отдельные процессы освобождают их на выходе.
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - uses: Swatinem/rust-cache@v2
+      - name: Установка зависимостей e2e
+        run: cd tests/e2e && npm install --no-audit --no-fund
+      - name: Браузерный e2e (basic)
+        run: cd tests/e2e && node basic.spec.mjs
+      - name: Браузерный e2e (resilience) — отдельным запуском
+        run: cd tests/e2e && node resilience.spec.mjs
+
+  deploy:
+    needs: [test, e2e]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build (linux/amd64, тег prod-<sha>)
+        run: |
+          TAG="prod-$(git rev-parse --short HEAD)"; echo "TAG=$TAG" >> "$GITHUB_ENV"
+          docker buildx build --provenance=false --sbom=false --platform linux/amd64 \
+            --build-arg APP_VERSION="$TAG" \
+            --build-arg GIT_COMMIT="$(git rev-parse HEAD)" \
+            --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --cache-from type=gha --cache-to type=gha,mode=max \
+            --load -t "chat:$TAG" .
+      - name: Deliver + deploy
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          PORT: ${{ secrets.DEPLOY_PORT }}
+          KNOWN: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m600 /dev/stdin key <<<"$KEY"
+          mkdir -p ~/.ssh && printf '%s\n' "$KNOWN" >> ~/.ssh/known_hosts
+          docker save "chat:$TAG" | gzip | ssh -i key -p "$PORT" "deployer@$HOST" "prod $TAG"
+
+  # Ш2 (разнесение доверия — см. README.md «Топология Ш2»): статика фронтенда
+  # уезжает на Cloudflare Pages (проект «chat-web»), backend остаётся
+  # только API/WS. Независим от job `deploy` (тот катит образ backend'а на
+  # свой сервер) — просто тоже гейтится теми же зелёными test/e2e.
+  #
+  # ГЕЙТ: пока координатор не завёл Pages-проект и секреты
+  # CLOUDFLARE_API_TOKEN/CLOUDFLARE_ACCOUNT_ID, шаг деплоя мягко скипается
+  # (echo + exit 0 в отдельном шаге-гейте) — пайплайн остаётся зелёным.
+  deploy-pages:
+    needs: [test, e2e]
+    runs-on: ubuntu-latest
+    # Точечно поднимаем права ТОЛЬКО для этого job (глобально в файле —
+    # contents: read, см. верх файла) — нужен contents: write ровно для
+    # шага "Опубликовать хэш бандла в GitHub Release" ниже (создание/правка
+    # релиза через `gh`). Другие jobs (test/e2e/deploy) этот блок не
+    # затрагивает — per-job permissions полностью замещают глобальные только
+    # для job, где он задан.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Собрать pages-dist/ (копия static/ + config.js под API-хост)
+        run: |
+          rm -rf pages-dist
+          # Структура как у origin-сервера: ассеты под /static/*, страницы в
+          # корне (HTML ссылается на /static/foo.js — см. src/main.rs роуты).
+          mkdir pages-dist
+          cp -r static pages-dist/static
+          mv pages-dist/static/index.html pages-dist/static/room.html pages-dist/ 2>/dev/null || cp static/index.html static/room.html pages-dist/
+          # SPA-маршрут комнат: /r/<id> отдаёт room.html (rewrite, не redirect).
+          printf '/r/* /room 200\n' > pages-dist/_redirects   # цель без .html: Pages со своими pretty-URL иначе даёт 308 и теряет путь
+          # Ш2: Pages-сборка ходит на отдельный API-хост — same-origin дефолт
+          # из репозитория (static/config.js: window.API_BASE = location.origin)
+          # здесь не годится, фронт и API теперь на разных доменах (см.
+          # deploy/manifests/ingress.yaml, src/main.rs::CORS_ORIGIN).
+          cat > pages-dist/static/config.js <<'EOF'
+          'use strict';
+          window.API_BASE = 'https://chat-api.fedorov.it';
+          EOF
+          # Кэш: у Pages свой edge-кэш, независимый от Cache-Control нашего
+          # origin (см. src/main.rs::NO_CACHE) — тот же принцип «безусловный
+          # no-cache», чтобы после деплоя не залипала старая статика (ровно
+          # та проблема, из-за которой на origin завели NO_CACHE, см. там же).
+          # Кэш-бастер ?v=N в HTML — не трогаем, разметка копируется как есть.
+          #
+          # M2 — строгие security-заголовки (см. tests/e2e/basic.spec.mjs,
+          # проверка на CSP/frame-ancestors в сгенерированном _headers):
+          #   - script-src/style-src 'self', БЕЗ 'unsafe-inline' — во всём
+          #     static/ нет ни одного инлайн <script>/<style>/style="..."
+          #     (все скрипты — внешние файлы, см. static/*.html), а точечные
+          #     JS-мутации через CSSOM (element.style.foo = ...; см.
+          #     static/room.js/chat.js — градиенты тайлов, полосы прогресса
+          #     файлов, позиционирование попапа реакций) CSP style-src не
+          #     затрагивает — это подтверждено локальной проверкой (Chromium
+          #     + securitypolicyviolation, см. историю решений): такие
+          #     мутации не идут через парсинг атрибута style, только через
+          #     него ходит инлайн-разметка/markup, которой в проекте нет;
+          #   - connect-src 'self' + сам API/WS-хост (Ш2, см. static/config.js
+          #     на Pages-сборке выше) — WebRTC/getUserMedia/getDisplayMedia
+          #     не идут через fetch/XHR/WebSocket, CSP их не касается вовсе
+          #     (SDP/ICE и есть сам P2P-транспорт, не подпадающий под connect-src),
+          #     STUN/TURN тоже не проходят через connect-src;
+          #   - img-src/media-src разрешают data:/blob: — инлайн-превью файлов
+          #     чата и objectURL у скачанных/полученных файлов и картинок
+          #     (см. static/chat.js: URL.createObjectURL) без них не отрисуются;
+          #   - frame-ancestors 'none' — комнату нельзя встроить во внешний
+          #     фрейм (кликджекинг), дублируется X-Frame-Options: DENY для
+          #     браузеров без поддержки CSP уровня 2;
+          #   - Permissions-Policy разрешает camera/microphone/display-capture
+          #     ТОЛЬКО self (сам фрейм, без вложенных чужих origin) — иначе
+          #     они были бы доступны потенциальным сторонним фреймам.
+          cat > pages-dist/_headers <<'HEADERS'
+          /*
+            Cache-Control: no-cache
+            Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' https://chat-api.fedorov.it wss://chat-api.fedorov.it; frame-ancestors 'none'; base-uri 'none'; form-action 'none'
+            X-Frame-Options: DENY
+            X-Content-Type-Options: nosniff
+            Referrer-Policy: no-referrer
+            Permissions-Policy: camera=(self), microphone=(self), display-capture=(self), geolocation=(), interest-cohort=()
+          HEADERS
+      - name: Посчитать детерминированный SHA-256 бандла и записать pages-dist/build-hash.json
+        # Форензический якорь против подмены статики хостером (Ш2 — см.
+        # docs/security.md, «Published Build Hash»): независимо от того, что
+        # отдаёт Cloudflare Pages, у любого проверяющего есть путь пересчитать
+        # тот же хэш из исходников и сверить его с GitHub Release (следующий
+        # шаг) — Cloudflare этот Release-канал не контролирует.
+        #
+        # Формула (ТОЧНО эта команда задокументирована в docs/security.md для
+        # независимого пересчёта — не меняйте одно без другого):
+        #   cd pages-dist && find . -type f ! -name build-hash.json \
+        #     | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -d' ' -f1
+        # — sha256 каждого файла бандла (кроме ещё не существующего на этот
+        # момент build-hash.json), список строк "hash  path" отсортирован
+        # БАЙТОВО (LC_ALL=C — не зависит от locale раннера/проверяющего), сам
+        # этот текст хэшируется ещё раз целиком -> берём первое поле.
+        # cd в pages-dist ОБЯЗАТЕЛЕН до find: пути должны быть относительными
+        # (`./static/chat.js`, не `/home/runner/.../pages-dist/static/chat.js`)
+        # — иначе хэш зависел бы от абсолютного пути чекаута и не совпал бы у
+        # стороннего проверяющего, распаковавшего бандл в другой каталог.
+        # build-hash.json пишется ПОСЛЕ вычисления и сам себя не хэширует
+        # (`! -name build-hash.json`) — иначе решение "что положить в файл"
+        # зависело бы от содержимого самого файла.
+        id: hash
+        run: |
+          cd pages-dist
+          HASH=$(find . -type f ! -name build-hash.json | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -d' ' -f1)
+          COMMIT="$(git -C .. rev-parse HEAD)"
+          BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          printf '{"hash":"%s","commit":"%s","buildDate":"%s"}' "$HASH" "$COMMIT" "$BUILD_DATE" > build-hash.json
+          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+          echo "build_date=$BUILD_DATE" >> "$GITHUB_OUTPUT"
+      - name: Опубликовать хэш бандла в GitHub Release (независимый канал сверки, см. docs/security.md)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          COMMIT="${{ steps.hash.outputs.commit }}"
+          SHORT_SHA="$(git rev-parse --short "$COMMIT")"
+          TAG="pages-$SHORT_SHA"
+          NOTES="$(cat <<EOF
+          Статика фронтенда (Cloudflare Pages), коммит \`$COMMIT\`.
+
+          - SHA-256 бандла: \`${{ steps.hash.outputs.hash }}\`
+          - commit: \`$COMMIT\`
+          - buildDate (UTC): \`${{ steps.hash.outputs.build_date }}\`
+
+          Пересчитать самостоятельно: собрать pages-dist/ теми же шагами, что
+          этот workflow (см. .github/workflows/deploy-prod.yml, job
+          deploy-pages, шаг «Собрать pages-dist/»), затем из корня бандла:
+
+              cd pages-dist && find . -type f ! -name build-hash.json | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -d' ' -f1
+
+          (на macOS нет sha256sum — используйте \`shasum -a 256\`, тот же
+          алгоритм и формат вывода, результат совпадёт).
+
+          Это форензическая точка сверки — независимый канал (сам этот
+          Release), НЕ криптогарантия: хостер статики теоретически может
+          подменить и то, что отдаёт /build-hash.json на странице, поэтому
+          сверять нужно с ЭТИМ значением, а не с тем, что показывает сама
+          страница. Подробности и честные границы — docs/security.md,
+          «Published Build Hash».
+          EOF
+          )"
+          gh release create "$TAG" --title "$TAG" --notes "$NOTES" --target "$COMMIT" \
+            || gh release edit "$TAG" --notes "$NOTES"
+      - name: Проверка секрета CLOUDFLARE_API_TOKEN (гейт — Pages-проект/токен заводит координатор)
+        id: gate
+        env:
+          TOKEN_PRESENT: ${{ secrets.CLOUDFLARE_API_TOKEN != '' }}
+        run: |
+          if [ "$TOKEN_PRESENT" != "true" ]; then
+            echo "CLOUDFLARE_API_TOKEN ещё не задан — пропускаем деплой на Cloudflare Pages."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+      - name: Деплой на Cloudflare Pages (project chat-web)
+        if: steps.gate.outputs.skip == 'false'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx wrangler pages deploy pages-dist --project-name=chat-web --branch=main

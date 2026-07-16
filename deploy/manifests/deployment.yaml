@@ -1,0 +1,63 @@
+# Deployment приложения. Создаёт админ ОДИН РАЗ; deploy-юзер (CI) потом только
+# `kubectl set image '*=…'` (см. .github/workflows/deploy-prod.yml и
+# simple-deploy/kube/backend-deploy.md).
+#
+# ОТСТУПЛЕНИЕ от обычного бесшовного шаблона (replicas:2 + RollingUpdate):
+# здесь replicas: 1 и strategy.type: Recreate. Причина — состояние комнат
+# живёт в памяти ОДНОГО процесса (`src/state.rs`, HashMap за std::sync::Mutex):
+# при двух репликах broadcaster и зрители могли бы попасть на разные поды и
+# никогда не увидеть друг друга. Recreate = на деплое старый под гасится,
+# новый поднимается — активные трансляции на несколько секунд рвутся, это
+# ожидаемо и описано в README.md.
+#
+# Полная эфемерность: приложение ничего не пишет на диск (ни истории чата,
+# ни сессий) — всё состояние комнаты живёт только в памяти процесса и
+# исчезает с ней (рестарт/реапер пустой комнаты). Поэтому здесь сознательно
+# нет volume/volumeMount и PVC: писать некуда, и это правильно, а не упущение.
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: chat, namespace: chat-prod }
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector: { matchLabels: { app: chat } }
+  template:
+    metadata: { labels: { app: chat } }
+    spec:
+      terminationGracePeriodSeconds: 30       # graceful drain; приложение ловит SIGTERM (src/main.rs)
+      containers:
+      - name: app
+        image: chat:PLACEHOLDER               # реальный тег ставит `kubectl set image '*='`
+        imagePullPolicy: IfNotPresent
+        env:
+        - { name: PORT, value: "8080" }
+        - { name: STATIC_DIR, value: "/app/static" }
+        # Ш2 (разнесение доверия — см. README.md «Топология Ш2»): фронт уезжает
+        # на Cloudflare Pages (chat.fedorov.it), этот сервер отвечает и на
+        # chat.fedorov.it (пока статика ещё раздаётся отсюда же, до переключения
+        # DNS), и на chat-api.fedorov.it (см. ingress.yaml) — поэтому единственный
+        # разрешённый CORS-origin для кросс-хостовых запросов с Pages это
+        # chat.fedorov.it. Пусто -> CORS выключен целиком (см. src/main.rs::CORS_ORIGIN).
+        - { name: CORS_ORIGIN, value: "https://chat.fedorov.it" }
+        # Лимит длительности созвона (см. README.md «Лимит длительности
+        # созвона»): комната старше этого возраста удаляется реапером
+        # целиком (все участники получают room-expired и сокет закрывается),
+        # даже если в ней есть живые участники. 10800с = 3 часа.
+        - { name: MAX_ROOM_LIFETIME_SECONDS, value: "10800" }
+        # H2 (DoS-защита): потолок числа комнат одновременно — дефолт в коде
+        # тот же (500), здесь явно ради видимости в манифесте.
+        - { name: MAX_ROOMS, value: "500" }
+        # TURN-креды (turn.yaml + Secret turn-creds, создан админом руками):
+        # приложение отдаёт их клиентам в /config. optional — без секрета
+        # приложение живёт на одном STUN, как раньше.
+        envFrom:
+        - secretRef: { name: turn-creds, optional: true }
+        ports: [ { containerPort: 8080 } ]
+        readinessProbe: { httpGet: { path: /healthz, port: 8080 }, periodSeconds: 3 }
+        livenessProbe:  { httpGet: { path: /healthz, port: 8080 }, initialDelaySeconds: 10, periodSeconds: 10 }
+        resources:
+          # Rust-сервер сигналинга лёгкий (мелкий рабочий набор в памяти,
+          # никакого медиатрафика через backend не проходит) — лимиты скромные.
+          requests: { memory: 32Mi, cpu: 50m }
+          limits:   { memory: 128Mi, cpu: 250m }

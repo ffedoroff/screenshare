@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f1114" />
+  <title>Video call — create room</title>
+  <link rel="stylesheet" href="/static/style.css?v=7" />
+  <link rel="manifest" href="/static/manifest.webmanifest" />
+  <link rel="apple-touch-icon" href="/static/icon-192.png" />
+</head>
+<body class="page-landing">
+  <div class="landing-page">
+    <div class="landing-card">
+      <h1>Video call with screen sharing</h1>
+      <p>No sign-up: create a room and share the link with others.</p>
+      <p>No cookies, no storage — in your browser or on the server. Calls and chat run over encrypted peer-to-peer connections; the server only relays encrypted connection setup, never the content.</p>
+
+      <input id="room-name-input" class="name-input" type="text" maxlength="40"
+             autocomplete="off" aria-label="Room name (shared with everyone who has the link)" />
+      <p class="field-hint">Room name is shared via the link — the server never sees it</p>
+
+      <button id="create-room-button" class="start-button">Create room</button>
+
+      <div id="landing-message" class="status-message"></div>
+
+      <!-- Форензический якорь против подмены статики хостером (Ш2, см.
+           docs/security.md, «Published Build Hash») — НЕ криптогарантия,
+           только точка сверки с независимым каналом (GitHub Release).
+           Скрыт, пока /build-hash.json не подтянулся (см. static/landing.js:
+           loadBuildHash) — в dev/self-hosted сборке файла нет вовсе, и это
+           штатно. -->
+      <footer id="landing-build-footer" class="build-footer hidden">
+        <details class="build-details">
+          <summary class="build-summary">build: <span id="landing-build-short"></span></summary>
+          <div id="landing-build-full" class="build-full"></div>
+        </details>
+        <a
+          id="landing-build-verify-link"
+          class="build-verify-link"
+          href="https://github.com/ffedoroff/screenshare/releases"
+          target="_blank"
+          rel="noopener noreferrer"
+          >verify</a
+        >
+      </footer>
+    </div>
+  </div>
+
+  <script src="/static/config.js?v=7"></script>
+  <script src="/static/crypto.js?v=7"></script>
+  <script src="/static/namegen.js?v=7"></script>
+  <script src="/static/landing.js?v=7"></script>
+</body>
+</html>

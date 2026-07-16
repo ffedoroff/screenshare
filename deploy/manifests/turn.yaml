@@ -1,0 +1,64 @@
+# TURN-сервер (turn-rs / ghcr.io/mycrl/turn-server) для пар, которым не
+# пробиться напрямую (симметричные NAT). Медиа через TURN идёт шифрованным
+# (DTLS-SRTP) — релей видит только байты и IP.
+#
+# hostNetwork: релей раздаёт UDP из диапазона 49160..49999 — пробрасывать
+# такой диапазон Service'ами бессмысленно, под сидит прямо на сети ноды.
+# Порты открыты в ОБЛАЧНОМ firewall Contabo (панель хостера, 2026-07-12):
+# UDP 3478 + 49160-49999 (см. registry, карточка хоста).
+#
+# H1 (эфемерные TURN-креды, см. README.md «TURN-сервер» и
+# src/main.rs::ice_config, 2026-07-13): раньше `config.toml` держал
+# `[auth.static-credentials]` (одна пара логин/пароль, валидная бессрочно
+# для КОГО УГОДНО, кто дошёл до `/config`) — теперь вместо неё
+# `auth.static-auth-secret = "<TURN_STATIC_SECRET>"` — long-term credential
+# по схеме TURN REST API (coturn-style HMAC-SHA1, подтверждено по исходникам
+# turn-rs, `codec::crypto::static_auth_secret`), backend вычисляет
+# username/credential на каждый вызов `/config` заново (TTL метки в
+# username, см. подробный комментарий в `ice_config` — сам turn-rs эту метку
+# НЕ проверяет, реальная граница жизни утёкшей пары — периодическая ротация
+# этого секрета, не срок в username).
+#
+# Секреты (НЕ в git, заводит/ротирует админ руками):
+#   - Secret turn/turn-config: config.toml целиком (realm, port-range,
+#     external=<публичный IP>:3478, `auth.static-auth-secret=<TURN_STATIC_SECRET>`
+#     — то же значение, что и в Secret ниже, БЕЗ отдельной пары логин/пароль).
+#   - Secret chat-prod/turn-creds: TURN_URL/TURN_STATIC_SECRET (ключ
+#     TURN_STATIC_SECRET — то самое значение из turn/turn-config выше) —
+#     их подхватывает Deployment chat (envFrom) и по ним раздаёт клиентам
+#     СВЕЖИЕ TURN-креды в `/config`, а не общую пару. TURN_USERNAME/
+#     TURN_PASSWORD можно оставить в том же Secret как fallback на время
+#     миграции (см. `ice_config`) — как только `TURN_STATIC_SECRET` заведён,
+#     backend их больше не читает.
+apiVersion: v1
+kind: Namespace
+metadata: { name: turn }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: turn-server, namespace: turn }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }   # hostNetwork: два пода не поделят порт
+  selector: { matchLabels: { app: turn-server } }
+  template:
+    metadata: { labels: { app: turn-server } }
+    spec:
+      hostNetwork: true
+      terminationGracePeriodSeconds: 10
+      containers:
+      - name: turn
+        image: ghcr.io/mycrl/turn-server:latest
+        imagePullPolicy: IfNotPresent
+        # У образа нет ENTRYPOINT — без command kubelet принял бы args за
+        # исполняемый файл (ловили CrashLoop с «/--config… not found»).
+        command: ["turn-server"]
+        args: ["--config=/etc/turn-server/config.toml"]
+        volumeMounts:
+        - { name: config, mountPath: /etc/turn-server, readOnly: true }
+        resources:
+          requests: { memory: 32Mi, cpu: 25m }
+          limits: { memory: 256Mi, cpu: 500m }
+      volumes:
+      - name: config
+        secret: { secretName: turn-config }

@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f1114" />
+  <title>Room — video call</title>
+  <link rel="stylesheet" href="/static/style.css?v=9" />
+  <link rel="manifest" href="/static/manifest.webmanifest" />
+  <link rel="apple-touch-icon" href="/static/icon-192.png" />
+</head>
+<body class="page-room">
+  <div class="room-page">
+    <!-- Модалка входа: показывается ПЕРВОЙ, до любого подключения к
+         сигналингу — имя вводится заново при каждом заходе (анонимность, см.
+         docs/privacy.md, «Anonymity»), join-room уходит только после клика
+         «Войти» (заодно даёт user-gesture для AudioContext, см.
+         static/common.js). При авто-reconnect модалка повторно не
+         показывается — имя уже есть в памяти вкладки. Поле предзаполняется
+         сгенерированным именем (static/namegen.js: NameGen.userName(), см.
+         static/room.js: showJoinModal) — можно сразу жать «Войти»; стереть
+         поле — остаться анонимом, как и раньше. -->
+    <div id="join-modal" class="join-modal">
+      <div class="join-modal-card">
+        <h2>Join the room</h2>
+        <input
+          id="join-name-input"
+          class="name-input"
+          type="text"
+          placeholder="Your name (optional)"
+          maxlength="40"
+          autocomplete="off"
+        />
+        <button id="join-modal-button" class="start-button">Join</button>
+      </div>
+    </div>
+
+    <!-- Оверлей текущего состояния: подключение / ожидание одобрения лобби /
+         вход отклонён / комната не найдена / заполнена / обрыв связи. -->
+    <div id="overlay" class="overlay hidden">
+      <div id="overlay-spinner" class="spinner"></div>
+      <h2 id="overlay-title">Connecting…</h2>
+      <p id="overlay-text"></p>
+      <button id="overlay-action-button" class="retry-button hidden">Create a new one</button>
+    </div>
+
+    <!-- Ненавязчивый тост (смена лидера и т.п.) — см. static/room.js: showToast(). -->
+    <div id="toast" class="toast hidden"></div>
+
+    <div class="room-top-bar">
+      <span class="room-logo">Video call</span>
+      <div class="room-top-bar-center">
+        <span id="participant-count" class="participant-count">Participants: 1 / 6</span>
+        <!-- Лимит длительности созвона (см. static/room.js: startRoomTimer) —
+             обратный отсчёт Ч:ММ:СС до expiresInSeconds из joined; скрыт до
+             первого joined (см. static/style.css: .room-timer). -->
+        <span id="room-timer" class="room-timer hidden"></span>
+        <!-- SAS «отпечаток комнаты» (5 эмодзи, см. static/crypto.js: deriveSas,
+             static/room.js: renderTopbarSas) — единственное место в UI, где
+             живёт SAS (раньше дублировался в шапке чат-панели, убрано —
+             см. docs/sas-verification.md §9). Кнопка: клик раскрывает попап
+             #topbar-sas-popup с крупными эмодзи, hex-кодом и пояснением.
+             ВАЖНО: класть только внутрь .room-top-bar-center (flex+wrap) —
+             .room-top-bar это грид 1fr auto 1fr, 4-й прямой потомок сломал бы
+             центрирование (см. style.css). Попап — absolute внутри этого же
+             контейнера (см. .topbar-sas-popup), из грид-раскладки не считается. -->
+        <button type="button" id="topbar-sas" class="topbar-sas hidden" aria-label="Room verification code" title=""></button>
+        <div id="topbar-sas-popup" class="topbar-sas-popup hidden">
+          <!-- Прозрачный полноэкранный перехватчик кликов «мимо» (тот же
+               приём, что у .share-popup-backdrop/.chat-message-popover-backdrop,
+               только без затемнения — это информационная плашка, а не модалка). -->
+          <div id="topbar-sas-popup-backdrop" class="topbar-sas-popup-backdrop"></div>
+          <div class="topbar-sas-popup-card" role="dialog" aria-label="Room verification code details">
+            <div id="topbar-sas-popup-emoji" class="topbar-sas-popup-emoji"></div>
+            <p id="topbar-sas-popup-text" class="topbar-sas-popup-text"></p>
+            <div id="topbar-sas-popup-hex" class="topbar-sas-popup-hex"></div>
+          </div>
+        </div>
+      </div>
+      <span class="room-top-bar-spacer" aria-hidden="true"></span>
+    </div>
+
+    <!-- Тонкий ненавязчивый баннер авто-reconnect'а сигналинга (НЕ
+         полноэкранный оверлей — mesh/медиа/чат продолжают работать во время
+         переподключения, см. static/room.js). -->
+    <div id="reconnect-banner" class="top-banner hidden">
+      <span class="top-banner-spinner" aria-hidden="true"></span>
+      <span>Reconnecting…</span>
+    </div>
+
+    <!-- Баннер version-skew (стандарт Романа): задеплоена новая версия,
+         предлагаем обновить страницу. Крестика/дисмисса нет намеренно. -->
+    <div id="version-banner" class="top-banner hidden">
+      <span>A new version is available — please refresh the page.</span>
+      <button id="version-banner-reload-button" class="top-banner-button" type="button">Refresh</button>
+    </div>
+
+    <div class="room-stage">
+      <!-- Главная зона: экран крупно, когда кто-то шарит. -->
+      <div id="screen-stage" class="screen-stage hidden">
+        <video id="screen-video" class="screen-video" autoplay playsinline></video>
+        <!-- Заглушка вместо живого превью СВОЕГО же захвата: показ своего
+             видео в этой же вкладке при захвате «всего экрана» рекурсивно
+             ловит само это превью («зеркальный коридор» — шлейф из курсоров и
+             видимая заморозка буфера, особенно в fullscreen). Meet/Zoom по
+             той же причине никогда не показывают шарящему живое превью его
+             же захвата. См. static/room.js: showLocalScreenPreview. -->
+        <div id="screen-self-placeholder" class="screen-self-placeholder hidden">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="2" y="4" width="20" height="14" rx="2"></rect>
+            <line x1="8" y1="21" x2="16" y2="21"></line>
+            <line x1="12" y1="18" x2="12" y2="21"></line>
+          </svg>
+          <p>You are sharing your screen</p>
+        </div>
+        <div id="screen-caption" class="screen-caption"></div>
+        <!-- Развернуть показ экрана на весь экран (Fullscreen API на
+             контейнере сцены, см. static/room.js) — крестик/Esc выходит
+             штатными средствами браузера. -->
+        <button id="screen-fullscreen-button" class="screen-fullscreen-button" type="button" aria-pressed="false" aria-label="Fullscreen" title="Fullscreen">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M8 3H5a2 2 0 0 0-2 2v3"></path>
+            <path d="M16 3h3a2 2 0 0 1 2 2v3"></path>
+            <path d="M8 21H5a2 2 0 0 1-2-2v-3"></path>
+            <path d="M16 21h3a2 2 0 0 0 2-2v-3"></path>
+          </svg>
+        </button>
+      </div>
+
+      <!-- Сетка тайлов участников (свой тайл — первым). -->
+      <div id="tiles-grid" class="tiles-grid"></div>
+
+      <!-- Пустая комната (только свой тайл) — ненавязчивый призыв позвать людей. -->
+      <div id="invite-cta" class="invite-cta hidden">
+        <p>Invite participants to start the conversation</p>
+        <button id="invite-cta-button" class="invite-cta-button" type="button">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="12" r="2.5"></circle><circle cx="18" cy="6" r="2.5"></circle><circle cx="18" cy="18" r="2.5"></circle><line x1="8.2" y1="10.8" x2="15.8" y2="7.2"></line><line x1="8.2" y1="13.2" x2="15.8" y2="16.8"></line></svg>
+          Share link
+        </button>
+      </div>
+    </div>
+
+    <!-- Ненавязчивые сообщения (отказ доступа к устройству, экран занят и т.п.). -->
+    <div id="room-message" class="room-message hidden"></div>
+
+    <!-- Заявки лобби (только у лидера, только пока lobbyEnabled=true и есть
+         ожидающие) — карточки над пилюлей управления, см. static/room.js:
+         renderJoinRequests(). -->
+    <div id="join-requests" class="join-requests hidden"></div>
+
+    <div class="control-panel">
+      <!-- Шестерёнка настроек — видна ВСЕМ участникам (секция «Устройства» —
+           выбор микрофона/камеры, доступна каждому); секция «Комната»
+           (лобби + права гостей) внутри панели скрыта для не-лидера (см.
+           static/room.js: updateSettingsButtonVisibility(), #settings-room-section).
+           Бейдж — число заявок в лобби, ждущих решения (виден только лидеру,
+           у остальных всегда 0). -->
+      <button id="settings-button" class="control-button" type="button" aria-pressed="false" aria-label="Settings" title="Settings">
+        <span class="control-button-icon" aria-hidden="true">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+          </svg>
+        </span>
+        <span id="settings-badge" class="chat-unread-badge hidden"></span>
+      </button>
+      <button id="mic-button" class="control-button" type="button" aria-pressed="false" aria-label="Microphone" title="Microphone">
+        <span class="control-button-icon" aria-hidden="true">
+          <svg class="icon icon-on" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="9" y="2" width="6" height="11" rx="3"></rect>
+            <path d="M5 10a7 7 0 0 0 14 0"></path>
+            <line x1="12" y1="19" x2="12" y2="22"></line>
+            <line x1="8" y1="22" x2="16" y2="22"></line>
+          </svg>
+          <svg class="icon icon-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="9" y="2" width="6" height="11" rx="3"></rect>
+            <path d="M5 10a7 7 0 0 0 14 0"></path>
+            <line x1="12" y1="19" x2="12" y2="22"></line>
+            <line x1="8" y1="22" x2="16" y2="22"></line>
+            <line x1="3" y1="3" x2="21" y2="21"></line>
+          </svg>
+        </span>
+      </button>
+      <button id="camera-button" class="control-button" type="button" aria-pressed="false" aria-label="Camera" title="Camera">
+        <span class="control-button-icon" aria-hidden="true">
+          <svg class="icon icon-on" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="2" y="6" width="14" height="12" rx="2.5"></rect>
+            <path d="M16 10.5l6-4v11l-6-4z"></path>
+          </svg>
+          <svg class="icon icon-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="2" y="6" width="14" height="12" rx="2.5"></rect>
+            <path d="M16 10.5l6-4v11l-6-4z"></path>
+            <line x1="1" y1="1" x2="23" y2="23"></line>
+          </svg>
+        </span>
+      </button>
+      <!-- Кнопка «Экран» прячется скриптом (room.js), если у браузера нет
+           navigator.mediaDevices.getDisplayMedia — так на мобильных
+           (Android Chrome, iOS Safari), где веб-API захвата экрана не
+           реализовано в принципе. -->
+      <button id="screen-button" class="control-button" type="button" aria-pressed="false" aria-label="Screen" title="Share screen">
+        <span class="control-button-icon" aria-hidden="true">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="4" width="18" height="12" rx="2"></rect>
+            <line x1="8" y1="20" x2="16" y2="20"></line>
+            <line x1="12" y1="16" x2="12" y2="20"></line>
+          </svg>
+        </span>
+      </button>
+      <button id="share-button" class="control-button" type="button" aria-label="Share the room link" title="Share link">
+        <span class="control-button-icon" aria-hidden="true">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="6" cy="12" r="2.5"></circle>
+            <circle cx="18" cy="6" r="2.5"></circle>
+            <circle cx="18" cy="18" r="2.5"></circle>
+            <line x1="8.2" y1="10.8" x2="15.8" y2="7.2"></line>
+            <line x1="8.2" y1="13.2" x2="15.8" y2="16.8"></line>
+          </svg>
+        </span>
+      </button>
+      <button id="chat-button" class="control-button" type="button" aria-pressed="false" aria-label="Chat" title="Chat">
+        <span class="control-button-icon" aria-hidden="true">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h2v4l5-4h9a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2H4z"></path>
+          </svg>
+        </span>
+        <span class="chat-unread-badge hidden"></span>
+      </button>
+      <button id="leave-button" class="control-button control-button--danger" type="button" aria-label="Leave the room" title="Leave the room">
+        <span class="control-button-icon" aria-hidden="true">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M9 4H5a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1h4"></path>
+            <polyline points="14 15 19 12 14 9"></polyline>
+            <line x1="19" y1="12" x2="7" y2="12"></line>
+          </svg>
+        </span>
+      </button>
+    </div>
+
+    <!-- Попап «Поделиться»: QR-код (серверный SVG) + ссылка текстом + копирование. -->
+    <div id="share-popup" class="share-popup hidden" role="dialog" aria-modal="true" aria-labelledby="share-popup-title">
+      <div id="share-popup-backdrop" class="share-popup-backdrop"></div>
+      <div class="share-popup-card">
+        <button id="share-popup-close" class="share-popup-close" type="button" aria-label="Close" title="Close">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="5" y1="5" x2="19" y2="19"></line>
+            <line x1="19" y1="5" x2="5" y2="19"></line>
+          </svg>
+        </button>
+        <h2 id="share-popup-title">Share the room</h2>
+        <!-- QR рендерится ЛОКАЛЬНО в браузере (см. static/vendor/qrcode.js,
+             static/room.js: renderShareQr) — никакого похода на сервер за
+             картинкой: ссылка комнаты (включая секретный #k) не должна
+             покидать вкладку ради QR. -->
+        <div id="share-popup-qr" class="share-popup-qr" role="img" aria-label="QR code with the room link"></div>
+        <div id="share-popup-link" class="share-popup-link"></div>
+        <!-- Хэш опубликованной статики — ОТДЕЛЬНОЙ строкой текста, для
+             сверки (форензический якорь, см. docs/security.md, «Published
+             Build Hash»). НЕ часть ссылки/QR выше — те несут только
+             `<origin>/r/<id>#k=<key>` (см. static/room.js: buildShareLink/
+             renderShareQr). Скрыт, пока /build-hash.json не подтянулся или
+             недоступен (dev/self-hosted, см. static/room.js: loadBuildHash).
+             Формат — как в подвале лендинга (static/index.html): короткий
+             хэш + раскрывающийся полный + ссылка «verify» на GitHub Releases
+             (см. static/room.js: renderShareBuildLine, .build-* в style.css). -->
+        <div id="share-popup-build" class="share-popup-build hidden">
+          <details class="build-details">
+            <summary class="build-summary">build: <span id="share-popup-build-short"></span></summary>
+            <div id="share-popup-build-full" class="build-full"></div>
+          </details>
+          <a
+            id="share-popup-build-verify-link"
+            class="build-verify-link"
+            href="https://github.com/ffedoroff/screenshare/releases"
+            target="_blank"
+            rel="noopener noreferrer"
+            >verify</a
+          >
+        </div>
+        <button id="share-popup-copy-button" class="share-popup-copy-button" type="button">Copy</button>
+      </div>
+    </div>
+
+    <!-- Настройки: попап на десктопе, bottom-sheet на мобильном (см.
+         media-запрос в style.css). Секция «Устройства» (выбор микрофона/
+         камеры) видна ВСЕМ участникам; секция «Комната» (лобби + права
+         гостей, #settings-room-section) — только лидеру, скрывается/
+         показывается через static/room.js: updateSettingsButtonVisibility().
+         Изменение прав шлёт update-settings, см. static/room.js. -->
+    <div id="settings-panel" class="settings-panel hidden" role="dialog" aria-modal="true" aria-labelledby="settings-panel-title">
+      <div id="settings-panel-backdrop" class="settings-panel-backdrop"></div>
+      <div class="settings-panel-card">
+        <button id="settings-panel-close" class="share-popup-close" type="button" aria-label="Close" title="Close">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="5" y1="5" x2="19" y2="19"></line>
+            <line x1="19" y1="5" x2="5" y2="19"></line>
+          </svg>
+        </button>
+        <h2 id="settings-panel-title">Settings</h2>
+
+        <div class="settings-section-label">Devices</div>
+
+        <label class="settings-row settings-row--select">
+          <span class="settings-row-label">Microphone</span>
+          <select id="setting-mic-device" class="settings-select"></select>
+        </label>
+
+        <label class="settings-row settings-row--select">
+          <span class="settings-row-label">Camera</span>
+          <select id="setting-camera-device" class="settings-select"></select>
+        </label>
+
+        <div id="settings-room-section">
+          <div class="settings-section-label">Room</div>
+
+          <label class="settings-row">
+            <span class="settings-row-label">Waiting room</span>
+            <span class="settings-toggle">
+              <input type="checkbox" id="setting-lobby" />
+              <span class="settings-toggle-track"><span class="settings-toggle-thumb"></span></span>
+            </span>
+          </label>
+
+          <div class="settings-section-label">Guests are allowed:</div>
+
+          <label class="settings-row">
+            <span class="settings-row-label">Chat</span>
+            <span class="settings-toggle">
+              <input type="checkbox" id="setting-guest-chat" />
+              <span class="settings-toggle-track"><span class="settings-toggle-thumb"></span></span>
+            </span>
+          </label>
+
+          <label class="settings-row">
+            <span class="settings-row-label">Microphone</span>
+            <span class="settings-toggle">
+              <input type="checkbox" id="setting-guest-audio" />
+              <span class="settings-toggle-track"><span class="settings-toggle-thumb"></span></span>
+            </span>
+          </label>
+
+          <label class="settings-row">
+            <span class="settings-row-label">Camera</span>
+            <span class="settings-toggle">
+              <input type="checkbox" id="setting-guest-video" />
+              <span class="settings-toggle-track"><span class="settings-toggle-thumb"></span></span>
+            </span>
+          </label>
+
+          <label class="settings-row">
+            <span class="settings-row-label">Screen sharing</span>
+            <span class="settings-toggle">
+              <input type="checkbox" id="setting-guest-screen" />
+              <span class="settings-toggle-track"><span class="settings-toggle-thumb"></span></span>
+            </span>
+          </label>
+        </div>
+
+        <!-- «Соединение и приватность» — видна ВСЕМ участникам (в отличие от
+             #settings-room-section выше). Наполняется/обновляется в
+             static/room.js: refreshConnectionSection() — при открытии панели
+             и каждые 5с, пока она открыта (таймер чистится при закрытии). -->
+        <div id="settings-conn-section">
+          <div class="settings-section-label">Connection and privacy</div>
+
+          <div id="settings-crypto-row" class="settings-crypto-row">
+            <svg class="settings-crypto-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="5" y="11" width="14" height="9" rx="1.5"></rect>
+              <path d="M8 11V8a4 4 0 0 1 8 0v3"></path>
+            </svg>
+            <span id="settings-crypto-text"></span>
+          </div>
+
+          <!-- Хэш опубликованной статики (опционально, см. static/room.js:
+               loadBuildHash/renderSettingsBuildRow) — та же форензическая
+               точка сверки, что в подвале лендинга и попапе «Поделиться»,
+               см. docs/security.md, «Published Build Hash». Скрыт, если
+               /build-hash.json недоступен (dev/self-hosted). -->
+          <div id="settings-build-row" class="settings-build-row hidden">
+            <span id="settings-build-text"></span>
+          </div>
+
+          <div class="settings-section-label">Connections with participants</div>
+          <ul id="settings-peers-list" class="settings-peers-list"></ul>
+
+          <div class="settings-section-label">What the server can see</div>
+          <ul class="settings-server-list">
+            <li>Connection IP and port</li>
+            <li>Room and participant IDs</li>
+            <li>Join/leave timestamps</li>
+            <li>Whether screen sharing is active and by whom</li>
+          </ul>
+          <div class="settings-server-counters">
+            <div>Signaling messages via server: <span id="settings-signaling-count">0</span> (encrypted)</div>
+            <div>Server relay traffic: <span id="settings-server-traffic"></span></div>
+          </div>
+          <div class="settings-server-summary">The server cannot read call content, chat, or names.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/config.js?v=9"></script>
+  <script src="/static/crypto.js?v=9"></script>
+  <script src="/static/namegen.js?v=9"></script>
+  <script src="/static/vendor/qrcode.js?v=9"></script>
+  <script src="/static/common.js?v=9"></script>
+  <script src="/static/bus.js?v=9"></script>
+  <script src="/static/rtc.js?v=9"></script>
+  <script src="/static/chat.js?v=9"></script>
+  <script src="/static/room.js?v=9"></script>
+</body>
+</html>
