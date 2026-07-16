@@ -283,10 +283,11 @@
 
     <!-- Настройки: попап на десктопе, bottom-sheet на мобильном (см.
          media-запрос в style.css). Секция «Устройства» (выбор микрофона/
-         камеры) видна ВСЕМ участникам; секция «Комната» (лобби + права
-         гостей, #settings-room-section) — только лидеру, скрывается/
-         показывается через static/room.js: updateSettingsButtonVisibility().
-         Изменение прав шлёт update-settings, см. static/room.js. -->
+         камеры) видна ВСЕМ участникам; секция «Комната» (лобби + лимит
+         участников + права гостей, #settings-room-section) — только лидеру,
+         скрывается/показывается через static/room.js:
+         updateSettingsButtonVisibility(). Изменение прав/лимита шлёт
+         update-settings, см. static/room.js. -->
     <div id="settings-panel" class="settings-panel hidden" role="dialog" aria-modal="true" aria-labelledby="settings-panel-title">
       <div id="settings-panel-backdrop" class="settings-panel-backdrop"></div>
       <div class="settings-panel-card">
@@ -319,6 +320,15 @@
               <input type="checkbox" id="setting-lobby" />
               <span class="settings-toggle-track"><span class="settings-toggle-thumb"></span></span>
             </span>
+          </label>
+
+          <!-- Опции заполняются в JS (populateMaxParticipantsOptions,
+               static/room.js), а не статично в разметке — от 2 до лучшего
+               известного настоящего серверного потолка (не текущего суженного
+               лидером значения), см. комментарий у этой функции. -->
+          <label class="settings-row settings-row--select">
+            <span class="settings-row-label">Max participants</span>
+            <select id="setting-max-participants" class="settings-select"></select>
           </label>
 
           <div class="settings-section-label">Guests are allowed:</div>
@@ -408,6 +418,6 @@
   <script src="/static/bus.js?v=10"></script>
   <script src="/static/rtc.js?v=10"></script>
   <script src="/static/chat.js?v=10"></script>
-  <script src="/static/room.js?v=11"></script>
+  <script src="/static/room.js?v=12"></script>
 </body>
 </html>

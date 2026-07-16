@@ -115,7 +115,17 @@ function extractYamlRunStepScript(workflowText, stepNameSubstring) {
 
 const PORT = 3322;
 const { step, skip, printSummary, bumpFailedForUnexpectedError, counts } = createRunner();
-const server = createServerController(PORT);
+// A (H2, docs/research-dos.md §3.2): JOIN_ROOM_IP_LIMIT — дефолт 20/60с на
+// join-room с одного IP. Этот файл гоняет десятки joinRoom() с одного и того
+// же адреса (localhost) за один прогон — тот же самый повод, что уже привёл
+// tests/signaling.test.mjs к такому же бампу для СВОЕГО тестового сервера
+// (см. там: `JOIN_ROOM_IP_LIMIT: '100000'`, комментарий у
+// DEFAULT_JOIN_ROOM_IP_LIMIT в src/state.rs явно называет это НЕ прод-гибкостью,
+// а тестируемостью — WS-хендшейк не поддерживает произвольный CF-Connecting-IP
+// на запрос, в отличие от HTTP). Настоящий дефолт (20/60с) проверяется в
+// signaling.test.mjs через изолированный CF-Connecting-IP на каждый прогон —
+// здесь нужен именно бамп, а не тест самого лимита.
+const server = createServerController(PORT, { JOIN_ROOM_IP_LIMIT: '100000' });
 
 // Общие стабы для контекста участника: сначала мик (иначе камера-стаб не
 // сможет к нему делегировать audio-запросы, см. комментарий у installCamStub
@@ -2541,16 +2551,20 @@ async function main() {
     //
     // Отдельная комната: Лида — создатель (предъявляет leaderToken из
     // фрагмента, становится лидером), Гоша — обычный гость по прямой ссылке
-    // (без токена, лобби пока выключено). Дальше по шагам: (б) лидер включает
-    // лобби, Тоня ждёт одобрения и получает его, Юра ждёт и получает отказ;
-    // (в) лидер выключает гостям чат — у Гоши инпут дизейблен, а ПОДДЕЛАННЫЙ
-    // конверт (инъекция через evaluate в bus._dispatch у Лиды, минуя реальный
+    // (без токена, лобби пока выключено). Дальше по шагам: (а.5) лидер через
+    // UI-панель ограничивает число участников (#setting-max-participants=2),
+    // счётчик «Participants: N / M» показывает эффективный лимит у ОБОИХ
+    // (не только у лидера), третий по прямой ссылке получает «Room is full»,
+    // возврат к «No limit» снова пускает; (б) лидер включает лобби, Тоня ждёт
+    // одобрения и получает его, Юра ждёт и получает отказ; (в) лидер
+    // выключает гостям чат — у Гоши инпут дизейблен, а ПОДДЕЛАННЫЙ конверт
+    // (инъекция через evaluate в bus._dispatch у Лиды, минуя реальный
     // DataChannel — тот же приём, что и в негативном тесте edit выше) с
     // ЧУЖИМ from не рендерится ни у кого; (г) лидер выключает гостям показ
     // экрана — кнопка «Экран» у Гоши дизейблена; (д) лидер уходит — старейший
     // гость (Гоша, joined_at раньше Тони) получает корону и тост.
     await step(
-      'Права и лидер: корона создателя, лобби (одобрение/отказ), запрет чата гостям (+ игнор поддельного конверта), запрет показа экрана, смена лидера при уходе',
+      'Права и лидер: корона создателя, лимит участников от лидера через UI (счётчик + room-full + снятие лимита), лобби (одобрение/отказ), запрет чата гостям (+ игнор поддельного конверта), запрет показа экрана, смена лидера при уходе',
       async () => {
         const res = await fetch(`${server.baseUrl}/api/rooms`, { method: 'POST' });
         assert.ok(res.ok, `POST /api/rooms ответил статусом ${res.status}`);
@@ -2613,6 +2627,86 @@ async function main() {
           const goshaMicOptionsCount = await goshaPage.locator('#setting-mic-device option').count();
           assert.ok(goshaMicOptionsCount > 0, 'у Гоши селект микрофона должен наполниться хотя бы одним устройством');
           await goshaPage.click('#settings-panel-close');
+
+          // --- (а.5) лидер ограничивает число участников через UI-панель
+          //     (RoomSettings.max_participants) ---
+          //
+          // Сейчас в комнате ровно Лида + Гоша (2 участника, см. подготовку
+          // выше) — самый момент проверить лимит «третий не пройдёт», пока
+          // счёт не вырос дальше в шагах (б) ниже (лобби, Тоня, Юра). Своей
+          // комнаты этому кусочку не заводим и не тратим лишний POST
+          // /api/rooms — H2: ROOM_CREATION_IP_LIMIT (10 за 60с на IP), файл и
+          // так держит бюджет ровно в 10 (см. комментарий у
+          // roomIdForTimerTestReuse ниже) — переиспользуем permRoomUrl/
+          // permRoomId этого же шага. Серверный signaling-путь (валидация
+          // 2..потолок, «снижение не выгоняет» и т.п.) уже покрыт
+          // signaling.test.mjs — здесь именно UI: селект в панели настроек,
+          // счётчик у ОБОИХ участников (не только у лидера) и оверлей
+          // «Room is full» у заблокированного.
+          await lidaPage.click('#settings-button');
+          await lidaPage.locator('#setting-max-participants').selectOption('2');
+          await waitUntil(
+            async () => (await lidaPage.evaluate(() => roomSettings && roomSettings.maxParticipants === 2)),
+            { timeoutMs: 5000, message: 'maxParticipants=2 не применился у Лиды после выбора в селекте' }
+          );
+          await lidaPage.click('#settings-panel-close');
+
+          // Счётчик «Participants: N / M» показывает эффективный лимит У
+          // ОБОИХ — это не лидер-only UI (в отличие от самой секции
+          // «Комната» настроек, см. проверку у Гоши выше).
+          for (const page of [lidaPage, goshaPage]) {
+            await page.waitForFunction(
+              () => document.getElementById('participant-count')?.textContent === 'Participants: 2 / 2',
+              undefined,
+              { polling: 100, timeout: 5000 }
+            );
+          }
+
+          // Третий по прямой ссылке (лобби пока выключено, до шага (б)) —
+          // «Room is full» (тот же паттерн переполнения, что и в
+          // tests/e2e/resilience.spec.mjs про серверный дефолт).
+          const extraContext = await browser.newContext();
+          try {
+            const extraPage = await extraContext.newPage();
+            await extraPage.goto(permRoomUrl);
+            await joinRoom(extraPage, 'Лишний');
+            await waitOverlayTitle(extraPage, 'Room is full', 10_000);
+          } finally {
+            await extraContext.close();
+          }
+          // Комната не пострадала от отклонённой попытки — по-прежнему двое.
+          await waitForTileCount(lidaPage, 2, 5000);
+          await waitForTileCount(goshaPage, 2, 5000);
+
+          // Возврат к «No limit»: сам факт применения (roomSettings.maxParticipants
+          // === null у обоих) уже проверен выше в тестах на update-settings
+          // (см. блоки guestChat/guestScreen ниже — та же одна и та же
+          // причинно-следственная связь UI-селект -> broadcast -> roomSettings)
+          // и отдельно сервер-side валидацией в signaling.test.mjs; здесь НЕ
+          // добавляем ещё один join-room, чтобы проверить, что комната
+          // «снова пускает» — файл и так подходит к пределу
+          // JOIN_ROOM_IP_LIMIT (20 join-room за 60с с одного IP, см.
+          // DEFAULT_JOIN_ROOM_IP_LIMIT в src/state.rs) за счёт совокупности
+          // всех joinRoom() по файлу; лишний join здесь эмпирически валил
+          // последующие шаги («Мобильный смоук», «Ш1: неверный t») отказом
+          // сервера по этому лимиту. Пускает ли «No limit» снова — это чисто
+          // серверная логика (effective_max_participants), уже покрытая
+          // signaling.test.mjs; здесь важен именно UI-переход селекта и то,
+          // что он реально долетает до сервера (см. проверку roomSettings
+          // ниже).
+          await lidaPage.click('#settings-button');
+          await lidaPage.locator('#setting-max-participants').selectOption('');
+          await waitUntil(
+            async () => (await lidaPage.evaluate(() => roomSettings && roomSettings.maxParticipants === null)),
+            { timeoutMs: 5000, message: 'возврат к «No limit» не применился у Лиды' }
+          );
+          await waitUntil(
+            async () => (await goshaPage.evaluate(() => roomSettings && roomSettings.maxParticipants === null)),
+            { timeoutMs: 5000, message: 'возврат к «No limit» не применился у Гоши' }
+          );
+          await lidaPage.click('#settings-panel-close');
+          await waitForTileCount(lidaPage, 2, 5000);
+          await waitForTileCount(goshaPage, 2, 5000);
 
           // --- (б) лидер включает лобби ---
           await lidaPage.click('#settings-button');
@@ -3668,13 +3762,24 @@ async function main() {
             );
             const page = await context.newPage();
 
-            // PUT /api/rooms/<id>, а не POST: к этому месту файла счёт
-            // POST-запросов (H2: ROOM_CREATION_IP_LIMIT — 10 за 60с с одного
-            // IP, см. src/state.rs) уже исчерпан другими шагами этого файла
-            // — тот же приём, что и в Ш3-блоке выше (см. комментарий там).
-            // PUT restore_room этот лимит не проверяет вовсе; комната
-            // создаётся пустой, без лидера — первый вошедший (эта страница)
-            // станет лидером автоматически, leaderToken не нужен.
+            // PUT /api/rooms/<id>, а не POST: комната создаётся пустой, без
+            // лидера — первый вошедший (эта страница) станет лидером
+            // автоматически, leaderToken не нужен.
+            //
+            // (B, docs/research-dos.md §3.1): PUT restore_room ТЕПЕРЬ (в
+            // отличие от старого поведения, на которое рассчитывал прежний
+            // комментарий здесь) тоже проверяет per-IP лимит — делит бюджет
+            // с POST /api/rooms (тот же ROOM_CREATION_IP_LIMIT/room_creation_ips,
+            // см. src/main.rs::restore_room) — а не отдельный счётчик. К этому
+            // месту файла POST-запросов с реального (localhost) IP уже
+            // накопилось много (см. H2: ROOM_CREATION_IP_LIMIT — 10 за 60с) —
+            // делить с ними бюджет этого PUT было бы гонкой с реальным
+            // временем прогона (сколько из них уже выпало из скользящего
+            // окна). Изолируем этот вызов СВОИМ CF-Connecting-IP (тот же
+            // приём, что в tests/signaling.test.mjs::createRoom(ip) — сервер
+            // доверяет этому заголовку напрямую, см. src/state.rs::extract_client_ip),
+            // чтобы проверка PUT здесь была про фактическое поведение
+            // recovery-эндпоинта, а не про везение с таймингом остального файла.
             const roomId = Array.from({ length: 8 }, () => 'abcdefghijklmnopqrstuvwxyz0123456789'[Math.floor(Math.random() * 36)]).join('');
             // `t`/`e` фиксируем сами (а не отдаём генерацию `e` по умолчанию
             // внутрь roomUrlWithKey), чтобы ниже точно знать, какой именно
@@ -3684,7 +3789,10 @@ async function main() {
             // здесь не читаем.
             const roomToken = generateRoomToken();
             const roomExpiry = defaultValidExpiryB36();
-            const putRes = await fetch(`${server.baseUrl}/api/rooms/${roomId}`, { method: 'PUT' });
+            const putRes = await fetch(`${server.baseUrl}/api/rooms/${roomId}`, {
+              method: 'PUT',
+              headers: { 'CF-Connecting-IP': '10.77.0.1' }, // см. комментарий выше про изоляцию от ROOM_CREATION_IP_LIMIT
+            });
             assert.ok(putRes.ok, `PUT /api/rooms/${roomId} ответил статусом ${putRes.status}`);
 
             await page.goto(roomUrlWithKey(server.baseUrl, roomId, roomToken, { e: roomExpiry }));

@@ -48,7 +48,12 @@ terms, the server never has access to:
   at all for a current client (that field is always `null`); a name instead
   travels as a separate `name-announce` message, encrypted client-side under
   a key specific to the sender/recipient pair, before it's sent (see
-  [`e2e-encryption.md`](e2e-encryption.md)).
+  [`e2e-encryption.md`](e2e-encryption.md)). The server doesn't just receive
+  `null` here — it no longer keeps a `name` field in its own in-memory
+  participant state at all any more (that storage, kept around only for
+  hypothetical v1-client compatibility, has been removed; the wire field
+  stays in the protocol schema, always sent as `null`) — one less thing for
+  the server to hold even transiently, however briefly.
 - A room's own name, if its creator gave it one — unlike a participant's
   name, it isn't merely encrypted before being sent, it is never sent to the
   server at all, encrypted or otherwise, even though every participant who

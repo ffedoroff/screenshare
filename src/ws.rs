@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -17,25 +17,9 @@ use uuid::Uuid;
 use crate::protocol::{ClientMessage, PeerInfo, PendingInfo, RoomSettings, ServerMessage};
 use crate::state::{
     check_ip_rate_limit, extract_client_ip, generate_peer_id, send_to, AppState, IpRateLimitMap,
-    PendingParticipant, Participant, PeerTx, Room, SharedRooms, MAX_PENDING,
+    PendingParticipant, Participant, PeerTx, Room, SharedRooms, JOIN_ROOM_IP_WINDOW, MAX_PENDING,
     PENDING_JOIN_IP_LIMIT, PENDING_JOIN_IP_WINDOW,
 };
-
-/// Максимальная длина отображаемого имени в символах.
-///
-/// Ш1 (E2E-шифрование, см. static/crypto.js/room.js): `name` теперь — не
-/// открытый текст, а шифрблоб (base64: iv + AES-256-GCM ciphertext, см.
-/// `RoomCrypto.encryptToBase64`) под ключом, выведенным из секрета `k`,
-/// известного только участникам (сервер его не видит и не может видеть) —
-/// поэтому сервер больше не понимает содержимое этого поля вообще и не
-/// может проверить, что это осмысленное «имя»: единственная содержательная
-/// проверка, которая ему тут по силам — не пропустить откровенно
-/// неадекватный размер и управляющие символы. Лимит поднят с прежних 32
-/// (когда поле было настоящим именем) до 512 — шифртекст всегда длиннее
-/// исходного открытого имени (12 байт iv + до 16 байт GCM-тега + base64
-/// накладывает ~33% сверху), 512 символов даёт большой запас даже для имён
-/// у верхней границы `maxlength` инпута (см. static/room.html).
-const CHAT_NAME_MAX_CHARS: usize = 512;
 
 /// E2E v2 (см. docs/research-p2p-key-handoff.md §6.5–6.6): максимальная длина
 /// `epub` (эфемерный публичный ключ пира, ECDH P-256, base64url raw) в
@@ -168,6 +152,12 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, ip: String) {
     // общее на все релеи) сгруппированы в одну структуру — см. `RateLimits`.
     let mut rate_limits = RateLimits::default();
 
+    // C (docs/research-ops.md §1.0/§1.6, см. `crate::shutdown_signal`):
+    // подписка на broadcast-уведомление о шатдауне — по SIGTERM/SIGINT сервер
+    // сам активно закрывает это соединение (см. select ниже), вместо того
+    // чтобы пассивно доживать до `terminationGracePeriodSeconds`/`SIGKILL`.
+    let mut shutdown_rx = state.shutdown.subscribe();
+
     // Хартбит: тикает каждые PING_INTERVAL, шлёт Message::Ping. axum сам
     // отвечает Pong'ом на ВХОДЯЩИЕ Ping (нам ничего для этого делать не нужно),
     // а вот входящие Pong (ответ на НАШ ping) прилетают в socket.recv() ниже
@@ -180,6 +170,23 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, ip: String) {
 
     loop {
         tokio::select! {
+            // C: сервер уходит на SIGTERM/SIGINT — закрываем сокет активно
+            // СЕЙЧАС, а не ждём пассивно `terminationGracePeriodSeconds`
+            // (30с)/`SIGKILL` (см. docs/research-ops.md §1.0/§1.6). Клиент
+            // ловит `Close` немедленно и уходит в свой обычный
+            // auto-reconnect. Результат `recv()` (Ok/Err/Lagged) не важен —
+            // в любом случае пора закрываться; `Err` возможен только если
+            // отправитель уже сброшен (сервер уже почти остановлен) — тоже
+            // сигнал закрываться.
+            _ = shutdown_rx.recv() => {
+                debug!("получен сигнал шатдауна — закрываем WS активно");
+                let _ = socket.send(Message::Close(Some(CloseFrame {
+                    code: axum::extract::ws::close_code::RESTART,
+                    reason: "server restarting, please reconnect".into(),
+                }))).await;
+                break;
+            }
+
             // Хартбит: раз в PING_INTERVAL. Если два ping'а подряд ушли без
             // единого ответа (пуст ни pong, ни вообще что-либо от клиента) —
             // соединение считаем мёртвым и рвём сами, не дожидаясь TCP-таймаута.
@@ -241,7 +248,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, ip: String) {
                             Ok(msg) => {
                                 let flow = handle_message(
                                     msg, &mut me, &tx, &state.rooms, &mut rate_limits,
-                                    &ip, &state.pending_join_ips,
+                                    &ip, &state.pending_join_ips, &state.join_room_ips,
                                 );
                                 if flow == Flow::Stop {
                                     // Не рвём сразу: даём писателю дослать очередь.
@@ -272,9 +279,12 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, ip: String) {
         }
     }
 
-    // Чистка при любом исходе: leave, close, обрыв.
+    // Чистка при любом исходе: leave, close, обрыв. `&tx` — см.
+    // `cleanup_peer`: нужен, чтобы отличить "это соединение всё ещё владеет
+    // своим слотом" от "слот уже перехвачен реконнектом другого соединения"
+    // (см. `reconnect_participant`/задачи A/D).
     if let Some(ctx) = me {
-        cleanup_peer(&ctx, &state.rooms);
+        cleanup_peer(&ctx, &state.rooms, &tx);
     }
 }
 
@@ -289,14 +299,18 @@ fn handle_message(
     rate_limits: &mut RateLimits,
     ip: &str,
     pending_join_ips: &IpRateLimitMap,
+    join_room_ips: &IpRateLimitMap,
 ) -> Flow {
     match msg {
-        ClientMessage::JoinRoom { room_id, name, peer_id, leader_token, epub } => {
+        // `name` сознательно не биндится (`name: _`): сервер его больше не
+        // хранит и не использует — см. docs/research-minimize-state.md §3,
+        // комментарий у `crate::state::Participant`. Поле остаётся в схеме
+        // протокола только ради обратной совместимости десериализации.
+        ClientMessage::JoinRoom { room_id, name: _, peer_id, leader_token, epub } => {
             if me.is_some() {
                 send_to(tx, err("already in a room"));
                 return Flow::Continue;
             }
-            let name = sanitize_name(name);
             let epub = sanitize_epub(epub);
 
             let mut rooms_guard = rooms.lock().unwrap();
@@ -305,10 +319,42 @@ fn handle_message(
                 return Flow::Continue; // сокет закроет писатель
             };
 
+            // A/D: реконнект СВОИМ прежним peerId, который ПРЯМО СЕЙЧАС
+            // занимает слот полноценного участника этой же комнаты — см.
+            // `reconnect_participant` за подробным обоснованием. Обрабатываем
+            // ДО per-IP лимита join-room (A) и ДО room-full/effective-лимита
+            // (D): это не новый вход, а тот же самый участник с новым
+            // сигналинг-соединением, поэтому не должен ни тратить чужой/свой
+            // бюджет, ни спотыкаться о лимит, который сам уже занимает.
+            if let Some(id) = peer_id.as_deref() {
+                if Uuid::parse_str(id).is_ok() && room.participants.contains_key(id) {
+                    let peer_id = id.to_string();
+                    reconnect_participant(room, &room_id, &peer_id, tx.clone());
+                    drop(rooms_guard);
+                    *me = Some(PeerCtx { room_id: room_id.clone(), peer_id });
+                    return Flow::Continue;
+                }
+            }
+
+            // A (H2, DoS-защита, docs/research-dos.md §3.2 — «главная дыра»):
+            // per-IP лимит на сам факт JoinRoom, отдельный бюджет от
+            // ROOM_CREATION_IP_LIMIT/PENDING_JOIN_IP_LIMIT (см.
+            // DEFAULT_JOIN_ROOM_IP_LIMIT в state.rs). Проверяется здесь,
+            // ДО ветвления на лобби/прямой вход — попадание в лобби поэтому
+            // расходует и этот бюджет, и PENDING_JOIN_IP_LIMIT ниже; это не
+            // ошибка, а сознательно избыточная защита (раздельные карты,
+            // не делят счётчик) ради простоты одной точки проверки.
+            if !check_ip_rate_limit(join_room_ips, ip, *crate::JOIN_ROOM_IP_LIMIT, JOIN_ROOM_IP_WINDOW) {
+                send_to(tx, err("too many join attempts from your network, try again later"));
+                drop(rooms_guard);
+                return Flow::Stop;
+            }
+
             // Клиентский peerId (переподключение после обрыва сигналинга, см.
             // ClientMessage::JoinRoom) — принимаем, только если валидный UUID
             // и ещё свободен в этой комнате (ни среди участников, ни среди
-            // ожидающих в лобби); иначе как раньше генерируем новый.
+            // ожидающих в лобби; занятый среди участников уже обработан выше
+            // как реконнект); иначе как раньше генерируем новый.
             let peer_id = peer_id
                 .filter(|id| Uuid::parse_str(id).is_ok())
                 .filter(|id| !room.participants.contains_key(id) && !room.pending.contains_key(id))
@@ -351,7 +397,6 @@ fn handle_message(
                     peer_id.clone(),
                     PendingParticipant {
                         tx: tx.clone(),
-                        name: name.clone(),
                         epub: epub.clone(),
                         joined_at: Instant::now(),
                     },
@@ -377,7 +422,7 @@ fn handle_message(
                     if let Some(leader) = room.participants.get(&leader_id) {
                         send_to(&leader.tx, ServerMessage::JoinRequest {
                             peer_id: peer_id.clone(),
-                            name: name.clone(),
+                            name: None, // мёртвое поле, см. комментарий модуля protocol.rs
                             epub: epub.clone(),
                         });
                     }
@@ -387,12 +432,16 @@ fn handle_message(
                 return Flow::Continue;
             }
 
-            if room.participants.len() >= *crate::MAX_PARTICIPANTS {
+            // D (docs/research-room-limit.md §2.2): эффективный лимит комнаты
+            // — собственный лидера, если задан, иначе серверный потолок (см.
+            // `Room::effective_max_participants`) — ВЕЗДЕ вместо прямого
+            // сравнения с `crate::MAX_PARTICIPANTS`.
+            if room.participants.len() >= room.effective_max_participants() {
                 send_to(tx, ServerMessage::RoomFull);
                 return Flow::Continue;
             }
 
-            admit_participant(room, &room_id, peer_id.clone(), name.clone(), epub.clone(), tx.clone(), becomes_leader);
+            admit_participant(room, &room_id, peer_id.clone(), epub.clone(), tx.clone(), becomes_leader);
 
             drop(rooms_guard);
             *me = Some(PeerCtx { room_id: room_id.clone(), peer_id });
@@ -487,11 +536,14 @@ fn handle_message(
 /// стал им), уведомляет остальных `peer-joined` и шлёт самому вошедшему
 /// `joined` — с текущими pending-заявками ТОЛЬКО если он лидер, иначе с
 /// пустым списком.
+///
+/// `name` больше не параметр (было мёртвое поле — сервер его не хранит, см.
+/// docs/research-minimize-state.md §3): и в `peers[]`/`peer-joined`
+/// подставляется `None`/`null` безусловно.
 fn admit_participant(
     room: &mut Room,
     room_id: &str,
     peer_id: String,
-    name: Option<String>,
     epub: Option<String>,
     tx: PeerTx,
     becomes_leader: bool,
@@ -500,13 +552,13 @@ fn admit_participant(
     let peers: Vec<PeerInfo> = room
         .participants
         .iter()
-        .map(|(id, p)| PeerInfo { peer_id: id.clone(), name: p.name.clone(), epub: p.epub.clone() })
+        .map(|(id, p)| PeerInfo { peer_id: id.clone(), name: None, epub: p.epub.clone() })
         .collect();
     let screen_owner = room.screen_owner.clone();
 
     room.participants.insert(
         peer_id.clone(),
-        Participant { tx: tx.clone(), name: name.clone(), epub: epub.clone(), joined_at: Instant::now() },
+        Participant { tx: tx.clone(), epub: epub.clone(), joined_at: Instant::now() },
     );
     // Вход в опустевшую-но-живую комнату снимает отметку TTL.
     room.emptied_at = None;
@@ -525,7 +577,7 @@ fn admit_participant(
         if id != &peer_id {
             send_to(&p.tx, ServerMessage::PeerJoined {
                 peer_id: peer_id.clone(),
-                name: name.clone(),
+                name: None,
                 epub: epub.clone(),
             });
         }
@@ -547,7 +599,9 @@ fn admit_participant(
         settings: room.settings.clone(),
         pending,
         expires_in_seconds: room_expires_in_seconds(room),
-        max_participants: *crate::MAX_PARTICIPANTS,
+        // D: эффективный лимит комнаты (лидерский, если задан, иначе
+        // серверный потолок), см. `Room::effective_max_participants`.
+        max_participants: room.effective_max_participants(),
     });
 
     // Истории чата сервер новичку больше не шлёт: чат целиком на mesh
@@ -557,20 +611,102 @@ fn admit_participant(
 
 /// Текущие заявки лобби, отсортированные по времени подачи (`joined_at`,
 /// старейшая первой) — используется и для `Joined::pending` лидера, и при
-/// переносе заявок новому лидеру после смены (см. `cleanup_peer`).
+/// переносе заявок новому лидеру после смены (см. `cleanup_peer`). `name`
+/// сервер больше не хранит — всегда `None` (см. комментарий модуля
+/// protocol.rs).
 fn pending_sorted_by_arrival(room: &Room) -> Vec<PendingInfo> {
     let mut items: Vec<_> = room.pending.iter().collect();
     items.sort_by_key(|(_, p)| p.joined_at);
     items
         .into_iter()
-        .map(|(id, p)| PendingInfo { peer_id: id.clone(), name: p.name.clone(), epub: p.epub.clone() })
+        .map(|(id, p)| PendingInfo { peer_id: id.clone(), name: None, epub: p.epub.clone() })
         .collect()
+}
+
+/// A/D: реконнект СВОИМ прежним `peerId`, который прямо сейчас занимает слот
+/// полноценного участника этой же комнаты. Типичная причина — клиент потерял
+/// только сигналинг-WS (не mesh, см. docs/self-hosting.md §7.2) и успел
+/// переподключиться быстрее, чем сервер хартбитом (до `PING_INTERVAL *
+/// MAX_MISSED_PONGS`, ~40-60с) обнаружил обрыв старого соединения: старая
+/// запись `Participant` всё это время «зомби» — числится занятой, но её `tx`
+/// уже никто не читает на другом конце. Заводить для такого реконнекта НОВЫЙ
+/// слот (как раньше — коллизия peerId просто генерировала новый) означает:
+/// (а) ложный `room-full`/`effective_max_participants` именно в комнатах с
+/// маленьким лидерским лимитом (см. docs/research-room-limit.md §4 — это и
+/// есть тот «тонкий момент», который там явно предупреждён), (б) расход
+/// per-IP бюджета `JOIN_ROOM_IP_LIMIT` за легитимное действие.
+///
+/// Что делаем: заменяем `tx` в СУЩЕСТВУЮЩЕЙ записи новым каналом. `joined_at`
+/// НЕ трогаем — иначе реконнект перепрыгнул бы очередь на лидерство
+/// относительно участников, вошедших раньше него, но позже его первого
+/// входа. `epub` тоже НЕ трогаем: остальные участники уже получили
+/// `peer-joined` с ПРЕЖНИМ `epub` этого пира и вывели попарные E2E-ключи из
+/// него (см. docs/e2e-encryption.md) — подменить значение сейчас означало бы
+/// разъехаться по ключам с уже сидящими участниками; рассылать всем новый
+/// `peer-joined` для того, кто и не уходил с их точки зрения, тоже не нужно
+/// — membership для них не изменился.
+///
+/// Старое (замещённое) соединение само по себе не трогаем — его собственный
+/// `handle_socket`-цикл рано или поздно завершится сам (хартбит или просто
+/// обрыв), и в этот момент его `cleanup_peer` НЕ должен снести чужой, уже
+/// перехваченный слот — см. проверку `same_channel` там.
+///
+/// Доверие к переиспользованию: единственная проверка — совпадение самого
+/// `peerId`, а он `Uuid::new_v4()` (128 бит криптослучайности, см.
+/// `generate_peer_id`) — угадать чужой практически невозможно, тот же
+/// уровень доверия, что уже есть у `leaderToken`. Если он всё же угадан —
+/// жертва (если её соединение ещё живо) продолжает получать сообщения по
+/// старому каналу до его собственной смерти, а НОВЫЕ сообщения, адресованные
+/// ей другими, уходят захватчику: заметный сбой сигналинга для конкретной
+/// пары, но не молчаливая утечка контента (SDP/ICE шифруются попарным
+/// ключом, выведенным из `epub`, которого захватчик не знает).
+///
+/// Реконнектящемуся шлём ПОЛНОЦЕННЫЙ свежий `joined` (как при обычном входе)
+/// — не no-op: пока сигналинг был оборван, состояние комнаты могло измениться
+/// (настройки, лобби, владелец экрана, эффективный лимит) — свежий `joined`
+/// даёт клиенту тот же самый ресинк, что уже делает `waiting` при смене
+/// лидера (см. `cleanup_peer`). Остальным участникам НИЧЕГО не рассылаем —
+/// с их точки зрения этот peerId никуда не уходил (`peer-joined`/`peer-left`
+/// не было и не будет).
+fn reconnect_participant(room: &mut Room, room_id: &str, peer_id: &str, tx: PeerTx) {
+    match room.participants.get_mut(peer_id) {
+        Some(participant) => participant.tx = tx.clone(),
+        None => return,
+    }
+    info!(room = %room_id, peer = %peer_id, "реконнект существующего участника (сигналинг переустановлен)");
+
+    let peers: Vec<PeerInfo> = room
+        .participants
+        .iter()
+        .filter(|(id, _)| id.as_str() != peer_id)
+        .map(|(id, p)| PeerInfo { peer_id: id.clone(), name: None, epub: p.epub.clone() })
+        .collect();
+    let is_leader = room.leader_id.as_deref() == Some(peer_id);
+    let pending = if is_leader { pending_sorted_by_arrival(room) } else { Vec::new() };
+
+    send_to(&tx, ServerMessage::Joined {
+        peer_id: peer_id.to_string(),
+        peers,
+        screen_owner: room.screen_owner.clone(),
+        leader_id: room.leader_id.clone().unwrap_or_else(|| peer_id.to_string()),
+        settings: room.settings.clone(),
+        pending,
+        expires_in_seconds: room_expires_in_seconds(room),
+        max_participants: room.effective_max_participants(),
+    });
 }
 
 /// `update-settings`: применяет новые настройки целиком (не патч) — только от
 /// лидера, иначе `error`. Рассылает `settings-changed` всем участникам. Если
 /// `guest_screen` только что отобрали, а текущий владелец экрана — не лидер,
 /// сервер сам останавливает его шаринг (`share-stopped` всем).
+///
+/// D (docs/research-room-limit.md §2.1): `settings.max_participants`, если
+/// `Some(n)`, валидируется — `n` должно быть `2..=crate::MAX_PARTICIPANTS`,
+/// иначе весь `update-settings` отклоняется ЦЕЛИКОМ (`error`, ничего не
+/// применяется — та же механика «всё или ничего», что у остальных полей
+/// `settings`). Нижняя граница 2 (не 1) — комната с лимитом 1 не имеет
+/// смысла: лидер не смог бы впустить даже самого себя вторым.
 fn handle_update_settings(
     settings: RoomSettings,
     me: &Option<PeerCtx>,
@@ -588,6 +724,15 @@ fn handle_update_settings(
     if room.leader_id.as_deref() != Some(ctx.peer_id.as_str()) {
         send_to(tx, err("only the room leader can change settings"));
         return;
+    }
+    if let Some(n) = settings.max_participants {
+        if !(2..=*crate::MAX_PARTICIPANTS).contains(&n) {
+            send_to(tx, err(&format!(
+                "maxParticipants must be between 2 and {} (server limit)",
+                *crate::MAX_PARTICIPANTS,
+            )));
+            return;
+        }
     }
 
     let guest_screen_was_allowed = room.settings.guest_screen;
@@ -614,10 +759,10 @@ fn handle_update_settings(
 }
 
 /// `approve {peerId}`: только лидер, только по действующей заявке в
-/// `room.pending`. Переносит ожидающего в участники (тем же `tx`/`name`),
-/// шлёт ему полноценный `joined` и остальным `peer-joined`. Если комната
-/// успела заполниться, пока заявка ждала — отклоняем её отдельно (не даём
-/// превысить `crate::MAX_PARTICIPANTS`).
+/// `room.pending`. Переносит ожидающего в участники (тем же `tx`), шлёт ему
+/// полноценный `joined` и остальным `peer-joined`. Если комната успела
+/// заполниться, пока заявка ждала — отклоняем её отдельно (не даём превысить
+/// эффективный лимит комнаты, см. `Room::effective_max_participants` — D).
 fn handle_approve(target: String, me: &Option<PeerCtx>, tx: &PeerTx, rooms: &SharedRooms) {
     let Some(ctx) = me else {
         send_to(tx, err("not in a room"));
@@ -635,14 +780,14 @@ fn handle_approve(target: String, me: &Option<PeerCtx>, tx: &PeerTx, rooms: &Sha
         send_to(tx, err("no such pending join request"));
         return;
     };
-    if room.participants.len() >= *crate::MAX_PARTICIPANTS {
+    if room.participants.len() >= room.effective_max_participants() {
         send_to(&pending.tx, ServerMessage::RoomFull);
         send_to(tx, err("room is full, cannot approve"));
         return;
     }
 
     let room_id = ctx.room_id.clone();
-    admit_participant(room, &room_id, target, pending.name, pending.epub, pending.tx, false);
+    admit_participant(room, &room_id, target, pending.epub, pending.tx, false);
 }
 
 /// `reject {peerId}`: только лидер, только по действующей заявке. Ожидающему
@@ -773,31 +918,19 @@ fn room_expires_in_seconds(room: &Room) -> u64 {
         .as_secs()
 }
 
-/// `name`: trim, вырезать управляющие символы, обрезать до
-/// `CHAT_NAME_MAX_CHARS` символов; пустое после очистки — `None`. С Ш1 это
-/// шифрблоб (см. CHAT_NAME_MAX_CHARS выше), но сама санитизация (trim +
-/// вырезание control-символов) безвредна и для base64 — там таких символов
-/// не бывает — и оставлена как есть, а не убрана вовсе: это дешёвая защита
-/// от совсем уж некорректных байтов, даже если клиент когда-нибудь пришлёт
-/// что-то, не являющееся валидным шифрблобом.
-fn sanitize_name(name: Option<String>) -> Option<String> {
-    let raw = name?;
-    let cleaned: String = raw.trim().chars().filter(|c| !c.is_control()).collect();
-    let trimmed = cleaned.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    Some(trimmed.chars().take(CHAT_NAME_MAX_CHARS).collect())
-}
-
 /// `epub` (E2E v2): непустая строка после trim, не длиннее `EPUB_MAX_CHARS`
 /// символов — иначе (пусто, отсутствует вовсе, слишком длинная) `None`.
 /// Сервер содержимое НЕ парсит (опак, как `sdp`/`candidate`) — единственная
-/// его забота — не пропустить откровенно неадекватный размер. В отличие от
-/// `sanitize_name` — НЕ обрезаем слишком длинное значение, а отбрасываем
-/// целиком: обрезанный публичный ключ не будет соответствовать ни одному
-/// валидному ключу, так что "почти правильный, но обрезанный" эфемерный
-/// эпаб бесполезен и только маскирует ошибку клиента.
+/// его забота — не пропустить откровенно неадекватный размер. НЕ обрезаем
+/// слишком длинное значение, а отбрасываем целиком: обрезанный публичный
+/// ключ не будет соответствовать ни одному валидному ключу, так что "почти
+/// правильный, но обрезанный" эфемерный эпаб бесполезен и только маскирует
+/// ошибку клиента.
+///
+/// (`name` в `join-room` больше не санитизируется/не хранится вовсе — см.
+/// docs/research-minimize-state.md §3 и комментарий у
+/// `crate::state::Participant`: поле мёртвое у всех v2-клиентов, сервер
+/// просто игнорирует присланное значение целиком.)
 fn sanitize_epub(epub: Option<String>) -> Option<String> {
     let raw = epub?;
     let trimmed = raw.trim();
@@ -927,9 +1060,28 @@ fn handle_name_announce(
 ///
 /// Для ожидающего в лобби: просто убираем из `pending` и, если лидер ещё
 /// есть, уведомляем его `join-request-cancelled`.
-fn cleanup_peer(ctx: &PeerCtx, rooms: &SharedRooms) {
+///
+/// `tx` — канал ИМЕННО ЭТОГО (закрывающегося) соединения (см. A/D,
+/// `reconnect_participant`): реконнект мог УЖЕ забрать `ctx.peer_id` себе,
+/// заменив `tx` в `room.participants` на канал нового, более свежего
+/// соединения, пока СТАРОЕ (это) соединение просто ещё не успело завершить
+/// свой собственный `handle_socket`-цикл (хартбит истекает не мгновенно).
+/// Если это произошло — слот больше не принадлежит этому вызову: не трогаем
+/// участника вовсе (ни удаления, ни `peer-left`/`leader-changed` за чужое,
+/// уже живое соединение) — сравниваем каналы через `same_channel`
+/// (`tokio::sync::mpsc::UnboundedSender::same_channel`), а не сам факт
+/// наличия записи.
+fn cleanup_peer(ctx: &PeerCtx, rooms: &SharedRooms, tx: &PeerTx) {
     let mut rooms_guard = rooms.lock().unwrap();
     let Some(room) = rooms_guard.get_mut(&ctx.room_id) else { return };
+
+    if let Some(participant) = room.participants.get(&ctx.peer_id) {
+        if !participant.tx.same_channel(tx) {
+            debug!(room = %ctx.room_id, peer = %ctx.peer_id,
+                "закрывается уже замещённое реконнектом соединение — слот не трогаем");
+            return;
+        }
+    }
 
     if room.participants.remove(&ctx.peer_id).is_some() {
         if room.screen_owner.as_deref() == Some(ctx.peer_id.as_str()) {

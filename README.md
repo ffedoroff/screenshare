@@ -55,8 +55,10 @@ blocked there. Use the domain/TLS setup above, a self-signed cert (e.g.
 `mkcert`), or a tunnel.
 
 TURN is optional (STUN alone covers most networks); add one only if some users
-sit behind symmetric NAT. Full guide, environment variables, and reverse-proxy
-examples: **[docs/self-hosting.md](docs/self-hosting.md)**.
+sit behind symmetric NAT. Sensible anti-abuse defaults (per-IP rate limits on
+room creation and joining) are built in and tunable via env. Full guide,
+environment variables, and reverse-proxy examples:
+**[docs/self-hosting.md](docs/self-hosting.md)**.
 
 ## Documentation
 

@@ -154,6 +154,7 @@ const settingGuestChatInput = document.getElementById('setting-guest-chat');
 const settingGuestAudioInput = document.getElementById('setting-guest-audio');
 const settingGuestVideoInput = document.getElementById('setting-guest-video');
 const settingGuestScreenInput = document.getElementById('setting-guest-screen');
+const settingMaxParticipantsInput = document.getElementById('setting-max-participants');
 
 // --- DOM: «Соединение и приватность» (см. раздел ниже) — видно ВСЕМ участникам ---
 const settingsCryptoRowEl = document.getElementById('settings-crypto-row');
@@ -320,13 +321,38 @@ const ROOM_TIMER_CRITICAL_MS = 60 * 1000; // последняя минута —
 let roomExpiresAtMs = null; // Date.now() на момент joined + expiresInSeconds*1000, null до первого joined
 let roomTimerInterval = null;
 
-// Потолок числа участников — сервер присылает его сам в `joined.maxParticipants`
-// (см. src/protocol.rs::ServerMessage::Joined, env `MAX_PARTICIPANTS` на
-// сервере, рекомендуемый дефолт 6 — см. docs/self-hosting.md, §6). 6 здесь —
-// ТОЛЬКО фолбэк на случай совсем старого сервера без этого поля (аддитивное,
-// см. joined-обработчик ниже) — реальное значение приходит на каждом joined,
-// как и roomExpiresAtMs выше.
+// Лимит числа участников комнаты — сервер присылает ЭФФЕКТИВНЫЙ лимит в
+// `joined.maxParticipants` (см. src/protocol.rs::ServerMessage::Joined) на
+// КАЖДОМ joined; в `settings-changed` отдельного числа нет — пересчитываем
+// сами из `settings.maxParticipants` (см. обработчик settings-changed ниже).
+// Эффективный лимит — это либо серверный потолок из env `MAX_PARTICIPANTS`
+// (рекомендуемый дефолт 6, см. docs/self-hosting.md §6), либо СВОЙ, более
+// низкий лимит, который лидер комнаты выставил через панель настроек
+// (`RoomSettings.maxParticipants`, `null` = «без своего лимита», следует за
+// серверным потолком автоматически — см. populateMaxParticipantsOptions
+// ниже). 6 здесь — фолбэк ТОЛЬКО на случай совсем старого сервера без этого
+// поля вовсе. Снижение лимита НЕ выгоняет уже вошедших — сервер просто
+// перестаёт пропускать новых, пока состав не поредеет сам естественным
+// образом (см. docs/research-room-limit.md §2.2) — клиент здесь только
+// отображает текущее значение и блокирует выбор чисел выше уже известного
+// максимума, сам никого не выгоняет и не может.
 let maxParticipants = 6;
+
+// Лучшее известное значение НАСТОЯЩЕГО серверного потолка (без учёта
+// собственного лимита лидера, если он есть) — нужно для двух вещей: (а)
+// верхняя граница списка опций в селекте «Max participants» (см.
+// populateMaxParticipantsOptions), чтобы после сужения лимита лидер мог
+// вернуть его обратно к реальному потолку, а не только к текущему суженному
+// числу; (б) фолбэк при пересчёте эффективного лимита из settings-changed,
+// которое (в отличие от joined) не присылает эффективное число отдельно —
+// см. обработчик settings-changed ниже. Обновляется ТОЛЬКО когда есть
+// железное доказательство: сразу после joined/реконнекта, у которого
+// `roomSettings.maxParticipants === null` (лидер не сузил лимит) — в этот
+// момент `joined.maxParticipants` совпадает с настоящим потолком по
+// построению (см. `Room::effective_max_participants` на сервере). Если мы
+// попали в уже суженную кем-то комнату и ни разу не видели её несуженной —
+// остаётся на дефолтном фолбэке 6 до первого joined без своего лимита.
+let knownServerMaxParticipants = 6;
 
 /** Ч:ММ:СС из миллисекунд (не может быть отрицательным — вызывающая сторона зажимает снизу в 0). */
 function formatRoomTimer(remainingMs) {
@@ -1593,6 +1619,44 @@ function syncSettingsPanelInputs() {
   settingGuestAudioInput.checked = !!roomSettings.guestAudio;
   settingGuestVideoInput.checked = !!roomSettings.guestVideo;
   settingGuestScreenInput.checked = !!roomSettings.guestScreen;
+  populateMaxParticipantsOptions();
+}
+
+/**
+ * Пересобрать опции селекта «Max participants»: «No limit (default)» (= null
+ * на проводе) + числа 2..knownServerMaxParticipants.
+ *
+ * Почему верхняя граница списка — knownServerMaxParticipants (см. её
+ * объявление выше), а не сама maxParticipants: сервер присылает нам ТОЛЬКО
+ * эффективное значение (settings.maxParticipants ?? серверный env), никогда —
+ * отдельно настоящий потолок. Если строить список прямо из текущего
+ * эффективного значения, то после того как лидер сузит лимит (скажем, до 2),
+ * список схлопнется до одной опции «2» и без явного шага «сначала верни No
+ * limit» поднять лимит выше будет нельзя. knownServerMaxParticipants
+ * запоминает настоящий потолок отдельно (см. её объявление) именно чтобы
+ * избежать этого — список всегда полон, пока мы хоть раз видели комнату без
+ * собственного лимита лидера.
+ */
+function populateMaxParticipantsOptions() {
+  if (!roomSettings) return;
+  const current = roomSettings.maxParticipants; // null = «без своего лимита» (дефолт)
+  // Подстраховка: если мы попали в уже суженную кем-то комнату и ни разу не
+  // видели её несуженной, knownServerMaxParticipants может быть занижен
+  // (остался на фолбэке) относительно текущего значения — не даём списку
+  // «потерять» текущий выбор лидера, всегда включаем его в диапазон.
+  const ceiling = Math.max(2, knownServerMaxParticipants, typeof current === 'number' ? current : 0);
+  settingMaxParticipantsInput.innerHTML = '';
+  const noLimitOption = document.createElement('option');
+  noLimitOption.value = '';
+  noLimitOption.textContent = 'No limit (default)';
+  settingMaxParticipantsInput.appendChild(noLimitOption);
+  for (let n = 2; n <= ceiling; n++) {
+    const opt = document.createElement('option');
+    opt.value = String(n);
+    opt.textContent = String(n);
+    settingMaxParticipantsInput.appendChild(opt);
+  }
+  settingMaxParticipantsInput.value = current === null || current === undefined ? '' : String(current);
 }
 
 function openSettingsPanel() {
@@ -2380,6 +2444,14 @@ wireSettingToggle(settingGuestAudioInput, 'guestAudio');
 wireSettingToggle(settingGuestVideoInput, 'guestVideo');
 wireSettingToggle(settingGuestScreenInput, 'guestScreen');
 
+// Пустое значение селекта ("No limit") кодируется как null на проводе, а не
+// как число — см. populateMaxParticipantsOptions выше про то, почему это
+// важно (null «следует» за серверным потолком, зафиксированное число — нет).
+settingMaxParticipantsInput.addEventListener('change', () => {
+  const raw = settingMaxParticipantsInput.value;
+  sendSettingsUpdate({ maxParticipants: raw === '' ? null : parseInt(raw, 10) });
+});
+
 // ---------- Локальные потоки: рассылка новым и уже существующим пирам ----------
 
 /**
@@ -3010,6 +3082,13 @@ function registerSignalingHandlers(iceServers) {
     // updateParticipantCount на своём обычном пути.
     if (typeof joinedMaxParticipants === 'number' && Number.isFinite(joinedMaxParticipants)) {
       maxParticipants = joinedMaxParticipants;
+      // Если у комнаты в этот момент нет своего лимита (лидер не сужал его) —
+      // эффективное значение выше и есть настоящий серверный потолок,
+      // запоминаем его отдельно (см. knownServerMaxParticipants выше) — это
+      // единственный момент, когда мы можем быть в этом уверены.
+      if (settings && settings.maxParticipants == null) {
+        knownServerMaxParticipants = joinedMaxParticipants;
+      }
     }
 
     if (!joinedOnce) {
@@ -3177,6 +3256,18 @@ function registerSignalingHandlers(iceServers) {
 
   signaling.on('settings-changed', ({ settings }) => {
     roomSettings = settings;
+    // ВАЖНО (легко забываемая точка, см. docs/research-room-limit.md §2.3):
+    // в отличие от joined, settings-changed не присылает эффективный лимит
+    // отдельным числом — только сами настройки. Пересчитываем его сами:
+    // settings.maxParticipants, если лидер выставил свой (не null), иначе —
+    // лучшее известное значение настоящего серверного потолка (см.
+    // knownServerMaxParticipants выше). Без этого пересчёта счётчик
+    // «Participants: N / M» и текст оверлея «Room is full» не обновились бы
+    // у уже подключённых участников в реальном времени при смене лимита
+    // лидером посреди звонка — они читают именно maxParticipants, а не
+    // roomSettings напрямую.
+    maxParticipants = typeof settings.maxParticipants === 'number' ? settings.maxParticipants : knownServerMaxParticipants;
+    updateParticipantCount();
     if (!settingsPanelEl.classList.contains('hidden')) syncSettingsPanelInputs();
     applyGuestEnforcement();
     refreshMediaRenderingForAllPeers();

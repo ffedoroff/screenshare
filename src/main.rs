@@ -63,9 +63,9 @@ use uuid::Uuid;
 
 use crate::protocol::RoomSettings;
 use crate::state::{
-    check_ip_rate_limit, extract_client_ip, AppState, Room, DEFAULT_MAX_PARTICIPANTS,
-    DEFAULT_MAX_ROOMS, DEFAULT_MAX_ROOM_LIFETIME_SECONDS, ROOM_CREATION_IP_LIMIT,
-    ROOM_CREATION_IP_WINDOW,
+    check_ip_rate_limit, extract_client_ip, AppState, Room, DEFAULT_JOIN_ROOM_IP_LIMIT,
+    DEFAULT_MAX_PARTICIPANTS, DEFAULT_MAX_ROOMS, DEFAULT_MAX_ROOM_LIFETIME_SECONDS,
+    ROOM_CREATION_IP_LIMIT, ROOM_CREATION_IP_WINDOW,
 };
 
 /// Каталог со статикой фронтенда. Настраивается через env `STATIC_DIR` (в
@@ -122,6 +122,21 @@ pub(crate) static MAX_PARTICIPANTS: LazyLock<usize> = LazyLock::new(|| {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_MAX_PARTICIPANTS)
+});
+
+/// Per-IP лимит на прямой `join-room` в комнату (H2, docs/research-dos.md
+/// §3.2 — см. подробное обоснование у `state::DEFAULT_JOIN_ROOM_IP_LIMIT` про
+/// то, почему именно ЭТОТ лимит, в отличие от «соседних»
+/// (`ROOM_CREATION_IP_LIMIT`/`PENDING_JOIN_IP_LIMIT`), сделан configurable
+/// через env — тестируемость WS-хендшейка, у которого нет способа
+/// проставить произвольный `CF-Connecting-IP`, как это делает HTTP). Env
+/// `JOIN_ROOM_IP_LIMIT`, дефолт `DEFAULT_JOIN_ROOM_IP_LIMIT` (20). `LazyLock`
+/// — тот же приём, что у `MAX_PARTICIPANTS` выше.
+pub(crate) static JOIN_ROOM_IP_LIMIT: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("JOIN_ROOM_IP_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_JOIN_ROOM_IP_LIMIT)
 });
 
 /// CORS вручную, без tower-http: у нас всего три кросс-оригин HTTP-пути
@@ -223,11 +238,20 @@ async fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_MAX_ROOMS);
 
+    // C (docs/research-ops.md §1.0/§1.6): канал активного broadcast-закрытия
+    // WS по SIGTERM/SIGINT — см. `shutdown_signal` ниже и `AppState::shutdown`.
+    // Начальный приёмник от `channel()` нам не нужен (подписчики создаются
+    // позже через `subscribe()` по одному на каждое WS-соединение) — дропаем
+    // его сразу же деструктуризацией.
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+
     let state = AppState {
         rooms,
         max_rooms,
         room_creation_ips: Arc::new(Mutex::new(HashMap::new())),
         pending_join_ips: Arc::new(Mutex::new(HashMap::new())),
+        join_room_ips: Arc::new(Mutex::new(HashMap::new())),
+        shutdown: shutdown_tx.clone(),
     };
 
     // Ш2: CORS-мидлварь навешивается ТОЧЕЧНО только на кросс-оригин
@@ -279,15 +303,34 @@ async fn main() {
     // per-IP лимитов (H2/M3), когда ни `CF-Connecting-IP`, ни
     // `X-Forwarded-For` не пришли (прямое подключение без proxy).
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(shutdown_tx))
         .await
         .expect("серверу конец");
 }
 
 /// Ждёт SIGTERM (стандартный сигнал остановки в k8s) или SIGINT (Ctrl+C
 /// локально). По любому из них сервер перестаёт принимать новые соединения
-/// и завершается, дав in-flight запросам/сокетам доработать.
-async fn shutdown_signal() {
+/// (`axum::serve`'s `with_graceful_shutdown` останавливает листенер и ждёт
+/// завершения уже принятых HTTP-запросов) — но, как честно зафиксировано в
+/// docs/research-ops.md §1.0, это НЕ закрывает уже апгрейженные WS-соединения:
+/// они живут в собственных `tokio`-задачах (`ws::handle_socket`) вне
+/// видимости hyper и раньше пассивно доживали до `terminationGracePeriodSeconds`
+/// (30с в k8s-манифесте) и последующего `SIGKILL` — то есть простой
+/// сигналинга при активном созвоне в момент деплоя составлял ~30-40с.
+///
+/// C (§1.5/§1.6 того же документа, «дешёвое улучшение»): вместо пассивного
+/// ожидания рассылаем ВСЕМ открытым WS-соединениям (через
+/// `AppState::shutdown`, broadcast-подписка в каждом `handle_socket`) сигнал
+/// сразу закрыть свой сокет активно (`Close`-фрейм) — клиент ловит закрытие
+/// немедленно и начинает свой обычный auto-reconnect (`static/room.js`),
+/// вместо того чтобы держать мёртвый по факту сигналинг ещё десятки секунд.
+/// Это НЕ полноценный graceful drain (варианты 1.1-1.4 того исследования,
+/// сознательно не сделаны — см. их вердикт: несут риск split-brain
+/// несоразмерный выгоде для однопроцессной in-memory модели этого проекта) —
+/// минимальная мера: короткая пауза (не `terminationGracePeriodSeconds`,
+/// а именно «дать задачам время дослать один Close-фрейм в свой сокет перед
+/// тем, как процесс попытается завершиться»), см. `SHUTDOWN_FLUSH_GRACE`.
+async fn shutdown_signal(shutdown_tx: state::ShutdownSignal) {
     let sigterm = async {
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("не удалось подписаться на SIGTERM")
@@ -300,10 +343,25 @@ async fn shutdown_signal() {
             .expect("не удалось подписаться на SIGINT");
     };
     tokio::select! {
-        _ = sigterm => info!("получен SIGTERM, завершаемся"),
-        _ = sigint => info!("получен SIGINT, завершаемся"),
+        _ = sigterm => info!("получен SIGTERM — активно закрываем открытые WS-соединения"),
+        _ = sigint => info!("получен SIGINT — активно закрываем открытые WS-соединения"),
     }
+    // Приёмников может не быть вовсе (нет ни одного открытого WS в моменте) —
+    // `send` тогда просто вернёт ошибку, которую сознательно игнорируем: это
+    // штатный случай, а не сбой.
+    let _ = shutdown_tx.send(());
+    // Дать уже разбуженным задачам `handle_socket` время дойти до
+    // `socket.send(Message::Close(...))` и реально протолкнуть кадр в TCP,
+    // прежде чем `axum::serve(...)` вернётся из `.await` и процесс завершится
+    // (в этот момент раннтайм молча роняет оставшиеся задачи, недописанное не
+    // долетит). НЕ полноценный `terminationGracePeriodSeconds` (30с) — на
+    // порядки меньше, с большим запасом на то, чтобы кооперативный
+    // планировщик tokio просто успел прокрутить эти задачи хотя бы раз.
+    tokio::time::sleep(SHUTDOWN_FLUSH_GRACE).await;
 }
+
+/// См. `shutdown_signal`.
+const SHUTDOWN_FLUSH_GRACE: Duration = Duration::from_millis(500);
 
 /// `POST /api/rooms`: создать новую ПУСТУЮ комнату (протокол v2 — комната
 /// заводится отдельно от входа в неё, чтобы создатель успел скопировать и
@@ -425,10 +483,28 @@ async fn create_room(
 /// перебором ни через этот эндпоинт, ни через `POST /api/rooms`.
 async fn restore_room(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Path(room_id): Path<String>,
 ) -> Response {
     if !is_valid_room_id(&room_id) {
         return (StatusCode::BAD_REQUEST, "invalid room id").into_response();
+    }
+
+    // H2 (DoS-защита, docs/research-dos.md §3.1): PUT раньше не проверял
+    // per-IP лимит вовсе — единственный «create-подобный» маршрут (создаёт
+    // запись в `rooms`, если её не было) без учёта IP. Делит бюджет с `POST
+    // /api/rooms` (тот же `ROOM_CREATION_IP_LIMIT`/`room_creation_ips`) —
+    // не отдельный счётчик: с точки зрения этого лимита не важно, каким из
+    // двух путей вызывающий заводит запись комнаты, важно СКОЛЬКО записей
+    // один IP заводит суммарно за окно. Проверяем безусловно (даже если
+    // комната по этому `room_id` уже существует и ветка ниже вернёт `200`
+    // без создания) — простая единая точка проверки для всего хендлера,
+    // не только для «настоящей» ветки создания.
+    let ip = extract_client_ip(&headers, Some(peer_addr));
+    if !check_ip_rate_limit(&state.room_creation_ips, &ip, ROOM_CREATION_IP_LIMIT, ROOM_CREATION_IP_WINDOW) {
+        warn!(%ip, "превышен per-IP лимит создания/восстановления комнат — 429 (PUT)");
+        return (StatusCode::TOO_MANY_REQUESTS, "too many rooms created, slow down").into_response();
     }
 
     let mut rooms_guard = state.rooms.lock().unwrap();

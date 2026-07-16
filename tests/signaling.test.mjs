@@ -29,6 +29,12 @@ const EMPTY_ROOM_TTL_SECONDS = 2;
 // ROOM_CREATION_IP_LIMIT (H2, 10/60с). Свой собственный IP из зарезервированного
 // под тесты диапазона (TEST-NET-3) — свой отдельный бюджет, как и у раздела 22.
 const E2E_TEST_IP = '203.0.113.99';
+// Свой выделенный IP для ВСЕХ обычных restoreRoom()-вызовов в этом файле
+// (раздел 2b, раздел 31) — теперь, когда PUT тоже проверяет
+// ROOM_CREATION_IP_LIMIT и делит бюджет с POST (H2, §3.1, см. раздел «22c»),
+// эти вызовы больше не могут молча делить фолбэк-IP (уже под завязку занят
+// createRoom() без явного IP) ни E2E_TEST_IP (тоже занят почти под лимит).
+const RESTORE_ROOM_TEST_IP = '203.0.113.50';
 
 let passed = 0, failed = 0;
 
@@ -100,7 +106,21 @@ function spawnServer(port, extraEnv = {}) {
 
 function startServer() {
   console.log(`Запуск сервера на порту ${PORT}...`);
-  serverProc = spawnServer(PORT, { EMPTY_ROOM_TTL_SECONDS: String(EMPTY_ROOM_TTL_SECONDS) });
+  serverProc = spawnServer(PORT, {
+    EMPTY_ROOM_TTL_SECONDS: String(EMPTY_ROOM_TTL_SECONDS),
+    // A (H2, docs/research-dos.md §3.2): JOIN_ROOM_IP_LIMIT — дефолт 20/60с,
+    // рассчитан на реальных пользователей одного NAT, а не на этот файл: он
+    // сам гоняет через WS многие десятки join-room с ОДНОГО IP за прогон, а
+    // WS-хендшейк глобального WebSocket этого рантайма (в отличие от HTTP
+    // fetch() у createRoom()) не поддерживает произвольные заголовки —
+    // изолировать разделы этого файла друг от друга по CF-Connecting-IP для
+    // WS-подключений физически нечем (все они падают на один и тот же
+    // адрес пира сокета). Поднимаем лимит ОСНОВНОГО тестового процесса
+    // далеко за пределы того, что весь этот файл способен нафлудить за
+    // минуту; сам лимит (реальный дефолт, БЕЗ переопределения) проверяется
+    // отдельным изолированным серверным процессом — см. раздел «22d».
+    JOIN_ROOM_IP_LIMIT: '100000',
+  });
 }
 
 async function waitForReady(configUrl, proc, timeoutMs = 15000) {
@@ -167,8 +187,12 @@ function stopServer(proc) {
 }
 
 // PUT /api/rooms/<roomId> — идемпотентное восстановление (см. src/main.rs::restore_room).
-async function restoreRoom(roomId) {
-  const res = await fetch(`${ROOMS_URL}/${encodeURIComponent(roomId)}`, { method: 'PUT' });
+// `ip` (опционально) — см. раздел 22c: PUT теперь тоже проверяет
+// ROOM_CREATION_IP_LIMIT (H2, §3.1) и делит бюджет с POST /api/rooms.
+async function restoreRoom(roomId, ip = undefined) {
+  const opts = { method: 'PUT', headers: {} };
+  if (ip !== undefined) opts.headers['CF-Connecting-IP'] = ip;
+  const res = await fetch(`${ROOMS_URL}/${encodeURIComponent(roomId)}`, opts);
   let json = null;
   try { json = await res.json(); } catch { /* не JSON — ниже проверим статус */ }
   return { status: res.status, roomId: json && json.roomId, lifetimeSeconds: json && json.lifetimeSeconds };
@@ -322,7 +346,7 @@ async function runTests() {
   {
     // Комнаты с таким id ещё нет (никогда не создавалась) -> 201, комната создана.
     const freshId = 'zx9k2m7q'; // валидный формат ^[a-z0-9]{8}$, заведомо не существовал
-    const created = await restoreRoom(freshId);
+    const created = await restoreRoom(freshId, RESTORE_ROOM_TEST_IP);
     ok(created.status === 201, `восстановление НЕсуществующей комнаты -> 201 (status=${created.status})`);
     ok(created.roomId === freshId, 'в ответе тот же roomId, что запрошен');
 
@@ -331,7 +355,7 @@ async function runTests() {
     ok(joined.type === 'joined' && joined.peers.length === 0, 'вход в восстановленную комнату успешен, участников ещё 0');
 
     // Комната уже существует (мы только что в неё вошли) -> 200, ничего не пересоздано.
-    const already = await restoreRoom(freshId);
+    const already = await restoreRoom(freshId, RESTORE_ROOM_TEST_IP);
     ok(already.status === 200, `восстановление УЖЕ существующей комнаты -> 200 (status=${already.status})`);
     peer.ws.close();
 
@@ -369,10 +393,13 @@ async function runTests() {
   ok(Array.isArray(j2.pending) && j2.pending.length === 0, 'joined.pending пуст для не-лидера, даже если бы там что-то было');
 
   const pj1 = await p1.next();
-  ok(pj1.type === 'peer-joined' && pj1.peerId === p2Id && pj1.name === 'Аня',
-    'первый участник получил peer-joined с именем второго (Аня)');
+  // E (docs/research-minimize-state.md §3): сервер БОЛЬШЕ НЕ ХРАНИТ name —
+  // peer-joined всегда несёт null, независимо от того, что клиент прислал в
+  // join-room (имя теперь ходит отдельным зашифрованным name-announce).
+  ok(pj1.type === 'peer-joined' && pj1.peerId === p2Id && pj1.name === null,
+    'первый участник получил peer-joined — name всегда null (сервер его не хранит, см. §E)');
 
-  // --- 4b. join-room с клиентским peerId (переподключение после обрыва сигналинга) ---
+  // --- 4b. join-room с клиентским peerId (свободный/занятый -> реконнект/невалидный) ---
   console.log('4b. join-room с клиентским peerId');
   {
     // Свободный валидный uuid -> сервер принимает его как есть.
@@ -381,58 +408,66 @@ async function runTests() {
     ok(jCustom.peerId === desiredId, `свободный валидный peerId принят как есть (${jCustom.peerId})`);
     await Promise.all([p1.next(), p2.next()]); // peer-joined остальным
 
-    // peerId уже занят (p1Id) -> сервер тихо генерирует новый, а не отказывает.
-    const { peer: pTaken, joined: jTaken } = await join(roomId, 'Занятой', URL, p1Id);
-    ok(jTaken.type === 'joined' && jTaken.peerId !== p1Id, `занятый peerId -> выдан другой (${jTaken.peerId} !== ${p1Id})`);
-    await Promise.all([p1.next(), p2.next(), pCustom.next()]); // peer-joined остальным
+    // peerId уже занят — но не p1Id/p2Id (они нужны целыми для всего
+    // остального файла), а СВОЙ ЖЕ недавно созданный pCustom -> теперь это
+    // РЕКОННЕКТ (см. §A/§D задачи, src/ws.rs::reconnect_participant): сервер
+    // НЕ генерирует новый peerId, а забирает слот себе (заменяет tx) — тот
+    // же peerId остаётся занят той же "личностью", просто новым
+    // сигналинг-соединением. Другим участникам peer-joined НЕ шлётся
+    // повторно — с их точки зрения этот peerId и не уходил.
+    const { peer: pReconnect, joined: jReconnect } = await join(roomId, 'ИгорьСнова', URL, desiredId);
+    ok(jReconnect.type === 'joined' && jReconnect.peerId === desiredId,
+      `join своим уже занятым peerId -> реконнект, тот же peerId (${jReconnect.peerId})`);
+
+    // Доказываем, что канал реально переехал: релей на desiredId идёт теперь
+    // НОВОМУ соединению.
+    sendBeacon(p1, desiredId, { kind: 'reconnect-routing-check' });
+    const routed = await pReconnect.next();
+    ok(isBeaconMsg(routed) && routed.info.kind === 'reconnect-routing-check',
+      'после реконнекта релей на peerId уходит новому соединению');
+
+    // Закрываем СТАРЫЙ (уже замещённый, "зомби") сокет — не должен рождать
+    // peer-left и не должен портить состояние (см. same_channel-проверку в
+    // cleanup_peer, src/ws.rs).
+    pCustom.ws.close();
+    await sleep(200);
+    sendBeacon(p1, p2Id, { kind: 'after-zombie-close-4b' });
+    const afterZombie = await p2.next();
+    ok(isBeaconMsg(afterZombie) && afterZombie.info.kind === 'after-zombie-close-4b',
+      'закрытие уже замещённого (зомби) сокета не рождает peer-left и не портит состояние');
 
     // Кривой peerId (не uuid) -> сервер тихо генерирует новый.
     const { peer: pBad, joined: jBad } = await join(roomId, 'Кривой', URL, 'not-a-uuid');
     ok(jBad.type === 'joined' && typeof jBad.peerId === 'string' && jBad.peerId !== 'not-a-uuid',
       `невалидный (не-uuid) peerId -> выдан новый (${jBad.peerId})`);
-    await Promise.all([p1.next(), p2.next(), pCustom.next(), pTaken.next()]); // peer-joined остальным
+    await Promise.all([p1.next(), p2.next(), pReconnect.next()]); // peer-joined остальным
 
-    // Прибираем троих за собой — порядок трёх peer-left относительно друг
-    // друга не важен, важно что p1/p2 получат ровно по три (не считаем, чей
-    // именно peerId в каком сообщении — уже проверено выше при входе).
-    pCustom.ws.close();
-    pTaken.ws.close();
+    // Прибираем оставшихся временных участников за собой.
+    pReconnect.ws.close();
     pBad.ws.close();
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < 2; i++) {
       const [m1, m2] = await Promise.all([p1.next(), p2.next()]);
       ok(m1.type === 'peer-left' && m2.type === 'peer-left', 'peer-left дошёл p1 и p2 при уходе временного участника');
     }
   }
 
-  // --- 4c. Ш1: лимит имени поднят с 32 до 512 символов (name теперь шифрблоб
-  // клиента — длиннее открытого текста, см. src/ws.rs::CHAT_NAME_MAX_CHARS) —
-  // сервер по-прежнему прозрачен к содержимому: не проверяет, что это валидный
-  // шифрблоб, просто обрезает по новому лимиту символов. ---
-  console.log('4c. name: лимит поднят с 32 до 512 символов');
+  // --- 4c. name в join-room больше не хранится и не влияет на peer-joined —
+  // всегда null независимо от длины/содержимого (см. §E,
+  // docs/research-minimize-state.md §3: мёртвое поле убрано из
+  // Participant/PendingParticipant; прежний тест на обрезку до 512 символов
+  // (CHAT_NAME_MAX_CHARS) больше не применим — санитизации/лимита длины
+  // больше нет, поле просто игнорируется целиком). ---
+  console.log('4c. name: больше не хранится — join с длинным именем работает, peer-joined.name всегда null');
   {
-    const name400 = 'x'.repeat(400); // укладывается в новый лимит (512) — не уложилось бы в прежний (32)
-    const { peer: pLong, joined: jLong } = await join(roomId, name400);
-    ok(jLong.type === 'joined', 'участник с именем 400 символов входит без ошибки');
-    ok(jLong.peerId, 'у вошедшего есть свой peerId');
-    await Promise.all([p1.next(), p2.next()]); // peer-joined у уже сидящих в комнате
-
-    const name600 = 'y'.repeat(600); // длиннее нового лимита (512) -> сервер обрезает
-    const { peer: pTooLong, joined: jTooLong } = await join(roomId, name600);
-    ok(jTooLong.type === 'joined', 'участник с именем 600 символов всё равно входит (не ошибка, просто обрежется)');
-    const [pj1, pj2, pjLong] = await Promise.all([p1.next(), p2.next(), pLong.next()]);
-    ok(
-      pj1.type === 'peer-joined' && pj1.name === 'y'.repeat(512),
-      `peer-joined с именем 600 символов обрезан сервером до 512 (получено ${pj1.name ? pj1.name.length : 'null'})`
-    );
-    ok(pj2.type === 'peer-joined' && pj2.name.length === 512, 'второй получатель тоже видит обрезанное до 512 имя');
-    ok(pjLong.type === 'peer-joined' && pjLong.name.length === 512, 'третий получатель тоже видит обрезанное до 512 имя');
-
-    // Прибираем обоих за собой — по одному, чтобы не гадать порядок peer-left.
-    pTooLong.ws.close();
-    await Promise.all([p1.next(), p2.next(), pLong.next()]); // peer-left ушедшего с длинным именем
+    const name600 = 'y'.repeat(600); // раньше обрезалось бы до 512 — теперь просто не используется вовсе
+    const { peer: pLong, joined: jLong } = await join(roomId, name600);
+    ok(jLong.type === 'joined', 'участник с именем 600 символов входит без ошибки (длина никак не проверяется)');
+    const [pj1c, pj2c] = await Promise.all([p1.next(), p2.next()]);
+    ok(pj1c.type === 'peer-joined' && pj1c.name === null, 'peer-joined.name всегда null, вне зависимости от длины имени');
+    ok(pj2c.type === 'peer-joined' && pj2c.name === null, 'то же самое видит второй получатель');
 
     pLong.ws.close();
-    await Promise.all([p1.next(), p2.next()]); // peer-left второго временного участника
+    await Promise.all([p1.next(), p2.next()]); // peer-left ушедшего временного участника
   }
 
   // --- 5. Третий участник видит ОБОИХ предыдущих в peers ---
@@ -440,12 +475,13 @@ async function runTests() {
   const { peer: p3, joined: j3 } = await join(roomId, 'Боб');
   const p3Id = j3.peerId;
   ok(j3.peers.length === 2, 'у третьего участника peers содержит двух предыдущих');
-  ok(j3.peers.some((p) => p.peerId === p1Id && p.name === null), 'peers содержит первого (имя null)');
-  ok(j3.peers.some((p) => p.peerId === p2Id && p.name === 'Аня'), 'peers содержит второго (имя Аня)');
+  ok(j3.peers.every((p) => p.name === null), 'peers[].name всегда null (сервер имя не хранит, см. §E)');
+  ok(j3.peers.some((p) => p.peerId === p1Id), 'peers содержит первого');
+  ok(j3.peers.some((p) => p.peerId === p2Id), 'peers содержит второго');
 
   const [pj2a, pj2b] = await Promise.all([p1.next(), p2.next()]);
-  ok(pj2a.type === 'peer-joined' && pj2a.peerId === p3Id && pj2a.name === 'Боб', 'первый получил peer-joined (Боб)');
-  ok(pj2b.type === 'peer-joined' && pj2b.peerId === p3Id && pj2b.name === 'Боб', 'второй получил peer-joined (Боб)');
+  ok(pj2a.type === 'peer-joined' && pj2a.peerId === p3Id && pj2a.name === null, 'первый получил peer-joined (name null)');
+  ok(pj2b.type === 'peer-joined' && pj2b.peerId === p3Id && pj2b.name === null, 'второй получил peer-joined (name null)');
 
   // --- 6. Релей offer/answer/ice/stream-info между ДВУМЯ НЕ-первыми участниками ---
   console.log('6. релей между вторым и третьим участником (не первым)');
@@ -834,8 +870,8 @@ async function runTests() {
     const waitMsg = await guest1.next();
     ok(waitMsg.type === 'waiting', 'новый гость при lobbyEnabled=true получает waiting вместо joined');
     const jr1 = await leader.next();
-    ok(jr1.type === 'join-request' && jr1.name === 'Ждущий1' && typeof jr1.peerId === 'string',
-      'лидер получает join-request с именем ожидающего');
+    ok(jr1.type === 'join-request' && jr1.name === null && typeof jr1.peerId === 'string',
+      'лидер получает join-request — name всегда null (сервер его не хранит, см. §E)');
     const guest1Id = jr1.peerId;
 
     // Approve -> ожидающему joined, остальным (пока только лидеру) peer-joined.
@@ -853,7 +889,7 @@ async function runTests() {
     guest2.send({ type: 'join-room', roomId: lId, name: 'Ждущий2' });
     await guest2.next(); // waiting
     const jr2 = await leader.next();
-    ok(jr2.type === 'join-request' && jr2.name === 'Ждущий2', 'вторая заявка приходит лидеру');
+    ok(jr2.type === 'join-request' && jr2.name === null, 'вторая заявка приходит лидеру (name null)');
     leader.send({ type: 'reject', peerId: jr2.peerId });
     const rejMsg = await guest2.next();
     ok(rejMsg.type === 'join-rejected', 'reject -> ожидающему join-rejected');
@@ -865,7 +901,7 @@ async function runTests() {
     guest3.send({ type: 'join-room', roomId: lId, name: 'Ждущий3' });
     await guest3.next(); // waiting
     const jr3 = await leader.next();
-    ok(jr3.type === 'join-request' && jr3.name === 'Ждущий3', 'третья заявка приходит лидеру');
+    ok(jr3.type === 'join-request' && jr3.name === null, 'третья заявка приходит лидеру (name null)');
     guest3.ws.close();
     const cancelMsg = await leader.next();
     ok(cancelMsg.type === 'join-request-cancelled' && cancelMsg.peerId === jr3.peerId,
@@ -876,7 +912,7 @@ async function runTests() {
     guest4.send({ type: 'join-room', roomId: lId, name: 'Ждущий4' });
     await guest4.next(); // waiting
     const jr4 = await leader.next();
-    ok(jr4.type === 'join-request' && jr4.name === 'Ждущий4', 'четвёртая заявка приходит прежнему лидеру');
+    ok(jr4.type === 'join-request' && jr4.name === null, 'четвёртая заявка приходит прежнему лидеру (name null)');
 
     // Комната сейчас: участники — leader (лидер) и guest1 (approved); ожидает — guest4.
     leader.ws.close();
@@ -884,8 +920,8 @@ async function runTests() {
     ok(lcMsg.type === 'leader-changed' && lcMsg.leaderId === guest1Id,
       'уход лидера при непустом pending -> leader-changed новому (единственному оставшемуся) участнику');
     const jrAgain = await guest1.next();
-    ok(jrAgain.type === 'join-request' && jrAgain.peerId === jr4.peerId && jrAgain.name === 'Ждущий4',
-      'непустой pending пересылается новому лидеру заново (join-request)');
+    ok(jrAgain.type === 'join-request' && jrAgain.peerId === jr4.peerId && jrAgain.name === null,
+      'непустой pending пересылается новому лидеру заново (join-request, name null)');
 
     // E2E v2: смена лидера, пока pending ждёт, шлёт ЕМУ СВЕЖИЙ waiting с
     // новым лидером (см. раздел 26/27) — здесь просто дренируем это
@@ -944,6 +980,109 @@ async function runTests() {
     const otherIp = '203.0.113.6';
     const otherIpResult = await createRoom(undefined, ROOMS_URL, otherIp);
     ok(otherIpResult.status === 201, `создание с ДРУГОГО IP не задето лимитом первого (status=${otherIpResult.status})`);
+  }
+
+  // --- 22b. Per-IP лимит на PUT /api/rooms/{id} — делит бюджет с POST (H2, §3.1) ---
+  console.log('22b. per-IP лимит на PUT /api/rooms/{id}, общий с POST (429)');
+  {
+    const ip = '203.0.113.61';
+    // 4 создания через POST + 6 восстановлений через PUT = 10 запросов за
+    // окно с одного IP — РАЗНЫМИ путями одного и того же бюджета
+    // (ROOM_CREATION_IP_LIMIT), доказывает, что бюджет общий.
+    let allOk = true;
+    for (let i = 0; i < 4; i++) {
+      const r = await createRoom(undefined, ROOMS_URL, ip);
+      if (r.status !== 201) allOk = false;
+    }
+    for (let i = 0; i < 6; i++) {
+      const freshId = `pb${String(i).padStart(6, '0')}`; // валидный формат ^[a-z0-9]{8}$, заведомо не существовал
+      const r = await restoreRoom(freshId, ip);
+      if (r.status !== 201) allOk = false;
+    }
+    ok(allOk, '4 POST + 6 PUT = 10 запросов за окно с одного IP — все в пределах общего лимита (201)');
+
+    const eleventhPut = await restoreRoom('pbeleven', ip);
+    ok(eleventhPut.status === 429,
+      `11-й запрос (PUT) с тем же IP -> 429, общий с POST бюджет исчерпан (status=${eleventhPut.status})`);
+    const eleventhPost = await createRoom(undefined, ROOMS_URL, ip);
+    ok(eleventhPost.status === 429,
+      `POST с тем же IP тоже отклонён — бюджет действительно общий (status=${eleventhPost.status})`);
+
+    // Другой IP — свой собственный бюджет, не задет.
+    const otherIp = '203.0.113.62';
+    const otherPut = await restoreRoom('pbother1', otherIp);
+    ok(otherPut.status === 201, `PUT с ДРУГОГО IP не задет чужим лимитом (status=${otherPut.status})`);
+  }
+
+  // --- 22c. Per-IP лимит на прямой join-room в комнату (H2, §3.2 — главная
+  // дыра) + легитимный реконнект не блокируется этим же лимитом. Отдельный
+  // изолированный серверный процесс с РЕАЛЬНЫМ дефолтом JOIN_ROOM_IP_LIMIT
+  // (20/60с, не переопределяем) — см. комментарий у startServer() про то,
+  // почему этот лимит нельзя проверять на основном тестовом процессе. ---
+  console.log('22c. per-IP лимит на прямой join-room (§3.2) + реконнект не блокируется');
+  {
+    const port = 3315;
+    // MAX_PARTICIPANTS поднимаем далеко за пределы того, сколько join'ов
+    // понадобится нафлудить (иначе комната сама упёрлась бы в room-full
+    // задолго до per-IP лимита и смешала бы два разных повода отказа).
+    const proc = spawnServer(port, { MAX_PARTICIPANTS: '25' });
+    await waitForReady(`http://localhost:${port}/config`, proc);
+    const roomsUrl = `http://localhost:${port}/api/rooms`;
+    const wsUrl = `ws://localhost:${port}/ws`;
+
+    const { roomId: floodRoomId } = await createRoom(undefined, roomsUrl);
+
+    // Участник, чей peerId позже используем для проверки легитимного
+    // реконнекта — обычный вход, потребляет 1 из бюджета JOIN_ROOM_IP_LIMIT,
+    // как и любой другой join.
+    const zombieId = genUuid();
+    const { peer: zombie, joined: zombieJoined } = await join(floodRoomId, undefined, wsUrl, zombieId);
+    ok(zombieJoined.peerId === zombieId, 'участник вошёл со своим желаемым peerId (1/20 бюджета)');
+
+    // Ещё 19 обычных join'ов добивают лимит окна ровно до 20 (1 уже
+    // потрачен выше) — держим сокеты открытыми специально, не давая реаперу/
+    // MAX_PARTICIPANTS размыть смысл теста.
+    const flooders = [];
+    for (let i = 0; i < 19; i++) {
+      const { peer, joined } = await join(floodRoomId, undefined, wsUrl);
+      ok(joined.type === 'joined', `join #${i + 2} из 20 в пределах лимита`);
+      flooders.push(peer);
+    }
+
+    // 21-й join (не реконнект, случайный новый peerId) -> отказ по лимиту.
+    const over = await connect(wsUrl);
+    over.send({ type: 'join-room', roomId: floodRoomId });
+    const overMsg = await over.next();
+    ok(overMsg.type === 'error' && /too many join attempts/.test(overMsg.message),
+      `21-й join за окно с одного IP -> отказ по лимиту (получено ${overMsg.type}: ${overMsg.message})`);
+    await over.closed;
+    ok(true, 'сервер закрыл сокет после отказа по join-лимиту');
+
+    // РЕКОННЕКТ своим уже занятым peerId — не должен спотыкаться о только
+    // что исчерпанный лимит: не новый join для целей бюджета (см.
+    // src/ws.rs::reconnect_participant).
+    const { peer: reconnected, joined: reconnJoined } = await join(floodRoomId, undefined, wsUrl, zombieId);
+    ok(reconnJoined.type === 'joined' && reconnJoined.peerId === zombieId,
+      'реконнект своим уже занятым peerId проходит, несмотря на исчерпанный per-IP лимит');
+
+    // Релей на zombieId теперь уходит НОВОМУ соединению.
+    sendBeacon(flooders[0], zombieId, { kind: 'reconnect-check' });
+    const beacon = await reconnected.next();
+    ok(isBeaconMsg(beacon) && beacon.info.kind === 'reconnect-check',
+      'релей на peerId после реконнекта уходит новому соединению');
+
+    // Старое (зомби) соединение закрываем — не должно портить состояние
+    // реконнекченного участника (same_channel-проверка в cleanup_peer).
+    zombie.ws.close();
+    await sleep(300);
+    sendBeacon(flooders[0], zombieId, { kind: 'after-zombie-close' });
+    const beacon2 = await reconnected.next();
+    ok(isBeaconMsg(beacon2) && beacon2.info.kind === 'after-zombie-close',
+      'после закрытия зомби-сокета реконнекченный участник остаётся в комнате');
+
+    reconnected.ws.close();
+    for (const p of flooders) p.ws.close();
+    await stopServer(proc);
   }
 
   // --- 23. Лимит длительности созвона (MAX_ROOM_LIFETIME_SECONDS) ---
@@ -1224,12 +1363,98 @@ async function runTests() {
 
     // PUT — то же поле, для симметрии API (см. спецификацию E2E v2 §2): обе ветки идемпотентности.
     const freshId2 = 'lt9k2m7q'; // валидный формат, заведомо не существовал
-    const created = await restoreRoom(freshId2);
+    const created = await restoreRoom(freshId2, RESTORE_ROOM_TEST_IP);
     ok(created.status === 201 && created.lifetimeSeconds === 10800,
       `PUT восстановления несуществующей комнаты возвращает lifetimeSeconds (${created.lifetimeSeconds})`);
-    const already = await restoreRoom(freshId2);
+    const already = await restoreRoom(freshId2, RESTORE_ROOM_TEST_IP);
     ok(already.status === 200 && already.lifetimeSeconds === 10800,
       `PUT уже существующей комнаты тоже возвращает lifetimeSeconds (${already.lifetimeSeconds})`);
+  }
+
+  // --- 32. Лимит участников от лидера (max_participants, docs/research-room-limit.md) ---
+  console.log('32. лимит участников от лидера (max_participants)');
+  {
+    const { roomId: capId, leaderToken: capToken } = await createRoom(undefined, ROOMS_URL, E2E_TEST_IP);
+    const { peer: leader, joined: leaderJoined } = await join(capId, 'Лидер', URL, undefined, capToken);
+    ok(leaderJoined.maxParticipants === 6,
+      `без собственного лимита joined.maxParticipants — серверный потолок (получено ${leaderJoined.maxParticipants})`);
+
+    // Второй и третий входят при ещё дефолтном (серверном) лимите.
+    const { peer: p2, joined: j2 } = await join(capId, 'Второй');
+    await leader.next(); // peer-joined
+    const { peer: p3, joined: j3 } = await join(capId, 'Третий');
+    await Promise.all([leader.next(), p2.next()]); // peer-joined обоим
+    ok(j2.type === 'joined' && j3.type === 'joined', 'второй и третий вошли при серверном лимите');
+
+    // Лидер выставляет свой собственный лимит 2 — НИЖЕ текущей занятости (3).
+    updateSettings(leader, defaultSettings({ maxParticipants: 2 }));
+    const [sc1, sc2, sc3] = await Promise.all([leader.next(), p2.next(), p3.next()]);
+    ok(sc1.type === 'settings-changed' && sc1.settings.maxParticipants === 2
+      && sc2.settings.maxParticipants === 2 && sc3.settings.maxParticipants === 2,
+      'settings-changed несёт новый maxParticipants=2 всем участникам');
+
+    // Никого не выгнали — все трое всё ещё могут получать/слать (маячок).
+    sendBeacon(leader, j2.peerId, { kind: 'still-here' });
+    const stillHere = await p2.next();
+    ok(isBeaconMsg(stillHere) && stillHere.info.kind === 'still-here',
+      'снижение лимита ниже занятости НЕ выгоняет уже вошедших (D, §2.2)');
+
+    // Новый вход отклоняется — уже 3 участника >= эффективного лимита 2.
+    const fourth = await connect();
+    fourth.send({ type: 'join-room', roomId: capId });
+    const roomFull1 = await fourth.next();
+    ok(roomFull1.type === 'room-full', 'вход четвёртого отклонён — 3 участника >= лимита лидера (2)');
+    await fourth.closed;
+
+    // Один выходит (3 -> 2) — по-прежнему >= 2, всё ещё отказ.
+    p3.ws.close();
+    await Promise.all([leader.next(), p2.next()]); // peer-left
+    const fifth = await connect();
+    fifth.send({ type: 'join-room', roomId: capId });
+    const roomFull2 = await fifth.next();
+    ok(roomFull2.type === 'room-full', 'после ухода одного (2 участника) вход всё ещё отклонён — 2 >= лимита 2');
+    await fifth.closed;
+
+    // Ещё один выходит (2 -> 1) — теперь 1 < 2, вход снова разрешён.
+    p2.ws.close();
+    await leader.next(); // peer-left
+    const { peer: p6, joined: j6 } = await join(capId, 'Шестой');
+    ok(j6.type === 'joined' && j6.maxParticipants === 2,
+      `после освобождения слота вход снова разрешён, joined.maxParticipants===2 (получено ${j6.maxParticipants})`);
+    await leader.next(); // peer-joined
+
+    // Валидация границ update-settings: maxParticipants=1 (< 2) -> отказ.
+    updateSettings(leader, defaultSettings({ maxParticipants: 1 }));
+    const errLow = await leader.next();
+    ok(errLow.type === 'error', `maxParticipants=1 (< 2) отклонён как невалидный (${errLow.message})`);
+
+    // maxParticipants=7 (> серверного потолка 6) -> отказ.
+    updateSettings(leader, defaultSettings({ maxParticipants: 7 }));
+    const errHigh = await leader.next();
+    ok(errHigh.type === 'error', `maxParticipants=7 (> серверного потолка 6) отклонён (${errHigh.message})`);
+
+    // Подтверждаем, что ОБА отклонённых update-settings НЕ поменяли
+    // действующий лимит — комната всё ещё под ним же (count=2, limit=2).
+    const seventh = await connect();
+    seventh.send({ type: 'join-room', roomId: capId });
+    const stillFull = await seventh.next();
+    ok(stillFull.type === 'room-full',
+      'после ДВУХ отклонённых update-settings лимит остался прежним (2), вход всё ещё отклонён');
+    await seventh.closed;
+
+    // maxParticipants=6 (ровно серверный потолок, верхняя граница) — принят.
+    updateSettings(leader, defaultSettings({ maxParticipants: 6 }));
+    const [scOk1, scOk2] = await Promise.all([leader.next(), p6.next()]);
+    ok(scOk1.type === 'settings-changed' && scOk1.settings.maxParticipants === 6 && scOk2.settings.maxParticipants === 6,
+      'maxParticipants=6 (ровно серверный потолок) принят');
+
+    const eighth = await join(capId, 'Восьмой');
+    ok(eighth.joined.type === 'joined', 'после поднятия лимита до 6 новый вход снова разрешён');
+    await Promise.all([leader.next(), p6.next()]); // peer-joined
+
+    leader.ws.close();
+    p6.ws.close();
+    eighth.peer.ws.close();
   }
 }
 

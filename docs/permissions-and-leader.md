@@ -74,10 +74,29 @@ patched field-by-field):
 | `guestAudio` | `true` | Whether guests' microphones are rendered for other participants |
 | `guestVideo` | `true` | Whether guests' cameras are rendered for other participants |
 | `guestScreen` | `true` | Whether guests may start screen sharing |
+| `maxParticipants` | `null` | Leader-set ceiling on room size, on top of the server's own `MAX_PARTICIPANTS` — see below |
 
 Any change is broadcast to all current participants as `settings-changed`
 (see [`signaling-protocol.md`](signaling-protocol.md)) and takes effect
 immediately, not only for future arrivals.
+
+`maxParticipants` is `Option<usize>`: `null` means "no leader-set limit" and
+the room simply follows the server's own ceiling (`MAX_PARTICIPANTS` env,
+default 6). If the leader sets a number, it must be `2..=MAX_PARTICIPANTS`
+(inclusive on the server ceiling) — anything outside that range is rejected
+by the server and the whole `update-settings` call is refused (no partial
+application, same as any other invalid `RoomSettings`). The room's
+*effective* limit is always `maxParticipants ?? MAX_PARTICIPANTS`, and that's
+the number used everywhere the ceiling matters: `join-room`, `approve` for a
+waiting-room request, and the `Joined.maxParticipants` value the client shows
+in its "Participants: N / M" counter. Lowering the limit below the current
+occupancy does **not** evict anyone already in the room — there is no `kick`
+in the protocol — it only blocks *future* admissions (direct `join-room` or
+lobby `approve`) until the count naturally drops back under the new ceiling.
+As with membership itself ([§1](#1-overview)), this is server-side truth: the
+server is the only party that ever compares occupancy against the effective
+limit, and it applies the same check regardless of whether the limit came
+from the operator's env var or the leader's own choice.
 
 ## 6. The Waiting Room (Lobby)
 
