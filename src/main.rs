@@ -38,6 +38,8 @@
 //! production (static assets and API still on one host) behave exactly as
 //! before.
 
+#[cfg(feature = "embedded-turn")]
+mod embedded_turn;
 mod metrics;
 mod protocol;
 mod state;
@@ -252,7 +254,18 @@ async fn main() {
         .install_recorder()
         .expect("failed to install the Prometheus recorder");
     metrics::describe();
+    #[cfg(feature = "embedded-turn")]
+    metrics::describe_embedded_turn();
     spawn_metrics_server(prometheus).await;
+
+    // Embedded TURN (optional, `embedded-turn` Cargo feature — see
+    // `embedded_turn` module and docs/self-hosting.md, "TURN (Optional)"):
+    // in the default (split) build this is always `None` at zero cost — the
+    // `turn-server` crate isn't even in the dependency graph. Started next
+    // to the metrics server and before the main listener for the same
+    // reason as `spawn_metrics_server` above: if it fails to come up, we'd
+    // rather see that early than have it silently missing later.
+    let turn_abort_handle = spawn_embedded_turn();
 
     let rooms = Arc::new(Mutex::new(HashMap::new()));
 
@@ -342,9 +355,24 @@ async fn main() {
     // per-IP limits (H2/M3) when neither `CF-Connecting-IP` nor
     // `X-Forwarded-For` was sent (direct connection without a proxy).
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(shutdown_signal(shutdown_tx))
+        .with_graceful_shutdown(shutdown_signal(shutdown_tx, turn_abort_handle))
         .await
         .expect("server ended unexpectedly");
+}
+
+/// Spawns the embedded TURN server (see `embedded_turn::spawn`) when built
+/// with `--features embedded-turn`, otherwise a zero-cost `None` — kept as a
+/// plain function (rather than inlining `#[cfg]` blocks into `main()`) so
+/// the rest of `main()`/`shutdown_signal` doesn't need to know which build
+/// it's in: they just carry an `Option<AbortHandle>` either way.
+#[cfg(feature = "embedded-turn")]
+fn spawn_embedded_turn() -> Option<tokio::task::AbortHandle> {
+    embedded_turn::spawn()
+}
+
+#[cfg(not(feature = "embedded-turn"))]
+fn spawn_embedded_turn() -> Option<tokio::task::AbortHandle> {
+    None
 }
 
 /// Waits for SIGTERM (the standard stop signal in k8s) or SIGINT (Ctrl+C
@@ -372,7 +400,19 @@ async fn main() {
 /// `terminationGracePeriodSeconds`, but specifically "give the tasks time
 /// to push one more Close frame onto their socket before the process tries
 /// to exit"), see `SHUTDOWN_FLUSH_GRACE`.
-async fn shutdown_signal(shutdown_tx: state::ShutdownSignal) {
+///
+/// `turn_abort_handle`: the embedded TURN server's task (see
+/// `spawn_embedded_turn`/`embedded_turn::spawn`), `None` in the default
+/// (split) build or when the feature is compiled in but unconfigured. It's
+/// aborted here too, alongside the WS Close broadcast — turn-rs doesn't need
+/// a graceful drain of its own (no in-flight HTTP requests, unlike the main
+/// server; abandoning in-progress UDP relay sessions on shutdown is fine),
+/// so a plain `abort()` is enough to make sure the process doesn't hang on
+/// it past `SHUTDOWN_FLUSH_GRACE`.
+async fn shutdown_signal(
+    shutdown_tx: state::ShutdownSignal,
+    turn_abort_handle: Option<tokio::task::AbortHandle>,
+) {
     let sigterm = async {
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("failed to subscribe to SIGTERM")
@@ -392,6 +432,10 @@ async fn shutdown_signal(shutdown_tx: state::ShutdownSignal) {
     // moment) — `send` will then simply return an error, which we
     // deliberately ignore: this is a normal case, not a failure.
     let _ = shutdown_tx.send(());
+    if let Some(handle) = turn_abort_handle {
+        info!("aborting the embedded TURN server task");
+        handle.abort();
+    }
     // Give the now-woken `handle_socket` tasks time to reach
     // `socket.send(Message::Close(...))` and actually push the frame onto
     // TCP, before `axum::serve(...)` returns from `.await` and the process
@@ -774,7 +818,12 @@ fn turn_hmac_credential(secret: &str, username: &str) -> String {
 
 /// ICE configuration for the client: STUN always, TURN — if `TURN_URL` is
 /// set (the turn-rs server runs separately, see
-/// `deploy/manifests/turn.yaml`).
+/// `deploy/manifests/turn.yaml`). With `embedded-turn` (see
+/// `embedded_turn` module, docs/self-hosting.md "TURN (Optional)"), nothing
+/// here changes: the operator simply points `TURN_URL` at this same host's
+/// public IP on port 3478 — the embedded server IS the turn-rs this URL
+/// resolves to, so credentials issued below (from `TURN_STATIC_SECRET`,
+/// shared with `embedded_turn::spawn`) always match it.
 ///
 /// H1 (formerly — an open relay): the server used to hand out a STATIC
 /// `TURN_USERNAME`/`TURN_PASSWORD` to whoever called `/config` — the pair

@@ -5,6 +5,13 @@ from CI can only change the image tag on an already-created Deployment. The
 approach and conventions come from the `simple-deploy` playbook
 (`kube/backend-deploy.md`).
 
+This is the **split** production topology (this project's own instance) —
+`deployment.yaml` for the app plus `manifests/turn.yaml` for a separate
+TURN deployment. For a simpler, single-binary self-host alternative (TURN
+embedded in the app container, no separate TURN deployment at all), see
+[`examples/docker-compose.embedded.yml`](examples/docker-compose.embedded.yml)
+and [`../docs/self-hosting.md` §5.2](../docs/self-hosting.md#52-embedded-turn-single-binary).
+
 ## Order of application (once, with the admin kubeconfig)
 
 ```bash

@@ -8,7 +8,13 @@
 FROM rust:slim-bookworm AS builder
 WORKDIR /src
 COPY . .
-RUN cargo build --release && cp target/release/screenshare /screenshare
+# Embedded TURN (optional, see Cargo.toml `embedded-turn` feature and
+# docs/self-hosting.md, "TURN (Optional)"): empty by default, so a plain
+# `docker build .` (the default, split-production image) never pulls in
+# `turn-server`/`aws-lc-rs` and friends. Self-host operators who want a
+# single embedded-TURN image pass `--build-arg CARGO_FEATURES=embedded-turn`.
+ARG CARGO_FEATURES=""
+RUN cargo build --release ${CARGO_FEATURES:+--features $CARGO_FEATURES} && cp target/release/screenshare /screenshare
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 # Artifact version (standard from versioning-release.md): baked in by CI at build time,

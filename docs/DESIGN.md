@@ -146,6 +146,11 @@ other identifier as a label, which keeps this consistent with the
 minimal-server-state principle in [§2.1](#21-design-principles) and the
 guarantees in [`privacy.md`](privacy.md). A ready-made Grafana dashboard
 ships at [`../deploy/monitoring/grafana-dashboard-chat.yaml`](../deploy/monitoring/grafana-dashboard-chat.yaml).
+An optional, off-by-default `embedded-turn` build (see
+[`self-hosting.md` §5.2](self-hosting.md#52-embedded-turn-single-binary))
+folds a TURN server into this same process rather than running it as a
+separate deployment; its `turn_*` metrics are emitted through the same
+recorder and appear on this same `/metrics`, never a second endpoint.
 
 ## 3. Component Model
 
@@ -153,7 +158,7 @@ ships at [`../deploy/monitoring/grafana-dashboard-chat.yaml`](../deploy/monitori
 |-----------|-----------------|------------------|
 | Frontend SPA (`static/*.js`, plain HTML/CSS, no build step) | UI, WebRTC mesh, encryption/decryption, chat logic, permission enforcement on the receiving side | [`webrtc-mesh.md`](webrtc-mesh.md), [`e2e-encryption.md`](e2e-encryption.md), [`chat.md`](chat.md) |
 | Signaling server (Rust/axum, `src/`) | Room lifecycle, membership, leader/lobby state, message relay, rate limiting, TURN credential issuance, optionally serving the static frontend too | [`signaling-protocol.md`](signaling-protocol.md), [`permissions-and-leader.md`](permissions-and-leader.md), [`security.md`](security.md) |
-| TURN server (third-party, e.g. `coturn`/`turn-rs`) | Optional fallback media relay when a direct peer connection fails | [`webrtc-mesh.md`](webrtc-mesh.md), [`self-hosting.md`](self-hosting.md) |
+| TURN server (third-party, e.g. `coturn`/`turn-rs`; split deployment by default, or optionally embedded into the signaling server binary — see [`self-hosting.md` §5.2](self-hosting.md#52-embedded-turn-single-binary)) | Optional fallback media relay when a direct peer connection fails | [`webrtc-mesh.md`](webrtc-mesh.md), [`self-hosting.md`](self-hosting.md) |
 | Static origin (optional, separate from the signaling server) | Serves the frontend from an origin independent of the signaling server, for deployments that want the trust split in [§1.2](#12-trust-split) | [`self-hosting.md`](self-hosting.md) |
 
 ## 4. Technology Stack

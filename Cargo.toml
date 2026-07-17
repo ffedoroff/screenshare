@@ -31,3 +31,24 @@ base64 = "0.22.1"
 # /metrics), see simple-deploy/standards/observability/metrics.md.
 metrics = "0.23"
 metrics-exporter-prometheus = { version = "0.15", default-features = false }
+# Embedded TURN (optional, only pulled in behind the `embedded-turn` Cargo
+# feature below — see docs/self-hosting.md, "TURN (Optional)"): a patched
+# turn-rs fork whose metrics are emitted through the `metrics` facade crate
+# above, so they land in the SAME global recorder/registry this process
+# already installs in `main()` — no second Prometheus registry, no second
+# `/metrics` endpoint to scrape. `default-features = false` + an explicit
+# feature list: only the UDP/TCP data plane + the metrics facade — NOT
+# upstream's own `api` (tonic/axum-server gRPC control plane) or `ssl`
+# (rustls) features, which this embedding doesn't use and which the default
+# (split, production) build must not pull in at all.
+turn-server = { git = "https://github.com/ffedoroff/turn-rs", rev = "95bc72188ba01ce447cf438e635b083a49516889", default-features = false, features = ["udp", "tcp", "metrics-facade"], optional = true }
+
+[features]
+# Off by default: production stays "split" — turn-rs runs as its own
+# separate process/deployment (see deploy/manifests/turn.yaml,
+# docs/self-hosting.md, "TURN (Optional)"). This feature exists for
+# self-host operators who'd rather run a single binary/container with TURN
+# baked in, at the cost of the two processes sharing fate (one restart/OOM
+# takes both down together — acceptable for a single self-hosted node, not
+# for the split production deployment).
+embedded-turn = ["dep:turn-server"]

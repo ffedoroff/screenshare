@@ -79,3 +79,43 @@ pub fn describe() {
         "Current number of open WS connections (not the same as room participants)."
     );
 }
+
+/// Embedded TURN (optional, `embedded-turn` Cargo feature — see
+/// `crate::embedded_turn`, docs/self-hosting.md "TURN (Optional)"):
+/// pre-registers the forked turn-rs's own metric names (name + HELP text)
+/// so `/metrics` carries them right away at startup — same rationale as
+/// [`describe`] above. The metric NAMES themselves are owned by the
+/// turn-rs fork (see its `metrics_facade.rs`, feature `metrics-facade`), not
+/// declared here as `pub const`s like the ones above — they're emitted from
+/// inside that crate, not from our own code, so there's no local call site
+/// where a typo'd string literal could cause a silent new series the same
+/// way `describe()`'s consts guard against.
+///
+/// `turn_relay_allocations` is a gauge that the fork only registers lazily,
+/// on the first allocation/session (see `metrics_facade::on_register`) — we
+/// additionally set it to `0.0` here so it's visible in `/metrics` even
+/// before that happens, not just described.
+#[cfg(feature = "embedded-turn")]
+pub fn describe_embedded_turn() {
+    describe_gauge!(
+        "turn_relay_allocations",
+        Unit::Count,
+        "Number of currently active embedded TURN relay allocations/sessions."
+    );
+    describe_counter!(
+        "turn_relayed_bytes_total",
+        Unit::Bytes,
+        "Bytes relayed by the embedded TURN server, labeled by transport and direction."
+    );
+    describe_counter!(
+        "turn_relayed_packets_total",
+        Unit::Count,
+        "Packets relayed by the embedded TURN server, labeled by transport and direction."
+    );
+    describe_counter!(
+        "turn_relay_errors_total",
+        Unit::Count,
+        "Packet-level errors in the embedded TURN server, labeled by transport."
+    );
+    metrics::gauge!("turn_relay_allocations").set(0.0);
+}

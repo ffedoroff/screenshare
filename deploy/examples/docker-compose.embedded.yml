@@ -1,0 +1,89 @@
+# Self-host with an embedded TURN server: ONE container provides signaling,
+# STUN, TURN, and a single private /metrics — instead of running a separate
+# turn-rs deployment alongside the app (see ../manifests/turn.yaml for that
+# split alternative, which is what this project's own production instance
+# actually runs). Embedded is an option purely for simpler self-hosting —
+# see ../../docs/self-hosting.md, "5.2 Embedded TURN (Single-Binary)" for
+# the full writeup of everything configured below.
+#
+# Run from the repository root:
+#   docker compose -f deploy/examples/docker-compose.embedded.yml up -d --build
+#
+# Then open http://<this-host>:8080 (or your domain, once you've put a
+# TLS-terminating reverse proxy in front — see docs/self-hosting.md §3).
+
+services:
+  chat:
+    build:
+      # Repo root — this compose file lives two directories below it.
+      context: ../..
+      dockerfile: Dockerfile
+      args:
+        # This is the ONLY thing that turns on the embedded TURN server at
+        # build time. Without it, `turn-server` is never even compiled in
+        # (see ../../Cargo.toml, the `embedded-turn` feature).
+        CARGO_FEATURES: embedded-turn
+    container_name: chat-embedded
+    restart: unless-stopped
+
+    # REQUIRED for embedded TURN: it binds UDP ports directly on the host
+    # and must advertise the host's real public IP as relay candidates.
+    # Under Docker's default bridge networking, published ports and the
+    # advertised address wouldn't line up with what's actually reachable
+    # from the internet — see docs/self-hosting.md §5.2. With
+    # network_mode: host there is no `ports:` mapping to declare below: the
+    # container shares the host's network namespace directly. Make sure
+    # your host/cloud firewall (separate from anything Docker does) allows
+    # inbound UDP 3478 plus the entire TURN_PORT_RANGE below, in addition to
+    # whatever TCP port fronts signaling/HTTP (8080 here).
+    network_mode: host
+
+    environment:
+      # Main HTTP/WebSocket port (signaling + static frontend). Reachable
+      # directly at this port on the host, since network_mode is "host".
+      PORT: "8080"
+
+      # Management port (Prometheus /metrics — chat_* AND turn_* series in
+      # this build, see docs/self-hosting.md §5.2/§7.4). Deliberately NOT
+      # published/exposed anywhere beyond the host itself: keep it private,
+      # scrape it from localhost or over a private network only.
+      MGMT_PORT: "8081"
+
+      # --- Embedded TURN -------------------------------------------------
+      # Required for the embedded TURN server to start at all: the SAME
+      # secret this app uses to hand out TURN credentials via /config, so
+      # issued credentials always match what the embedded server verifies.
+      # CHANGE THIS before going anywhere near production.
+      TURN_STATIC_SECRET: "change-me-shared-secret"
+
+      # This host's public IP, advertised in relay candidates handed to
+      # clients. Without it, TURN still starts on 0.0.0.0 but relay
+      # candidates aren't reachable from outside this host (warning only,
+      # not a hard failure) — set this for TURN to actually be usable.
+      TURN_EXTERNAL_IP: "203.0.113.10"
+
+      # Points the client-facing /config at this same host's own embedded
+      # TURN server, port 3478 (the embedded server IS what this resolves
+      # to — see docs/self-hosting.md §5.2).
+      TURN_URL: "turn:203.0.113.10:3478"
+
+      # Optional: TURN realm (default "localhost" if unset) and the UDP
+      # relay port range (format "START-END", default is turn-rs's own).
+      # TURN_REALM: "your-domain.example"
+      # TURN_PORT_RANGE: "49160-49999"
+
+      # Room lifecycle knobs — all optional, defaults are sane for
+      # self-hosting. Uncomment to override (see docs/self-hosting.md §6).
+      # MAX_ROOM_LIFETIME_SECONDS: "10800"   # hard cap per room, default 3h
+      # EMPTY_ROOM_TTL_SECONDS: "300"        # how long an empty room lingers
+      # MAX_ROOMS: "1000"                    # ceiling on concurrent rooms (DoS guard)
+
+    healthcheck:
+      # distroless/cc ships no shell/curl of its own; the image bakes in a
+      # single static busybox (see ../../Dockerfile) purely so this check
+      # can run from inside the container. Probes GET /healthz on PORT.
+      test: ["CMD", "/bin/busybox", "sh", "-c", "/bin/busybox wget -q -O /dev/null http://127.0.0.1:${PORT:-8080}/healthz || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s

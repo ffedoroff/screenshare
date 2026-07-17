@@ -10,6 +10,7 @@
 - [4. The `localhost` vs. LAN/Domain Secure-Context Nuance](#4-the-localhost-vs-landomain-secure-context-nuance)
 - [5. TURN (Optional)](#5-turn-optional)
   - [5.1 Rotating the Shared Secret](#51-rotating-the-shared-secret)
+  - [5.2 Embedded TURN (Single-Binary)](#52-embedded-turn-single-binary)
 - [6. Environment Variables](#6-environment-variables)
 - [7. Operational Notes](#7-operational-notes)
   - [7.1 Single Replica, In-Memory State](#71-single-replica-in-memory-state)
@@ -212,6 +213,92 @@ main benefit (bounding a leak's lifetime via rotation); it's worth
 considering if your TURN server supports it and you want the TTL to be a
 hard guarantee rather than an operational habit.
 
+### 5.2 Embedded TURN (Single-Binary)
+
+Everything in [§5](#5-turn-optional) above assumes a **separate** TURN
+server (the **split** topology — this project's own production instance
+runs this way, with turn-rs as its own deployment; see
+[`../deploy/manifests/turn.yaml`](../deploy/manifests/turn.yaml)). For
+self-host operators who would rather not run a second process/deployment
+just for TURN, an optional, **off-by-default** Cargo build feature,
+`embedded-turn`, compiles a patched fork of `turn-rs` directly into the chat
+binary and runs it as a background task inside the same process — no
+separate TURN container, no separate metrics exporter. One binary then
+provides signaling, STUN, TURN, and a single private `GET /metrics` with
+both `chat_*` and `turn_*` series (see [§7.4](#74-metrics--dashboard)).
+This is purely an option for simpler self-hosting; the split topology
+remains the default and the recommended production setup. The default
+`cargo build`/`docker build .` never compiles this code path in at all —
+see [`../src/embedded_turn.rs`](../src/embedded_turn.rs) and
+[`../Cargo.toml`](../Cargo.toml).
+
+The embedded server is the patched fork
+[`ffedoroff/turn-rs`](https://github.com/ffedoroff/turn-rs) at commit
+`95bc72188ba01ce447cf438e635b083a49516889`, built with only the UDP/TCP
+data plane and its `metrics-facade` feature (not upstream's own Prometheus
+exporter or gRPC control plane). See
+[`research-merge-servers.md`](research-merge-servers.md) for the full
+rationale behind embedding vs. the split default, and why this particular
+fork/rev.
+
+**Build.** Pass the feature as a build arg — the default `docker build .`
+still never pulls in the `turn-server` crate:
+
+```bash
+docker build --build-arg CARGO_FEATURES=embedded-turn -t chat:embedded .
+```
+
+**Configure.** In addition to `TURN_URL`/`TURN_STATIC_SECRET` from
+[§6](#6-environment-variables) below — the *same* variables the split
+topology uses; `/config` and the embedded server are driven by the same
+`TURN_STATIC_SECRET`, so credentials issued to clients always match what
+the embedded server verifies — it also reads:
+
+| Variable | Required | Default | Purpose |
+|---|---|---|---|
+| `TURN_STATIC_SECRET` | **yes**, for the embedded server to start at all | unset | Without it, the embedded server does **not** start (only a warning is logged, not a fatal error) — it would otherwise issue/verify credentials that never match what `/config` hands out, since both are driven by this one variable |
+| `TURN_EXTERNAL_IP` | recommended | unset | This host's public IP, advertised in relay candidates handed to clients. Without it, the embedded server still binds `0.0.0.0` and starts, but relay candidates aren't reachable from outside the host — logged as a warning, not a hard failure |
+| `TURN_REALM` | no | `localhost` | TURN realm for the embedded server |
+| `TURN_PORT_RANGE` | no | turn-rs's own default range | UDP relay port range, format `START-END` (e.g. `49160-49999`) — note the single dash, distinct from turn-rs's own internal `START..END` notation |
+| `TURN_URL` | no | unset | Same variable as [§6](#6-environment-variables); for embedded TURN, point it at this same host's own public IP on port `3478` — the embedded server *is* the TURN server this URL resolves to |
+
+The embedded server always listens on UDP `3478` (fixed, not currently
+configurable) plus the relay port range above.
+
+**`hostNetwork` / `--network host` is required.** The embedded TURN server
+binds UDP ports directly on the host and must advertise this host's real
+public IP as relay candidates — behind a Kubernetes `Service` or Docker's
+default bridge networking, the ports it binds and the address it
+advertises would not line up with what's actually reachable from the
+internet. Set `hostNetwork: true` in Kubernetes (the same requirement as
+the split TURN deployment, see
+[`../deploy/manifests/turn.yaml`](../deploy/manifests/turn.yaml)), or run
+the container with `--network host` under plain Docker/Compose — see the
+worked example at
+[`../deploy/examples/docker-compose.embedded.yml`](../deploy/examples/docker-compose.embedded.yml).
+If host networking is truly not an option, publish UDP `3478` and the
+entire `TURN_PORT_RANGE` individually instead. Either way, do **not**
+publish the management port (`MGMT_PORT`, default `8081`, see
+[§7.4](#74-metrics--dashboard)) — `/metrics` is meant to stay private
+regardless of topology.
+
+**Metrics.** Embedding TURN does not add a second Prometheus endpoint: the
+fork emits its metrics through the same `metrics` facade this process
+already installs, so they land in the exact same `/metrics` as the
+`chat_*` series — `turn_relay_allocations` (gauge: the number of currently
+active relay allocations, i.e. how many connections are being proxied
+through this server right now), `turn_relayed_bytes_total` /
+`turn_relayed_packets_total` (counters, labeled `transport`/`direction`),
+and `turn_relay_errors_total` (counter, labeled `transport`). No separate
+turn-rs exporter is started, and none is needed.
+
+**Shutdown.** The chat process's single SIGTERM handler cancels the
+embedded TURN task alongside actively closing WebSocket connections (see
+[§7.2](#72-surviving-a-restartredeploy)) — turn-rs needs no graceful drain
+of its own (no in-flight HTTP requests to finish; abandoning in-progress
+UDP relay sessions on shutdown is acceptable). `SIGKILL`, as always, cannot
+be intercepted by anything in the process.
+
 ## 6. Environment Variables
 
 | Variable | Required | Default | Purpose |
@@ -226,9 +313,12 @@ hard guarantee rather than an operational habit.
 | `ROOM_CREATION_IP_LIMIT` | no | `3` (per 60s) | Per-IP rate limit on `POST /api/rooms` and `PUT /api/rooms/{roomId}` (they share the same budget) — deliberately tight: creating a room is a rare action for a legitimate user, unlike joining one — see [`security.md` §4](security.md#4-h2--denial-of-service-limits) |
 | `MGMT_PORT` | no | `8081` | Port for the **separate** management server that serves `GET /metrics` (Prometheus text exposition) — never the main `PORT`/signaling listener, and not meant to be reachable through the same public path; see [§7.4](#74-metrics--dashboard) |
 | `CORS_ORIGIN` | no | unset (CORS off entirely) | The frontend's origin, if running the split topology ([§1.2](#12-split-origin-frontend--signaling-separated)); also enables `Origin` validation on the WebSocket upgrade |
-| `TURN_URL` | no | unset | TURN server address, e.g. `turn:your-server:3478` |
-| `TURN_STATIC_SECRET` | no (recommended if using TURN) | unset | Shared secret for computing short-lived TURN credentials — see [§5](#5-turn-optional) |
+| `TURN_URL` | no | unset | TURN server address, e.g. `turn:your-server:3478`. With embedded TURN ([§5.2](#52-embedded-turn-single-binary)), point this at this same host's own public IP on port `3478` |
+| `TURN_STATIC_SECRET` | no (recommended if using TURN); **yes** to start embedded TURN | unset | Shared secret for computing short-lived TURN credentials — see [§5](#5-turn-optional). With embedded TURN ([§5.2](#52-embedded-turn-single-binary)) this is also the one variable that gates whether the embedded server starts at all |
 | `TURN_USERNAME` / `TURN_PASSWORD` | no | unset | Static TURN credential fallback, ignored once `TURN_STATIC_SECRET` is set |
+| `TURN_EXTERNAL_IP` | no (recommended, embedded TURN only) | unset | This host's public IP, advertised in relay candidates handed to embedded-TURN clients — see [§5.2](#52-embedded-turn-single-binary) |
+| `TURN_REALM` | no (embedded TURN only) | `localhost` | TURN realm for the embedded server — see [§5.2](#52-embedded-turn-single-binary) |
+| `TURN_PORT_RANGE` | no (embedded TURN only) | turn-rs's own default range | UDP relay port range for the embedded server, format `START-END` (e.g. `49160-49999`) — see [§5.2](#52-embedded-turn-single-binary) |
 | `APP_VERSION` / `GIT_COMMIT` / `BUILD_DATE` | no (build args, not runtime env) | `dev` / `unknown` / `unknown` | Baked in at image build time, surfaced via `/version.json` |
 
 If `TURN_URL` is unset, clients get STUN only from `/config` — fine unless
@@ -293,7 +383,9 @@ current participant count, current waiting-lobby count, and a lifetime
 room-creation counter (see [`../src/metrics.rs`](../src/metrics.rs) for the
 exact names and help text) — never a room id, peer id, or any other
 per-entity label; this is consistent with the privacy posture in
-[`privacy.md`](privacy.md).
+[`privacy.md`](privacy.md). Builds with the `embedded-turn` feature ([§5.2](#52-embedded-turn-single-binary))
+add `turn_*` series to this **same** `/metrics` — there is no second
+exporter or port to scrape for TURN metrics in that build.
 
 A ready-made Grafana dashboard (a `ConfigMap` picked up by a sidecar
 provisioner watching `/var/lib/grafana/dashboards`) lives at
