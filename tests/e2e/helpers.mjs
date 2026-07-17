@@ -1,11 +1,12 @@
-// tests/e2e/helpers.mjs — переиспользуемое между *.spec.mjs: мини-раннер
-// step/skip, сборка/запуск/остановка сервера (порт параметром), стабы
-// getDisplayMedia/getUserMedia, чат-хелперы, ожидание ухода оверлея, флаги
-// запуска Chrome. Выделено из basic.spec.mjs (см. историю решений там же —
-// заголовок файла объясняет, почему стабы и waitForFunction именно такие).
+// tests/e2e/helpers.mjs — shared between *.spec.mjs: mini test runner
+// step/skip, build/run/stop server (port as a parameter), stubs for
+// getDisplayMedia/getUserMedia, chat helpers, waiting for the overlay to
+// hide, Chrome launch flags. Extracted from basic.spec.mjs (see the decision
+// history there — the file header explains why the stubs and
+// waitForFunction calls are shaped this way).
 //
-// Ничего из static/*.js этот файл не трогает и не подменяет — только
-// тестовый арнесс со стороны страницы (addInitScript) и драйвер сервера.
+// Nothing under static/*.js is touched or replaced by this file — only the
+// test harness on the page side (addInitScript) and the server driver.
 
 import { spawn, execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
@@ -19,49 +20,51 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = path.resolve(__dirname, '../..');
 export const BINARY_PATH = path.join(REPO_ROOT, 'target/debug/screenshare');
 
-// --- Ш1 (E2E-шифрование v2, см. static/crypto.js/docs/research-p2p-key-handoff.md
-//     §6.5–6.6): PSK-токен `t` + срок `e` в тестах ---
+// --- S1 (E2E encryption v2, see static/crypto.js/docs/research-p2p-key-handoff.md
+//     §6.5–6.6): PSK token `t` + expiry `e` in tests ---
 //
-// Формат фрагмента ссылки теперь `#lt=<leaderToken>&t=<token>&e=<expiry>[&n=<roomName>]`
-// (см. static/landing.js/static/room.js) — `t` (16 случайных байт, base64url,
-// 22 символа) статически аутентифицирует комнату, `e` (unix-секунды истечения
-// в base36) зашивается в вывод K_auth. Оба чисто клиентские: реальный
-// браузер генерирует их при клике «Создать комнату» и сервер о них никогда
-// не узнаёт. Когда сценарий заводит комнату НАПРЯМУЮ через `POST /api/rooms`
-// (в обход лендинга — так делает большинство сценариев ниже, чтобы не
-// гонять реальный клик по кнопке ради каждой новой комнаты), `t`/`e`
-// точно так же должны появиться на стороне теста — сервер их не выдаст.
+// The link fragment format is now `#lt=<leaderToken>&t=<token>&e=<expiry>[&n=<roomName>]`
+// (see static/landing.js/static/room.js) — `t` (16 random bytes, base64url,
+// 22 characters) statically authenticates the room, `e` (unix seconds of
+// expiry in base36) is baked into the K_auth derivation. Both are purely
+// client-side: a real browser generates them on clicking "Create room" and
+// the server never learns them. When a scenario creates a room DIRECTLY via
+// `POST /api/rooms` (bypassing the landing page — most scenarios below do
+// this, to avoid driving a real click on the button for every new room),
+// `t`/`e` must appear on the test side the exact same way — the server will
+// not hand them out.
 
-const TOKEN_BYTES = 16; // должно совпадать с LINK_TOKEN_BYTES в static/room.js / RoomCrypto.generateRoomToken()
-const DEFAULT_LINK_LIFETIME_SECONDS = 10800; // тот же дефолт, что и в static/landing.js (фолбэк без lifetimeSeconds в ответе POST /api/rooms)
-const LINK_EXPIRY_GRACE_SECONDS = 300; // +5 минут — тот же запас, что и static/landing.js: expiryB36
+const TOKEN_BYTES = 16; // must match LINK_TOKEN_BYTES in static/room.js / RoomCrypto.generateRoomToken()
+const DEFAULT_LINK_LIFETIME_SECONDS = 10800; // same default as static/landing.js (fallback when lifetimeSeconds is absent from the POST /api/rooms response)
+const LINK_EXPIRY_GRACE_SECONDS = 300; // +5 minutes — the same margin as static/landing.js: expiryB36
 
-/** Случайный PSK-токен ссылки (16 байт, base64url без паддинга, 22 символа) — тот же формат, что и `RoomCrypto.generateRoomToken()+bytesToBase64url()`. */
+/** Random link PSK token (16 bytes, base64url without padding, 22 characters) — the same format as `RoomCrypto.generateRoomToken()+bytesToBase64url()`. */
 export function generateRoomToken() {
   return nodeCrypto.randomBytes(TOKEN_BYTES).toString('base64url');
 }
 
-/** `e` (base36 unix-секунды) на `deltaSeconds` от текущего момента — отрицательное значение даёт УЖЕ истёкшую ссылку (см. тест «Link expired»). */
+/** `e` (base36 unix seconds) at `deltaSeconds` from now — a negative value gives an ALREADY expired link (see the "Link expired" test). */
 export function expiryB36FromNow(deltaSeconds) {
   return (Math.floor(Date.now() / 1000) + deltaSeconds).toString(36);
 }
 
-/** Валидный (не истёкший) `e` по умолчанию — как посчитал бы static/landing.js для комнаты с дефолтным сроком жизни. */
+/** Valid (non-expired) default `e` — as static/landing.js would compute it for a room with the default lifetime. */
 export function defaultValidExpiryB36(lifetimeSeconds = DEFAULT_LINK_LIFETIME_SECONDS) {
   return expiryB36FromNow(lifetimeSeconds + LINK_EXPIRY_GRACE_SECONDS);
 }
 
 /**
- * Дефолтный `e` для данного токена — ДЕТЕРМИНИРОВАННЫЙ: один и тот же токен
- * всегда получает один и тот же `e` в пределах прогона (кеш ниже).
+ * Default `e` for a given token — DETERMINISTIC: the same token always gets
+ * the same `e` within a single run (cache below).
  *
- * КРИТИЧНО для E2E v2: `e` зашит в деривацию K_auth (см. static/crypto.js),
- * поэтому у всех участников ОДНОЙ комнаты `e` обязан совпадать до символа —
- * иначе попарные ключи разойдутся и первый же SDP даст честный GCM-провал
- * «Link is invalid». Реальные пользователи делят одну ссылку, у них `t`+`e`
- * совпадают по построению; тесты же строили URL для каждой страницы отдельным
- * вызовом, и два вызова через границу секунды получали разные `e` — источник
- * плавающего падения мобильного смоука (падал десктопный участник).
+ * CRITICAL for E2E v2: `e` is baked into the K_auth derivation (see
+ * static/crypto.js), so for all participants of ONE room `e` must match
+ * character-for-character — otherwise the pairwise keys diverge and the very
+ * first SDP produces a legitimate GCM failure "Link is invalid". Real users
+ * share one link, so their `t`+`e` match by construction; the tests, however,
+ * used to build the URL separately for each page, and two calls straddling a
+ * second boundary got different `e` values — the source of a flaky mobile
+ * smoke test failure (the desktop participant would fail).
  */
 const defaultExpiryByToken = new Map();
 function defaultExpiryForToken(token) {
@@ -72,11 +75,12 @@ function defaultExpiryForToken(token) {
 }
 
 /**
- * Собрать `t=...&e=...[&n=...]` — тело нового фрагмента ссылки (без `lt=`).
- * `t`/`e`, если не переданы явно, генерируются валидными (см. выше); дефолтный
- * `e` стабилен для одного `t` (см. defaultExpiryForToken) — участники одной
- * комнаты, чьи URL построены независимыми вызовами с одним токеном, получают
- * идентичный фрагмент, как если бы делили одну реальную ссылку.
+ * Build `t=...&e=...[&n=...]` — the body of a new link fragment (without `lt=`).
+ * `t`/`e`, when not passed explicitly, are generated as valid (see above); the
+ * default `e` is stable for a given `t` (see defaultExpiryForToken) —
+ * participants of the same room whose URLs are built by independent calls
+ * with the same token get an identical fragment, as if they shared one real
+ * link.
  */
 export function makeRoomFragment({ t, e, n } = {}) {
   const tok = t ?? generateRoomToken();
@@ -87,44 +91,45 @@ export function makeRoomFragment({ t, e, n } = {}) {
 }
 
 /**
- * Ссылка гостя: `<baseUrl>/r/<roomId>#t=<token>&e=<expiry>[&n=...]` — без
- * leaderToken (гость лидером не становится). `token` — строка `t` (обычно
- * generateRoomToken(), но допускается и заведомо невалидная строка — см.
- * тест «Link is invalid» на битый формат). `extra` — необязательные `e`/`n`
- * (по умолчанию валидный `e`, без имени комнаты).
+ * Guest link: `<baseUrl>/r/<roomId>#t=<token>&e=<expiry>[&n=...]` — without
+ * leaderToken (a guest does not become the leader). `token` — the `t` string
+ * (usually generateRoomToken(), but a deliberately invalid string is also
+ * allowed — see the "Link is invalid" test for a malformed format). `extra` —
+ * optional `e`/`n` (defaults to a valid `e`, no room name).
  */
 export function roomUrlWithKey(baseUrl, roomId, token, extra = {}) {
   return `${baseUrl}/r/${roomId}#${makeRoomFragment({ t: token, ...extra })}`;
 }
 
-/** Ссылка создателя: `<baseUrl>/r/<roomId>#lt=<leaderToken>&t=<token>&e=<expiry>[&n=...]` — предъявляет leaderToken, становится лидером. */
+/** Creator's link: `<baseUrl>/r/<roomId>#lt=<leaderToken>&t=<token>&e=<expiry>[&n=...]` — presents the leaderToken, becomes the leader. */
 export function leaderUrlWithKey(baseUrl, roomId, leaderToken, token, extra = {}) {
   return `${baseUrl}/r/${roomId}#lt=${encodeURIComponent(leaderToken)}&${makeRoomFragment({ t: token, ...extra })}`;
 }
 
 /**
- * Прочитать `t`/`e` (base64url/base36 строки как они лежат во фрагменте) со
- * СТРАНИЦЫ уже вошедшего участника — top-level `const linkTokenBase64url`/
- * `linkExpiry` в static/room.js, тот же приём, что и чтение `leaderId`/
- * `myPeerId`/`roomSettings`/`bus` в существующих тестах (обычный
- * classic-script top-level scope, не модуль). Нужен там, где комната заведена
- * через реальный лендинг (t/e сгенерировал сам браузер, тест их заранее не
- * знает) — см. basic.spec.mjs, сценарий создания комнаты кликом.
+ * Read `t`/`e` (base64url/base36 strings as they sit in the fragment) from
+ * the PAGE of an already-joined participant — the top-level `const
+ * linkTokenBase64url`/`linkExpiry` in static/room.js, the same trick used to
+ * read `leaderId`/`myPeerId`/`roomSettings`/`bus` in existing tests (a
+ * classic-script top-level scope, not a module). Needed where the room was
+ * created through the real landing page (t/e was generated by the browser
+ * itself, the test doesn't know them in advance) — see basic.spec.mjs, the
+ * room-creation-by-click scenario.
  */
 export async function getRoomFragmentFromPage(page) {
   return page.evaluate(() => ({ t: linkTokenBase64url, e: linkExpiry }));
 }
 
-// Сколько ждём реальный getDisplayMedia в broadcaster-контексте, прежде чем
-// откатиться на синтетический источник (см. installCaptureStub).
+// How long to wait for a real getDisplayMedia in the broadcaster context
+// before falling back to a synthetic source (see installCaptureStub).
 export const REAL_CAPTURE_TIMEOUT_MS = 10_000;
 
-// Сколько ждём реальный getUserMedia(audio) у зрителя, прежде чем откатиться
-// на синтетический источник (см. installMicStub).
+// How long to wait for a real getUserMedia(audio) on the viewer before
+// falling back to a synthetic source (see installMicStub).
 export const REAL_MIC_TIMEOUT_MS = 5_000;
 
-// Сколько ждём реальный getUserMedia(video) (камера), прежде чем откатиться
-// на синтетический источник (см. installCamStub).
+// How long to wait for a real getUserMedia(video) (camera) before falling
+// back to a synthetic source (see installCamStub).
 export const REAL_CAM_TIMEOUT_MS = 5_000;
 
 export const CAPTURE_FLAGS = [
@@ -133,12 +138,13 @@ export const CAPTURE_FLAGS = [
   '--use-fake-device-for-media-stream',
 ];
 
-// --- Мини-раннер: ok/FAIL построчно, без внешнего test-runner'а ---
+// --- Mini runner: ok/FAIL line by line, without an external test runner ---
 //
-// Каждый *.spec.mjs вызывает createRunner() один раз и получает свой
-// изолированный счётчик (важно: два спека в одном процессе не делили бы
-// счётчики иначе — на практике спеки и так отдельные процессы, но
-// изоляция дешёвая и не создаёт скрытых предположений).
+// Each *.spec.mjs calls createRunner() once and gets its own isolated
+// counter (this matters: two specs in the same process wouldn't want to
+// share counters otherwise — in practice specs are already separate
+// processes, but the isolation is cheap and doesn't create hidden
+// assumptions).
 export function createRunner() {
   let passedCount = 0;
   let failedCount = 0;
@@ -164,7 +170,7 @@ export function createRunner() {
 
   function printSummary() {
     console.log('');
-    console.log(`# итого: ok=${passedCount} FAIL=${failedCount} skip=${skippedCount}`);
+    console.log(`# total: ok=${passedCount} FAIL=${failedCount} skip=${skippedCount}`);
   }
 
   function bumpFailedForUnexpectedError() {
@@ -182,25 +188,24 @@ export function createRunner() {
   };
 }
 
-// --- Сервер: сборка, запуск, ожидание готовности, гарантированное убийство ---
+// --- Server: build, start, wait for readiness, guaranteed kill ---
 
 export async function buildServer() {
   console.log('# cargo build...');
   execFileSync('cargo', ['build'], { cwd: REPO_ROOT, stdio: 'inherit' });
   if (!existsSync(BINARY_PATH)) {
-    throw new Error(`бинарь не найден после сборки: ${BINARY_PATH}`);
+    throw new Error(`binary not found after build: ${BINARY_PATH}`);
   }
 }
 
-// Возвращает контроллер сервера на конкретном порту: { baseUrl, start(), stop() }.
-// Инкапсулирует свой process/tmp-dir — можно поднимать несколько независимых
-// серверов в одном файле (не требуется сейчас, но не создаёт скрытого
-// глобального состояния).
+// Returns a controller for a server on a specific port: { baseUrl, start(), stop() }.
+// Encapsulates its own process/tmp-dir — several independent servers could be
+// started in a single file (not needed right now, but doesn't create hidden
+// global state).
 //
-// `extraEnv` — дополнительные переменные окружения сервера (например,
-// EMPTY_ROOM_TTL_SECONDS для resilience.spec.mjs, сценарий с TTL пустой
-// комнаты) — необязательный второй параметр, не ломает существующие вызовы
-// с одним аргументом (basic.spec.mjs).
+// `extraEnv` — extra server environment variables (e.g. EMPTY_ROOM_TTL_SECONDS
+// for resilience.spec.mjs, the empty-room TTL scenario) — an optional second
+// parameter that doesn't break existing single-argument calls (basic.spec.mjs).
 export function createServerController(port, extraEnv = {}) {
   const baseUrl = `http://localhost:${port}`;
   let serverProcess = null;
@@ -211,15 +216,14 @@ export function createServerController(port, extraEnv = {}) {
       env: {
         ...process.env,
         PORT: String(port),
-        // ROOM_CREATION_IP_LIMIT: прод-дефолт ужесточён до 3/60с (см.
-        // state::DEFAULT_ROOM_CREATION_IP_LIMIT в src/state.rs) — e2e-спеки
-        // (basic.spec.mjs, resilience.spec.mjs) создают/восстанавливают много
-        // комнат с одного и того же IP за прогон (см. там комментарии про
-        // ROOM_CREATION_IP_LIMIT), поэтому дефолтный env этого контроллера
-        // поднимает лимит далеко за пределы того, что прогон способен
-        // нафлудить — тот же приём, что у JOIN_ROOM_IP_LIMIT в
-        // basic.spec.mjs. `extraEnv` ниже может переопределить при
-        // необходимости.
+        // ROOM_CREATION_IP_LIMIT: the prod default is tightened to 3/60s (see
+        // state::DEFAULT_ROOM_CREATION_IP_LIMIT in src/state.rs) — the e2e
+        // specs (basic.spec.mjs, resilience.spec.mjs) create/restore many
+        // rooms from the same IP within a run (see the ROOM_CREATION_IP_LIMIT
+        // comments there), so this controller's default env raises the limit
+        // well beyond what a run could possibly flood — the same trick used
+        // for JOIN_ROOM_IP_LIMIT in basic.spec.mjs. `extraEnv` below can
+        // override it if needed.
         ROOM_CREATION_IP_LIMIT: '100000',
         ...extraEnv,
       },
@@ -231,7 +235,7 @@ export function createServerController(port, extraEnv = {}) {
     serverProcess.stderr.on('data', (d) => { serverLog += d.toString(); });
     serverProcess.on('exit', (code, signal) => {
       if (code !== null && code !== 0) {
-        console.log(`# сервер неожиданно завершился (code=${code}, signal=${signal})`);
+        console.log(`# server exited unexpectedly (code=${code}, signal=${signal})`);
         console.log(serverLog);
       }
     });
@@ -242,11 +246,11 @@ export function createServerController(port, extraEnv = {}) {
         const res = await fetch(`${baseUrl}/`);
         if (res.ok) return;
       } catch {
-        // сервер ещё не поднялся — подождём и попробуем снова
+        // server not up yet — wait a bit and try again
       }
       await new Promise((r) => setTimeout(r, 150));
     }
-    throw new Error(`сервер не ответил на ${baseUrl}/ за 10с. Лог:\n${serverLog}`);
+    throw new Error(`server did not respond at ${baseUrl}/ within 10s. Log:\n${serverLog}`);
   }
 
   async function stop() {
@@ -269,17 +273,18 @@ export function createServerController(port, extraEnv = {}) {
   return { baseUrl, start, stop };
 }
 
-// --- Синтетический источник видео для случая, когда реальный getDisplayMedia
-//     недоступен. Ставится ДО загрузки любых скриптов страницы через
-//     addInitScript — static/broadcaster.js не трогаем. ---
+// --- Synthetic video source for when a real getDisplayMedia is unavailable.
+//     Installed BEFORE any page scripts load, via addInitScript —
+//     static/broadcaster.js is not touched. ---
 //
-// ВАЖНО (выяснено диагностикой флейка mic-ренегоциации): попытка реального
-// getDisplayMedia, чей промис на этой машине никогда не резолвится, не просто
-// стоит 10 секунд на старте — зависший desktop-capture-запрос остаётся жить в
-// медиастеке Chrome и потом задерживает обработку последующих медиа-операций
-// той же страницы (ответ вещающего на mic-offer зрителя приходил ровно через
-// REAL_CAPTURE_TIMEOUT_MS после offer'а). Поэтому по умолчанию идём сразу в
-// синтетику; попытка реального захвата — только по E2E_TRY_REAL_CAPTURE=1.
+// IMPORTANT (found while diagnosing a mic-renegotiation flake): attempting a
+// real getDisplayMedia whose promise never resolves on this machine doesn't
+// just cost 10 seconds at startup — the hung desktop-capture request stays
+// alive in Chrome's media stack and then delays processing of subsequent
+// media operations on the same page (the broadcaster's response to the
+// viewer's mic-offer arrived exactly REAL_CAPTURE_TIMEOUT_MS after the
+// offer). So by default we go straight to synthetic; a real capture attempt
+// only happens with E2E_TRY_REAL_CAPTURE=1.
 export function installCaptureStub() {
   return ({ tryReal, timeoutMs }) => {
     const realGetDisplayMedia = navigator.mediaDevices.getDisplayMedia
@@ -298,7 +303,7 @@ export function installCaptureStub() {
           window.__e2eCaptureSource = 'real';
           return stream;
         } catch (err) {
-          console.warn('[e2e] реальный getDisplayMedia не сработал за отведённое время, откат на синтетический источник:', err);
+          console.warn('[e2e] real getDisplayMedia did not succeed in time, falling back to synthetic source:', err);
         }
       }
 
@@ -323,19 +328,19 @@ export function installCaptureStub() {
   };
 }
 
-// --- Синтетический источник аудио для микрофона зрителя ---
+// --- Synthetic audio source for the viewer's microphone ---
 //
-// На этой машине getUserMedia(audio) зависает навсегда даже при выданном
-// разрешении (permissions.query -> 'granted') — подменяем на осциллятор Web
-// Audio API -> MediaStreamAudioDestinationNode, полноценный live-трек, не
-// трогающий реальное аудио-железо. static/viewer.js не меняется — как обычно
-// вызывает getUserMedia({ audio: true }).
+// On this machine getUserMedia(audio) hangs forever even with permission
+// granted (permissions.query -> 'granted') — we replace it with a Web Audio
+// API oscillator -> MediaStreamAudioDestinationNode, a full live track that
+// doesn't touch real audio hardware. static/viewer.js is unchanged — it
+// calls getUserMedia({ audio: true }) as usual.
 //
-// ВАЖНО: «сначала реальный getUserMedia с Promise.race + setTimeout»
-// ненадёжно — страница зрителя к моменту клика по микрофону может быть
-// фоновой, а Chrome троттлит таймеры фоновых страниц, поэтому фолбэк
-// срабатывал через десятки секунд и тест мигал. По умолчанию — сразу
-// синтетика; реальный захват — E2E_TRY_REAL_MIC=1.
+// IMPORTANT: "try the real getUserMedia first with Promise.race + setTimeout"
+// is unreliable — by the time the viewer clicks the mic, the page may be
+// backgrounded, and Chrome throttles timers on background pages, so the
+// fallback could take tens of seconds and make the test flaky. By default —
+// go straight to synthetic; real capture — E2E_TRY_REAL_MIC=1.
 export function installMicStub() {
   return ({ tryReal, timeoutMs }) => {
     const realGetUserMedia = navigator.mediaDevices.getUserMedia
@@ -352,14 +357,14 @@ export function installMicStub() {
         try {
           const stream = await withTimeout(realGetUserMedia(constraints), timeoutMs);
           window.__e2eMicSource = 'real';
-          // Нормализация громкости: фейковое аудиоустройство Chrome
-          // (--use-fake-device-for-media-stream) выдаёт очень тихий тон —
-          // RMS ~0.010–0.019, аккурат на границе продуктового порога
-          // детектора «кто говорит» (0.02), из-за чего проверка индикатора
-          // флейкала. Прогоняем трек через GainNode ×6: тестируется тот же
-          // реальный путь getUserMedia (разрешения, устройство), но громкость
-          // становится детерминированно «речевой». Порог продукта под тест
-          // не подгоняем принципиально.
+          // Volume normalization: Chrome's fake audio device
+          // (--use-fake-device-for-media-stream) outputs a very quiet tone —
+          // RMS ~0.010–0.019, right at the edge of the product's "who is
+          // speaking" detector threshold (0.02), which made the indicator
+          // check flaky. We run the track through a GainNode ×6: the same
+          // real getUserMedia path is exercised (permissions, device), but
+          // the volume becomes deterministically "speech-like". We
+          // deliberately don't tune the product's threshold to fit the test.
           const boostCtx = new (window.AudioContext || window.webkitAudioContext)();
           const boostSrc = boostCtx.createMediaStreamSource(stream);
           const gain = boostCtx.createGain();
@@ -369,7 +374,7 @@ export function installMicStub() {
           gain.connect(boostDst);
           return boostDst.stream;
         } catch (err) {
-          console.warn('[e2e] реальный getUserMedia(audio) не сработал за отведённое время, откат на синтетический источник:', err);
+          console.warn('[e2e] real getUserMedia(audio) did not succeed in time, falling back to synthetic source:', err);
         }
       }
 
@@ -386,19 +391,20 @@ export function installMicStub() {
   };
 }
 
-// --- Синтетический источник видео для камеры участника (протокол v2: room.js) ---
+// --- Synthetic video source for a participant's camera (protocol v2: room.js) ---
 //
-// room.js вызывает getUserMedia({ video: {...} }) для камеры и отдельно
-// getUserMedia({ audio: true }) для микрофона — оба через один и тот же
-// navigator.mediaDevices.getUserMedia. Чтобы стабы камеры и микрофона могли
-// сосуществовать на одной странице, этот стаб проверяет constraints сам:
-// запрос без constraints.video прозрачно делегируется в ту функцию
-// getUserMedia, что была установлена ДО него (обычно installMicStub) — важен
-// порядок установки в addInitScript: сначала installMicStub, потом
-// installCamStub (иначе делегирование пойдёт не туда). Запрос с
-// constraints.video обрабатывается этим стабом: как и installCaptureStub,
-// сперва (по флагу) пробует реальный getUserMedia с таймаутом, иначе сразу
-// синтетический canvas.captureStream() — той же логике, что и у камеры.
+// room.js calls getUserMedia({ video: {...} }) for the camera and separately
+// getUserMedia({ audio: true }) for the microphone — both through the same
+// navigator.mediaDevices.getUserMedia. So that the camera and mic stubs can
+// coexist on one page, this stub inspects the constraints itself: a request
+// without constraints.video is transparently delegated to whatever
+// getUserMedia function was installed BEFORE it (usually installMicStub) —
+// the installation order in addInitScript matters: installMicStub first,
+// then installCamStub (otherwise the delegation would go to the wrong
+// place). A request with constraints.video is handled by this stub: like
+// installCaptureStub, it first (behind a flag) tries a real getUserMedia
+// with a timeout, otherwise goes straight to a synthetic
+// canvas.captureStream() — the same logic used for the camera.
 export function installCamStub() {
   return ({ tryReal, timeoutMs }) => {
     const previousGetUserMedia = navigator.mediaDevices.getUserMedia
@@ -409,7 +415,7 @@ export function installCamStub() {
       const wantsVideo = !!(constraints && constraints.video);
       if (!wantsVideo) {
         if (previousGetUserMedia) return previousGetUserMedia(constraints);
-        throw new Error('getUserMedia недоступен (нет ни реального, ни предыдущего стаба)');
+        throw new Error('getUserMedia unavailable (no real implementation nor a previous stub)');
       }
 
       if (tryReal && previousGetUserMedia) {
@@ -423,7 +429,7 @@ export function installCamStub() {
           window.__e2eCamSource = 'real';
           return stream;
         } catch (err) {
-          console.warn('[e2e] реальный getUserMedia(video) не сработал за отведённое время, откат на синтетический источник:', err);
+          console.warn('[e2e] real getUserMedia(video) did not succeed in time, falling back to synthetic source:', err);
         }
       }
 
@@ -448,35 +454,38 @@ export function installCamStub() {
   };
 }
 
-// --- Мобильный UX чата (волна 11): фейковый window.visualViewport ---
+// --- Mobile chat UX (wave 11): fake window.visualViewport ---
 //
-// Реальной виртуальной клавиатуры в headless Chromium (даже с isMobile:true/
-// hasTouch:true) не бывает — фокус на textarea её не открывает и
-// window.visualViewport никак не сжимается сам по себе, поэтому для проверки
-// подгонки полноэкранной мобильной панели чата под клавиатуру (см.
-// static/chat.js: syncMobileChatViewport) нужен детерминированный способ
-// эмулировать её появление. Настоящий VisualViewport — почти все свойства
-// (height/width/offsetTop/offsetLeft/scale) read-only геттеры на прототипе,
-// присвоить им напрямую нельзя; вместо этого ДО первой навигации (см.
-// addInitScript) подменяем весь window.visualViewport на простой EventTarget
-// с теми же именами свойств (обычные mutable-поля, не геттеры) — chat.js
-// работает с ним ровно так же (feature-detect + addEventListener/height/
-// offsetTop), продуктовый код не меняется и не знает, что viewport фейковый.
-// window.__e2eSetVisualViewport(height, offsetTop) — дёргается из теста,
-// чтобы "сжать" видимую область (как будто снизу выросла клавиатура) и
-// продиспатчить 'resize', на который подписан chat.js.
-// ВАЖНО (обнаружено эмпирически): addInitScript выполняется в момент
-// СОЗДАНИЯ документа — ДО того, как HTML-парсер дошёл до <meta
-// name="viewport">, поэтому window.innerHeight/innerWidth, прочитанные ПРЯМО
-// В КОНСТРУКТОРЕ синхронно, на мобильной эмуляции (isMobile:true) в этот
-// момент отражают ещё не применённый viewport-meta и оказываются дикими
-// числами (наблюдалось: 844 -> 2121) — из-за этого при первом же измерении
-// панель "сжималась" в гигантский исходный размер, а не в реальный размер
-// вьюпорта, отправить сообщение (или ткнуть по кнопке) было physически
-// невозможно (элемент вне вьюпорта). Фикс — читать innerHeight/innerWidth
-// ЛЕНИВО через геттеры (значение по умолчанию, пока explicitTest ничего не
-// задал явно) — к моменту, когда chat.js реально обращается к .height (после
-// открытия чата, много позже DOMContentLoaded), window.innerHeight уже верный.
+// There is no real virtual keyboard in headless Chromium (even with
+// isMobile:true/hasTouch:true) — focusing a textarea doesn't open it and
+// window.visualViewport never shrinks on its own, so testing how the
+// full-screen mobile chat panel adapts to the keyboard (see
+// static/chat.js: syncMobileChatViewport) requires a deterministic way to
+// emulate its appearance. The real VisualViewport has almost all its
+// properties (height/width/offsetTop/offsetLeft/scale) as read-only getters
+// on the prototype, so they can't be assigned directly; instead, BEFORE the
+// first navigation (see addInitScript) we replace the entire
+// window.visualViewport with a plain EventTarget with the same property
+// names (regular mutable fields, not getters) — chat.js works with it
+// exactly the same way (feature-detect + addEventListener/height/
+// offsetTop), the product code is unchanged and doesn't know the viewport is
+// fake.
+// window.__e2eSetVisualViewport(height, offsetTop) — invoked from the test
+// to "shrink" the visible area (as if a keyboard grew from the bottom) and
+// dispatch a 'resize' event, which chat.js listens for.
+// IMPORTANT (found empirically): addInitScript runs at document CREATION
+// time — BEFORE the HTML parser reaches <meta name="viewport">, so
+// window.innerHeight/innerWidth, read SYNCHRONOUSLY RIGHT IN THE
+// CONSTRUCTOR, on mobile emulation (isMobile:true) at that moment reflect a
+// not-yet-applied viewport-meta and turn out to be wild numbers (observed:
+// 844 -> 2121) — because of this, on the very first measurement the panel
+// would "shrink" to the giant original size instead of the real viewport
+// size, making it physically impossible to send a message (or tap a button)
+// because the element was off-viewport. The fix — read
+// innerHeight/innerWidth LAZILY through getters (the default value, as long
+// as explicitTest hasn't set anything explicitly) — by the time chat.js
+// actually accesses .height (after the chat is opened, much later than
+// DOMContentLoaded), window.innerHeight is already correct.
 export function installFakeVisualViewport(context) {
   return context.addInitScript(() => {
     class FakeVisualViewport extends EventTarget {
@@ -527,39 +536,41 @@ export function installFakeVisualViewport(context) {
   });
 }
 
-// --- Модалка входа (анонимность — см. static/room.js) ---
+// --- Join modal (anonymity — see static/room.js) ---
 //
-// Никакого localStorage больше нет: имя вводится в модалке «Присоединиться»
-// при КАЖДОМ заходе в комнату (первый вход и любой page.reload() — реконнект
-// после обрыва сигналинга БЕЗ перезагрузки страницы модалку повторно не
-// показывает, см. static/room.js). Эта функция — единая точка входа для
-// ВСЕХ сценариев теста: дождаться модалки, (опционально) ввести имя, кликнуть
-// «Войти». Создатель комнаты тоже проходит через неё — лендинг больше не
-// спрашивает имя, только создаёт комнату и редиректит на /r/<id>#lt=<token>.
+// There is no more localStorage at all: the name is entered in the "Join"
+// modal on EVERY entry into the room (the first join and any page.reload()
+// — a reconnect after a signaling drop WITHOUT reloading the page does not
+// show the modal again, see static/room.js). This function is the single
+// entry point for ALL test scenarios: wait for the modal, (optionally) enter
+// a name, click "Join". The room creator also goes through it — the landing
+// page no longer asks for a name, it only creates the room and redirects to
+// /r/<id>#lt=<token>.
 //
-// Поле #join-name-input теперь предзаполнено сгенерированным именем (см.
-// static/room.js: showJoinModal, NameGen.userName()) — без явного `name` тест
-// хочет войти анонимом, как и раньше, а не унести в комнату случайное
-// сгенерированное имя. Поэтому fill безусловный: `name ?? ''` затирает
-// предзаполнение пустой строкой, если имя не передано, и вписывает `name`,
-// если передано — тем самым сохраняется прежняя детерминированная семантика
-// joinRoom(page) во всех ~40 существующих вызовах (включая filler-страницы
-// resilience.spec.mjs и retry-путь waitForMeshSettled ниже).
+// The #join-name-input field is now pre-filled with a generated name (see
+// static/room.js: showJoinModal, NameGen.userName()) — without an explicit
+// `name` the test wants to join anonymously, as before, rather than carry a
+// random generated name into the room. That's why the fill is
+// unconditional: `name ?? ''` overwrites the pre-fill with an empty string
+// when no name is passed, and types `name` when it is passed — this
+// preserves the previous deterministic semantics of joinRoom(page) across
+// all ~40 existing call sites (including the filler pages in
+// resilience.spec.mjs and the retry path in waitForMeshSettled below).
 export async function joinRoom(page, name) {
   await page.waitForSelector('#join-modal:not(.hidden)', { timeout: 10_000 });
   await page.fill('#join-name-input', name ?? '');
   await page.click('#join-modal-button');
 }
 
-// --- Ш1 (E2E-шифрование): шпион на ВСЕ фреймы серверного WebSocket ---
+// --- S1 (E2E encryption): spy on ALL frames of the server WebSocket ---
 //
-// Тот же приём, что и installChatWsSpy/installPcRegistry (см. basic.spec.mjs)
-// — оборачивает window.WebSocket до первой навигации (addInitScript). В
-// отличие от installChatWsSpy (там интересен только `type==='chat'`) этот
-// шпион копит АБСОЛЮТНО ВСЁ, что страница отправляет в сокет — нужен для
-// проверок Ш1: и `join-room` (не должно быть плейнтекстового имени), и
-// `offer`/`answer` (SDP должен быть уже зашифрованным блобом, а не текстом с
-// "v=0"/fingerprint).
+// The same trick as installChatWsSpy/installPcRegistry (see basic.spec.mjs)
+// — wraps window.WebSocket before the first navigation (addInitScript). Unlike
+// installChatWsSpy (which only cares about `type==='chat'`), this spy
+// collects ABSOLUTELY EVERYTHING the page sends over the socket — needed for
+// S1 checks: both `join-room` (must not contain a plaintext name) and
+// `offer`/`answer` (the SDP must already be an encrypted blob, not plaintext
+// with "v=0"/fingerprint).
 export function installSignalingFrameSpy(context) {
   return context.addInitScript(() => {
     window.__e2eAllFramesSent = [];
@@ -575,7 +586,7 @@ export function installSignalingFrameSpy(context) {
               window.__e2eAllFramesSent.push(parsed);
             }
           } catch {
-            // не строка/не JSON — точно не наш фрейм
+            // not a string/not JSON — definitely not our frame
           }
           return realSend(data);
         };
@@ -588,24 +599,25 @@ export async function allFramesSentOn(page) {
   return page.evaluate(() => window.__e2eAllFramesSent || []);
 }
 
-/** Фреймы конкретного `type` из allFramesSentOn(page) — сокращение для частого фильтра. */
+/** Frames of a given `type` from allFramesSentOn(page) — a shorthand for a common filter. */
 export async function framesOfTypeSentOn(page, type) {
   const frames = await allFramesSentOn(page);
   return frames.filter((f) => f && f.type === type);
 }
 
 /**
- * Ф3 (повторные offer/answer/ice по шине, см. static/rtc.js): дождаться, что
- * DataChannel-шина (static/bus.js: bus.isOpen) открыта СО ВСЕМИ прочими
- * участниками на этой странице. `bus` — обычный top-level `const` в room.js
- * (классический скрипт, не module — тот же приём, что и с ChatPanel/leaderId
- * в других хелперах этого файла), поэтому виден из page.evaluate() напрямую.
+ * F3 (repeated offer/answer/ice over the bus, see static/rtc.js): wait until
+ * the DataChannel bus (static/bus.js: bus.isOpen) is open with ALL other
+ * participants on this page. `bus` — a plain top-level `const` in room.js
+ * (a classic script, not a module — the same trick as with
+ * ChatPanel/leaderId in the other helpers in this file), so it's visible
+ * directly from page.evaluate().
  *
- * Нужно, чтобы исключить гонку «pc.connectionState уже 'connected'
- * (см. waitForAllConnectionsSettled выше), а SCTP-хендшейк самой шины ещё не
- * успел завершиться» перед тем, как тест намеренно спровоцирует ренегоциацию
- * (addTrack при включении камеры/микрофона/шаринга экрана) и проверит, что
- * offer/answer/ice в этот момент уходят по шине, а не через сервер.
+ * Needed to rule out the race "pc.connectionState is already 'connected'
+ * (see waitForAllConnectionsSettled above), but the bus's own SCTP handshake
+ * hasn't finished yet" before the test deliberately triggers a renegotiation
+ * (addTrack when turning on the camera/mic/screen share) and checks that
+ * offer/answer/ice go over the bus at that point, not through the server.
  */
 export async function waitForBusOpenToAllPeers(page, timeoutMs = 8000) {
   await page.waitForFunction(
@@ -619,7 +631,7 @@ export async function waitForBusOpenToAllPeers(page, timeoutMs = 8000) {
   );
 }
 
-/** Оверлей «Ссылка неполная» (Ш1: нет валидных `t`/`e`, либо токен неверен — см. static/room.js: showInvalidLinkOverlay). */
+/** "Link is incomplete" overlay (S1: no valid `t`/`e`, or an invalid token — see static/room.js: showInvalidLinkOverlay). */
 export async function waitInvalidLinkOverlay(page, timeoutMs = 10_000) {
   await page.waitForFunction(
     () => document.getElementById('overlay-title')?.textContent === 'Link is invalid',
@@ -628,7 +640,7 @@ export async function waitInvalidLinkOverlay(page, timeoutMs = 10_000) {
   );
 }
 
-/** Оверлей «Ссылка истекла» (Ш1 v2: `e` из фрагмента в прошлом за пределами LINK_EXPIRY_GRACE_SECONDS — см. static/room.js: showLinkExpiredOverlay). */
+/** "Link expired" overlay (S1 v2: the fragment's `e` is in the past beyond LINK_EXPIRY_GRACE_SECONDS — see static/room.js: showLinkExpiredOverlay). */
 export async function waitLinkExpiredOverlay(page, timeoutMs = 10_000) {
   await page.waitForFunction(
     () => document.getElementById('overlay-title')?.textContent === 'Link expired',
@@ -637,29 +649,29 @@ export async function waitLinkExpiredOverlay(page, timeoutMs = 10_000) {
   );
 }
 
-// --- Реестр RTCPeerConnection для ожидания реального "соединения устаканились" ---
+// --- RTCPeerConnection registry for waiting for a real "connections settled" ---
 //
-// Ф0 (см. static/rtc.js): каждая пара заводит DataChannel-шину сразу при
-// входе в комнату (createDataChannel у impolite-стороны, ondatachannel у
-// polite), а не по клику пользователя — то есть SDP-негоциация для КАЖДОЙ
-// пары стартует почти сразу после join, ещё до включения любой медиа. В
-// процессе расследования одной hang-флакиности (см. историю: симметричный
-// negotiated-канал с id=0 у обеих сторон иногда не триггерил
-// onnegotiationneeded вовсе у одного из нескольких RTCPeerConnection,
-// созданных на странице почти одновременно) был найден и устранён
-// продуктовый баг — static/rtc.js теперь использует классическую
-// одностороннюю схему (createDataChannel только у impolite,
-// ondatachannel у polite), ту же, что уже была проверена для медиа-треков
-// до Ф0. Реестр здесь и waitForAllConnectionsSettled/waitForMeshSettled
-// ниже оставлены как недорогая страховка теста (ждать реального
-// connectionState==='connected' надёжнее и быстрее, чем гадать с
-// таймерами) — тестам basic.spec.mjs/resilience.spec.mjs это ничего не
-// стоит, а вложенный ретрай на случай редкого ICE-затора (setOffline,
-// перегруженный CI-раннер и т.п.) не помешает.
+// F0 (see static/rtc.js): every pair sets up a DataChannel bus right at room
+// entry (createDataChannel on the impolite side, ondatachannel on the polite
+// side), not on a user click — meaning SDP negotiation for EVERY pair starts
+// almost immediately after join, before any media is turned on. While
+// investigating a hang flakiness (see history: a symmetric negotiated
+// channel with id=0 on both sides sometimes didn't trigger
+// onnegotiationneeded at all for one of several RTCPeerConnections created
+// on a page nearly simultaneously), a product bug was found and fixed —
+// static/rtc.js now uses the classic one-directional scheme
+// (createDataChannel only on the impolite side, ondatachannel on the polite
+// side), the same scheme already verified for media tracks before F0. The
+// registry here and waitForAllConnectionsSettled/waitForMeshSettled below
+// are kept as a cheap test-side safety net (waiting for a real
+// connectionState==='connected' is more reliable and faster than guessing
+// with timers) — this costs basic.spec.mjs/resilience.spec.mjs nothing, and
+// the nested retry for the rare ICE stall (setOffline, an overloaded CI
+// runner, etc.) won't hurt.
 //
-// installPcRegistry не трогает static/*.js — только оборачивает
-// window.RTCPeerConnection в addInitScript, как и installChatWsSpy
-// оборачивает WebSocket в basic.spec.mjs.
+// installPcRegistry doesn't touch static/*.js — it only wraps
+// window.RTCPeerConnection in addInitScript, the same way installChatWsSpy
+// wraps WebSocket in basic.spec.mjs.
 export function installPcRegistry(context) {
   return context.addInitScript(() => {
     window.__e2ePcs = [];
@@ -673,9 +685,9 @@ export function installPcRegistry(context) {
   });
 }
 
-// Дождаться, пока на странице появится минимум `expectedCount` учтённых
-// RTCPeerConnection и у ВСЕХ них connectionState === 'connected'. Требует
-// installPcRegistry(context) до навигации.
+// Wait until at least `expectedCount` RTCPeerConnections have been
+// registered on the page and ALL of them have connectionState ===
+// 'connected'. Requires installPcRegistry(context) before navigation.
 export async function waitForAllConnectionsSettled(page, expectedCount, timeoutMs = 12000) {
   await page.waitForFunction(
     (n) => {
@@ -688,12 +700,13 @@ export async function waitForAllConnectionsSettled(page, expectedCount, timeoutM
   );
 }
 
-// --- Ожидание "mesh устаканился", со страховочным ретраем через перезаход ---
+// --- Wait for "mesh settled", with a safety-net retry via rejoin ---
 //
-// Ждём тайлы и connectionState==='connected' у всех mesh-связей страницы.
-// Обёрнуто в пару попыток с page.reload() между ними — недорогая страховка
-// на случай единичного реального ICE-затора в CI/песочнице (сеть,
-// перегруженный раннер), не связанная с конкретным багом протокола.
+// Wait for tiles and connectionState==='connected' on all mesh connections
+// of the page. Wrapped in a couple of attempts with page.reload() between
+// them — a cheap safety net in case of a single real ICE stall in
+// CI/sandbox (network, an overloaded runner), unrelated to a specific
+// protocol bug.
 export async function waitForMeshSettled(pages, { tileCount, connectionsPerPage, attempts = 2 } = {}) {
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
@@ -711,15 +724,15 @@ export async function waitForMeshSettled(pages, { tileCount, connectionsPerPage,
     } catch (err) {
       if (attempt === attempts) throw err;
       console.log(
-        `[waitForMeshSettled] попытка ${attempt}/${attempts} не устаканилась (${err.message}) — перезаходим в комнату и пробуем снова`
+        `[waitForMeshSettled] attempt ${attempt}/${attempts} did not settle (${err.message}) — rejoining the room and trying again`
       );
       for (const page of pages) {
-        // page.reload() — полная перезагрузка (не авто-reconnect внутри
-        // вкладки) — модалка входа появляется заново (анонимность, см.
-        // static/room.js), имя заново не важно для этой страховки — просто
-        // жмём «Войти» без имени (joinRoom(page) без второго аргумента
-        // затирает предзаполнение NameGen.userName() пустой строкой, см.
-        // joinRoom выше), чтобы снова оказаться в комнате анонимом.
+        // page.reload() — a full reload (not an in-tab auto-reconnect) — the
+        // join modal appears again (anonymity, see static/room.js), the name
+        // doesn't matter for this safety net — we just click "Join" without
+        // a name (joinRoom(page) without a second argument overwrites the
+        // NameGen.userName() pre-fill with an empty string, see joinRoom
+        // above), to end up back in the room anonymously.
         await page.reload();
         await joinRoom(page);
         await waitForOverlayHidden(page);
@@ -728,18 +741,19 @@ export async function waitForMeshSettled(pages, { tileCount, connectionsPerPage,
   }
 }
 
-// --- Вспомогательные функции для страниц ---
+// --- Helper functions for pages ---
 
-// Дожидается реального просмотра потока у зрителя. Хром блокирует autoplay
-// незамьюченного <video> без пользовательского взаимодействия со страницей —
-// в этом случае viewer.js сам показывает кнопку «Нажмите, чтобы начать
-// просмотр» (см. static/viewer.js: attemptPlay()). Это штатное поведение
-// приложения, а не баг — поэтому тест эмулирует реального пользователя и
-// кликает по кнопке, если она появилась, вместо того чтобы обходить это стороной.
-// Важно: НЕ page.waitForSelector('#overlay.hidden') — по умолчанию он ждёт
-// видимость совпавшего элемента, а элемент с классом .hidden как раз
-// display:none (см. static/style.css), поэтому такой селектор никогда бы не
-// срезолвился. Проверяем classList напрямую через waitForFunction.
+// Waits for the viewer to actually be watching the stream. Chrome blocks
+// autoplay of an unmuted <video> without a user interaction on the page —
+// in that case viewer.js itself shows a "Click to start watching" button
+// (see static/viewer.js: attemptPlay()). This is expected app behavior, not
+// a bug — so the test emulates a real user and clicks the button if it
+// appears, instead of working around it.
+// Important: NOT page.waitForSelector('#overlay.hidden') — by default it
+// waits for the matched element to be visible, and an element with the
+// .hidden class is exactly display:none (see static/style.css), so such a
+// selector would never resolve. We check classList directly via
+// waitForFunction.
 export async function waitForOverlayHidden(page, timeoutMs = 20_000) {
   const isOverlayHidden = () => document.getElementById('overlay').classList.contains('hidden');
   const outcome = await Promise.race([
@@ -752,21 +766,22 @@ export async function waitForOverlayHidden(page, timeoutMs = 20_000) {
   }
 }
 
-// Проверка, что видео реально идёт: videoWidth/readyState сразу, и
-// currentTime растёт спустя waitMs. Используется и в basic.spec.mjs (сразу
-// после подключения — и там, и в room.js-версии теста, для разных <video> —
-// см. `selector`), и в resilience.spec.mjs (после reload, старый viewer.js
-// с единственным #remote-video — поэтому `selector` по умолчанию именно им
-// и остаётся, ради обратной совместимости).
+// Check that the video is actually playing: videoWidth/readyState right
+// away, and currentTime growing after waitMs. Used both in basic.spec.mjs
+// (right after connecting — for both the room.js version of the test and a
+// different <video> — see `selector`), and in resilience.spec.mjs (after
+// reload, the old viewer.js with a single #remote-video — which is why
+// `selector` defaults to it, for backward compatibility).
 export async function assertVideoPlaying(
   page,
   { selector = '#remote-video', waitMs = 2000, warmupTimeoutMs = 5000 } = {}
 ) {
-  // videoWidth может на пару кадров отставать от момента, когда overlay уже
-  // скрылся/трек подключён (синхронно, но декодирование первого кадра — нет)
-  // — особенно заметно сразу после reload(), когда вся страница (и
-  // WebRTC-стек) поднимается с нуля. Поэтому сначала дожидаемся первого
-  // кадра поллингом, а не считаем videoWidth>0 сразу гарантированным.
+  // videoWidth may lag the moment the overlay hid / the track connected
+  // (synchronously, but decoding the first frame is not) by a couple of
+  // frames — especially noticeable right after reload(), when the whole
+  // page (and the WebRTC stack) comes up from scratch. So we first wait for
+  // the first frame by polling, rather than assuming videoWidth>0
+  // immediately.
   await page.waitForFunction(
     (sel) => (document.querySelector(sel)?.videoWidth || 0) > 0,
     selector,
@@ -777,8 +792,8 @@ export async function assertVideoPlaying(
     const v = document.querySelector(sel);
     return { videoWidth: v.videoWidth, readyState: v.readyState, currentTime: v.currentTime };
   }, selector);
-  assert.ok(before.videoWidth > 0, `videoWidth должен быть > 0, получено ${before.videoWidth}`);
-  assert.ok(before.readyState >= 2, `readyState должен быть >= 2, получено ${before.readyState}`);
+  assert.ok(before.videoWidth > 0, `videoWidth should be > 0, got ${before.videoWidth}`);
+  assert.ok(before.readyState >= 2, `readyState should be >= 2, got ${before.readyState}`);
 
   await new Promise((r) => setTimeout(r, waitMs));
 
@@ -788,17 +803,17 @@ export async function assertVideoPlaying(
   }, selector);
   assert.ok(
     after.currentTime > before.currentTime,
-    `currentTime должен вырасти за ${waitMs}мс: было ${before.currentTime}, стало ${after.currentTime}`
+    `currentTime should have grown over ${waitMs}ms: was ${before.currentTime}, now ${after.currentTime}`
   );
 }
 
-// Заглушка «You are sharing your screen» вместо живого превью у ШАРЯЩЕГО
-// (см. static/room.js: showLocalScreenPreview) — рекурсивный self-capture
-// собственного захвата «всего экрана» иначе даёт «зеркальный коридор»
-// (шлейф из курсоров, видимая заморозка буфера на macOS, особенно в
-// fullscreen). Проверяем и то, что заглушка видна, и то, что video реально
-// не подключён (а не просто визуально перекрыт), — иначе рекурсия всё равно
-// происходит незаметно для теста.
+// Placeholder "You are sharing your screen" instead of a live preview for
+// the SHARER (see static/room.js: showLocalScreenPreview) — a recursive
+// self-capture of the "entire screen" would otherwise produce a "mirror
+// corridor" (a trail of cursors, visible buffer freeze on macOS, especially
+// in fullscreen). We check both that the placeholder is visible and that
+// the video is actually not connected (not just visually covered) —
+// otherwise the recursion would still happen invisibly to the test.
 export async function assertLocalScreenPlaceholder(page, timeoutMs = 5000) {
   await page.waitForFunction(
     () => {
@@ -817,21 +832,21 @@ export async function assertLocalScreenPlaceholder(page, timeoutMs = 5000) {
   );
 }
 
-// Состояние кнопки фулскрина сцены шаринга (#screen-fullscreen-button) —
-// у шарящего самого себя она скрыта и задизейблена (фулскринить заглушку
-// смысла нет, см. updateFullscreenButtonState в static/room.js), у зрителя
-// остаётся обычной.
+// State of the screen-share fullscreen button (#screen-fullscreen-button) —
+// for the person sharing themselves it's hidden and disabled (no point in
+// fullscreening the placeholder, see updateFullscreenButtonState in
+// static/room.js), for a viewer it stays normal.
 export async function assertScreenFullscreenButtonState(page, { hidden, disabled }) {
   const state = await page.evaluate(() => {
     const btn = document.getElementById('screen-fullscreen-button');
     return btn ? { hidden: btn.classList.contains('hidden'), disabled: btn.disabled } : null;
   });
-  assert.ok(state, '#screen-fullscreen-button должен быть в DOM');
-  assert.equal(state.hidden, hidden, `screen-fullscreen-button.hidden: ожидали ${hidden}, получили ${state.hidden}`);
+  assert.ok(state, '#screen-fullscreen-button should be in the DOM');
+  assert.equal(state.hidden, hidden, `screen-fullscreen-button.hidden: expected ${hidden}, got ${state.hidden}`);
   assert.equal(
     state.disabled,
     disabled,
-    `screen-fullscreen-button.disabled: ожидали ${disabled}, получили ${state.disabled}`
+    `screen-fullscreen-button.disabled: expected ${disabled}, got ${state.disabled}`
   );
 }
 
@@ -847,10 +862,11 @@ export async function getChatDom(page) {
   };
 }
 
-// Идемпотентно: если панель уже открыта — просто убеждаемся, что она видима.
-// Кнопка-тогглер (#chat-button в пилюле управления) всегда на месте и видима
-// — в отличие от старой плавающей кнопки, теперь она не прячется, пока чат
-// открыт, а просто переключает open/closed (см. chat.js: toggleButton click).
+// Idempotent: if the panel is already open — just make sure it's visible.
+// The toggle button (#chat-button in the control pill) is always present
+// and visible — unlike the old floating button, it no longer hides while
+// chat is open, it just toggles open/closed (see chat.js: toggleButton
+// click).
 export async function openChatPanel(page) {
   const chat = await getChatDom(page);
   const alreadyOpen = await chat.panel.evaluate((el) => !el.classList.contains('hidden'));
@@ -878,16 +894,16 @@ export async function messageTextsInclude(page, text, timeoutMs = 5000) {
 }
 
 /**
- * Дождаться отрисованного МНОГОСТРОЧНОГО сообщения из `lines` (см.
- * static/chat.js: renderMessageBody вставляет между строками <br>, а НЕ
- * текстовый '\n' — поэтому `.textContent` многострочного сообщения это
- * строки, слитые БЕЗ разделителя, например ['a','b'] -> textContent "ab", а
- * НЕ "a\nb"; `messageTextsInclude` с текстом, содержащим буквальный '\n',
- * поэтому никогда не совпадёт с реальным textContent — этот хелпер проверяет
- * многострочность правильно: конкатенация строк совпадает с textContent
- * контейнера И внутри него есть хотя бы `lines.length - 1` элементов <br>
- * (доказывает, что перенос действительно применился, а не просто визуально
- * совпал текст без переноса).
+ * Wait for a rendered MULTI-LINE message from `lines` (see
+ * static/chat.js: renderMessageBody inserts <br> between lines, NOT a text
+ * '\n' — so a multi-line message's `.textContent` is the lines joined
+ * WITHOUT a separator, e.g. ['a','b'] -> textContent "ab", NOT "a\nb";
+ * `messageTextsInclude` with text containing a literal '\n' will therefore
+ * never match the real textContent — this helper checks multi-line
+ * rendering correctly: the concatenated lines match the container's
+ * textContent AND there are at least `lines.length - 1` <br> elements
+ * inside it (proving that a line break was actually applied, not just
+ * visually matching text without a break).
  */
 export async function messageWithLineBreaksIncludes(page, lines, timeoutMs = 5000) {
   const expectedConcat = lines.join('');
@@ -910,12 +926,12 @@ export async function messageWithLineBreaksIncludes(page, lines, timeoutMs = 500
 }
 
 /**
- * Отправить текстовое сообщение и вернуть его сгенерированный id (см.
- * chat.js: dataset.msgId на .chat-message) — нужно, когда дальше по тесту
- * сообщение будут редактировать/удалять и его ТЕКСТ перестанет быть
- * стабильным якорем для поиска элемента (в отличие от id, который не
- * меняется). Id общий для всех участников (один и тот же конверт), поэтому
- * им же можно искать `.chat-message[data-msg-id="..."]` и на других страницах.
+ * Send a text message and return its generated id (see chat.js:
+ * dataset.msgId on .chat-message) — needed when the message will later be
+ * edited/deleted in the test and its TEXT stops being a stable anchor for
+ * finding the element (unlike the id, which doesn't change). The id is
+ * shared across all participants (the same envelope), so it can also be
+ * used to find `.chat-message[data-msg-id="..."]` on other pages.
  */
 export async function sendChatMessageAndGetId(page, text) {
   await sendChatMessage(page, text);
@@ -930,28 +946,29 @@ export async function sendChatMessageAndGetId(page, text) {
   return id;
 }
 
-// --- Попап действий сообщения (волна 13) — заменяет hover-кнопки/on-tap
-// action-row прошлых волн: единственный способ добраться до действий
-// сообщения теперь тап/клик по самому сообщению, см. static/chat.js:
-// openMessagePopover/closeMessagePopover. Общий синглтон на панель (не по
-// одному на сообщение) — все локаторы `.chat-message-popover *` ниже
-// работают ОДИНАКОВО на мобильном (bottom-sheet) и десктопе (поповер у
-// сообщения).
+// --- Message action popover (wave 13) — replaces the hover-buttons/on-tap
+// action-row of previous waves: the only way to reach a message's actions
+// now is a tap/click on the message itself, see static/chat.js:
+// openMessagePopover/closeMessagePopover. A single singleton per panel (not
+// one per message) — all the `.chat-message-popover *` locators below work
+// THE SAME WAY on mobile (bottom-sheet) and desktop (popover next to the
+// message).
 
 /**
- * Открыть попап действий для сообщения `messageLocator` (уже отфильтрованный
- * `.chat-message`, например `page.locator('.chat-message', { hasText }).last()`).
- * Клик — по `.chat-message-meta` (строка имя+время): она никогда не содержит
- * ссылок/чипов реакций/спойлеров, поэтому не рискует попасть на элемент со
- * своей отдельной клик-логикой (в отличие от клика по всему `.chat-message-text`,
- * который для форматированных сообщений может содержать ссылку/спойлер).
+ * Open the actions popover for message `messageLocator` (already filtered
+ * `.chat-message`, e.g. `page.locator('.chat-message', { hasText }).last()`).
+ * The click targets `.chat-message-meta` (the name+time row): it never
+ * contains links/reaction chips/spoilers, so it doesn't risk hitting an
+ * element with its own separate click logic (unlike clicking the whole
+ * `.chat-message-text`, which for formatted messages may contain a
+ * link/spoiler).
  */
 export async function openMessagePopoverFor(page, messageLocator) {
   await messageLocator.locator('.chat-message-meta').click();
   await page.locator('.chat-message-popover:not(.hidden)').waitFor({ state: 'visible', timeout: 3000 });
 }
 
-/** Закрыть попап действий кнопкой-крестиком (см. openMessagePopoverFor). */
+/** Close the actions popover via the close (X) button (see openMessagePopoverFor). */
 export async function closeMessagePopover(page) {
   await page.click('.chat-message-popover-close');
   await page.waitForFunction(
@@ -961,30 +978,30 @@ export async function closeMessagePopover(page) {
   );
 }
 
-/** Локатор действия попапа по суффиксу класса (reply/react/edit/delete/copy) — попап один на страницу, поэтому без привязки к конкретному сообщению. */
+/** Popover action locator by class suffix (reply/react/edit/delete/copy) — there's one popover per page, so no need to scope it to a specific message. */
 export function popoverAction(page, suffix) {
   return page.locator(`.chat-message-popover .chat-message-action--${suffix}`);
 }
 
-/** Кликнуть эмодзи в палитре реакций попапа (см. .chat-message-popover-emoji). */
+/** Click an emoji in the popover's reaction palette (see .chat-message-popover-emoji). */
 export async function clickPopoverEmoji(page, emoji) {
   await page.locator(`.chat-message-popover-emoji[data-emoji="${emoji}"]`).click();
 }
 
-/** Строки разбора реакций «кто/чем/когда» в открытом попапе (см. .chat-message-popover-reaction-row). */
+/** Reaction breakdown rows "who/which/when" in the open popover (see .chat-message-popover-reaction-row). */
 export function popoverReactionRows(page) {
   return page.locator('.chat-message-popover-reaction-row');
 }
 
-// --- Передача файлов (Ф3): генерация тестовых файлов и хелпер вброса ---
+// --- File transfer (F3): generating test files and an injection helper ---
 //
-// PNG собирается вручную (сигнатура + IHDR + один IDAT со случайными
-// пикселями, сжатыми zlib.deflateSync, + IEND) — так тест не тянет
-// сторонних зависимостей (canvas/pngjs) и не гадает с browser-side
-// canvas.toBlob(). Пиксели случайны намеренно: PNG со случайным шумом почти
-// не сжимается, поэтому итоговый размер файла предсказуемо близок к сырому
-// (ширина×высота×4 + служебные байты строк), а не схлопывается в
-// несколько байт, как было бы с однотонной заливкой.
+// The PNG is assembled by hand (signature + IHDR + a single IDAT with random
+// pixels compressed via zlib.deflateSync, + IEND) — this way the test
+// doesn't pull in third-party dependencies (canvas/pngjs) and doesn't have
+// to fuss with browser-side canvas.toBlob(). Pixels are random on purpose: a
+// PNG with random noise barely compresses, so the resulting file size is
+// predictably close to the raw size (width×height×4 + row overhead bytes),
+// instead of collapsing to a few bytes as it would with a solid fill.
 
 function crc32(buf) {
   let crc = 0xffffffff;
@@ -1006,7 +1023,7 @@ function pngChunk(type, data) {
   return Buffer.concat([lenBuf, typeBuf, data, crcBuf]);
 }
 
-/** Валидный PNG (RGBA, 8 бит) заданных размеров со случайными пикселями — размер файла ~width*height*4 байт. */
+/** A valid PNG (RGBA, 8-bit) of the given dimensions with random pixels — file size ~width*height*4 bytes. */
 export function makeTestPngBuffer({ width = 112, height = 112 } = {}) {
   const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
 
@@ -1034,7 +1051,7 @@ export function makeTestPngBuffer({ width = 112, height = 112 } = {}) {
   return Buffer.concat([signature, ihdr, idat, iend]);
 }
 
-/** Текстовый "файл" заданного размера (повторяющаяся ASCII-фраза) — для проверки передачи произвольного (не картиночного) файла. */
+/** A text "file" of the given size (a repeating ASCII phrase) — for checking transfer of an arbitrary (non-image) file. */
 export function makeTestTextFileBuffer(sizeBytes) {
   const phrase = Buffer.from('The quick brown fox jumps over the lazy dog. ', 'ascii');
   const buf = Buffer.alloc(sizeBytes);
@@ -1048,13 +1065,13 @@ export function makeTestTextFileBuffer(sizeBytes) {
 }
 
 /**
- * Валидный WAV (PCM 16-бит, тон 440Гц заданной длительности) — тривиально
- * настоящий аудио-контейнер (заголовок RIFF/WAVE/fmt/data по спецификации),
- * никаких сторонних зависимостей/кодеков не нужно, Chromium проигрывает и
- * репортит длительность через `loadedmetadata` детерминированно (в отличие
- * от видео-контейнеров, см. TINY_WEBM_BASE64 ниже). Размер файла и
- * длительность связаны напрямую (durationSeconds * sampleRate * 2 байта +
- * 44 байта заголовка) — оба свойства проверяются в тестах.
+ * A valid WAV (16-bit PCM, a 440Hz tone of the given duration) — trivially a
+ * real audio container (RIFF/WAVE/fmt/data header per spec), no third-party
+ * dependencies/codecs needed, Chromium actually plays it and reports the
+ * duration via `loadedmetadata` deterministically (unlike video containers,
+ * see TINY_WEBM_BASE64 below). File size and duration are directly related
+ * (durationSeconds * sampleRate * 2 bytes + 44 header bytes) — both
+ * properties are checked in the tests.
  */
 export function makeTestWavBuffer({ durationSeconds = 1, sampleRate = 8000, numChannels = 1 } = {}) {
   const bitsPerSample = 16;
@@ -1067,8 +1084,8 @@ export function makeTestWavBuffer({ durationSeconds = 1, sampleRate = 8000, numC
   buf.writeUInt32LE(36 + dataSize, 4);
   buf.write('WAVE', 8, 'ascii');
   buf.write('fmt ', 12, 'ascii');
-  buf.writeUInt32LE(16, 16); // размер subchunk1 (PCM)
-  buf.writeUInt16LE(1, 20); // audio format = PCM (без сжатия)
+  buf.writeUInt32LE(16, 16); // subchunk1 size (PCM)
+  buf.writeUInt16LE(1, 20); // audio format = PCM (uncompressed)
   buf.writeUInt16LE(numChannels, 22);
   buf.writeUInt32LE(sampleRate, 24);
   buf.writeUInt32LE(sampleRate * blockAlign, 28); // byte rate
@@ -1077,8 +1094,8 @@ export function makeTestWavBuffer({ durationSeconds = 1, sampleRate = 8000, numC
   buf.write('data', 36, 'ascii');
   buf.writeUInt32LE(dataSize, 40);
 
-  // Не чистая цифровая тишина (хотя и она была бы валидна) — простой тон
-  // 440Гц, чтобы файл не выглядел как "пустой" при ручной проверке.
+  // Not pure digital silence (though that would be valid too) — a simple
+  // 440Hz tone, so the file doesn't look "empty" on manual inspection.
   for (let i = 0; i < numSamples; i++) {
     const sample = Math.round(Math.sin((2 * Math.PI * 440 * i) / sampleRate) * 3000);
     for (let ch = 0; ch < numChannels; ch++) {
@@ -1088,30 +1105,30 @@ export function makeTestWavBuffer({ durationSeconds = 1, sampleRate = 8000, numC
   return buf;
 }
 
-// --- Крошечный, но НАСТОЯЩИЙ валидный WebM-контейнер (видео) ---
+// --- A tiny but REAL valid WebM container (video) ---
 //
-// В отличие от WAV (собирается тривиально вручную по спецификации), валидный
-// видео-контейнер руками не соберёшь — используем заранее (офлайн, ffmpeg)
-// сгенерированный минимальный VP8/WebM: 64×64, 5 кадров/с, 1 секунда, без
-// звука (`ffmpeg -f lavfi -i color=c=blue:s=64x64:d=1:r=5 -c:v libvpx -crf 40
-// -b:v 40k -an tiny.webm`) — захардкожен как base64, тесты его не
-// перегенерируют и сторонних бинарных зависимостей (ffmpeg) на машине с
-// тестами не требуют. Chromium реально проигрывает этот файл и репортит
-// duration≈1с через `loadedmetadata` — тест ниже это проверяет.
+// Unlike WAV (trivially assembled by hand per spec), a valid video container
+// can't be hand-built — we use a pre-generated (offline, via ffmpeg) minimal
+// VP8/WebM: 64×64, 5 fps, 1 second, no audio (`ffmpeg -f lavfi -i
+// color=c=blue:s=64x64:d=1:r=5 -c:v libvpx -crf 40 -b:v 40k -an tiny.webm`)
+// — hardcoded as base64, the tests don't regenerate it and don't require a
+// third-party binary dependency (ffmpeg) on the test machine. Chromium
+// actually plays this file and reports duration≈1s via `loadedmetadata` —
+// the test below verifies this.
 const TINY_WEBM_BASE64 =
-  'GkXfo59ChoEBQveBAULygQRC84EIQoKEd2VibUKHgQJChYECGFOAZwEAAAAAAAJnEU2bdLpNu4tTq4QVSalmU6yBoU27i1OrhBZUrmtTrIHWTbuMU6uEElTDZ1OsggEjTbuMU6uEHFO7a1OsggJR7AEAAAAAAABZAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVSalmsCrXsYMPQkBNgIxMYXZmNjEuNy4xMDBXQYxMYXZmNjEuNy4xMDBEiYhAj0AAAAAAABZUrmvIrgEAAAAAAAA/14EBc8WIa65O3zZP2V+cgQAitZyDdW5kiIEAhoVWX1ZQOIOBASPjg4QL68IA4JCwgUC6gUCagQJVsIRVuYEBElTDZ/tzc59jwIBnyJlFo4dFTkNPREVSRIeMTGF2ZjYxLjcuMTAwc3PWY8CLY8WIa65O3zZP2V9nyKFFo4dFTkNPREVSRIeUTGF2YzYxLjE5LjEwMSBsaWJ2cHhnyKFFo4hEVVJBVElPTkSHkzAwOjAwOjAxLjAwMDAwMDAwMAAfQ7Z1QKjngQCjw4EAAICQAwCdASpAAEAAAEcIhYWIhYSIAgICdaoD+AIG6EFcMdITAFVYAP7/TRL//FhX8WFfxYV/8WFf/PzO7cX85gCjloEAyADRAQAHEOwAGAAYWC/0AAiOgACjloEBkADRAQAHEOwAGAAYWC/0AAiOgACjloECWADRAQAHEOwAGAAYWC/0AAiOgACjloEDIADRAQAHEOwAGAAYWC/0AAiOgAAcU7trkbuPs4EAt4r3gQHxggGj8IED';
+  'GkXfo59ChoEBQveBAULygQRC84EIQoKEd2VibUKHgQJChYECGFOAZwEAAAAAAAJnEU2bdLpNu4tTq4QVSalmU6yBoU27i1OrhBZUrmtTrIHWTbuMU6uEElTDZ1OsggEjTbuMU6uEHFO7a1OsggJR7AEAAAAAAABZAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVSalmsCrXsYMPQkBNgIxMYXZmNjEuNy4xMDBXQYxMYXZmNjEuNy4xMDBEiYhAj0AAAAAAABZUrmvIrgEAAAAAAAA/14EBc8WIa65O3zZP2V+cgQAitZyDdW5kiIEAhoVWX1ZQOIOBASPjg4QL68IA4JCwgUC6gUCagQJVsIRVuYEBElTDZ/tzc59jwIBnyJlFo4dFTkNPREVSRIeMTGF2ZjYxLjcuMTAwc3PWY8CLY8WIa65O3zZP2V9nyKFFo4dFTkNPREVSRIeUTGF2YzYxLjE5LjEwMSBsaWJ2cHhnyKFFo4hEVVJBVElPTkSHkzAwOjAwOjAxLjAwMDAwMDAwMAAfQ7Z1QKjngQCjw4EAAICQAwCdASpAAEAAAEcIhYWIhYSIAgICdaoD+AIG6EFcMdITAFVYAP7/TRL//FhX8WFfxYV/8WFf/PzO7cX85gCjloEAyADRAQAHEOwAGAAYWC/0AAiOgACjloEBkADRAQAHEOwAGAAYWC/0AAiOgACjloECWADRAQAHEOwAGAAYWC/0AAiOgACjloEDIADRAQAHEOwAGAAYWC/0AAiOgAAcU7trkbuPs4EAt4r3gQHxggGj8IED';
 
 export function makeTestWebmBuffer() {
   return Buffer.from(TINY_WEBM_BASE64, 'base64');
 }
 
 /**
- * Вбросить файлы в чат через скрытый `<input type=file>` скрепки (см.
- * static/chat.js: buildDom -> .chat-file-input). setInputFiles не требует
- * видимости элемента (в отличие от click) — работает даже пока сам инпут
- * `hidden`, поэтому не обязательно предварительно открывать панель, хотя в
- * тестах мы всё равно открываем её для остальных проверок по соседству.
- * `files` — массив { name, mimeType, buffer } (см. Playwright FilePayload).
+ * Inject files into chat via the hidden paperclip `<input type=file>` (see
+ * static/chat.js: buildDom -> .chat-file-input). setInputFiles doesn't
+ * require the element to be visible (unlike click) — it works even while
+ * the input itself is `hidden`, so opening the panel first isn't required,
+ * though the tests open it anyway for other checks nearby. `files` — an
+ * array of { name, mimeType, buffer } (see Playwright FilePayload).
  */
 export async function attachFilesToChat(page, files) {
   await page.locator('.chat-file-input').setInputFiles(files);
@@ -1125,13 +1142,13 @@ export async function unreadBadgeCount(page) {
   return Number(text);
 }
 
-// --- Наблюдатель за счётчиком зрителей у вещающего (#viewer-count) ---
+// --- Observer for the broadcaster's viewer counter (#viewer-count) ---
 //
-// MutationObserver фиксирует КАЖДОЕ изменение textContent синхронно
-// (микротаска на мутацию), в отличие от поллинга с интервалом — не пропустит
-// короткий "провал" счётчика (например, 1 -> 0 -> 1 при переподключении
-// зрителя), даже если сама просадка длится миллисекунды. Устанавливается
-// один раз (после появления #live-section, элемент уже существует).
+// A MutationObserver captures EVERY textContent change synchronously (a
+// microtask per mutation), unlike interval polling — it won't miss a brief
+// counter "dip" (e.g. 1 -> 0 -> 1 on viewer reconnect), even if the dip
+// itself lasts milliseconds. Installed once (after #live-section appears,
+// the element already exists).
 export async function installViewerCountHistory(broadcasterPage) {
   await broadcasterPage.evaluate(() => {
     const el = document.getElementById('viewer-count');
@@ -1159,15 +1176,16 @@ export function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// Поллинг произвольного условия с дедлайном — используется там, где
-// page.waitForFunction не подходит (например, условие зависит от нескольких
-// страниц/значений сразу). Никогда не спит "вслепую" фиксированное время —
-// всегда проверяет условие и завершается досрочно, как только оно выполнено.
-export async function waitUntil(conditionFn, { timeoutMs = 10_000, intervalMs = 150, message = 'условие не выполнилось' } = {}) {
+// Polling of an arbitrary condition with a deadline — used where
+// page.waitForFunction doesn't fit (e.g. the condition depends on several
+// pages/values at once). Never sleeps "blindly" for a fixed time — always
+// checks the condition and finishes early as soon as it's met.
+export async function waitUntil(conditionFn, { timeoutMs = 10_000, intervalMs = 150, message = 'condition not met' } = {}) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     if (await conditionFn()) return;
-    if (Date.now() >= deadline) throw new Error(`${message} (таймаут ${timeoutMs}мс)`);
+    if (Date.now() >= deadline) throw new Error(`${message} (timeout ${timeoutMs}ms)`);
     await sleep(intervalMs);
   }
 }
+

@@ -1,99 +1,105 @@
-// rtc.js — обёртка над RTCPeerConnection, реализующая канонический паттерн
-// perfect negotiation (Jan-Ivar Bruaroey / MDN):
+// rtc.js — wrapper around RTCPeerConnection implementing the canonical
+// perfect negotiation pattern (Jan-Ivar Bruaroey / MDN):
 // https://developer.chrome.com/blog/perfect-negotiation/
 // https://developer.mozilla.org/en-US/docs/Web/API/WebRTC_API/Perfect_negotiation
 //
-// Протокол v2: симметричная комната, mesh — на каждого другого участника
-// заводится свой RtcPeer. Роли broadcaster/viewer больше нет: polite/impolite
-// выводится детерминированно из сравнения peerId обеих сторон (см.
-// static/room.js: polite = мой peerId > peerId собеседника, лексикографически)
-// — обе стороны сравнивают одну и ту же пару id, поэтому ровно один получает
-// polite=true. Любая сторона может первой добавить трек (getUserMedia на
-// микрофон/камеру, getDisplayMedia на шаринг экрана) и тем самым
-// инициировать offer — коллизии разрешает perfect negotiation ниже.
+// Protocol v2: symmetric room, mesh — each other participant gets its own
+// RtcPeer. There's no more broadcaster/viewer role: polite/impolite is
+// derived deterministically by comparing the peerId of both sides (see
+// static/room.js: polite = my peerId > the other peer's peerId, lexicographically)
+// — both sides compare the same pair of ids, so exactly one of them gets
+// polite=true. Either side may be the first to add a track (getUserMedia for
+// microphone/camera, getDisplayMedia for screen sharing) and thereby
+// initiate an offer — collisions are resolved by perfect negotiation below.
 //
-// Флаги:
-//   - makingOffer — true между началом onnegotiationneeded и отправкой offer;
-//   - ignoreOffer — true, если impolite-пир решил проигнорировать чужой offer
-//     из-за коллизии (см. handleDescription);
-//   - isSettingRemoteAnswerPending — true во время setRemoteDescription(answer)
-//     (зафиксировано для полного соответствия референсному паттерну).
+// Flags:
+//   - makingOffer — true between the start of onnegotiationneeded and sending
+//     the offer;
+//   - ignoreOffer — true if the impolite peer decided to ignore the other
+//     side's offer due to a collision (see handleDescription);
+//   - isSettingRemoteAnswerPending — true during setRemoteDescription(answer)
+//     (kept to fully match the reference pattern).
 //
-// Откат локального оффера при коллизии на polite-стороне НЕ делается явно
-// через setLocalDescription({type:'rollback'}) — современные браузеры делают
-// неявный rollback внутри setRemoteDescription(offer), если signalingState
-// был "have-local-offer".
+// Rolling back the local offer on collision on the polite side is NOT done
+// explicitly via setLocalDescription({type:'rollback'}) — modern browsers
+// perform an implicit rollback inside setRemoteDescription(offer) if
+// signalingState was "have-local-offer".
 //
-// Ф0: шина комнаты (см. static/bus.js) поверх RTCDataChannel — обычный
-// (НЕ negotiated) канал: заводит его ТОЛЬКО impolite-сторона обычным
-// pc.createDataChannel('bus'), polite-сторона получает свою половину через
-// pc.ondatachannel. Симметричный negotiated-канал (обе стороны создают
-// одинаковый id=0 сразу в конструкторе) эмпирически оказался хрупок в
-// этой headless Chrome песочнице: при создании нескольких
-// RTCPeerConnection на одной странице почти одновременно браузер иногда
-// вовсе не вызывал onnegotiationneeded для одного из соединений (не баг
-// perfect negotiation — у остальных пар всё штатно доходило до
-// stable/connected, а для сломанной пары негоциация не начиналась вообще
-// ни с одной стороны). У обычного одностороннего createDataChannel('bus')
-// та же самая цепочка (createDataChannel -> onnegotiationneeded -> offer)
-// уже была многократно проверена штатной работой этого файла для
-// addTrack() (медиа) до Ф0 — воспроизвести ту же хрупкость с ней не
-// удалось, поэтому шина использует именно эту, уже проверенную схему.
-// Единственное отличие от медиа: канал создаётся сразу в конструкторе (а не
-// по клику пользователя), поэтому та же самая коллизия офферов, что раньше
-// возникала только при одновременном старте видео/аудио с двух сторон,
-// теперь возможна и от одного самого факта входа в комнату — perfect
-// negotiation ниже её штатно разруливает.
+// F0: the room bus (see static/bus.js) on top of RTCDataChannel — a plain
+// (NOT negotiated) channel: it is opened ONLY by the impolite side via a
+// plain pc.createDataChannel('bus'), the polite side gets its half through
+// pc.ondatachannel. A symmetric negotiated channel (both sides create the
+// same id=0 right in the constructor) turned out empirically to be fragile
+// in this headless Chrome sandbox: when several RTCPeerConnections were
+// created on one page almost simultaneously, the browser sometimes never
+// called onnegotiationneeded for one of the connections at all (not a bug
+// in perfect negotiation — other pairs reliably reached stable/connected,
+// while for the broken pair negotiation never started on either side at
+// all). With the plain one-sided createDataChannel('bus') the exact same
+// chain (createDataChannel -> onnegotiationneeded -> offer) had already been
+// repeatedly verified to work reliably in this file for addTrack() (media)
+// before F0 — reproducing the same fragility with it did not succeed, so
+// the bus uses this already-proven scheme. The only difference from media:
+// the channel is created immediately in the constructor (rather than on a
+// user click), so the same offer collision that previously only happened
+// when video/audio started simultaneously on both sides is now also
+// possible from the mere fact of entering the room — perfect negotiation
+// below resolves it the same way as usual.
 //
-// Ш1 (E2E-шифрование, см. static/crypto.js): offer/answer/ice-candidate ВСЕГДА
-// идут через серверный сигналинг-релей (это как раз то сообщение, которым
-// P2P-соединение только устанавливается — по определению не может пойти по
-// ещё не существующей шине), поэтому sdp/candidate шифруются безусловно, на
-// каждый такой обмен, под ПОПАРНЫМ ключом K_pair_sig этой конкретной пары
-// участников (E2E v2 — эфемерные ECDH-ключи + PSK-токен `t` из ссылки, см.
-// docs/e2e-encryption.md; больше не единый room-wide K_sig) — см. sigCrypto
-// в конструкторе и handleDescription/handleCandidate ниже. Сама P2P-шина (DataChannel 'bus')
-// и медиатреки НЕ шифруются этим слоем — WebRTC обязан гнать их поверх DTLS,
-// это уже полноценный E2E между двумя конкретными пирами, второй прикладной
-// слой шифрования той же пары ничего не добавил бы к безопасности.
+// S1 (E2E encryption, see static/crypto.js): offer/answer/ice-candidate
+// ALWAYS go through the server signaling relay (this is precisely the
+// message that establishes the P2P connection in the first place — by
+// definition it cannot travel over a bus that doesn't exist yet), so
+// sdp/candidate are unconditionally encrypted, for every such exchange,
+// under the PAIRWISE key K_pair_sig of this specific pair of participants
+// (E2E v2 — ephemeral ECDH keys + the PSK token `t` from the link, see
+// docs/e2e-encryption.md; no longer a single room-wide K_sig) — see
+// sigCrypto in the constructor and handleDescription/handleCandidate below.
+// The P2P bus itself (DataChannel 'bus') and media tracks are NOT encrypted
+// by this layer — WebRTC is required to run them over DTLS, which is
+// already full E2E between the two specific peers, and a second application
+// layer of encryption for the same pair would add nothing to security.
 //
-// Ф3: файловые DataChannel (см. static/chat.js — протокол передачи файлов).
-// В отличие от шины ('bus', одна на пару, создаётся один раз при входе),
-// файловый канал создаётся ПО ЗАПРОСУ, отдельный на каждую пару
-// (fileId, получатель), и инициатором может быть ЛЮБАЯ из сторон пары (кто
-// держит файл — не обязательно impolite), поэтому pc.ondatachannel должен
-// уметь ловить входящий канал НЕЗАВИСИМО от роли polite/impolite —
-// диспетчеризуется по префиксу label ('bus' -> шина, 'file-' -> файл).
-// Создание дополнительного DataChannel на уже установленном соединении не
-// требует новой SDP-негоциации (SCTP-ассоциация уже есть) — onnegotiationneeded
-// в норме не срабатывает повторно.
+// F3: file DataChannels (see static/chat.js — file transfer protocol).
+// Unlike the bus ('bus', one per pair, created once on entry), the file
+// channel is created ON DEMAND, a separate one for each pair (fileId,
+// recipient), and the initiator can be EITHER side of the pair (whoever
+// holds the file — not necessarily the impolite one), so pc.ondatachannel
+// must be able to catch the incoming channel REGARDLESS of the
+// polite/impolite role — it dispatches on the label prefix ('bus' -> bus,
+// 'file-' -> file). Creating an additional DataChannel on an already
+// established connection does not require a new SDP negotiation (the SCTP
+// association already exists) — onnegotiationneeded normally doesn't fire
+// again.
 //
-// Ф3 (повторные offer/answer/ice по шине): ПЕРВОЕ рукопожатие пары (когда
-// шина ещё не существует — курица-яйцо, см. Ш1 выше) и ICE-restart/реконнект
-// ВСЕГДА идут через серверный релей с шифрованием, как и раньше. Но КАЖДАЯ
-// ПОСЛЕДУЮЩАЯ ренегоциация той же пары (добавление/снятие трека, смена
-// камеры с реальной ренегоциацией и т.п.) — уже после того, как шина к этому
-// пиру открылась — гоняется прямо по ней: kind: 'rtc-signal', payload
-// {type: 'offer'|'answer'|'ice', data}, БЕЗ шифрования этим слоем (DataChannel
-// уже идёт поверх DTLS — это и есть E2E между этими двумя конкретными
-// пирами, второй прикладной слой шифрования той же пары ничего не добавил
-// бы, см. рассуждение про P2P-шину/медиатреки в комментарии Ш1 выше).
-// sigCrypto остаётся нужен ТОЛЬКО для серверного пути.
+// F3 (repeated offer/answer/ice over the bus): the FIRST handshake of a
+// pair (when the bus doesn't exist yet — chicken-and-egg, see S1 above) and
+// ICE-restart/reconnect ALWAYS go through the server relay with encryption,
+// as before. But EVERY SUBSEQUENT renegotiation of the same pair
+// (adding/removing a track, switching camera with an actual renegotiation,
+// etc.) — once the bus to that peer has already opened — travels directly
+// over it: kind: 'rtc-signal', payload {type: 'offer'|'answer'|'ice', data},
+// WITHOUT encryption at this layer (the DataChannel already runs over DTLS
+// — that already is E2E between these two specific peers, a second
+// application layer of encryption for the same pair would add nothing, see
+// the reasoning about the P2P bus/media tracks in the S1 comment above).
+// sigCrypto remains needed ONLY for the server path.
 //
-// ТОНКОЕ МЕСТО: сама шина живёт на том же RTCPeerConnection, который сейчас
-// ренегоциируется — если именно ЭТА ренегоциация сломает pc (редко, но
-// возможно — ICE не сойдётся заново, DTLS отвалится и т.п.), шина умрёт
-// вместе с ним, и offer/answer/ice, отправленные по ней, просто не доедут
-// (никакого отдельного failure-сигнала от DataChannel.send() при этом может
-// и не быть — сообщение либо ушло в буфер SCTP, либо канал уже закрылся
-// синхронно, см. try/catch ниже). Никаких подтверждений/ретраев здесь
-// сознательно не заводим (усложнение несоразмерно риску) — вместо этого
-// простое и дешёвое правило проверяется НЕПОСРЕДСТВЕННО перед каждой
-// отправкой: канал открыт И pc.connectionState === 'connected' -> шина;
-// иначе (в частности — весь путь ICE-restart/реконнекта, где connectionState
-// заведомо не 'connected') -> сервер, как и раньше. Проверка и сам
-// channel.send() — синхронный код без await между ними, гонка «состояние
-// изменилось между проверкой и отправкой» исключена.
+// SUBTLE POINT: the bus itself lives on the same RTCPeerConnection that is
+// currently being renegotiated — if THIS renegotiation breaks the pc
+// (rare, but possible — ICE fails to re-converge, DTLS drops, etc.), the
+// bus will die along with it, and any offer/answer/ice sent over it will
+// simply never arrive (there may be no separate failure signal from
+// DataChannel.send() in this case — the message either went into the SCTP
+// buffer or the channel already closed synchronously, see try/catch below).
+// We deliberately don't add any acknowledgments/retries here (the added
+// complexity would be disproportionate to the risk) — instead a simple and
+// cheap rule is checked IMMEDIATELY before each send: channel is open AND
+// pc.connectionState === 'connected' -> bus; otherwise (in particular — the
+// entire ICE-restart/reconnect path, where connectionState is definitely
+// not 'connected') -> server, same as before. The check and the
+// channel.send() itself are synchronous code with no await in between, so
+// the race "state changed between the check and the send" is excluded.
 
 'use strict';
 
@@ -116,50 +122,52 @@ class RtcPeer {
     this.targetPeerId = targetPeerId;
     this.polite = polite;
     this.onBusMessage = onBusMessage || null;
-    // Ш1 (E2E-шифрование, см. static/crypto.js): sdp/candidate идут через
-    // серверный сигналинг-релей (offer/answer/ice-candidate НИКОГДА не
-    // ходят по P2P-шине — сама шина устанавливается ЭТИМИ сообщениями,
-    // курица-яйцо), поэтому шифруются ВСЕГДА, а не только опционально.
+    // S1 (E2E encryption, see static/crypto.js): sdp/candidate travel through
+    // the server signaling relay (offer/answer/ice-candidate NEVER travel
+    // over the P2P bus — the bus itself is established BY these messages,
+    // chicken-and-egg), so they are ALWAYS encrypted, not just optionally.
     // `sigCrypto` — { encrypt(obj) -> Promise<blob>, decrypt(blob) -> Promise<obj> },
-    // выданный вызывающей стороной (см. static/room.js: createRemotePeer) —
-    // сам RtcPeer ничего не знает про устройство ключа комнаты, только
-    // вызывает эти две функции. `onCryptoFailure` — колбэк на случай, если
-    // decrypt() отказал (см. handleDescription/handleCandidate ниже) —
-    // почти всегда означает неверный ключ комнаты у одной из сторон.
+    // supplied by the caller (see static/room.js: createRemotePeer) —
+    // RtcPeer itself knows nothing about how the room key is derived, it
+    // just calls these two functions. `onCryptoFailure` — a callback for
+    // when decrypt() fails (see handleDescription/handleCandidate below) —
+    // almost always means one of the sides has the wrong room key.
     this.sigCrypto = sigCrypto;
     this.onCryptoFailure = onCryptoFailure || null;
-    // Ф2: колбэк на момент, когда шина к этому пиру открылась (после флаша
-    // очереди) — используется для рассылки снапшота актуального состояния
-    // (см. static/room.js: sendAllActiveStreamInfoTo) сразу по шине, закрывая
-    // гонку «оффер с треками ушёл раньше, чем открылась шина».
+    // F2: a callback for the moment the bus to this peer opens (after
+    // flushing the queue) — used to broadcast a snapshot of the current
+    // state (see static/room.js: sendAllActiveStreamInfoTo) right over the
+    // bus, closing the race "the offer with tracks went out before the bus
+    // opened".
     this.onBusOpen = onBusOpen || null;
-    // Ф3: колбэк на входящий файловый DataChannel (label начинается с
-    // 'file-') — см. createFileChannel ниже и static/chat.js.
+    // F3: a callback for an incoming file DataChannel (label starts with
+    // 'file-') — see createFileChannel below and static/chat.js.
     this.onFileChannel = onFileChannel || null;
 
     this.makingOffer = false;
     this.ignoreOffer = false;
     this.isSettingRemoteAnswerPending = false;
 
-    // Кандидаты, пришедшие раньше, чем применён remoteDescription — как и в
-    // прежней ручной реализации, копим в очередь и сбрасываем после
-    // setRemoteDescription.
+    // Candidates that arrive before remoteDescription has been applied —
+    // just like in the previous manual implementation, we queue them and
+    // flush after setRemoteDescription.
     this.remoteSet = false;
     this.candidateQueue = [];
 
-    // busChannel появляется не сразу: у impolite-стороны — синхронно здесь
-    // же (createDataChannel), у polite-стороны — асинхронно, когда придёт
-    // pc.ondatachannel. sendBus() должен уметь копить исходящее и до этого
-    // момента тоже, поэтому busQueue — это очередь СТРОК JSON, а не что-то
-    // завязанное на конкретный channel.
+    // busChannel doesn't appear right away: on the impolite side —
+    // synchronously right here (createDataChannel), on the polite side —
+    // asynchronously, when pc.ondatachannel fires. sendBus() must be able
+    // to queue outgoing messages before that moment too, so busQueue is a
+    // queue of JSON STRINGS, not something tied to a specific channel.
     this.busChannel = null;
     this.busQueue = [];
 
-    // SAS (см. static/crypto.js: deriveSas): чтобы у участника был ОДИН
-    // стабильный DTLS-фингерпринт на все его соединения в mesh, room.js
-    // генерирует один RTCCertificate на сессию и передаёт его сюда — иначе
-    // браузер сгенерировал бы новый сертификат на каждый RTCPeerConnection,
-    // и «отпечаток комнаты» не сошёлся бы у разных пиров.
+    // SAS (see static/crypto.js: deriveSas): so that a participant has ONE
+    // stable DTLS fingerprint across all their connections in the mesh,
+    // room.js generates a single RTCCertificate per session and passes it
+    // in here — otherwise the browser would generate a new certificate for
+    // each RTCPeerConnection, and the "room fingerprint" would not match
+    // across different peers.
     const pcConfig = { iceServers };
     if (certificate) pcConfig.certificates = [certificate];
     const pc = new RTCPeerConnection(pcConfig);
@@ -175,7 +183,7 @@ class RtcPeer {
           try {
             channel.send(text);
           } catch (err) {
-            console.error(`[peer ${targetPeerId}] Ошибка отправки в шину (флаш очереди):`, err);
+            console.error(`[peer ${targetPeerId}] Error sending to bus (queue flush):`, err);
           }
         }
         if (this.onBusOpen) this.onBusOpen();
@@ -186,28 +194,29 @@ class RtcPeer {
         try {
           obj = JSON.parse(event.data);
         } catch (err) {
-          console.error(`[peer ${targetPeerId}] Некорректный JSON в шине:`, event.data, err);
+          console.error(`[peer ${targetPeerId}] Invalid JSON on the bus:`, event.data, err);
           return;
         }
         if (this.onBusMessage) this.onBusMessage(obj);
       };
 
       channel.onerror = (event) => {
-        console.error(`[peer ${targetPeerId}] Ошибка DataChannel-шины:`, event);
+        console.error(`[peer ${targetPeerId}] Bus DataChannel error:`, event);
       };
     };
 
     if (!polite) {
-      // impolite создаёт канал — само создание триггерит onnegotiationneeded
-      // ниже (если для этой пары ещё не было ни одной SCTP-негоциации).
+      // impolite creates the channel — the creation itself triggers
+      // onnegotiationneeded below (if this pair hasn't had any SCTP
+      // negotiation yet).
       setupBusChannel(pc.createDataChannel('bus'));
     }
-    // pc.ondatachannel вешаем БЕЗУСЛОВНО с обеих сторон (не только у polite):
-    // 'bus' — только polite реально его тут дождётся (impolite создал канал
-    // сам, ей ondatachannel на него никогда не прилетит); входящий файловый
-    // канал ('file-...', см. заголовок файла) может прийти к ЛЮБОЙ из сторон
-    // независимо от polite/impolite, поэтому диспетчеризация по label здесь
-    // общая для обеих ролей.
+    // pc.ondatachannel is attached UNCONDITIONALLY on both sides (not just
+    // polite): 'bus' — only polite will actually receive it here (impolite
+    // created the channel itself, its ondatachannel will never fire for
+    // it); an incoming file channel ('file-...', see the file header) can
+    // arrive on EITHER side regardless of polite/impolite, so dispatching
+    // by label here is shared between both roles.
     pc.ondatachannel = (event) => {
       const { channel } = event;
       if (channel.label === 'bus') {
@@ -222,18 +231,19 @@ class RtcPeer {
         this.makingOffer = true;
         await pc.setLocalDescription();
         const offer = { type: pc.localDescription.type, sdp: pc.localDescription.sdp };
-        // Ф3: шина к этому пиру уже открыта и pc в порядке -> гоним offer по
-        // ней напрямую (см. заголовок файла); иначе — прежний серверный путь
-        // с шифрованием под попарным K_pair_sig этой пары (сервер видит только
-        // непрозрачный {v,iv,ct} вместо настоящего SDP и его DTLS-отпечатков, см.
-        // заголовок static/crypto.js).
+        // F3: if the bus to this peer is already open and pc is fine -> send
+        // the offer directly over it (see the file header); otherwise — the
+        // old server path with encryption under this pair's pairwise
+        // K_pair_sig (the server only sees the opaque {v,iv,ct} instead of
+        // the real SDP and its DTLS fingerprints, see the header of
+        // static/crypto.js).
         if (!this._trySendBusSignal('offer', offer)) {
           const encSdp = await this.sigCrypto.encrypt(offer);
           signaling.send('offer', { targetPeerId, sdp: encSdp });
           ConnStats.incSignalingRelay();
         }
       } catch (err) {
-        console.error(`[peer ${targetPeerId}] Ошибка onnegotiationneeded:`, err);
+        console.error(`[peer ${targetPeerId}] onnegotiationneeded error:`, err);
       } finally {
         this.makingOffer = false;
       }
@@ -242,7 +252,7 @@ class RtcPeer {
     pc.onicecandidate = (event) => {
       if (!event.candidate) return;
       const candidateJson = event.candidate.toJSON();
-      // Ф3: тот же выбор пути, что и у offer/answer выше — см. _trySendBusSignal.
+      // F3: the same path choice as for offer/answer above — see _trySendBusSignal.
       if (this._trySendBusSignal('ice', candidateJson)) return;
       this.sigCrypto.encrypt(candidateJson).then((encCandidate) => {
         signaling.send('ice-candidate', {
@@ -268,34 +278,35 @@ class RtcPeer {
   }
 
   /**
-   * Приём SDP-описания от удалённого пира ЧЕРЕЗ СЕРВЕРНЫЙ РЕЛЕЙ — offer ИЛИ
-   * answer, разбираются по description.type. `encryptedDescription` —
-   * зашифрованный блоб {v,iv,ct} под попарным K_pair_sig этой пары (см.
-   * derivePairKeys в static/crypto.js) — расшифровывается ПЕРВЫМ делом, до
-   * какой-либо иной обработки; отказ расшифровки почти всегда значит, что у
-   * одной из сторон неверный/несовпадающий токен ссылки `t`/`e` (см.
-   * onCryptoFailure). Сама обработка (perfect negotiation) —
-   * в _applyRemoteDescription, общей с приёмом по шине (см. handleBusSignal).
+   * Receiving an SDP description from the remote peer THROUGH THE SERVER
+   * RELAY — offer OR answer, distinguished by description.type.
+   * `encryptedDescription` — an encrypted blob {v,iv,ct} under this pair's
+   * pairwise K_pair_sig (see derivePairKeys in static/crypto.js) — decrypted
+   * FIRST, before any other processing; a decryption failure almost always
+   * means one of the sides has a wrong/mismatched link token `t`/`e` (see
+   * onCryptoFailure). The actual processing (perfect negotiation) is in
+   * _applyRemoteDescription, shared with receiving over the bus (see
+   * handleBusSignal).
    */
   async handleDescription(encryptedDescription) {
     let description;
     try {
       description = await this.sigCrypto.decrypt(encryptedDescription);
     } catch (err) {
-      console.error(`[peer ${this.targetPeerId}] Не удалось расшифровать SDP (неверный ключ комнаты?):`, err);
+      console.error(`[peer ${this.targetPeerId}] Failed to decrypt SDP (wrong room key?):`, err);
       if (this.onCryptoFailure) this.onCryptoFailure(err);
       return;
     }
     await this._applyRemoteDescription(description);
   }
 
-  /** Приём ICE-кандидата от удалённого пира ЧЕРЕЗ СЕРВЕРНЫЙ РЕЛЕЙ (trickle). `encryptedCandidate` — блоб {v,iv,ct}, расшифровывается первым делом (см. handleDescription про onCryptoFailure). */
+  /** Receiving an ICE candidate from the remote peer THROUGH THE SERVER RELAY (trickle). `encryptedCandidate` — a blob {v,iv,ct}, decrypted first (see handleDescription regarding onCryptoFailure). */
   async handleCandidate(encryptedCandidate) {
     let candidate;
     try {
       candidate = await this.sigCrypto.decrypt(encryptedCandidate);
     } catch (err) {
-      console.error(`[peer ${this.targetPeerId}] Не удалось расшифровать ICE-кандидат (неверный ключ комнаты?):`, err);
+      console.error(`[peer ${this.targetPeerId}] Failed to decrypt ICE candidate (wrong room key?):`, err);
       if (this.onCryptoFailure) this.onCryptoFailure(err);
       return;
     }
@@ -303,13 +314,13 @@ class RtcPeer {
   }
 
   /**
-   * Ф3: приём rtc-signal с P2P-шины (см. room.js: bus.onMessage — уже
-   * маршрутизирует по kind и зовёт это для соответствующего RtcPeer).
-   * `payload` — {type: 'offer'|'answer'|'ice', data} — данные УЖЕ в чистом
-   * виде (не зашифрованы этим слоем, см. заголовок файла), поэтому просто
-   * заводятся в те же _applyRemoteDescription/_applyRemoteCandidate, что и
-   * серверный путь — вся логика perfect negotiation/очереди кандидатов не
-   * дублируется.
+   * F3: receiving an rtc-signal from the P2P bus (see room.js: bus.onMessage
+   * — it already routes by kind and calls this for the corresponding
+   * RtcPeer). `payload` — {type: 'offer'|'answer'|'ice', data} — the data is
+   * ALREADY in plain form (not encrypted by this layer, see the file
+   * header), so it's simply fed into the same
+   * _applyRemoteDescription/_applyRemoteCandidate as the server path — all
+   * the perfect negotiation/candidate queue logic is not duplicated.
    */
   async handleBusSignal(payload) {
     if (!payload || typeof payload !== 'object') return;
@@ -320,7 +331,7 @@ class RtcPeer {
     }
   }
 
-  /** Общая обработка удалённого SDP-описания (offer/answer) — детект и разрешение коллизии офферов, применение remoteDescription, ответный answer при offer. Не завязана на транспорт (сервер/шина) — см. handleDescription/handleBusSignal. */
+  /** Shared handling of a remote SDP description (offer/answer) — detecting and resolving offer collisions, applying remoteDescription, sending an answer back on offer. Not tied to the transport (server/bus) — see handleDescription/handleBusSignal. */
   async _applyRemoteDescription(description) {
     const pc = this.pc;
     const isOffer = description.type === 'offer';
@@ -331,7 +342,7 @@ class RtcPeer {
     this.ignoreOffer = !this.polite && offerCollision;
     if (this.ignoreOffer) {
       console.warn(
-        `[peer ${this.targetPeerId}] Коллизия офферов — impolite-пир игнорирует чужой offer`
+        `[peer ${this.targetPeerId}] Offer collision — impolite peer is ignoring the other side's offer`
       );
       return;
     }
@@ -341,7 +352,7 @@ class RtcPeer {
       await pc.setRemoteDescription(description);
       this.isSettingRemoteAnswerPending = false;
     } catch (err) {
-      console.error(`[peer ${this.targetPeerId}] Ошибка setRemoteDescription:`, err);
+      console.error(`[peer ${this.targetPeerId}] setRemoteDescription error:`, err);
       return;
     }
 
@@ -352,9 +363,9 @@ class RtcPeer {
       try {
         await pc.setLocalDescription();
         const answer = { type: pc.localDescription.type, sdp: pc.localDescription.sdp };
-        // Ф3: тот же выбор пути (шина/сервер), что и у offer/ice — см.
-        // _trySendBusSignal и заголовок файла про ТОНКОЕ МЕСТО ренегоциации
-        // поверх той же самой шины.
+        // F3: the same path choice (bus/server) as for offer/ice — see
+        // _trySendBusSignal and the file header on the SUBTLE POINT of
+        // renegotiating over this very same bus.
         if (!this._trySendBusSignal('answer', answer)) {
           const encAnswer = await this.sigCrypto.encrypt(answer);
           this.signaling.send('answer', {
@@ -364,12 +375,12 @@ class RtcPeer {
           ConnStats.incSignalingRelay();
         }
       } catch (err) {
-        console.error(`[peer ${this.targetPeerId}] Ошибка setLocalDescription (answer):`, err);
+        console.error(`[peer ${this.targetPeerId}] setLocalDescription (answer) error:`, err);
       }
     }
   }
 
-  /** Общая обработка удалённого ICE-кандидата (trickle, очередь до remoteDescription) — не завязана на транспорт, см. handleCandidate/handleBusSignal. */
+  /** Shared handling of a remote ICE candidate (trickle, queued until remoteDescription) — not tied to the transport, see handleCandidate/handleBusSignal. */
   async _applyRemoteCandidate(candidate) {
     if (!this.remoteSet) {
       this.candidateQueue.push(candidate);
@@ -378,10 +389,10 @@ class RtcPeer {
     try {
       await this.pc.addIceCandidate(candidate);
     } catch (err) {
-      // Как в референсном паттерне: если кандидат относится к офферу, который
-      // мы только что проигнорировали (ignoreOffer), ошибка ожидаема — глотаем.
+      // As in the reference pattern: if the candidate belongs to an offer we
+      // just ignored (ignoreOffer), the error is expected — swallow it.
       if (!this.ignoreOffer) {
-        console.error(`[peer ${this.targetPeerId}] Ошибка addIceCandidate:`, err);
+        console.error(`[peer ${this.targetPeerId}] addIceCandidate error:`, err);
       }
     }
   }
@@ -392,30 +403,30 @@ class RtcPeer {
     for (const candidate of queue) {
       this.pc.addIceCandidate(candidate).catch((err) => {
         if (!this.ignoreOffer) {
-          console.error(`[peer ${this.targetPeerId}] Ошибка addIceCandidate (из очереди):`, err);
+          console.error(`[peer ${this.targetPeerId}] addIceCandidate error (from queue):`, err);
         }
       });
     }
   }
 
   /**
-   * Отправить объект в шину этого пира: JSON.stringify + try/catch на сам
-   * send. Пока канал не создан/не открыт — копится в очереди (см.
-   * setupBusChannel/channel.onopen в конструкторе).
+   * Send an object to this peer's bus: JSON.stringify + try/catch around
+   * the send itself. While the channel isn't created/open yet — it queues
+   * up (see setupBusChannel/channel.onopen in the constructor).
    */
   sendBus(obj) {
     let text;
     try {
       text = JSON.stringify(obj);
     } catch (err) {
-      console.error(`[peer ${this.targetPeerId}] Не удалось сериализовать сообщение шины:`, err);
+      console.error(`[peer ${this.targetPeerId}] Failed to serialize bus message:`, err);
       return;
     }
     if (this.busChannel && this.busChannel.readyState === 'open') {
       try {
         this.busChannel.send(text);
       } catch (err) {
-        console.error(`[peer ${this.targetPeerId}] Ошибка отправки в шину:`, err);
+        console.error(`[peer ${this.targetPeerId}] Error sending to bus:`, err);
       }
     } else {
       this.busQueue.push(text);
@@ -427,32 +438,34 @@ class RtcPeer {
   }
 
   /**
-   * Ф3: можно ли прямо СЕЙЧАС гонять offer/answer/ice по шине этой пары —
-   * простое правило без подтверждений/ретраев (см. заголовок файла,
-   * «ТОНКОЕ МЕСТО»): канал открыт И pc уже 'connected'. Если пара ещё
-   * устанавливается (bootstrap, шина не открылась) или разваливается/
-   * переустанавливается (ICE-restart, реконнект после падения канала —
-   * connectionState тогда не 'connected') — сигналы обязаны идти сервером.
+   * F3: whether offer/answer/ice can be sent over this pair's bus RIGHT NOW
+   * — a simple rule with no acknowledgments/retries (see the file header,
+   * "SUBTLE POINT"): the channel is open AND pc is already 'connected'. If
+   * the pair is still being established (bootstrap, bus hasn't opened) or
+   * is falling apart/being re-established (ICE-restart, reconnect after the
+   * channel died — connectionState then isn't 'connected') — signals must
+   * go through the server.
    */
   _canUseBus() {
     return this.isBusOpen() && this.pc.connectionState === 'connected';
   }
 
   /**
-   * Попытаться отправить один сигнал ('offer'|'answer'|'ice') по шине этой
-   * пары. Возвращает true, если реально ушло по шине (вызывающая сторона
-   * тогда НЕ шлёт тем же сигналом ещё и через сервер и НЕ инкрементирует
-   * ConnStats.incSignalingRelay — см. static/room.js, п.4 задания), false —
-   * если бус недоступен или send() синхронно отказал (тогда вызывающая
-   * сторона обязана откатиться на серверный путь сама).
+   * Try to send a single signal ('offer'|'answer'|'ice') over this pair's
+   * bus. Returns true if it actually went out over the bus (in that case
+   * the caller must NOT also send the same signal through the server and
+   * must NOT increment ConnStats.incSignalingRelay — see static/room.js,
+   * task item 4), false if the bus is unavailable or send() failed
+   * synchronously (in that case the caller must fall back to the server
+   * path itself).
    *
-   * Намеренно НЕ используется sendBus() (тот копит недоставленное в очередь
-   * до следующего открытия канала) — если именно эта ренегоциация сломала
-   * pc, канал, скорее всего, никогда больше не откроется, и offer застрял бы
-   * в очереди навсегда вместо честного немедленного отката на сервер.
-   * Проверка _canUseBus() и сам channel.send() — синхронный код без await
-   * между ними, поэтому гонка «состояние изменилось между проверкой и
-   * отправкой» здесь исключена.
+   * Deliberately does NOT use sendBus() (which queues undelivered messages
+   * until the channel next opens) — if this very renegotiation broke pc,
+   * the channel will most likely never open again, and the offer would get
+   * stuck in the queue forever instead of honestly falling back to the
+   * server immediately. The _canUseBus() check and the channel.send() call
+   * itself are synchronous code with no await in between, so the race
+   * "state changed between the check and the send" is excluded here.
    */
   _trySendBusSignal(type, data) {
     if (!this._canUseBus()) return false;
@@ -460,48 +473,51 @@ class RtcPeer {
       this.busChannel.send(JSON.stringify({ kind: 'rtc-signal', payload: { type, data } }));
       return true;
     } catch (err) {
-      console.warn(`[peer ${this.targetPeerId}] Не удалось отправить ${type} по шине — откат на серверный релей:`, err);
+      console.warn(`[peer ${this.targetPeerId}] Failed to send ${type} over the bus — falling back to the server relay:`, err);
       return false;
     }
   }
 
   /**
-   * Открыть НОВЫЙ отдельный DataChannel для передачи одного файла одному
-   * конкретному получателю (см. static/chat.js). `label` должен быть вида
-   * `file-${fileId}-${получатель}` — получатель заранее знает ожидаемый
-   * label целиком (сам его сконструировал) и матчит входящий канал по
-   * точному совпадению строки, парсинг label на составные части не нужен.
+   * Open a NEW separate DataChannel to transfer one file to one specific
+   * recipient (see static/chat.js). `label` must have the form
+   * `file-${fileId}-${recipient}` — the recipient already knows the entire
+   * expected label in advance (it constructed it itself) and matches the
+   * incoming channel by exact string match, so parsing the label into its
+   * component parts isn't needed.
    */
   createFileChannel(label) {
     return this.pc.createDataChannel(label);
   }
 
   /**
-   * Фингерпринт СЕРТИФИКАТА, который удалённый пир реально предъявил в
-   * DTLS-рукопожатии (не «обещанного» в SDP, а фактически использованного) —
-   * читается из pc.getStats() по записи type==='remote-certificate'. Нужен
-   * для SAS (см. static/room.js: recomputeRoomSas, static/crypto.js:
-   * deriveSas). Возвращает строку-фингерпринт или null, если DTLS ещё не
-   * установлен / статы недоступны.
+   * The fingerprint of the CERTIFICATE that the remote peer actually
+   * presented in the DTLS handshake (not the one "promised" in the SDP, but
+   * the one actually used) — read from pc.getStats() from the
+   * type==='remote-certificate' record. Needed for SAS (see
+   * static/room.js: recomputeRoomSas, static/crypto.js: deriveSas). Returns
+   * the fingerprint string or null if DTLS hasn't been established yet /
+   * stats are unavailable.
    */
   async getRemoteCertificateFingerprint() {
     try {
       const report = await this.pc.getStats();
-      // Спек-путь (webrtc-stats): transport -> remoteCertificateId -> запись
-      // type:'certificate' с полем fingerprint. Именно фактически предъявленный
-      // в DTLS сертификат пира (не «обещанный» в SDP).
+      // Spec path (webrtc-stats): transport -> remoteCertificateId -> a
+      // type:'certificate' record with a fingerprint field. This is the
+      // peer's certificate as actually presented in DTLS (not the one
+      // "promised" in the SDP).
       for (const stat of report.values()) {
         if (stat.type === 'transport' && stat.remoteCertificateId) {
           const cert = report.get(stat.remoteCertificateId);
           if (cert && cert.fingerprint) return cert.fingerprint;
         }
       }
-      // Фоллбэк на нестандартный тип, если вдруг встретится.
+      // Fallback to the non-standard type, in case it's ever encountered.
       for (const stat of report.values()) {
         if (stat.type === 'remote-certificate' && stat.fingerprint) return stat.fingerprint;
       }
     } catch (err) {
-      console.warn(`[peer ${this.targetPeerId}] getStats() для SAS не удался:`, err);
+      console.warn(`[peer ${this.targetPeerId}] getStats() for SAS failed:`, err);
     }
     return null;
   }

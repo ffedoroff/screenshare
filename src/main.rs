@@ -1,43 +1,42 @@
-//! Точка входа: HTTP-сервер на axum.
+//! Entry point: HTTP server on axum.
 //!
-//! Backend делает ровно три вещи (по спецификации):
-//!   1. Signaling-релей поверх WebSocket (`/ws`) — см. `ws.rs`. Текстовый чат
-//!      комнаты сюда вообще не попадает: он идёт исключительно напрямую
-//!      между участниками по mesh RTCDataChannel (см. `static/chat.js`,
-//!      docs/chat.md §12) — сервер в этом пути не участвует и не видит ни
-//!      байта из содержимого чата.
-//!   2. Раздача статики фронтенда (`/`, `/r/{id}`, `/static/...`).
-//!   3. Крошечный `/config` с ICE-серверами из переменных окружения.
+//! The backend does exactly three things (per the spec):
+//!   1. Signaling relay over WebSocket (`/ws`) — see `ws.rs`. Room text chat
+//!      never reaches here at all: it travels exclusively directly between
+//!      participants over the mesh RTCDataChannel (see `static/chat.js`,
+//!      docs/chat.md §12) — the server does not participate in this path
+//!      and never sees a single byte of chat content.
+//!   2. Serving the frontend's static assets (`/`, `/r/{id}`, `/static/...`).
+//!   3. A tiny `/config` with ICE servers from environment variables.
 //!
-//! Медиа через сервер по-прежнему не проходит.
+//! Media still never passes through the server.
 //!
-//! Ш1 (E2E-шифрование, см. static/crypto.js): сервер релеит sdp/candidate/
-//! info/имя участника уже ЗАШИФРОВАННЫМИ клиентом попарными ключами,
-//! выведенными из секрета `t`/`e` фрагмента ссылки (сервер его никогда не
-//! видел и не видит) — с точки зрения этого файла и `ws.rs` ничего не
-//! изменилось, они как релеили опаковый JSON/строку, так и продолжают.
-//! QR-код (раньше `GET /qr.svg`) теперь рендерится ЛОКАЛЬНО в браузере (см.
-//! `static/vendor/qrcode.js`, `static/room.js`), чтобы ссылка с секретными
-//! `#t`/`#e` не уходила на сервер ради картинки — этот эндпоинт удалён
-//! целиком.
+//! Phase 1 (E2E encryption, see static/crypto.js): the server relays
+//! sdp/candidate/info/participant name already ENCRYPTED by the client with
+//! pairwise keys derived from the `t`/`e` secret in the URL fragment (the
+//! server has never seen it and never will) — from the point of view of
+//! this file and `ws.rs`, nothing has changed, they relayed opaque
+//! JSON/strings before and still do. The QR code (formerly `GET /qr.svg`)
+//! is now rendered LOCALLY in the browser (see `static/vendor/qrcode.js`,
+//! `static/room.js`), so that the link with secret `#t`/`#e` doesn't go to
+//! the server just for an image — this endpoint has been removed entirely.
 //!
-//! Приватность: на диске не остаётся ничего — ни IP/портов клиентов (в
-//! tracing-логах фигурируют только room/peer id), ни содержимого чата
-//! (сервер его не видит и не хранит вовсе — см. выше), ни какой бы то ни
-//! было информации о сессии. Комната умирает — умирает вся её память
-//! (участники, имена).
+//! Privacy: nothing is left on disk — no client IPs/ports (tracing logs
+//! only carry room/peer id), no chat content (the server never sees or
+//! stores it at all — see above), no session information of any kind. When
+//! a room dies, all its memory dies with it (participants, names).
 //!
-//! Ш2 (разнесение доверия, см. docs/self-hosting.md, «Split Origin (Frontend
-//! / Signaling Separated)», и docs/e2e-encryption.md, «Trust Split»): статика
-//! фронтенда может уехать на отдельный статический хостинг, этот сервер
-//! остаётся ТОЛЬКО API/WS на отдельном хосте (a separate API host) — фронт и
-//! бэкенд МОГУТ жить на разных origin. Отсюда: CORS на кросс-оригин
-//! HTTP-эндпоинтах (`cors_middleware` ниже, включается через env
-//! `CORS_ORIGIN`) и опциональная проверка `Origin`
-//! на `/ws` (см. `ws.rs::ws_handler`) — оба выключены (никаких заголовков,
-//! никакой проверки) по умолчанию, пока `CORS_ORIGIN` не задан, так что
-//! локалка и нынешний прод (статика и API ещё на одном хосте) ведут себя
-//! ровно как раньше.
+//! Phase 2 (trust separation, see docs/self-hosting.md, "Split Origin
+//! (Frontend / Signaling Separated)", and docs/e2e-encryption.md, "Trust
+//! Split"): the frontend's static assets can move to a separate static
+//! hosting service, this server remains ONLY the API/WS on a separate host
+//! (a separate API host) — frontend and backend CAN live on different
+//! origins. Hence: CORS on cross-origin HTTP endpoints (`cors_middleware`
+//! below, enabled via env `CORS_ORIGIN`) and an optional `Origin` check on
+//! `/ws` (see `ws.rs::ws_handler`) — both disabled (no headers, no check) by
+//! default, until `CORS_ORIGIN` is set, so that local dev and current
+//! production (static assets and API still on one host) behave exactly as
+//! before.
 
 mod metrics;
 mod protocol;
@@ -70,38 +69,39 @@ use crate::state::{
     DEFAULT_ROOM_CREATION_IP_LIMIT, ROOM_CREATION_IP_WINDOW,
 };
 
-/// Каталог со статикой фронтенда. Настраивается через env `STATIC_DIR` (в
-/// контейнере — например `/app/static`), а для `cargo run` без переменной
-/// падаем на путь рядом с Cargo.toml, зафиксированный на этапе компиляции.
+/// Directory with frontend static assets. Configurable via env `STATIC_DIR`
+/// (in a container — e.g. `/app/static`), and for `cargo run` without the
+/// variable set, we fall back to a path next to Cargo.toml, fixed at
+/// compile time.
 static STATIC_DIR: LazyLock<String> = LazyLock::new(|| {
     std::env::var("STATIC_DIR")
         .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/static").to_string())
 });
 
-/// Ш2 (разнесение доверия — статика уезжает на отдельный статический хостинг,
-/// этот сервер остаётся только API/WS на отдельном хосте, см.
-/// docs/self-hosting.md, «Split Origin (Frontend / Signaling Separated)»):
-/// разрешённый кросс-оригин для CORS, из env `CORS_ORIGIN` (например
-/// `https://your-domain.example`). Пусто/не задано (дефолт — локалка и
-/// однохостовый деплой, где фронт и API ещё на одном хосте) значит «CORS
-/// выключен целиком»:
-/// ни один Access-Control-* заголовок не шлётся (см. `cors_middleware`) — с
-/// точки зрения браузера ничего не изменилось по сравнению с тем, как сервер
-/// вёл себя раньше.
+/// Phase 2 (trust separation — static assets move to a separate static
+/// hosting service, this server remains only API/WS on a separate host, see
+/// docs/self-hosting.md, "Split Origin (Frontend / Signaling Separated)"):
+/// the allowed cross-origin for CORS, from env `CORS_ORIGIN` (e.g.
+/// `https://your-domain.example`). Empty/unset (the default — local dev and
+/// single-host deployment, where frontend and API are still on one host)
+/// means "CORS is disabled entirely": not a single Access-Control-* header
+/// is sent (see `cors_middleware`) — from the browser's point of view
+/// nothing has changed compared to how the server behaved before.
 pub(crate) static CORS_ORIGIN: LazyLock<Option<String>> = LazyLock::new(|| {
     std::env::var("CORS_ORIGIN")
         .ok()
         .filter(|v| !v.is_empty())
 });
 
-/// Лимит длительности созвона (см. docs/security.md, «Meeting Duration
-/// Ceiling»): комната старше этого возраста удаляется реапером (`state::reap_rooms`)
-/// целиком, даже если в ней есть живые участники — им перед этим рассылается
-/// `room-expired`. Env `MAX_ROOM_LIFETIME_SECONDS`, дефолт 3 часа
-/// (`DEFAULT_MAX_ROOM_LIFETIME_SECONDS`). `LazyLock` (как `CORS_ORIGIN` выше)
-/// читает env один раз при первом обращении — этого достаточно, значение не
-/// меняется на лету; используется и здесь при спауне реапера, и в `ws.rs`
-/// (`room_expires_in_seconds`) при подсчёте остатка для `Joined`.
+/// Call duration limit (see docs/security.md, "Meeting Duration Ceiling"): a
+/// room older than this age is deleted entirely by the reaper
+/// (`state::reap_rooms`), even if it has live participants — they get sent
+/// `room-expired` right before that. Env `MAX_ROOM_LIFETIME_SECONDS`,
+/// default 3 hours (`DEFAULT_MAX_ROOM_LIFETIME_SECONDS`). `LazyLock` (like
+/// `CORS_ORIGIN` above) reads the env once on first access — that's enough,
+/// the value doesn't change on the fly; used both here when spawning the
+/// reaper and in `ws.rs` (`room_expires_in_seconds`) when computing the
+/// remainder for `Joined`.
 pub(crate) static MAX_ROOM_LIFETIME: LazyLock<Duration> = LazyLock::new(|| {
     let secs: u64 = std::env::var("MAX_ROOM_LIFETIME_SECONDS")
         .ok()
@@ -110,15 +110,16 @@ pub(crate) static MAX_ROOM_LIFETIME: LazyLock<Duration> = LazyLock::new(|| {
     Duration::from_secs(secs)
 });
 
-/// Потолок числа участников в комнате одновременно (см. `docs/self-hosting.md`,
-/// §6): env `MAX_PARTICIPANTS`, дефолт 6 (`DEFAULT_MAX_PARTICIPANTS`). Это
-/// РЕКОМЕНДУЕМЫЙ дефолт полноценной mesh-топологии, не жёсткий лимит
-/// протокола — комната полный WebRTC-mesh (каждый шлёт медиа каждому
-/// напрямую), поэтому расти сверх дефолта можно, но растёт исходящий трафик
-/// КАЖДОГО клиента (n-1 копий) — сервера самого это не касается, он лишь
-/// релеит сигналинг. `LazyLock` (как `MAX_ROOM_LIFETIME` выше) читает env
-/// один раз при первом обращении; используется в `ws.rs` при проверке
-/// room-full (`join-room` и `approve`).
+/// Ceiling on the number of participants in a room at once (see
+/// `docs/self-hosting.md`, §6): env `MAX_PARTICIPANTS`, default 6
+/// (`DEFAULT_MAX_PARTICIPANTS`). This is a RECOMMENDED default for a full
+/// mesh topology, not a hard protocol limit — a room is a full WebRTC mesh
+/// (everyone sends media to everyone else directly), so it's possible to go
+/// above the default, but each client's outgoing traffic grows (n-1
+/// copies) — the server itself isn't affected, it only relays signaling.
+/// `LazyLock` (like `MAX_ROOM_LIFETIME` above) reads the env once on first
+/// access; used in `ws.rs` when checking room-full (`join-room` and
+/// `approve`).
 pub(crate) static MAX_PARTICIPANTS: LazyLock<usize> = LazyLock::new(|| {
     std::env::var("MAX_PARTICIPANTS")
         .ok()
@@ -126,14 +127,14 @@ pub(crate) static MAX_PARTICIPANTS: LazyLock<usize> = LazyLock::new(|| {
         .unwrap_or(DEFAULT_MAX_PARTICIPANTS)
 });
 
-/// Per-IP лимит на прямой `join-room` в комнату (H2, docs/research-dos.md
-/// §3.2 — см. подробное обоснование у `state::DEFAULT_JOIN_ROOM_IP_LIMIT` про
-/// то, почему именно ЭТОТ лимит, в отличие от «соседних»
-/// (`ROOM_CREATION_IP_LIMIT`/`PENDING_JOIN_IP_LIMIT`), сделан configurable
-/// через env — тестируемость WS-хендшейка, у которого нет способа
-/// проставить произвольный `CF-Connecting-IP`, как это делает HTTP). Env
-/// `JOIN_ROOM_IP_LIMIT`, дефолт `DEFAULT_JOIN_ROOM_IP_LIMIT` (20). `LazyLock`
-/// — тот же приём, что у `MAX_PARTICIPANTS` выше.
+/// Per-IP limit on a direct `join-room` into a room (H2, docs/research-dos.md
+/// §3.2 — see the detailed rationale at `state::DEFAULT_JOIN_ROOM_IP_LIMIT`
+/// for why exactly THIS limit, unlike its "neighbors"
+/// (`ROOM_CREATION_IP_LIMIT`/`PENDING_JOIN_IP_LIMIT`), is made configurable
+/// via env — testability of the WS handshake, which has no way to set an
+/// arbitrary `CF-Connecting-IP` the way HTTP can). Env `JOIN_ROOM_IP_LIMIT`,
+/// default `DEFAULT_JOIN_ROOM_IP_LIMIT` (20). `LazyLock` — the same trick
+/// as `MAX_PARTICIPANTS` above.
 pub(crate) static JOIN_ROOM_IP_LIMIT: LazyLock<usize> = LazyLock::new(|| {
     std::env::var("JOIN_ROOM_IP_LIMIT")
         .ok()
@@ -141,15 +142,16 @@ pub(crate) static JOIN_ROOM_IP_LIMIT: LazyLock<usize> = LazyLock::new(|| {
         .unwrap_or(DEFAULT_JOIN_ROOM_IP_LIMIT)
 });
 
-/// Per-IP лимит на `POST /api/rooms` (и делящий с ним бюджет `PUT
-/// /api/rooms/{id}`, см. `restore_room`) — H2, DoS-защита. Прод-дефолт
-/// ужесточён до 3/60с (см. подробное обоснование у
-/// `state::DEFAULT_ROOM_CREATION_IP_LIMIT`): создание комнаты — редкое для
-/// легитимного пользователя действие, в отличие от `JOIN_ROOM_IP_LIMIT` выше.
-/// Configurable через env `ROOM_CREATION_IP_LIMIT` по той же причине, что и
-/// `JOIN_ROOM_IP_LIMIT` — тестируемость (signaling.test.mjs и e2e-тесты
-/// создают много комнат с одного IP за прогон и упёрлись бы в жёсткий
-/// прод-дефолт). `LazyLock` — тот же приём, что у `JOIN_ROOM_IP_LIMIT` выше.
+/// Per-IP limit on `POST /api/rooms` (and, sharing its budget, `PUT
+/// /api/rooms/{id}`, see `restore_room`) — H2, DoS protection. The
+/// production default is tightened to 3/60s (see the detailed rationale at
+/// `state::DEFAULT_ROOM_CREATION_IP_LIMIT`): creating a room is a rare
+/// action for a legitimate user, unlike `JOIN_ROOM_IP_LIMIT` above.
+/// Configurable via env `ROOM_CREATION_IP_LIMIT` for the same reason as
+/// `JOIN_ROOM_IP_LIMIT` — testability (signaling.test.mjs and the e2e tests
+/// create lots of rooms from a single IP per run and would hit the strict
+/// production default). `LazyLock` — the same trick as
+/// `JOIN_ROOM_IP_LIMIT` above.
 pub(crate) static ROOM_CREATION_IP_LIMIT: LazyLock<usize> = LazyLock::new(|| {
     std::env::var("ROOM_CREATION_IP_LIMIT")
         .ok()
@@ -157,21 +159,22 @@ pub(crate) static ROOM_CREATION_IP_LIMIT: LazyLock<usize> = LazyLock::new(|| {
         .unwrap_or(DEFAULT_ROOM_CREATION_IP_LIMIT)
 });
 
-/// CORS вручную, без tower-http: у нас всего три кросс-оригин HTTP-пути
-/// (`/api/rooms` (+`/api/rooms/{id}`), `/config`, `/version.json`) — тащить
-/// отдельный крейт (лишняя компиляция, лишняя поверхность) ради заголовков на
-/// три хендлера показалось overkill; сам протокол CORS здесь тривиален
-/// (никаких credentials/cookies, один статичный allow-list origin из env).
-/// Применяется точечно через `.route_layer()` только к этим маршрутам (см.
-/// main()) — остальные (статика, `/`, `/r/{id}`, `/ws`) не тратят на него
-/// ничего.
+/// CORS by hand, without tower-http: we only have three cross-origin HTTP
+/// paths (`/api/rooms` (+`/api/rooms/{id}`), `/config`, `/version.json`) —
+/// pulling in a separate crate (extra compilation, extra surface) just for
+/// headers on three handlers seemed like overkill; the CORS protocol itself
+/// is trivial here (no credentials/cookies, one static allow-list origin
+/// from env). Applied pointedly via `.route_layer()` only to these routes
+/// (see main()) — the rest (static assets, `/`, `/r/{id}`, `/ws`) don't pay
+/// anything for it.
 ///
-/// Preflight `OPTIONS` перехватывается и ЗДЕСЬ ЖЕ, до вызова хендлера маршрута
-/// (тем хендлерам метод OPTIONS не зарегистрирован вовсе) — отвечаем `204` с
-/// теми же заголовками. Если `CORS_ORIGIN` не задан, никакие Access-Control-*
-/// заголовки не добавляются вообще (см. `CORS_ORIGIN` выше) — но сам ответ
-/// `204` на OPTIONS сервер всё равно отдаст; практического значения это не
-/// имеет, т.к. same-origin запросы preflight не вызывают.
+/// Preflight `OPTIONS` is intercepted RIGHT HERE too, before the route
+/// handler is called (those handlers don't have the OPTIONS method
+/// registered at all) — we respond with `204` and the same headers. If
+/// `CORS_ORIGIN` isn't set, no Access-Control-* headers are added at all
+/// (see `CORS_ORIGIN` above) — but the server still returns the `204`
+/// response to OPTIONS regardless; this has no practical effect since
+/// same-origin requests don't trigger preflight.
 async fn cors_middleware(req: Request, next: Next) -> Response {
     let mut response = if req.method() == Method::OPTIONS {
         StatusCode::NO_CONTENT.into_response()
@@ -185,7 +188,7 @@ async fn cors_middleware(req: Request, next: Next) -> Response {
             Ok(v) => {
                 headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
             }
-            Err(e) => warn!("CORS_ORIGIN={origin:?} не годится в заголовок: {e}"),
+            Err(e) => warn!("CORS_ORIGIN={origin:?} is not a valid header value: {e}"),
         }
         headers.insert(header::VARY, HeaderValue::from_static("Origin"));
         headers.insert(
@@ -198,13 +201,14 @@ async fn cors_middleware(req: Request, next: Next) -> Response {
         );
     }
 
-    // M2 (security-заголовки на API-ответах): применяются на тех же
-    // маршрутах, что и CORS выше (`/api/rooms`, `/config`, `/version.json` —
-    // см. `.route_layer(cors...)` в `main()`), НЕЗАВИСИМО от того, задан ли
-    // `CORS_ORIGIN` — это чисто ответные заголовки, не про кросс-ориджин.
-    // Страницы (`page()`/`static_file()`) их не получают — эта мидлварь на
-    // них не навешана вовсе (см. main()), фронт-статика уезжает на Cloudflare
-    // Pages и заголовки страниц настраивает через `_headers` сама.
+    // M2 (security headers on API responses): applied on the same routes as
+    // CORS above (`/api/rooms`, `/config`, `/version.json` — see
+    // `.route_layer(cors...)` in `main()`), REGARDLESS of whether
+    // `CORS_ORIGIN` is set — these are purely response headers, not about
+    // cross-origin. Pages (`page()`/`static_file()`) don't get them — this
+    // middleware isn't attached to them at all (see main()), the frontend
+    // static assets move to Cloudflare Pages and it configures page headers
+    // itself via `_headers`.
     let headers = response.headers_mut();
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
@@ -212,14 +216,15 @@ async fn cors_middleware(req: Request, next: Next) -> Response {
     response
 }
 
-/// Handler-заглушка для метода `OPTIONS` на CORS-маршрутах. Тело НИКОГДА не
-/// выполняется: `cors_middleware` перехватывает `OPTIONS` до вызова
-/// `next.run()` и отвечает сам. Он всё равно должен существовать: у axum
-/// `MethodRouter` без зарегистрированного `OPTIONS` коротит незнакомый метод
-/// сразу в `405 Method Not Allowed` — ДО того, как запрос вообще дойдёт до
-/// `route_layer`-мидлвари (её накат `.route_layer()` оборачивает только уже
-/// зарегистрированные на этом MethodRouter методы, а не 405-фоллбэк) — без
-/// этой заглушки preflight OPTIONS никогда бы не увидел CORS-заголовки.
+/// Stub handler for the `OPTIONS` method on CORS routes. The body is NEVER
+/// executed: `cors_middleware` intercepts `OPTIONS` before `next.run()` is
+/// called and responds itself. It still has to exist: axum's
+/// `MethodRouter`, without a registered `OPTIONS`, short-circuits an
+/// unrecognized method straight to `405 Method Not Allowed` — BEFORE the
+/// request even reaches the `route_layer` middleware (its `.route_layer()`
+/// wrapping only covers methods already registered on this MethodRouter,
+/// not the 405 fallback) — without this stub, preflight OPTIONS would never
+/// see the CORS headers.
 async fn options_stub() -> StatusCode {
     StatusCode::NO_CONTENT
 }
@@ -233,48 +238,50 @@ async fn main() {
         )
         .init();
 
-    // Prometheus-метрики (см. src/metrics.rs) — тот же паттерн/крейт, что у
-    // code-ranker-backend (см. `code-ranker-private/backend/src/main.rs`):
-    // отдельный management-сервер на своём порту с `/metrics`, НЕ на основном
-    // 8080 и НЕ в Service/ingress (см. deploy/manifests/deployment.yaml) —
-    // тот же `MGMT_PORT`, что у code-ranker, дефолт 8081. Устанавливаем
-    // recorder и поднимаем listener ДО остального (роли/комнаты/основной
-    // сервер) — если что-то в инициализации ниже упадёт, лучше уже видеть
-    // это в метриках/логах management-порта, чем не иметь вообще ничего.
+    // Prometheus metrics (see src/metrics.rs) — the same pattern/crate as
+    // code-ranker-backend (see `code-ranker-private/backend/src/main.rs`):
+    // a separate management server on its own port with `/metrics`, NOT on
+    // the main 8080 and NOT in the Service/ingress (see
+    // deploy/manifests/deployment.yaml) — the same `MGMT_PORT` as
+    // code-ranker, default 8081. We install the recorder and bring up the
+    // listener BEFORE everything else (roles/rooms/main server) — if
+    // something in the initialization below panics, it's better to already
+    // see it in the management port's metrics/logs than to have nothing at
+    // all.
     let prometheus = PrometheusBuilder::new()
         .install_recorder()
-        .expect("не удалось установить Prometheus recorder");
+        .expect("failed to install the Prometheus recorder");
     metrics::describe();
     spawn_metrics_server(prometheus).await;
 
     let rooms = Arc::new(Mutex::new(HashMap::new()));
 
-    // Сколько пустая комната (никого не подключилось / все вышли) живёт до
-    // удаления реапером. Дефолт 120с — время создателю перейти по ссылке;
-    // в тестах выставляется значительно короче.
+    // How long an empty room (nobody connected / everyone left) lives
+    // before the reaper deletes it. Default 120s — time for the creator to
+    // follow the link; set much shorter in tests.
     let empty_room_ttl_secs: u64 = std::env::var("EMPTY_ROOM_TTL_SECONDS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(120);
     let empty_room_ttl = Duration::from_secs(empty_room_ttl_secs);
-    // Лимит длительности созвона (см. docs/security.md, «Meeting Duration
-    // Ceiling») — читаем сразу (форсируем LazyLock), чтобы значение зафиксировалось до
-    // спауна реапера и первого запроса.
+    // Call duration limit (see docs/security.md, "Meeting Duration
+    // Ceiling") — read right away (forcing the LazyLock), so the value is
+    // fixed before the reaper is spawned and the first request arrives.
     let max_room_lifetime = *MAX_ROOM_LIFETIME;
     tokio::spawn(state::reap_rooms(rooms.clone(), empty_room_ttl, max_room_lifetime));
 
-    // H2 (DoS-защита): потолок числа комнат одновременно — env `MAX_ROOMS`,
-    // дефолт `DEFAULT_MAX_ROOMS`.
+    // H2 (DoS protection): ceiling on the number of rooms at once — env
+    // `MAX_ROOMS`, default `DEFAULT_MAX_ROOMS`.
     let max_rooms: usize = std::env::var("MAX_ROOMS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_MAX_ROOMS);
 
-    // C (docs/research-ops.md §1.0/§1.6): канал активного broadcast-закрытия
-    // WS по SIGTERM/SIGINT — см. `shutdown_signal` ниже и `AppState::shutdown`.
-    // Начальный приёмник от `channel()` нам не нужен (подписчики создаются
-    // позже через `subscribe()` по одному на каждое WS-соединение) — дропаем
-    // его сразу же деструктуризацией.
+    // C (docs/research-ops.md §1.0/§1.6): channel for actively broadcasting
+    // WS shutdown on SIGTERM/SIGINT — see `shutdown_signal` below and
+    // `AppState::shutdown`. We don't need the initial receiver from
+    // `channel()` (subscribers are created later via `subscribe()`, one per
+    // WS connection) — we drop it right away by destructuring.
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
 
     let state = AppState {
@@ -286,15 +293,15 @@ async fn main() {
         shutdown: shutdown_tx.clone(),
     };
 
-    // Ш2: CORS-мидлварь навешивается ТОЧЕЧНО только на кросс-оригин
-    // HTTP-эндпоинты (см. cors_middleware выше) — статика/страницы/`/ws` её
-    // не видят вовсе.
+    // Phase 2: the CORS middleware is attached POINTEDLY only to
+    // cross-origin HTTP endpoints (see cors_middleware above) — static
+    // assets/pages/`/ws` never see it at all.
     let cors = middleware::from_fn(cors_middleware);
 
     let app = Router::new()
-        // Страница входа/лендинга.
+        // Landing/entry page.
         .route("/", get(|| page("index.html")))
-        // Страница комнаты: roomId фронтенд читает из URL сам.
+        // Room page: the frontend reads roomId from the URL itself.
         .route("/r/{room_id}", get(|_: Path<String>| page("room.html")))
         .route(
             "/api/rooms",
@@ -328,99 +335,104 @@ async fn main() {
     let addr = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
-        .unwrap_or_else(|e| panic!("не удалось занять {addr}: {e}"));
-    info!("сервер слушает http://localhost:{port}");
-    // `with_connect_info`: нужен для `ConnectInfo<SocketAddr>` в
-    // `ws::ws_handler`/`create_room` — фолбэк-источник IP клиента для
-    // per-IP лимитов (H2/M3), когда ни `CF-Connecting-IP`, ни
-    // `X-Forwarded-For` не пришли (прямое подключение без proxy).
+        .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
+    info!("server listening on http://localhost:{port}");
+    // `with_connect_info`: needed for `ConnectInfo<SocketAddr>` in
+    // `ws::ws_handler`/`create_room` — fallback source of the client IP for
+    // per-IP limits (H2/M3) when neither `CF-Connecting-IP` nor
+    // `X-Forwarded-For` was sent (direct connection without a proxy).
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown_signal(shutdown_tx))
         .await
-        .expect("серверу конец");
+        .expect("server ended unexpectedly");
 }
 
-/// Ждёт SIGTERM (стандартный сигнал остановки в k8s) или SIGINT (Ctrl+C
-/// локально). По любому из них сервер перестаёт принимать новые соединения
-/// (`axum::serve`'s `with_graceful_shutdown` останавливает листенер и ждёт
-/// завершения уже принятых HTTP-запросов) — но, как честно зафиксировано в
-/// docs/research-ops.md §1.0, это НЕ закрывает уже апгрейженные WS-соединения:
-/// они живут в собственных `tokio`-задачах (`ws::handle_socket`) вне
-/// видимости hyper и раньше пассивно доживали до `terminationGracePeriodSeconds`
-/// (30с в k8s-манифесте) и последующего `SIGKILL` — то есть простой
-/// сигналинга при активном созвоне в момент деплоя составлял ~30-40с.
+/// Waits for SIGTERM (the standard stop signal in k8s) or SIGINT (Ctrl+C
+/// locally). On either, the server stops accepting new connections
+/// (`axum::serve`'s `with_graceful_shutdown` stops the listener and waits
+/// for already-accepted HTTP requests to finish) — but, as honestly noted
+/// in docs/research-ops.md §1.0, this does NOT close already-upgraded WS
+/// connections: they live in their own `tokio` tasks (`ws::handle_socket`)
+/// outside hyper's visibility and used to passively live until
+/// `terminationGracePeriodSeconds` (30s in the k8s manifest) and the
+/// subsequent `SIGKILL` — meaning signaling downtime during an active call
+/// at deploy time was ~30-40s.
 ///
-/// C (§1.5/§1.6 того же документа, «дешёвое улучшение»): вместо пассивного
-/// ожидания рассылаем ВСЕМ открытым WS-соединениям (через
-/// `AppState::shutdown`, broadcast-подписка в каждом `handle_socket`) сигнал
-/// сразу закрыть свой сокет активно (`Close`-фрейм) — клиент ловит закрытие
-/// немедленно и начинает свой обычный auto-reconnect (`static/room.js`),
-/// вместо того чтобы держать мёртвый по факту сигналинг ещё десятки секунд.
-/// Это НЕ полноценный graceful drain (варианты 1.1-1.4 того исследования,
-/// сознательно не сделаны — см. их вердикт: несут риск split-brain
-/// несоразмерный выгоде для однопроцессной in-memory модели этого проекта) —
-/// минимальная мера: короткая пауза (не `terminationGracePeriodSeconds`,
-/// а именно «дать задачам время дослать один Close-фрейм в свой сокет перед
-/// тем, как процесс попытается завершиться»), см. `SHUTDOWN_FLUSH_GRACE`.
+/// C (§1.5/§1.6 of the same document, "cheap improvement"): instead of
+/// waiting passively, we broadcast to ALL open WS connections (via
+/// `AppState::shutdown`, a broadcast subscription in each `handle_socket`)
+/// a signal to actively close their own socket right away (a `Close`
+/// frame) — the client catches the closure immediately and starts its usual
+/// auto-reconnect (`static/room.js`), instead of the server holding onto a
+/// signaling connection that's effectively dead for another few dozen
+/// seconds. This is NOT a full graceful drain (options 1.1-1.4 of that
+/// research, deliberately not implemented — see their verdict: they carry a
+/// split-brain risk disproportionate to the benefit for this project's
+/// single-process in-memory model) — a minimal measure: a short pause (not
+/// `terminationGracePeriodSeconds`, but specifically "give the tasks time
+/// to push one more Close frame onto their socket before the process tries
+/// to exit"), see `SHUTDOWN_FLUSH_GRACE`.
 async fn shutdown_signal(shutdown_tx: state::ShutdownSignal) {
     let sigterm = async {
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("не удалось подписаться на SIGTERM")
+            .expect("failed to subscribe to SIGTERM")
             .recv()
             .await;
     };
     let sigint = async {
         tokio::signal::ctrl_c()
             .await
-            .expect("не удалось подписаться на SIGINT");
+            .expect("failed to subscribe to SIGINT");
     };
     tokio::select! {
-        _ = sigterm => info!("получен SIGTERM — активно закрываем открытые WS-соединения"),
-        _ = sigint => info!("получен SIGINT — активно закрываем открытые WS-соединения"),
+        _ = sigterm => info!("received SIGTERM — actively closing open WS connections"),
+        _ = sigint => info!("received SIGINT — actively closing open WS connections"),
     }
-    // Приёмников может не быть вовсе (нет ни одного открытого WS в моменте) —
-    // `send` тогда просто вернёт ошибку, которую сознательно игнорируем: это
-    // штатный случай, а не сбой.
+    // There may be no receivers at all (not a single open WS at the
+    // moment) — `send` will then simply return an error, which we
+    // deliberately ignore: this is a normal case, not a failure.
     let _ = shutdown_tx.send(());
-    // Дать уже разбуженным задачам `handle_socket` время дойти до
-    // `socket.send(Message::Close(...))` и реально протолкнуть кадр в TCP,
-    // прежде чем `axum::serve(...)` вернётся из `.await` и процесс завершится
-    // (в этот момент раннтайм молча роняет оставшиеся задачи, недописанное не
-    // долетит). НЕ полноценный `terminationGracePeriodSeconds` (30с) — на
-    // порядки меньше, с большим запасом на то, чтобы кооперативный
-    // планировщик tokio просто успел прокрутить эти задачи хотя бы раз.
+    // Give the now-woken `handle_socket` tasks time to reach
+    // `socket.send(Message::Close(...))` and actually push the frame onto
+    // TCP, before `axum::serve(...)` returns from `.await` and the process
+    // exits (at which point the runtime silently drops the remaining
+    // tasks, anything not yet sent won't get through). NOT a full
+    // `terminationGracePeriodSeconds` (30s) — orders of magnitude smaller,
+    // with plenty of margin for tokio's cooperative scheduler to simply get
+    // a chance to run these tasks at least once.
     tokio::time::sleep(SHUTDOWN_FLUSH_GRACE).await;
 }
 
-/// См. `shutdown_signal`.
+/// See `shutdown_signal`.
 const SHUTDOWN_FLUSH_GRACE: Duration = Duration::from_millis(500);
 
-/// Поднимает management-сервер (пока только `/metrics`) на СВОЁМ,
-/// ОТДЕЛЬНОМ от основного порту — тот же паттерн, что у `code-ranker-backend`
-/// (см. `code-ranker-private/backend/src/main.rs`): `/metrics` не примешан к
-/// основному 8080 (который стоит за `Service`/`Ingress`, см.
-/// `deploy/manifests/service.yaml`/`ingress.yaml`) — management-порт в
-/// `Service` сознательно НЕ проброшен (см. `deploy/manifests/deployment.yaml`),
-/// Prometheus скрейпит его напрямую по IP пода через `kubernetes_sd_config` +
-/// аннотации `prometheus.io/scrape|port|path` на самом поде (см. тот же
-/// манифест, `simple-deploy/standards/observability/metrics.md`, §
-/// «Автодискавери таргетов»).
+/// Brings up the management server (for now just `/metrics`) on ITS OWN
+/// port, SEPARATE from the main one — the same pattern as
+/// `code-ranker-backend` (see `code-ranker-private/backend/src/main.rs`):
+/// `/metrics` isn't mixed into the main 8080 (which sits behind a
+/// `Service`/`Ingress`, see `deploy/manifests/service.yaml`/`ingress.yaml`)
+/// — the management port is deliberately NOT exposed in the `Service` (see
+/// `deploy/manifests/deployment.yaml`), Prometheus scrapes it directly by
+/// pod IP via `kubernetes_sd_config` + `prometheus.io/scrape|port|path`
+/// annotations on the pod itself (see the same manifest,
+/// `simple-deploy/standards/observability/metrics.md`, § "Target
+/// autodiscovery").
 ///
-/// В отличие от `/healthz` (который остаётся на основном порту 8080 — этот
-/// эндпоинт уже используется readiness/liveness-пробами в
-/// `deploy/manifests/deployment.yaml`, трогать их не было причины) —
-/// `/metrics` заводится заново, только на management-порту, ничего
-/// существующего не переносим и не ломаем.
+/// Unlike `/healthz` (which stays on the main port 8080 — this endpoint is
+/// already used by the readiness/liveness probes in
+/// `deploy/manifests/deployment.yaml`, there was no reason to touch them) —
+/// `/metrics` is set up fresh, only on the management port, nothing
+/// existing is moved or broken.
 ///
-/// НЕ участвует в graceful shutdown основного сервера (`shutdown_signal`
-/// ниже): это внутренний scrape-эндпоинт без пользовательского состояния —
-/// обрывать его отдельной церемонией незачем, он просто перестаёт отвечать
-/// вместе с завершением процесса.
+/// Does NOT participate in the main server's graceful shutdown
+/// (`shutdown_signal` below): this is an internal scrape endpoint with no
+/// user-facing state — there's no need for a separate shutdown ceremony for
+/// it, it simply stops responding along with the process exiting.
 ///
-/// Ошибка bind (порт занят/недоступен) — не фатальна для всего процесса:
-/// метрики — вспомогательная возможность, а не то, ради чего вообще
-/// существует сервер (WS-сигналинг/статика) — логируем и продолжаем без них,
-/// а не паникуем.
+/// A bind error (port taken/unavailable) is not fatal to the whole process:
+/// metrics are an auxiliary capability, not the reason the server exists in
+/// the first place (WS signaling/static assets) — we log it and continue
+/// without them, rather than panicking.
 async fn spawn_metrics_server(handle: PrometheusHandle) {
     let mgmt_port: u16 = std::env::var("MGMT_PORT")
         .ok()
@@ -436,62 +448,61 @@ async fn spawn_metrics_server(handle: PrometheusHandle) {
     let addr = format!("0.0.0.0:{mgmt_port}");
     match tokio::net::TcpListener::bind(&addr).await {
         Ok(listener) => {
-            info!("management-сервер (метрики) слушает http://localhost:{mgmt_port}");
+            info!("management server (metrics) listening on http://localhost:{mgmt_port}");
             tokio::spawn(async move {
                 if let Err(e) = axum::serve(listener, mgmt_router).await {
-                    tracing::error!("management-сервер упал: {e}");
+                    tracing::error!("management server crashed: {e}");
                 }
             });
         }
         Err(e) => {
-            tracing::error!("не удалось занять management-порт {addr}: {e} — метрики недоступны, основной сервер продолжает без них");
+            tracing::error!("failed to bind management port {addr}: {e} — metrics unavailable, main server continues without them");
         }
     }
 }
 
-/// Prometheus-экспозиция (`text/plain; version=0.0.4`) — рендерится по
-/// запросу из установленного при старте recorder'а (см. `main()`), без
-/// собственного буфера/кэша: `PrometheusHandle::render()` сам достаточно
-/// дёшев для нашего масштаба (единицы метрик, без обвеса гистограммами RED —
-/// см. `crate::metrics`).
+/// Prometheus exposition (`text/plain; version=0.0.4`) — rendered on
+/// request from the recorder installed at startup (see `main()`), with no
+/// buffer/cache of its own: `PrometheusHandle::render()` is itself cheap
+/// enough at our scale (a handful of metrics, no RED-histogram overhead —
+/// see `crate::metrics`).
 fn render_metrics(handle: PrometheusHandle) -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], handle.render())
 }
 
-/// `POST /api/rooms`: создать новую ПУСТУЮ комнату (протокол v2 — комната
-/// заводится отдельно от входа в неё, чтобы создатель успел скопировать и
-/// открыть ссылку). Тело запроса опционально и сейчас не используется
-/// (задел на будущее — например, название комнаты), поэтому сознательно не
-/// парсится вовсе.
+/// `POST /api/rooms`: create a new EMPTY room (protocol v2 — a room is set
+/// up separately from joining it, so the creator has time to copy and open
+/// the link). The request body is optional and currently unused (a hook for
+/// the future — e.g. a room name), so it's deliberately not parsed at all.
 ///
-/// Комната без единого участника живёт `EMPTY_ROOM_TTL_SECONDS` — если за
-/// это время никто не подключится, реапер (`state::reap_rooms`) её
-/// удалит.
+/// A room with no participants lives for `EMPTY_ROOM_TTL_SECONDS` — if
+/// nobody connects within that time, the reaper (`state::reap_rooms`)
+/// deletes it.
 ///
-/// Возвращает вместе с `roomId` одноразовый `leaderToken` (см.
-/// docs/permissions-and-leader.md): создатель предъявляет его в своём `join-room`, чтобы
-/// стать лидером комнаты — токен сгорает при первом же успешном предъявлении
-/// (совпавшем с хранимым). Если никто не предъявит токен, лидером станет
-/// первый вошедший как обычно.
+/// Returns, along with `roomId`, a one-time `leaderToken` (see
+/// docs/permissions-and-leader.md): the creator presents it in their own
+/// `join-room` to become the room's leader — the token is burned on the
+/// first successful presentation (matching the stored one). If nobody
+/// presents the token, whoever joins first becomes the leader as usual.
 ///
-/// Также возвращает `lifetimeSeconds` — тот же `MAX_ROOM_LIFETIME`, которым
-/// сервер ограничивает длительность созвона (см. `MAX_ROOM_LIFETIME`,
-/// docs/security.md, «Meeting Duration Ceiling»). Нужен клиенту E2E v2 (см.
-/// docs/research-p2p-key-handoff.md §6.5–6.6): срок действия ссылки (`e` в
-/// фрагменте URL) зашивается в деривацию ключей клиентом при создании
-/// комнаты, а не подсматривается заново при каждом входе — поэтому клиент
-/// должен узнать лимит именно в момент создания.
+/// Also returns `lifetimeSeconds` — the same `MAX_ROOM_LIFETIME` the server
+/// uses to cap call duration (see `MAX_ROOM_LIFETIME`, docs/security.md,
+/// "Meeting Duration Ceiling"). Needed by the E2E v2 client (see
+/// docs/research-p2p-key-handoff.md §6.5–6.6): the link's expiry (`e` in the
+/// URL fragment) is baked into key derivation by the client at room
+/// creation time, not looked up again on every join — so the client needs
+/// to learn the limit exactly at creation time.
 async fn create_room(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    // H2 (DoS-защита): per-IP лимит — не больше ROOM_CREATION_IP_LIMIT
-    // запросов за ROOM_CREATION_IP_WINDOW с одного IP (см. её комментарий в
-    // state.rs про то, почему бюджет отдельный от лобби).
+    // H2 (DoS protection): per-IP limit — no more than ROOM_CREATION_IP_LIMIT
+    // requests per ROOM_CREATION_IP_WINDOW from a single IP (see its
+    // comment in state.rs for why the budget is separate from the lobby's).
     let ip = extract_client_ip(&headers, Some(peer_addr));
     if !check_ip_rate_limit(&state.room_creation_ips, &ip, *ROOM_CREATION_IP_LIMIT, ROOM_CREATION_IP_WINDOW) {
-        warn!(%ip, "превышен per-IP лимит создания комнат — 429");
+        warn!(%ip, "per-IP room creation limit exceeded — 429");
         return (StatusCode::TOO_MANY_REQUESTS, "too many rooms created, slow down").into_response();
     }
 
@@ -499,20 +510,21 @@ async fn create_room(
     let leader_token = Uuid::new_v4().to_string();
 
     let mut rooms_guard = state.rooms.lock().unwrap();
-    // H2 (DoS-защита): глобальный потолок числа комнат — проверяем ПОД ТЕМ
-    // ЖЕ локом, что и вставку ниже, иначе гонка двух одновременных create_room
-    // могла бы обе пройти проверку и вместе превысить потолок.
+    // H2 (DoS protection): the global ceiling on the number of rooms — we
+    // check it under the SAME lock as the insert below, otherwise a race
+    // between two concurrent create_room calls could let both pass the
+    // check and together exceed the ceiling.
     if rooms_guard.len() >= state.max_rooms {
         drop(rooms_guard);
-        warn!(max_rooms = state.max_rooms, "потолок числа комнат достигнут — 503");
+        warn!(max_rooms = state.max_rooms, "room count ceiling reached — 503");
         return (StatusCode::SERVICE_UNAVAILABLE, "server busy").into_response();
     }
-    // Коллизия 8-символьного id астрономически маловероятна (32^8 вариантов);
-    // в теоретическом проигрышном случае просто отказываем — клиент повторит
-    // запрос.
+    // A collision of an 8-character id is astronomically unlikely (32^8
+    // possibilities); in the theoretical losing case we simply refuse — the
+    // client retries the request.
     if rooms_guard.contains_key(&room_id) {
         drop(rooms_guard);
-        warn!(room = %room_id, "коллизия roomId при создании — отказ");
+        warn!(room = %room_id, "roomId collision on creation — refusing");
         return (StatusCode::INTERNAL_SERVER_ERROR, "try again").into_response();
     }
     rooms_guard.insert(
@@ -520,8 +532,8 @@ async fn create_room(
         Room {
             participants: HashMap::new(),
             screen_owner: None,
-            // Сразу помечена «пустой»: если никто не подключится за TTL,
-            // реапер её удалит.
+            // Marked "empty" right away: if nobody connects within the TTL,
+            // the reaper deletes it.
             emptied_at: Some(Instant::now()),
             leader_id: None,
             leader_token: Some(leader_token.clone()),
@@ -532,10 +544,11 @@ async fn create_room(
         },
     );
     drop(rooms_guard);
-    // `::metrics` (ведущие `::`) — внешний крейт `metrics`, а не наш модуль
-    // `crate::metrics` (см. `mod metrics;` ниже) — оба называются одинаково.
+    // `::metrics` (leading `::`) — the external `metrics` crate, not our
+    // own `crate::metrics` module (see `mod metrics;` below) — both happen
+    // to be named the same.
     ::metrics::counter!(crate::metrics::ROOMS_CREATED_TOTAL).increment(1);
-    info!(room = %room_id, "комната создана (пустая)");
+    info!(room = %room_id, "room created (empty)");
 
     (
         StatusCode::CREATED,
@@ -548,38 +561,40 @@ async fn create_room(
         .into_response()
 }
 
-/// `PUT /api/rooms/{room_id}`: идемпотентное восстановление комнаты после
-/// рестарта сервера (см. docs/self-hosting.md, «Surviving a Restart/Redeploy»)
-/// — вся память комнат целиком в процессе, поэтому рестарт стирает её без следа, а
-/// клиенты при авто-reconnect могут наткнуться на `room-not-found` для
-/// комнаты, в которой только что были. Вместо того чтобы это было тупиком,
-/// фронтенд (см. `static/room.js`) в ответ на `room-not-found` при
-/// переподключении сначала бьёт сюда с ЗАПОМНЕННЫМ `roomId`, а затем повторяет
-/// `join-room`.
+/// `PUT /api/rooms/{room_id}`: idempotent room restoration after a server
+/// restart (see docs/self-hosting.md, "Surviving a Restart/Redeploy") — all
+/// room memory lives entirely in the process, so a restart wipes it without
+/// a trace, and clients auto-reconnecting may run into `room-not-found` for
+/// a room they were just in. Rather than that being a dead end, the
+/// frontend (see `static/room.js`), in response to `room-not-found` while
+/// reconnecting, first hits this endpoint with the REMEMBERED `roomId`,
+/// then retries `join-room`.
 ///
-/// Семантика идемпотентности:
-///   - `room_id` не соответствует формату (`^[a-z0-9]{8}$`, см.
+/// Idempotency semantics:
+///   - `room_id` doesn't match the format (`^[a-z0-9]{8}$`, see
 ///     `is_valid_room_id`) — `400`;
-///   - комнаты с таким id нет — создаём пустую (как `POST /api/rooms`, но с
-///     заданным, а не случайным id) — `201`;
-///   - комната уже есть (не важно, пуста или с участниками) — ничего не
-///     трогаем, просто подтверждаем — `200`.
+///   - no room with that id exists — create an empty one (like `POST
+///     /api/rooms`, but with a given id rather than a random one) — `201`;
+///   - the room already exists (whether empty or with participants) —
+///     touch nothing, just confirm — `200`.
 ///
-/// В обоих успешных случаях (`200`/`201`) ответ дополнительно несёт то же
-/// `lifetimeSeconds`, что `POST /api/rooms` — для симметрии API; на практике
-/// клиенту E2E v2 оно тут не нужно (срок `e` уже зашит в адресной строке при
-/// восстановлении того же таба, см. docs/research-p2p-key-handoff.md §6.5–6.6).
+/// In both success cases (`200`/`201`) the response additionally carries the
+/// same `lifetimeSeconds` as `POST /api/rooms` — for API symmetry; in
+/// practice the E2E v2 client doesn't need it here (the `e` expiry is
+/// already baked into the address bar when restoring the same tab, see
+/// docs/research-p2p-key-handoff.md §6.5–6.6).
 ///
-/// Про безопасность восстановления по известному id: комнаты в этом проекте
-/// эфемерны и не имеют отдельного контроля доступа — единственный секрет это
-/// сам `roomId` в ссылке (см. docs/privacy.md). Восстановление по
-/// уже известному клиенту id НИЧЕГО не расширяет по доступу — кто знал
-/// ссылку до рестарта, тот и после рестарта мог бы просто получить
-/// `room-not-found` и создать СВОЮ новую комнату с другим id; этот эндпоинт
-/// лишь избавляет знающего ссылку от необходимости создавать новую и
-/// рассылать её заново остальным участникам. Кто ссылку не знал — не может
-/// подобрать `room_id` (8 символов из ограниченного алфавита) практическим
-/// перебором ни через этот эндпоинт, ни через `POST /api/rooms`.
+/// On the security of restoring by a known id: rooms in this project are
+/// ephemeral and have no separate access control — the only secret is the
+/// `roomId` itself in the link (see docs/privacy.md). Restoring by an id
+/// already known to the client expands access NOTHING — whoever knew the
+/// link before the restart could, after the restart, just as well get
+/// `room-not-found` and create THEIR OWN new room with a different id; this
+/// endpoint merely saves whoever knows the link from having to create a new
+/// one and redistribute it to the other participants. Whoever didn't know
+/// the link can't brute-force a `room_id` (8 characters from a limited
+/// alphabet) in any practical way, neither through this endpoint nor
+/// through `POST /api/rooms`.
 async fn restore_room(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
@@ -590,19 +605,21 @@ async fn restore_room(
         return (StatusCode::BAD_REQUEST, "invalid room id").into_response();
     }
 
-    // H2 (DoS-защита, docs/research-dos.md §3.1): PUT раньше не проверял
-    // per-IP лимит вовсе — единственный «create-подобный» маршрут (создаёт
-    // запись в `rooms`, если её не было) без учёта IP. Делит бюджет с `POST
-    // /api/rooms` (тот же `ROOM_CREATION_IP_LIMIT`/`room_creation_ips`) —
-    // не отдельный счётчик: с точки зрения этого лимита не важно, каким из
-    // двух путей вызывающий заводит запись комнаты, важно СКОЛЬКО записей
-    // один IP заводит суммарно за окно. Проверяем безусловно (даже если
-    // комната по этому `room_id` уже существует и ветка ниже вернёт `200`
-    // без создания) — простая единая точка проверки для всего хендлера,
-    // не только для «настоящей» ветки создания.
+    // H2 (DoS protection, docs/research-dos.md §3.1): PUT previously didn't
+    // check the per-IP limit at all — the only "create-like" route (creates
+    // a record in `rooms` if there wasn't one) with no IP accounting.
+    // Shares its budget with `POST /api/rooms` (the same
+    // `ROOM_CREATION_IP_LIMIT`/`room_creation_ips`) — not a separate
+    // counter: for the purposes of this limit it doesn't matter which of
+    // the two paths the caller uses to set up a room record, what matters
+    // is HOW MANY records a single IP sets up in total over the window.
+    // We check unconditionally (even if a room with this `room_id` already
+    // exists and the branch below returns `200` without creating anything)
+    // — a single simple check point for the whole handler, not just the
+    // "actual" creation branch.
     let ip = extract_client_ip(&headers, Some(peer_addr));
     if !check_ip_rate_limit(&state.room_creation_ips, &ip, *ROOM_CREATION_IP_LIMIT, ROOM_CREATION_IP_WINDOW) {
-        warn!(%ip, "превышен per-IP лимит создания/восстановления комнат — 429 (PUT)");
+        warn!(%ip, "per-IP room creation/restoration limit exceeded — 429 (PUT)");
         return (StatusCode::TOO_MANY_REQUESTS, "too many rooms created, slow down").into_response();
     }
 
@@ -615,11 +632,11 @@ async fn restore_room(
         )
             .into_response();
     }
-    // H2 (DoS-защита): тот же глобальный потолок, что в create_room, под тем
-    // же локом — восстановление НЕсуществующей комнаты тоже создаёт запись.
+    // H2 (DoS protection): the same global ceiling as in create_room, under
+    // the same lock — restoring a NONEXISTENT room also creates a record.
     if rooms_guard.len() >= state.max_rooms {
         drop(rooms_guard);
-        warn!(max_rooms = state.max_rooms, "потолок числа комнат достигнут — 503 (restore)");
+        warn!(max_rooms = state.max_rooms, "room count ceiling reached — 503 (restore)");
         return (StatusCode::SERVICE_UNAVAILABLE, "server busy").into_response();
     }
     rooms_guard.insert(
@@ -628,28 +645,30 @@ async fn restore_room(
             participants: HashMap::new(),
             screen_owner: None,
             emptied_at: Some(Instant::now()),
-            // Восстановленная комната токен лидера не выдаёт — лидером
-            // станет первый вошедший (см. docs/permissions-and-leader.md).
+            // A restored room doesn't issue a leader token — whoever joins
+            // first becomes the leader (see docs/permissions-and-leader.md).
             leader_id: None,
             leader_token: None,
             settings: RoomSettings::default(),
             pending: HashMap::new(),
-            // Отсчёт лимита длительности созвона — с момента восстановления,
-            // а не какого-то исходного создания (память о нём не переживает
-            // рестарт сервера) — см. комментарий у Room::created_at.
+            // The call duration limit countdown starts from the moment of
+            // restoration, not from some original creation (memory of that
+            // doesn't survive a server restart) — see the comment on
+            // Room::created_at.
             created_at: Instant::now(),
-            // Как и created_at — рестарт не переживает, отсчёт возраста
-            // комнаты для roomAgeSeconds начнётся заново с первого входа
-            // после восстановления (см. комментарий у Room::first_joined_at).
+            // Like created_at — doesn't survive a restart, the room's age
+            // countdown for roomAgeSeconds will start over from the first
+            // join after restoration (see the comment on
+            // Room::first_joined_at).
             first_joined_at: None,
         },
     );
     drop(rooms_guard);
-    // Реальное создание записи (в отличие от идемпотентной 200-ветки выше,
-    // которая ничего не создаёт и здесь не оказывается) — считается в
-    // chat_rooms_created_total наравне с POST /api/rooms.
+    // An actual record creation (unlike the idempotent 200-branch above,
+    // which creates nothing and never reaches here) — counted in
+    // chat_rooms_created_total on par with POST /api/rooms.
     ::metrics::counter!(crate::metrics::ROOMS_CREATED_TOTAL).increment(1);
-    info!(room = %room_id, "комната восстановлена после рестарта (PUT /api/rooms/{{id}})");
+    info!(room = %room_id, "room restored after restart (PUT /api/rooms/{{id}})");
 
     (
         StatusCode::CREATED,
@@ -658,15 +677,17 @@ async fn restore_room(
         .into_response()
 }
 
-/// Проба готовности/живости для k8s: если процесс отвечает на HTTP — он жив.
+/// Readiness/liveness probe for k8s: if the process responds over HTTP, it's
+/// alive.
 async fn healthz() -> &'static str {
     "ok"
 }
 
-/// Версия задеплоенного артефакта (стандарт versioning-release.md):
-/// APP_VERSION/GIT_COMMIT/BUILD_DATE впекает CI через build-args Dockerfile.
-/// Клиенты могут сверять версию для детекта version-skew (баннер «обновите
-/// страницу» — задел на будущее). Локальный `cargo run` отдаёт "dev".
+/// Version of the deployed artifact (versioning-release.md standard):
+/// APP_VERSION/GIT_COMMIT/BUILD_DATE are baked in by CI via Dockerfile
+/// build-args. Clients can compare the version to detect version-skew (a
+/// "refresh the page" banner — a hook for the future). A local `cargo run`
+/// returns "dev".
 async fn version_json() -> Json<serde_json::Value> {
     let env_or = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
     Json(json!({
@@ -676,29 +697,29 @@ async fn version_json() -> Json<serde_json::Value> {
     }))
 }
 
-/// Запрет кэширования страниц и статики. Без этого Cloudflare кэширует
-/// .css/.js на edge по расширению (origin не слал Cache-Control), и после
-/// деплоя браузеры получали СТАРУЮ статику к новой разметке — страницы
-/// выглядели разломанными до истечения edge-TTL (поймано живой проверкой
-/// прода 2026-07-12). Файлы крошечные, безусловный no-cache дешевле и
-/// надёжнее ETag-механики.
+/// Disallow caching of pages and static assets. Without this, Cloudflare
+/// caches .css/.js at the edge by extension (the origin sent no
+/// Cache-Control), and after a deploy browsers got OLD static assets paired
+/// with new markup — pages looked broken until the edge TTL expired (caught
+/// by a live check of production on 2026-07-12). The files are tiny,
+/// unconditional no-cache is cheaper and more reliable than ETag machinery.
 const NO_CACHE: (header::HeaderName, &str) = (header::CACHE_CONTROL, "no-cache");
 
-/// Отдать HTML-страницу из static/.
+/// Serve an HTML page from static/.
 async fn page(name: &str) -> Response {
     match tokio::fs::read_to_string(format!("{}/{name}", *STATIC_DIR)).await {
         Ok(body) => ([NO_CACHE], Html(body)).into_response(),
         Err(e) => {
-            tracing::error!("нет файла статики {name}: {e}");
+            tracing::error!("missing static file {name}: {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, "static file missing").into_response()
         }
     }
 }
 
-/// Отдать ассет из static/ (js/css). Без сторонних крейтов: файлов три штуки,
-/// полноценный ServeDir не нужен.
+/// Serve an asset from static/ (js/css). No third-party crates: there are
+/// only a handful of files, a full-blown ServeDir isn't needed.
 async fn static_file(Path(path): Path<String>) -> Response {
-    // Защита от выхода за пределы каталога.
+    // Protection against escaping the directory.
     if path.contains("..") || path.contains('\\') {
         return (StatusCode::BAD_REQUEST, "bad path").into_response();
     }
@@ -715,20 +736,21 @@ async fn static_file(Path(path): Path<String>) -> Response {
     }
 }
 
-/// H1 (эфемерные TURN-креды, см. docs/security.md, «H1 — Ephemeral TURN
-/// Credentials», и docs/self-hosting.md, «TURN (Optional)»): срок жизни
-/// каждой выданной `/config` пары username/credential — час достаточно на
-/// звонок (см. `MAX_ROOM_LIFETIME` — комнаты и так живут не дольше 3ч по
-/// умолчанию, а сам созвон переустанавливать ICE каждый час не должен: раз
-/// установленное TURN-allocation клиент продолжает рефрешить тем же
-/// credential, полученным при входе). НЕ энфорсится сервером turn-rs (см.
-/// предупреждение в `ice_config` ниже) — реальная граница жизни утёкшей
-/// пары задаётся ротацией `TURN_STATIC_SECRET`, а не этим числом.
+/// H1 (ephemeral TURN credentials, see docs/security.md, "H1 — Ephemeral
+/// TURN Credentials", and docs/self-hosting.md, "TURN (Optional)"): the
+/// lifetime of each username/credential pair handed out by `/config` — an
+/// hour is enough for a call (see `MAX_ROOM_LIFETIME` — rooms already don't
+/// live longer than 3h by default anyway, and the call itself shouldn't
+/// re-establish ICE every hour: once a TURN allocation is set up, the
+/// client keeps refreshing it with the same credential it got at join
+/// time). NOT enforced by the turn-rs server (see the caveat in
+/// `ice_config` below) — the real lifetime bound of a leaked pair is set by
+/// rotating `TURN_STATIC_SECRET`, not by this number.
 const TURN_CRED_TTL_SECONDS: u64 = 3600;
 
-/// Текущее unix-время в секундах. `unwrap_or_default()` на случай часов
-/// раньше эпохи (не должно происходить на реальном сервере) — деградирует
-/// в `0`, что для TTL-расчёта означает «уже истекло», а не панику.
+/// Current unix time in seconds. `unwrap_or_default()` in case the clock is
+/// before the epoch (shouldn't happen on a real server) — degrades to `0`,
+/// which for TTL computation means "already expired", not a panic.
 fn unix_now_secs() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -736,56 +758,59 @@ fn unix_now_secs() -> u64 {
         .as_secs()
 }
 
-/// `credential = base64(HMAC-SHA1(secret, username))` — ровно та схема TURN
-/// REST API (coturn-style long-term credentials,
-/// draft-uberti-behave-turn-rest-00 §2.2), которую понимает turn-rs через
-/// `auth.static-auth-secret` (проверено по его исходникам,
-/// `codec::crypto::static_auth_secret` в mycrl/turn-rs, считает буквально
-/// то же самое перед тем, как вывести из результата долгоживущий ключ
-/// `MD5(username:realm:password)`).
+/// `credential = base64(HMAC-SHA1(secret, username))` — exactly the TURN
+/// REST API scheme (coturn-style long-term credentials,
+/// draft-uberti-behave-turn-rest-00 §2.2) that turn-rs understands via
+/// `auth.static-auth-secret` (verified against its source,
+/// `codec::crypto::static_auth_secret` in mycrl/turn-rs, computes literally
+/// the same thing before deriving the long-lived key
+/// `MD5(username:realm:password)` from the result).
 fn turn_hmac_credential(secret: &str, username: &str) -> String {
     let mut mac = Hmac::<Sha1>::new_from_slice(secret.as_bytes())
-        .expect("HMAC-SHA1 принимает ключ произвольной длины");
+        .expect("HMAC-SHA1 accepts a key of any length");
     mac.update(username.as_bytes());
     BASE64_STANDARD.encode(mac.finalize().into_bytes())
 }
 
-/// ICE-конфигурация для клиента: STUN всегда, TURN — если задан `TURN_URL`
-/// (сервер turn-rs поднимается отдельно, см. `deploy/manifests/turn.yaml`).
+/// ICE configuration for the client: STUN always, TURN — if `TURN_URL` is
+/// set (the turn-rs server runs separately, see
+/// `deploy/manifests/turn.yaml`).
 ///
-/// H1 (было — открытый релей): раньше сервер отдавал СТАТИЧЕСКИЙ
-/// `TURN_USERNAME`/`TURN_PASSWORD` любому, кто вызвал `/config` — пара
-/// валидна бессрочно, пока админ не поменяет её руками сразу в двух местах
-/// (Secret turn-rs и Secret этого сервера) и не перезапустит оба — кто
-/// угодно, взяв её один раз, мог гонять свой трафик через наш TURN сколько
-/// угодно (кража bandwidth чужого хостера).
+/// H1 (formerly — an open relay): the server used to hand out a STATIC
+/// `TURN_USERNAME`/`TURN_PASSWORD` to whoever called `/config` — the pair
+/// was valid indefinitely, until an admin changed it by hand in two places
+/// at once (turn-rs's Secret and this server's Secret) and restarted both —
+/// anyone who grabbed it once could ride our TURN for their own traffic for
+/// as long as they liked (stealing our hoster's bandwidth).
 ///
-/// Теперь, если задан `TURN_STATIC_SECRET`, каждый вызов `/config` получает
-/// СВОЮ, отдельно вычисленную пару:
-///   - `username = "<unix-время-истечения>:chat"`;
+/// Now, if `TURN_STATIC_SECRET` is set, every call to `/config` gets its
+/// OWN, separately computed pair:
+///   - `username = "<unix-expiry-time>:chat"`;
 ///   - `credential = base64(HMAC-SHA1(TURN_STATIC_SECRET, username))`
-///     (см. `turn_hmac_credential`).
+///     (see `turn_hmac_credential`).
 ///
-/// ВАЖНО, честно: сам turn-rs эту встроенную в `username` метку времени НЕ
-/// проверяет — по его исходникам (`codec::crypto::static_auth_secret`),
-/// комментарий там прямо говорит, что RFC не обязывает к проверке
-/// временной метки и что за её актуальность отвечает внешний сервис.
-/// Значит, TTL здесь — это НЕ жёсткая граница на стороне TURN-сервера
-/// (протухшая по времени пара всё равно пройдёт HMAC-проверку и позволит
-/// и дальше рефрешить существующее allocation, и даже создать новое): это
-/// (а) метка для аудита в логах turn-rs (`get_password: username=...`), и
-/// (б) единица, синхронная с ПЕРИОДИЧЕСКОЙ РОТАЦИЕЙ `TURN_STATIC_SECRET` —
-/// именно ротация секрета (не встроенная метка) одним действием обесценивает
-/// вообще все ранее выданные пары сразу, и теперь для этого достаточно
-/// поменять ОДНО значение в ОДНОМ Secret'е, а не логин и пароль в двух
-/// разных местах синхронно. Настоящая серверная проверка срока (turn-rs
-/// умеет и её — `auth.enable-hooks-auth` + `hooks.endpoint`, вызов НАШЕГО
-/// вебхука на каждый `get_password`) — отдельная фаза, здесь не сделана.
+/// IMPORTANT, to be honest: turn-rs itself does NOT check this timestamp
+/// baked into `username` — per its source
+/// (`codec::crypto::static_auth_secret`), the comment there says outright
+/// that the RFC doesn't require checking the timestamp and that keeping it
+/// current is the external service's responsibility. So the TTL here is NOT
+/// a hard boundary on the TURN server's side (a pair expired by its
+/// timestamp will still pass HMAC verification and will still be able to
+/// refresh an existing allocation, or even create a new one): it's (a) a
+/// marker for auditing in turn-rs logs (`get_password: username=...`), and
+/// (b) a unit synchronized with the PERIODIC ROTATION of
+/// `TURN_STATIC_SECRET` — it's the secret rotation (not the embedded
+/// timestamp) that, in one action, invalidates all previously issued pairs
+/// at once, and now that only takes changing ONE value in ONE Secret,
+/// rather than a login and password in two different places in sync. A
+/// real server-side expiry check (turn-rs can do this too —
+/// `auth.enable-hooks-auth` + `hooks.endpoint`, calling OUR webhook on every
+/// `get_password`) is a separate phase, not done here.
 ///
-/// Обратная совместимость: если `TURN_STATIC_SECRET` не задан, но заданы
-/// старые `TURN_USERNAME`/`TURN_PASSWORD` — отдаём их как раньше (тот же
-/// статический риск, просто ещё не смигрировали на секрет). Если не задано
-/// вообще ничего — клиент получает только STUN, как и было.
+/// Backward compatibility: if `TURN_STATIC_SECRET` isn't set, but the old
+/// `TURN_USERNAME`/`TURN_PASSWORD` are — we hand those out as before (the
+/// same static risk, we just haven't migrated to the secret yet). If
+/// nothing at all is set — the client only gets STUN, as before.
 async fn ice_config() -> Json<serde_json::Value> {
     let mut servers = vec![json!({ "urls": "stun:stun.l.google.com:19302" })];
     if let Ok(url) = std::env::var("TURN_URL") {
@@ -801,7 +826,7 @@ async fn ice_config() -> Json<serde_json::Value> {
                 turn["username"] = json!(username);
                 turn["credential"] = json!(credential);
             } else {
-                // Фоллбэк обратной совместимости — старая статическая пара.
+                // Backward-compatibility fallback — the old static pair.
                 if let Ok(user) = std::env::var("TURN_USERNAME") {
                     turn["username"] = json!(user);
                 }
@@ -815,18 +840,19 @@ async fn ice_config() -> Json<serde_json::Value> {
     Json(json!({ "iceServers": servers }))
 }
 
-/// `room` валиден по `^[a-z0-9]{8}$` (то же множество символов, что генерирует
-/// `state::generate_room_id`, плюс цифры 0/1, которые генератор не использует,
-/// но которые не вредно принять во входной валидации).
+/// `room` is valid per `^[a-z0-9]{8}$` (the same character set that
+/// `state::generate_room_id` generates, plus digits 0/1, which the
+/// generator doesn't use but which it doesn't hurt to accept in input
+/// validation).
 fn is_valid_room_id(room: &str) -> bool {
     room.len() == 8 && room.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
 }
 
-/// H1 (эфемерные TURN-креды): юнит-проверка `turn_hmac_credential` и
-/// формата `username`, без подъёма сервера/turn-rs (для end-to-end
-/// проверки формата ответа `/config` см. docs/security.md, «H1 — Ephemeral
-/// TURN Credentials» — curl локально поднятого сервера с тестовым
-/// `TURN_STATIC_SECRET`).
+/// H1 (ephemeral TURN credentials): unit check of `turn_hmac_credential` and
+/// the `username` format, without bringing up a server/turn-rs (for an
+/// end-to-end check of the `/config` response format see docs/security.md,
+/// "H1 — Ephemeral TURN Credentials" — curl a locally running server with a
+/// test `TURN_STATIC_SECRET`).
 #[cfg(test)]
 mod turn_credential_tests {
     use super::*;
@@ -838,23 +864,23 @@ mod turn_credential_tests {
 
         let cred1 = turn_hmac_credential(secret, username);
         let cred2 = turn_hmac_credential(secret, username);
-        assert_eq!(cred1, cred2, "тот же вход должен давать тот же credential");
+        assert_eq!(cred1, cred2, "the same input should produce the same credential");
         assert!(!cred1.is_empty());
         assert!(
             BASE64_STANDARD.decode(&cred1).is_ok(),
-            "credential должен быть валидным base64: {cred1:?}"
+            "credential should be valid base64: {cred1:?}"
         );
 
         let cred_other_username = turn_hmac_credential(secret, "1234567891:chat");
         assert_ne!(
             cred1, cred_other_username,
-            "другой username должен давать другой credential"
+            "a different username should produce a different credential"
         );
 
-        let cred_other_secret = turn_hmac_credential("другой-секрет", username);
+        let cred_other_secret = turn_hmac_credential("different-secret", username);
         assert_ne!(
             cred1, cred_other_secret,
-            "другой secret должен давать другой credential"
+            "a different secret should produce a different credential"
         );
     }
 
@@ -866,13 +892,13 @@ mod turn_credential_tests {
 
         let (ts_part, label) = username
             .split_once(':')
-            .expect("username должен быть вида '<unix_ts>:label'");
+            .expect("username should be of the form '<unix_ts>:label'");
         let ts: u64 = ts_part
             .parse()
-            .expect("часть до ':' должна парситься как unix-timestamp");
+            .expect("the part before ':' should parse as a unix timestamp");
 
         assert_eq!(label, "chat");
-        assert!(ts > now, "expiry должен быть в будущем относительно момента генерации");
+        assert!(ts > now, "expiry should be in the future relative to the generation moment");
         assert_eq!(ts - now, TURN_CRED_TTL_SECONDS);
     }
 }

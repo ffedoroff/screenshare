@@ -1,28 +1,32 @@
-// bus.js — API шины сообщений комнаты поверх RTCDataChannel (Ф0).
+// bus.js — room message bus API on top of RTCDataChannel (F0).
 //
-// Сама механика канала (negotiated DataChannel id=0, очередь исходящих до
-// открытия, JSON-сериализация с try/catch) живёт в RtcPeer (см. rtc.js:
-// sendBus/isBusOpen/onBusMessage) — по одному каналу на пира, соответствует
-// топологии mesh. Bus здесь — тонкая прослойка над картой пиров комнаты:
-// room.js регистрирует/снимает пиров по мере их появления/ухода
-// (createRemotePeer/removeRemotePeer), а потребители шины (chat.js и любые
-// будущие фичи) работают только с этим API, не трогая RtcPeer напрямую:
-//   - sendToPeer(peerId, obj) — отправить одному конкретному пиру;
-//   - broadcast(obj) — отправить всем известным Bus пирам;
-//   - onMessage(cb(fromPeerId, obj)) — подписаться на входящие (можно
-//     несколько подписчиков, как в Signaling.on);
-//   - isOpen(peerId) — открыт ли канал до конкретного пира прямо сейчас.
+// The channel mechanics themselves (negotiated DataChannel id=0, outgoing
+// queue until open, JSON serialization with try/catch) live in RtcPeer (see
+// rtc.js: sendBus/isBusOpen/onBusMessage) — one channel per peer, matching
+// the mesh topology. Bus here is a thin layer over the room's peer map:
+// room.js registers/unregisters peers as they appear/leave
+// (createRemotePeer/removeRemotePeer), and bus consumers (chat.js and any
+// future features) only work with this API, without touching RtcPeer
+// directly:
+//   - sendToPeer(peerId, obj) — send to one specific peer;
+//   - broadcast(obj) — send to all known Bus peers;
+//   - onMessage(cb(fromPeerId, obj)) — subscribe to incoming messages (can
+//     have multiple subscribers, as in Signaling.on);
+//   - isOpen(peerId) — whether the channel to a specific peer is open right
+//     now.
 //
-// Bus не решает, ЧТО делать с сообщением не открытому пиру (fallback через
-// сервер и т.п.) — это уже забота вызывающего кода (chat.js), Bus — только
-// транспорт до тех пиров, с кем канал открыт.
+// Bus doesn't decide WHAT to do with a message to a peer that isn't open
+// (fallback via the server, etc.) — that's already the caller's concern
+// (chat.js); Bus is only the transport to the peers it has an open channel
+// with.
 //
-// Ф3 (передача файлов, см. static/chat.js): помимо шинного канала 'bus',
-// пары обмениваются файлами по ОТДЕЛЬНЫМ DataChannel (один на файл×получателя,
-// см. RtcPeer.createFileChannel/onFileChannel в rtc.js) — этими каналами Bus
-// не управляет напрямую, но даёт доступ к сырому RtcPeer конкретного пира
-// через getPeer(peerId), т.к. создание/приём такого канала требует самого
-// RTCPeerConnection, а не только JSON-транспорта sendToPeer/broadcast.
+// F3 (file transfer, see static/chat.js): besides the 'bus' bus channel,
+// peer pairs exchange files over SEPARATE DataChannels (one per
+// file×recipient, see RtcPeer.createFileChannel/onFileChannel in rtc.js) —
+// Bus doesn't manage these channels directly, but gives access to the raw
+// RtcPeer of a specific peer via getPeer(peerId), since creating/receiving
+// such a channel requires the RTCPeerConnection itself, not just the JSON
+// transport of sendToPeer/broadcast.
 
 'use strict';
 
@@ -32,47 +36,47 @@ class Bus {
     this._handlers = [];
   }
 
-  /** Зарегистрировать пира в шине — обычно сразу после создания RtcPeer. */
+  /** Register a peer with the bus — usually right after creating an RtcPeer. */
   addPeer(peerId, rtcPeer) {
     this._peers.set(peerId, rtcPeer);
   }
 
-  /** Снять пира с учёта (ушёл из комнаты) — дальнейшие sendToPeer/broadcast его не видят. */
+  /** Unregister a peer (left the room) — subsequent sendToPeer/broadcast won't see it. */
   removePeer(peerId) {
     this._peers.delete(peerId);
   }
 
-  /** Открыт ли DataChannel-канал до `peerId` прямо сейчас. */
+  /** Whether the DataChannel channel to `peerId` is open right now. */
   isOpen(peerId) {
     const rtc = this._peers.get(peerId);
     return !!rtc && rtc.isBusOpen();
   }
 
-  /** Сырой RtcPeer для `peerId` (или null) — нужен для файловых DataChannel (см. заголовок файла). */
+  /** Raw RtcPeer for `peerId` (or null) — needed for file DataChannels (see file header). */
   getPeer(peerId) {
     return this._peers.get(peerId) || null;
   }
 
-  /** Отправить `obj` конкретному пиру (если канал ещё не открыт — уйдёт в очередь и будет отправлен по open). */
+  /** Send `obj` to a specific peer (if the channel isn't open yet — it'll be queued and sent on open). */
   sendToPeer(peerId, obj) {
     const rtc = this._peers.get(peerId);
     if (!rtc) return;
     rtc.sendBus(obj);
   }
 
-  /** Отправить `obj` всем известным Bus пирам (каждому — своя очередь/канал). */
+  /** Send `obj` to all known Bus peers (each with its own queue/channel). */
   broadcast(obj) {
     for (const rtc of this._peers.values()) {
       rtc.sendBus(obj);
     }
   }
 
-  /** Подписаться на входящие сообщения шины: cb(fromPeerId, obj). */
+  /** Subscribe to incoming bus messages: cb(fromPeerId, obj). */
   onMessage(cb) {
     this._handlers.push(cb);
   }
 
-  /** Вызывается из RtcPeer.onBusMessage при получении сообщения от конкретного пира. */
+  /** Called from RtcPeer.onBusMessage when a message from a specific peer is received. */
   _dispatch(peerId, obj) {
     for (const cb of this._handlers) cb(peerId, obj);
   }

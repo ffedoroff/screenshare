@@ -1,49 +1,51 @@
-// namegen.js — генератор красивых случайных имён для лендинга и модалки
-// входа в комнату (см. static/landing.js, static/room.js).
+// namegen.js — generator of nice random names for the landing page and the
+// room-entry modal (see static/landing.js, static/room.js).
 //
-// В отличие от SAS_EMOJI в static/crypto.js — тот словарь ЧАСТЬ ПРОТОКОЛА
-// (фиксированный порядок из 64 символов, завязанный на 6-битную кодировку
-// хэша), словари здесь — чисто декоративные. Их можно свободно менять,
-// расширять, переставлять: это просто источник приятных человекочитаемых
-// имён, никакой код на конкретный состав/порядок/длину не завязан.
+// Unlike SAS_EMOJI in static/crypto.js — that dictionary is PART OF THE
+// PROTOCOL (a fixed order of 64 symbols tied to a 6-bit hash encoding), the
+// word lists here are purely decorative. They can be freely changed,
+// extended, reordered: this is just a source of pleasant human-readable
+// names, with no code tied to any specific composition/order/length.
 //
-// Форматы:
-//   roomName() -> "<эмодзи> <Adjective> <Noun>"   напр. "🌊 Silver Harbor"
-//   userName() -> "<эмодзи> <Adjective> <Animal>" напр. "🦊 Brave Fox"
+// Formats:
+//   roomName() -> "<emoji> <Adjective> <Noun>"   e.g. "🌊 Silver Harbor"
+//   userName() -> "<emoji> <Adjective> <Animal>" e.g. "🦊 Brave Fox"
 //
-// Почему у userName() эмодзи и животное — жёстко спарены (а не два
-// независимых случайных выбора, как в roomName()): на тайле участника
-// (static/room.js: createTile) буква-аватар рисуется как первый
-// графем-кластер отображаемого имени (Intl.Segmenter, фолбэк [...str][0]).
-// Если бы эмодзи выбирался отдельно от слова, юзер мог бы получить имя вида
-// "🦊 Gentle Panda" — эмодзи лисы при имени "панда", что выглядит как баг.
-// Спаривание [эмодзи, слово] в ANIMALS исключает этот разъезд по построению.
+// Why userName()'s emoji and animal are rigidly paired (rather than two
+// independent random picks, as in roomName()): on the participant tile
+// (static/room.js: createTile) the avatar letter is drawn as the first
+// grapheme cluster of the displayed name (Intl.Segmenter, fallback
+// [...str][0]). If the emoji were picked separately from the word, a user
+// could end up with a name like "🦊 Gentle Panda" — a fox emoji with the
+// name "panda", which looks like a bug. Pairing [emoji, word] in ANIMALS
+// rules out this mismatch by construction.
 //
-// Почему эмодзи в ANIMALS обязаны быть ОДНОКОДПОЙНТНЫМИ (без variation
-// selector U+FE0F, без ZWJ-последовательностей, без флагов-суррогатных пар
-// комбинаций): графемный кластер-фолбэк аватара — [...str][0] — корректно
-// берёт ОДНУ юникод-код-точку (уже достаточно для эмодзи ВНЕ zero-width
-// склеек), но многокодпойнтный эмодзи (напр. с VS16 или ZWJ) там, где
-// Intl.Segmenter недоступен, может быть разорван на середине и отрисован
-// как половина глифа. У эмодзи комнат (ROOM_EMOJI) такого ограничения нет —
-// они никогда не идут через аватар-фолбэк, только текстом в шапке/заголовке.
+// Why the emoji in ANIMALS must be SINGLE-CODEPOINT (no variation selector
+// U+FE0F, no ZWJ sequences, no flag surrogate-pair combinations): the
+// avatar's grapheme-cluster fallback — [...str][0] — correctly takes ONE
+// Unicode code point (already enough for emoji OUTSIDE zero-width joins),
+// but a multi-codepoint emoji (e.g. with VS16 or ZWJ), where Intl.Segmenter
+// is unavailable, can get torn in the middle and rendered as half a glyph.
+// Room emoji (ROOM_EMOJI) have no such restriction — they never go through
+// the avatar fallback, only appear as text in the header/title.
 
 'use strict';
 
 const NameGen = (() => {
-  // Равномерное целое число в [0, n) через crypto.getRandomValues с
-  // rejection sampling (без modulo-смещения). Это НЕ криптография — просто
-  // красивые имена, — но crypto.getRandomValues уже есть в любом браузере,
-  // который умеет WebRTC, так что грех не взять честный источник энтропии.
-  // Math.random — фолбэк на случай экзотического окружения без window.crypto.
+  // A uniform random integer in [0, n) via crypto.getRandomValues with
+  // rejection sampling (no modulo bias). This is NOT cryptography — just
+  // nice names — but crypto.getRandomValues is already available in any
+  // browser that supports WebRTC, so there's no reason not to use an
+  // honest source of entropy. Math.random is a fallback for the exotic
+  // case of an environment without window.crypto.
   function randInt(n) {
     if (!Number.isInteger(n) || n <= 0) throw new Error('randInt: n must be a positive integer');
     if (typeof crypto === 'undefined' || typeof crypto.getRandomValues !== 'function') {
       return Math.floor(Math.random() * n);
     }
-    // Наибольшее кратное n, не превышающее 256 — значения из "хвоста"
-    // [max, 256) отбрасываем и тянем новый байт, чтобы каждое значение из
-    // [0, n) выпадало строго с равной вероятностью.
+    // The largest multiple of n not exceeding 256 — values from the "tail"
+    // [max, 256) are discarded and a new byte is drawn, so that every value
+    // in [0, n) comes up with strictly equal probability.
     const max = 256 - (256 % n);
     const buf = new Uint8Array(1);
     let v;
@@ -58,7 +60,7 @@ const NameGen = (() => {
     return list[randInt(list.length)];
   }
 
-  // ~48 позитивных прилагательных без двойных смыслов.
+  // ~48 positive adjectives with no double meanings.
   const ADJECTIVES = [
     'Amber', 'Autumn', 'Azure', 'Bold', 'Brave', 'Bright', 'Calm', 'Cheerful',
     'Clear', 'Cosy', 'Crystal', 'Dapper', 'Emerald', 'Gentle', 'Golden', 'Happy',
@@ -68,7 +70,7 @@ const NameGen = (() => {
     'Swift', 'Tender', 'Velvet', 'Vivid', 'Warm', 'Wise', 'Witty', 'Zen',
   ];
 
-  // ~48 существительных-мест/природы для имён комнат.
+  // ~48 place/nature nouns for room names.
   const ROOM_NOUNS = [
     'Meadow', 'Harbor', 'Garden', 'Grove', 'Valley', 'River', 'Lake', 'Forest',
     'Island', 'Summit', 'Breeze', 'Cloud', 'Star', 'Moon', 'Aurora', 'Horizon',
@@ -78,19 +80,19 @@ const NameGen = (() => {
     'Canyon', 'Springs', 'Hollow', 'Peak', 'Shore', 'Reef', 'Orchard', 'Vale',
   ];
 
-  // ~20 эмодзи для комнат — многокодпойнтные (с variation selector) тут
-  // допустимы: эти эмодзи никогда не проходят через аватар-фолбэк
-  // [...str][0], только показываются целиком в шапке/заголовке страницы.
+  // ~20 emoji for rooms — multi-codepoint ones (with a variation selector)
+  // are fine here: these emoji never go through the avatar fallback, only
+  // shown in full in the page header/title.
   const ROOM_EMOJI = [
     '🌿', '🌸', '🌊', '🌙', '⭐', '🌈', '🍀', '🌻',
     '🌴', '🍁', '🔮', '🎈', '🎨', '🌷', '🫧', '🏔️',
     '🌺', '🕯️', '☀️', '🍉',
   ];
 
-  // ~30 пар [эмодзи, животное] для имён участников. Эмодзи ЖЁСТКО
-  // однокодпойнтные (без VS16/ZWJ) — см. комментарий в шапке файла про
-  // аватар-фолбэк. Проверено скриптом (node -e), что [...emoji].length === 1
-  // для каждой пары.
+  // ~30 [emoji, animal] pairs for participant names. Emoji are STRICTLY
+  // single-codepoint (no VS16/ZWJ) — see the file header comment about the
+  // avatar fallback. Verified with a script (node -e) that
+  // [...emoji].length === 1 for every pair.
   const ANIMALS = [
     ['🦊', 'Fox'], ['🐼', 'Panda'], ['🐨', 'Koala'], ['🦁', 'Lion'],
     ['🐯', 'Tiger'], ['🐸', 'Frog'], ['🦉', 'Owl'], ['🐙', 'Octopus'],

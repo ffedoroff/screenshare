@@ -1,5 +1,5 @@
 /target
-# Локальная SQLite-БД истории чата (DATABASE_URL по умолчанию).
+# Local SQLite chat history DB (default DATABASE_URL).
 /screenshare.db
 /screenshare.db-shm
 /screenshare.db-wal

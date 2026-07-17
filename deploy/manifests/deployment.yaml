@@ -1,19 +1,19 @@
-# Deployment приложения. Создаёт админ ОДИН РАЗ; deploy-юзер (CI) потом только
-# `kubectl set image '*=…'` (см. .github/workflows/deploy-prod.yml и
+# Application Deployment. Created by an admin ONCE; the deploy user (CI) afterwards only
+# does `kubectl set image '*=…'` (see .github/workflows/deploy-prod.yml and
 # simple-deploy/kube/backend-deploy.md).
 #
-# ОТСТУПЛЕНИЕ от обычного бесшовного шаблона (replicas:2 + RollingUpdate):
-# здесь replicas: 1 и strategy.type: Recreate. Причина — состояние комнат
-# живёт в памяти ОДНОГО процесса (`src/state.rs`, HashMap за std::sync::Mutex):
-# при двух репликах broadcaster и зрители могли бы попасть на разные поды и
-# никогда не увидеть друг друга. Recreate = на деплое старый под гасится,
-# новый поднимается — активные трансляции на несколько секунд рвутся, это
-# ожидаемо и описано в README.md.
+# DEPARTURE from the usual seamless template (replicas:2 + RollingUpdate):
+# here it's replicas: 1 and strategy.type: Recreate. Reason — room state
+# lives in the memory of ONE process (`src/state.rs`, HashMap behind std::sync::Mutex):
+# with two replicas, the broadcaster and viewers could land on different pods and
+# never see each other. Recreate = on deploy the old pod is torn down, the
+# new one comes up — active broadcasts drop for a few seconds, this is
+# expected and described in README.md.
 #
-# Полная эфемерность: приложение ничего не пишет на диск (ни истории чата,
-# ни сессий) — всё состояние комнаты живёт только в памяти процесса и
-# исчезает с ней (рестарт/реапер пустой комнаты). Поэтому здесь сознательно
-# нет volume/volumeMount и PVC: писать некуда, и это правильно, а не упущение.
+# Fully ephemeral: the application writes nothing to disk (no chat history,
+# no sessions) — all room state lives only in the process's memory and
+# disappears with it (restart/empty-room reaper). That's why there's deliberately
+# no volume/volumeMount or PVC here: there's nowhere to write, and that's by design, not an oversight.
 apiVersion: apps/v1
 kind: Deployment
 metadata: { name: chat, namespace: chat-prod }
@@ -25,61 +25,61 @@ spec:
   template:
     metadata:
       labels: { app: chat }
-      # Prometheus kubernetes_sd_config (role: pod) autodiscovery — тот же
-      # паттерн, что у code-ranker-backend (см.
-      # code-ranker-private/deploy/kubesolo/manifests/deployment.yaml) и
-      # simple-deploy/standards/observability/metrics.md, §«Автодискавери
-      # таргетов». Скрейпит ОТДЕЛЬНЫЙ management-порт (8081, см. `mgmt`
-      # ниже), никогда основной 8080 (WS-сигналинг/статика, за
-      # Service/Ingress) — /metrics НЕ выставлен наружу.
+      # Prometheus kubernetes_sd_config (role: pod) autodiscovery — the same
+      # pattern as code-ranker-backend (see
+      # code-ranker-private/deploy/kubesolo/manifests/deployment.yaml) and
+      # simple-deploy/standards/observability/metrics.md, §"Target
+      # Autodiscovery". Scrapes a SEPARATE management port (8081, see `mgmt`
+      # below), never the main 8080 (WS signaling/static assets, behind
+      # Service/Ingress) — /metrics is NOT exposed externally.
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/port: "8081"
         prometheus.io/path: "/metrics"
     spec:
-      terminationGracePeriodSeconds: 30       # graceful drain; приложение ловит SIGTERM (src/main.rs)
+      terminationGracePeriodSeconds: 30       # graceful drain; the app catches SIGTERM (src/main.rs)
       containers:
       - name: app
-        image: chat:PLACEHOLDER               # реальный тег ставит `kubectl set image '*='`
+        image: chat:PLACEHOLDER               # the real tag is set by `kubectl set image '*='`
         imagePullPolicy: IfNotPresent
         env:
         - { name: PORT, value: "8080" }
-        # Management-порт (см. src/main.rs::spawn_metrics_server) — только
-        # `/metrics`, тот же паттерн/дефолт (8081), что у code-ranker-backend.
-        # Сознательно НЕ в service.yaml (см. её комментарий): scrape идёт
-        # напрямую по подовому IP через аннотации выше, а не через Service.
+        # Management port (see src/main.rs::spawn_metrics_server) — just
+        # `/metrics`, the same pattern/default (8081) as code-ranker-backend.
+        # Deliberately NOT in service.yaml (see its comment): scraping goes
+        # directly to the pod IP via the annotations above, not through the Service.
         - { name: MGMT_PORT, value: "8081" }
         - { name: STATIC_DIR, value: "/app/static" }
-        # Ш2 (разнесение доверия — см. README.md «Топология Ш2»): фронт уезжает
-        # на Cloudflare Pages (chat.fedorov.it), этот сервер отвечает и на
-        # chat.fedorov.it (пока статика ещё раздаётся отсюда же, до переключения
-        # DNS), и на chat-api.fedorov.it (см. ingress.yaml) — поэтому единственный
-        # разрешённый CORS-origin для кросс-хостовых запросов с Pages это
-        # chat.fedorov.it. Пусто -> CORS выключен целиком (см. src/main.rs::CORS_ORIGIN).
+        # S2 (trust separation — see README.md "S2 topology"): the frontend moves
+        # to Cloudflare Pages (chat.fedorov.it), this server still answers on
+        # both chat.fedorov.it (while static assets are still served from here too,
+        # before the DNS switch) and chat-api.fedorov.it (see ingress.yaml) — so the only
+        # allowed CORS origin for cross-host requests from Pages is
+        # chat.fedorov.it. Empty -> CORS disabled entirely (see src/main.rs::CORS_ORIGIN).
         - { name: CORS_ORIGIN, value: "https://chat.fedorov.it" }
-        # Лимит длительности созвона (см. README.md «Лимит длительности
-        # созвона»): комната старше этого возраста удаляется реапером
-        # целиком (все участники получают room-expired и сокет закрывается),
-        # даже если в ней есть живые участники. 10800с = 3 часа.
+        # Call duration limit (see README.md "Call Duration Limit"):
+        # a room older than this age gets deleted by the reaper
+        # entirely (all participants receive room-expired and the socket closes),
+        # even if it still has live participants. 10800s = 3 hours.
         - { name: MAX_ROOM_LIFETIME_SECONDS, value: "10800" }
-        # H2 (DoS-защита): потолок числа комнат одновременно — дефолт в коде
-        # тот же (500), здесь явно ради видимости в манифесте.
+        # H2 (DoS protection): ceiling on the number of concurrent rooms — same
+        # default as in the code (500), spelled out here for visibility in the manifest.
         - { name: MAX_ROOMS, value: "500" }
-        # TURN-креды (turn.yaml + Secret turn-creds, создан админом руками):
-        # приложение отдаёт их клиентам в /config. optional — без секрета
-        # приложение живёт на одном STUN, как раньше.
+        # TURN credentials (turn.yaml + Secret turn-creds, created by hand by an admin):
+        # the app hands them to clients in /config. optional — without the secret
+        # the app runs on STUN alone, as before.
         envFrom:
         - secretRef: { name: turn-creds, optional: true }
-        # 8080 — WS-сигналинг/статика (в Service, см. service.yaml); 8081 —
-        # management (только /metrics пока — /healthz остаётся на 8080, там
-        # его уже читают пробы ниже, переносить не было причины).
+        # 8080 — WS signaling/static assets (in the Service, see service.yaml); 8081 —
+        # management (only /metrics for now — /healthz stays on 8080, the
+        # probes below already read it there, no reason to move it).
         ports:
         - { name: http, containerPort: 8080 }
         - { name: mgmt, containerPort: 8081 }
         readinessProbe: { httpGet: { path: /healthz, port: 8080 }, periodSeconds: 3 }
         livenessProbe:  { httpGet: { path: /healthz, port: 8080 }, initialDelaySeconds: 10, periodSeconds: 10 }
         resources:
-          # Rust-сервер сигналинга лёгкий (мелкий рабочий набор в памяти,
-          # никакого медиатрафика через backend не проходит) — лимиты скромные.
+          # The Rust signaling server is lightweight (small working set in memory,
+          # no media traffic ever passes through the backend) — modest limits.
           requests: { memory: 32Mi, cpu: 50m }
           limits:   { memory: 128Mi, cpu: 250m }

@@ -1,6 +1,6 @@
-/* Общие стили: комната — всегда тёмная сцена (видеозвонок), лендинг — уважает
-   системную тему. Адаптивная вёрстка, без UI-библиотек. Отступы — по шкале
-   4/8/12/16/24/32. */
+/* Common styles: the room is always a dark stage (video call), the landing page
+   respects the system theme. Responsive layout, no UI libraries. Spacing follows
+   the 4/8/12/16/24/32 scale. */
 
 :root {
   --bg: #0f1114;
@@ -41,18 +41,18 @@ body {
   color: var(--text);
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   line-height: 1.5;
-  /* Никакого горизонтального скролла страницы ни в одном состоянии — любой
-     случайный overflow (например, широкий контент внутри фикс-панелей)
-     обрезается, а не расширяет вьюпорт. */
+  /* No horizontal page scroll in any state — any
+     accidental overflow (e.g. wide content inside fixed panels)
+     gets clipped instead of expanding the viewport. */
   overflow-x: hidden;
 }
 
-/* Полноэкранный мобильный чат открыт (см. chat.js: syncMobileChatViewport) —
-   страница НЕ скроллится, пока клавиатура/адресная строка меняют видимую
-   область: панель чата и так перекрывает весь вьюпорт (position:fixed;
-   inset:0), но фокус textarea рядом с открывающейся клавиатурой на части
-   браузеров провоцирует попытку "проскроллить поле в видимую область" на
-   уровне документа — этот класс гарантированно её глушит. */
+/* Full-screen mobile chat is open (see chat.js: syncMobileChatViewport) —
+   the page does NOT scroll while the keyboard/address bar change the visible
+   area: the chat panel already covers the entire viewport (position:fixed;
+   inset:0), but focusing the textarea next to the opening keyboard on some
+   browsers triggers an attempt to "scroll the field into view" at the
+   document level — this class reliably suppresses that. */
 .chat-mobile-scroll-lock {
   overflow: hidden;
 }
@@ -63,7 +63,7 @@ body {
   display: block;
 }
 
-/* ---------- Общие элементы: кнопки, оверлей, статус ---------- */
+/* ---------- Common elements: buttons, overlay, status ---------- */
 
 .start-button,
 .retry-button {
@@ -165,7 +165,7 @@ body {
   }
 }
 
-/* ---------- Лендинг ---------- */
+/* ---------- Landing page ---------- */
 
 .landing-page {
   min-height: 100%;
@@ -214,11 +214,11 @@ body {
   border-color: var(--accent);
 }
 
-/* Строка «инпут имени + кнопка сгенерировать заново» (см. п.1 задания) —
-   переиспользуется и на лендинге (#room-name-input, static/index.html), и в
-   модалке входа в комнату (#join-name-input, static/room.html). Инпут
-   занимает всё доступное место, кнопка — компактная квадратная иконка
-   рядом, той же высоты. */
+/* The "name input + regenerate button" row (see task item 1) —
+   reused both on the landing page (#room-name-input, static/index.html) and in
+   the join-room modal (#join-name-input, static/room.html). The input
+   takes up all available space, the button is a compact square icon
+   next to it, at the same height. */
 .input-with-regen {
   width: 100%;
   display: flex;
@@ -250,10 +250,10 @@ body {
   background: var(--bg-elevated);
 }
 
-/* ---------- Build-хэш (форензический якорь, см. docs/security.md,
-   «Published Build Hash») — ненавязчивый подвал лендинга. Комната переиспользует
-   .build-verify-link/.build-full ниже для попапа «Поделиться» и настроек,
-   с собственными контейнерами (.share-popup-build/.settings-build-row). ---------- */
+/* ---------- Build hash (forensic anchor, see docs/security.md,
+   "Published Build Hash") — an unobtrusive landing-page footer. The room reuses
+   .build-verify-link/.build-full below for the "Share" popup and settings,
+   with their own containers (.share-popup-build/.settings-build-row). ---------- */
 
 .build-footer {
   width: 100%;
@@ -302,16 +302,16 @@ body {
   color: var(--text);
 }
 
-/* ---------- Комната: верхний бар ---------- */
+/* ---------- Room: top bar ---------- */
 
-/* height (не min-height!) — жёсткий потолок в рост вьюпорта, а не только
-   пол. С min-height контент, требующий больше места (например, наивный
-   размер тайлов сетки ДО пересчёта JS, см. layoutTilesGrid), просто раздувал
-   бы .room-page выше вьюпорта — body это не обрежет (overflow-x: hidden
-   только по горизонтали, см. шапку файла), и страница скроллилась бы целиком
-   вместо того, чтобы .room-stage (flex: 1; min-height: 0) сжался под
-   реально доступное место. Это и есть тот самый «странный скролл на
-   десктопе» из п.6 задания. */
+/* height (not min-height!) — a hard ceiling at viewport height, not just a
+   floor. With min-height, content that needs more room (e.g. the naive
+   tile-grid size BEFORE the JS recalculation, see layoutTilesGrid) would simply
+   inflate .room-page beyond the viewport — body won't clip that (overflow-x: hidden
+   is horizontal only, see the top of the file), and the whole page would scroll
+   instead of .room-stage (flex: 1; min-height: 0) shrinking to fit
+   the actually available space. This is exactly the "weird scroll on
+   desktop" from task item 6. */
 .room-page {
   height: 100%;
   display: flex;
@@ -331,10 +331,10 @@ body {
   font-weight: 600;
   color: var(--text-muted);
   letter-spacing: 0.02em;
-  /* Имя комнаты (см. static/room.js: initialRoomName) может быть длинным —
-     колонка бара узкая (1fr), обрезаем в одну строку с многоточием. min-width:0
-     нужен самой ячейке грида: без него flex/block-ребёнок не сжимается уже
-     "content width", а тянет всю колонку шире положенного. */
+  /* The room name (see static/room.js: initialRoomName) can be long —
+     the bar column is narrow (1fr), so we truncate to one line with an ellipsis. min-width:0
+     is needed on the grid cell itself: without it a flex/block child won't shrink below
+     its "content width", and stretches the whole column wider than intended. */
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -342,16 +342,16 @@ body {
 }
 
 .room-top-bar-spacer {
-  /* Пустая колонка справа — уравновешивает логотип слева, чтобы счётчик
-     оставался ровно по центру бара независимо от ширины логотипа. */
+  /* Empty column on the right — balances the logo on the left so the counter
+     stays exactly centered in the bar regardless of the logo's width. */
 }
 
-/* Центральная колонка бара — счётчик участников + таймер лимита созвона
-   (см. static/room.js: startRoomTimer) вместе, одним grid-элементом (auto),
-   чтобы .room-top-bar не потерял центрирование (3 явные колонки:
-   1fr auto 1fr — 4-й прямой ребёнок сломал бы раскладку, см. #room-timer в
-   room.html). flex-wrap — на случай узкого экрана таймер уходит на вторую
-   строку, а не толкает счётчик участников или выходит за пределы бара. */
+/* The bar's center column — the participant counter + the call duration limit timer
+   (see static/room.js: startRoomTimer) together, as a single grid item (auto),
+   so .room-top-bar doesn't lose its centering (3 explicit columns:
+   1fr auto 1fr — a 4th direct child would break the layout, see #room-timer in
+   room.html). flex-wrap — in case of a narrow screen the timer wraps to a second
+   line instead of pushing the participant counter or overflowing the bar. */
 .room-top-bar-center {
   grid-column: 2;
   display: flex;
@@ -359,12 +359,12 @@ body {
   justify-content: center;
   flex-wrap: wrap;
   gap: var(--space-2);
-  /* position: relative — якорь для .topbar-sas-popup (position: absolute,
-     см. ниже): попап позиционируется от этого контейнера, а не от всего
-     .room-top-bar, чтобы центрироваться под самим бейджем/центральной
-     группой, а не под всей широкой шапкой. Абсолютные потомки не участвуют в
-     grid/flex-раскладке, так что комментарий выше про "4-й прямой потомок
-     сломал бы центрирование" на попап не распространяется. */
+  /* position: relative — anchor for .topbar-sas-popup (position: absolute,
+     see below): the popup is positioned relative to this container, not the whole
+     .room-top-bar, so it centers under the badge/center group itself,
+     rather than under the entire wide header. Absolute descendants don't participate in
+     the grid/flex layout, so the comment above about "a 4th direct child
+     would break centering" doesn't apply to the popup. */
   position: relative;
 }
 
@@ -379,13 +379,13 @@ body {
   white-space: nowrap;
 }
 
-/* Таймер длительности созвона (см. docs/security.md, «Meeting Duration
-   Ceiling») — тот же стиль пилюли, что и .participant-count. Показывает
-   count-up (время, прошедшее с входа первого участника комнаты, см.
-   static/room.js: updateRoomTimerDisplay), поэтому цвет нейтральный и
-   постоянный — раньше здесь была подсветка жёлтым/красным по мере
-   приближения к остатку до лимита, но с уходом от countdown-семантики она
-   потеряла смысл и убрана вместе с .room-timer--warning/--critical. */
+/* Call duration timer (see docs/security.md, "Meeting Duration
+   Ceiling") — the same pill style as .participant-count. Shows a
+   count-up (time elapsed since the first room participant joined, see
+   static/room.js: updateRoomTimerDisplay), so the color is neutral and
+   constant — this used to have a yellow/red highlight as it
+   approached the remaining time to the limit, but once we moved away from countdown semantics it
+   lost its meaning and was removed along with .room-timer--warning/--critical. */
 .room-timer {
   font-size: 0.78rem;
   font-weight: 600;
@@ -395,18 +395,18 @@ body {
   border-radius: 999px;
   padding: var(--space-1) var(--space-3);
   white-space: nowrap;
-  font-variant-numeric: tabular-nums; /* цифры не "прыгают" по ширине на каждом тике */
+  font-variant-numeric: tabular-nums; /* digits don't "jump" in width on every tick */
 }
 
-/* SAS «отпечаток комнаты» в топ-баре главного окна (см. static/room.js:
-   renderTopbarSas/deriveSas в static/crypto.js) — ЕДИНСТВЕННОЕ место в UI,
-   где живёт SAS (раньше дублировался в шапке чат-панели через .chat-sas /
-   static/chat.js: setRoomSas — убрано вместе с этими стилями, см.
-   docs/sas-verification.md §9). Та же пилюля, что у соседей
-   (.participant-count/.room-timer), но теперь это <button> — клик открывает
-   .topbar-sas-popup (см. ниже) с подробностями, которые раньше жили в
-   .chat-sas-note. font-family/cursor сброшены явно — по умолчанию <button>
-   не наследует их от body. */
+/* SAS "room fingerprint" in the main window's top bar (see static/room.js:
+   renderTopbarSas/deriveSas in static/crypto.js) — the ONLY place in the UI
+   where the SAS lives (it used to be duplicated in the chat panel header via .chat-sas /
+   static/chat.js: setRoomSas — removed along with those styles, see
+   docs/sas-verification.md §9). The same pill as its neighbors
+   (.participant-count/.room-timer), but now it's a <button> — clicking opens
+   .topbar-sas-popup (see below) with the details that used to live in
+   .chat-sas-note. font-family/cursor are reset explicitly — by default a <button>
+   doesn't inherit them from body. */
 .topbar-sas {
   font-family: inherit;
   font-size: 0.78rem;
@@ -419,11 +419,11 @@ body {
   white-space: nowrap;
   letter-spacing: 0.05em;
   cursor: pointer;
-  /* position+z-index на 1 выше .topbar-sas-popup-backdrop (35, см. ниже):
-     бейдж должен оставаться напрямую кликабельным, даже когда попап открыт и
-     его полноэкранный backdrop физически перекрывает то же место экрана —
-     иначе повторный клик по бейджу попадал бы в backdrop, а не в кнопку
-     (explicit toggle в static/room.js надёжнее). */
+  /* position+z-index 1 above .topbar-sas-popup-backdrop (35, see below):
+     the badge must remain directly clickable even when the popup is open and
+     its full-screen backdrop physically overlaps the same spot on screen —
+     otherwise clicking the badge again would hit the backdrop instead of the button
+     (an explicit toggle in static/room.js is more reliable). */
   position: relative;
   z-index: 36;
 }
@@ -452,22 +452,22 @@ body {
   letter-spacing: 0;
 }
 
-/* Попап подробностей SAS — раскрывается кликом по .topbar-sas (см.
+/* SAS details popup — opened by clicking .topbar-sas (see
    static/room.js: openTopbarSasPopup/closeTopbarSasPopup). #topbar-sas-popup
-   сам — обычный статичный div без своих position/z-index (существует только
-   как контейнер для .hidden-тоггла), поэтому не участвует в поиске containing
-   block: оба его настоящих ребёнка ниже позиционируются НАПРЯМУЮ относительно
-   своих собственных предков. Карточка привязана к .room-top-bar-center
-   (position: relative, см. выше) и висит по центру, сразу под бейджем.
-   Backdrop — тот же приём, что у .share-popup-backdrop/
-   .chat-message-popover-backdrop (полноэкранный перехватчик кликов «мимо»),
-   но БЕЗ затемнения — это информационная плашка, а не блокирующая модалка, и
-   мы не хотим гасить видео участников ради пары строк текста. z-index: 35 —
-   НИЖЕ панели настроек (.settings-panel: 40), join-модалки (55) и .share-popup
-   (60): SAS-попап — лёгкий дропдаун из топ-бара, он НЕ должен перекрывать
-   настройки (если открыть настройки при раскрытом SAS-попапе, попап уходит
-   под их backdrop — ожидаемо). Но выше пилюли управления (20) и чата (25/30),
-   т.к. якорится к верхней панели над сценой. */
+   itself is a plain static div without its own position/z-index (it exists only
+   as a container for the .hidden toggle), so it doesn't participate in the search for the containing
+   block: both of its real children below are positioned DIRECTLY relative to
+   their own ancestors. The card is anchored to .room-top-bar-center
+   (position: relative, see above) and hangs centered, right below the badge.
+   The backdrop uses the same trick as .share-popup-backdrop/
+   .chat-message-popover-backdrop (a full-screen click-outside interceptor),
+   but WITHOUT dimming — this is an informational card, not a blocking modal, and
+   we don't want to dim the participants' video just for a couple lines of text. z-index: 35 —
+   BELOW the settings panel (.settings-panel: 40), the join modal (55), and .share-popup
+   (60): the SAS popup is a lightweight dropdown from the top bar, it must NOT overlap
+   settings (if settings are opened while the SAS popup is expanded, the popup goes
+   under their backdrop — expected). But above the control pill (20) and chat (25/30),
+   since it's anchored to the top panel above the stage. */
 .topbar-sas-popup-backdrop {
   position: fixed;
   inset: 0;
@@ -476,9 +476,9 @@ body {
 }
 
 .topbar-sas-popup-card {
-  /* Containing block — .room-top-bar-center (position: relative, см. выше):
-     .topbar-sas-popup между ними position:static, поэтому поиск
-     "ближайшего позиционированного предка" проходит его насквозь. */
+  /* Containing block — .room-top-bar-center (position: relative, see above):
+     .topbar-sas-popup between them is position:static, so the search for
+     the "nearest positioned ancestor" passes straight through it. */
   position: absolute;
   z-index: 35;
   top: 100%;
@@ -494,8 +494,8 @@ body {
   text-align: center;
 }
 
-/* .hidden (глобальная утилита, см. выше) прячет пустую строку эмодзи для
-   verifying/mismatch/unavailable — там показывать нечего. */
+/* .hidden (a global utility, see above) hides the empty emoji row for
+   verifying/mismatch/unavailable — there's nothing to show there. */
 .topbar-sas-popup-emoji {
   font-size: 1.6rem;
   letter-spacing: 0.15em;
@@ -522,7 +522,7 @@ body {
   display: none;
 }
 
-/* ---------- Комната: сцена и тайлы ---------- */
+/* ---------- Room: stage and tiles ---------- */
 
 .room-stage {
   flex: 1;
@@ -569,9 +569,9 @@ body {
   font-size: 0.8rem;
 }
 
-/* Заглушка вместо живого превью, когда экран шарю я сам (см. static/room.js:
-   showLocalScreenPreview) — .screen-video в этот момент скрыт классом
-   .hidden, заглушка занимает весь .screen-stage вместо него. */
+/* Placeholder instead of a live preview when I'm the one sharing the screen (see static/room.js:
+   showLocalScreenPreview) — .screen-video is hidden at this point via the
+   .hidden class, and the placeholder occupies all of .screen-stage instead of it. */
 .screen-self-placeholder {
   width: 100%;
   height: 100%;
@@ -595,9 +595,9 @@ body {
   font-weight: 600;
 }
 
-/* Кнопка «на весь экран» — угол сцены шаринга (см. static/room.js:
-   requestFullscreenCompat). Иконка/title меняются местами при входе/выходе
-   из fullscreen через fullscreenchange (в т.ч. -webkit- для iOS Safari). */
+/* "Fullscreen" button — corner of the screen-share stage (see static/room.js:
+   requestFullscreenCompat). Icon/title swap places when entering/exiting
+   fullscreen via fullscreenchange (including -webkit- for iOS Safari). */
 .screen-fullscreen-button {
   position: absolute;
   top: var(--space-2);
@@ -625,8 +625,8 @@ body {
   background: rgba(0, 0, 0, 0.75);
 }
 
-/* В нативном fullscreen сцена занимает весь экран — вертикальные
-   ограничения (max-height/border-radius) уместны только в обычном потоке. */
+/* In native fullscreen the stage takes up the whole screen — vertical
+   constraints (max-height/border-radius) only make sense in the normal document flow. */
 .screen-stage:fullscreen,
 .screen-stage:-webkit-full-screen {
   max-width: none;
@@ -639,13 +639,13 @@ body {
 
 .tiles-grid {
   display: grid;
-  /* Фоллбэк до первого расчёта фиксированной раскладки (см. static/room.js:
-     layoutTilesGrid/computeFixedTileLayout) — та проставляет инлайновые
-     grid-template-columns/-rows с точным размером тайла в px под фактический
-     размер сцены и число колонок/строк из computeTileGridColumns, и
-     инлайн-стиль имеет более высокий приоритет, чем это правило, так что оно
-     почти никогда не применяется на практике (только долю секунды до
-     первого вызова, либо если JS почему-то не сработал). */
+  /* Fallback until the first fixed-layout calculation (see static/room.js:
+     layoutTilesGrid/computeFixedTileLayout) — that function sets inline
+     grid-template-columns/-rows with the exact tile size in px based on the actual
+     stage size and the number of columns/rows from computeTileGridColumns, and
+     the inline style has higher priority than this rule, so it
+     is almost never applied in practice (only for a fraction of a second before
+     the first call, or if the JS somehow failed to run). */
   grid-template-columns: repeat(auto-fit, minmax(220px, 260px));
   grid-auto-rows: minmax(0, 1fr);
   gap: var(--space-4);
@@ -655,15 +655,15 @@ body {
   max-width: 1200px;
 }
 
-/* Комната из одного человека: собственный тайл крупно и по центру — тоже
-   фоллбэк (см. комментарий выше), JS обычно подставляет свой точный размер. */
+/* A room with a single person: one's own tile is large and centered — also
+   a fallback (see the comment above), JS usually substitutes its own exact size. */
 .tiles-grid--solo {
   grid-template-columns: minmax(260px, 480px);
 }
 
-/* Кто-то шарит экран: тайлы участников — горизонтальная лента над панелью,
-   а не сетка (сетка мельчила бы их без пользы, когда внимание на экране).
-   layoutTilesGrid сюда не лезет (compact — своя фиксированная геометрия). */
+/* Someone is sharing their screen: participant tiles become a horizontal strip above the panel,
+   not a grid (a grid would shrink them pointlessly while attention is on the screen).
+   layoutTilesGrid doesn't touch this (compact mode has its own fixed geometry). */
 .tiles-grid--compact {
   display: flex;
   flex-wrap: nowrap;
@@ -679,27 +679,27 @@ body {
   flex: 0 0 168px;
 }
 
-/* ---------- Спотлайт: максимизированный тайл + лента остальных участников ----------
-   Класс .tiles-grid--spotlight на #tiles-grid ставится ОДНОВРЕМЕННО с
-   .tile--maximized на выбранном тайле (см. static/room.js:
-   updateSpotlightMode) — но только когда, кроме него, есть другие
-   участники; иначе (максимизировали единственный тайл в пустой комнате)
-   лента не нужна, работает обычный .tile--maximized выше (inset: 0).
+/* ---------- Spotlight: maximized tile + strip of the other participants ----------
+   The .tiles-grid--spotlight class on #tiles-grid is set SIMULTANEOUSLY with
+   .tile--maximized on the chosen tile (see static/room.js:
+   updateSpotlightMode) — but only when there are other
+   participants besides it; otherwise (maximizing the only tile in an empty room)
+   the strip isn't needed, and the plain .tile--maximized above (inset: 0) applies.
 
-   Ключевой приём — ЧИСТО CSS, без единой лишней обёртки и без переноса
-   тайлов по DOM (иначе видео в них перезапустилось бы): сам #tiles-grid на
-   время спотлайта становится flex-контейнером ЛЕНТЫ. Максимизированный
-   тайл внутри него — position:fixed (см. правило `.tile--maximized` под
-   этим же классом ниже), то есть ИСКЛЮЧЁН из flex-потока; все остальные
-   тайлы остаются обычными flex-элементами этого контейнера и благодаря
-   align-items прижимаются к одному краю с фиксированным мелким размером —
-   десктоп: column + flex-end = вертикальная лента справа; мобильный: row +
-   flex-end = горизонтальная лента снизу (см. @media ниже). z-index/фон — те
-   же, что у обычного .tile--maximized (лестница z-index не растёт). */
+   The key trick is PURE CSS, without a single extra wrapper and without moving
+   tiles around the DOM (otherwise the video in them would restart): #tiles-grid itself
+   becomes a flex container for the STRIP during spotlight. The maximized
+   tile inside it is position:fixed (see the `.tile--maximized` rule under
+   the same class below), i.e. EXCLUDED from the flex flow; all the other
+   tiles remain regular flex items of this container and, thanks to
+   align-items, are pushed to one edge at a fixed small size —
+   desktop: column + flex-end = a vertical strip on the right; mobile: row +
+   flex-end = a horizontal strip at the bottom (see @media below). z-index/background are the
+   same as for a regular .tile--maximized (the z-index ladder doesn't grow). */
 .tiles-grid--spotlight {
   position: fixed;
   inset: 0;
-  z-index: 65; /* тот же уровень, что у .tile--maximized ниже — лестница не меняется */
+  z-index: 65; /* the same level as .tile--maximized below — the ladder doesn't change */
   display: flex;
   flex-direction: column;
   align-items: flex-end;
@@ -712,31 +712,31 @@ body {
   max-width: none;
 }
 
-/* Мелкие тайлы ленты (все, кроме максимизированного) — фиксированная ширина
-   колонки (180–220px по заданию), аспект 16:9 из общего правила .tile сам
-   даёт высоту. flex-shrink: 0 — при переполнении лента скроллится
-   (overflow-y/-x: auto выше), а не сжимает тайлы до нечитаемости. */
+/* Small strip tiles (all except the maximized one) — a fixed column
+   width (180-220px per the task), the 16:9 aspect ratio from the general .tile rule itself
+   gives the height. flex-shrink: 0 — on overflow the strip scrolls
+   (overflow-y/-x: auto above) instead of shrinking the tiles into illegibility. */
 .tiles-grid--spotlight .tile {
   flex: 0 0 auto;
   width: 200px;
 }
 
 .tiles-grid--spotlight .tile--maximized {
-  /* НЕ inset: 0 (как у обычного .tile--maximized ниже) — контейнер уже
-     position:fixed на весь вьюпорт, этому тайлу нужно просто «не долезать»
-     до полосы ленты справа. */
+  /* NOT inset: 0 (like a regular .tile--maximized below) — the container is already
+     position:fixed covering the whole viewport, this tile just needs to "not reach"
+     the strip band on the right. */
   position: fixed;
   top: 0;
   left: 0;
   bottom: 0;
-  right: 220px; /* ширина тайла ленты (200px) + gap (var(--space-2)) + запас */
+  right: 220px; /* strip tile width (200px) + gap (var(--space-2)) + margin */
   width: auto;
   height: auto;
 }
 
-/* Мелкие тайлы ленты: скорость на таком размере нечитаема — прячем совсем;
-   имя/корону оставляем, но заметно ужимаем (на десктопе рядом с видео есть
-   место, и «кто это» в ленте всё равно полезно видеть). */
+/* Small strip tiles: the speed indicator is unreadable at this size — hide it entirely;
+   keep the name/crown but shrink them noticeably (on desktop there's room next
+   to the video, and "who is this" is still useful to see in the strip). */
 .tiles-grid--spotlight .tile:not(.tile--maximized) .tile-speed {
   display: none;
 }
@@ -772,10 +772,10 @@ body {
   font-size: 0.65rem;
 }
 
-/* Мобильный: горизонтальная лента снизу вместо вертикальной справа — см.
-   @media (max-width: 640px) в конце файла для .tiles-grid--spotlight/
-   .tiles-grid--spotlight .tile/.tile--maximized (там же общий мобильный блок
-   тайлов). */
+/* Mobile: a horizontal strip at the bottom instead of a vertical one on the right — see
+   @media (max-width: 640px) at the end of the file for .tiles-grid--spotlight/
+   .tiles-grid--spotlight .tile/.tile--maximized (the shared mobile tile block
+   is there too). */
 
 .tile {
   position: relative;
@@ -788,39 +788,39 @@ body {
   align-items: center;
   justify-content: center;
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
-  /* Контейнер размерных запросов (cqw/cqh) для заглушки без видео — см.
-     .tile-placeholder-avatar/-name ниже: размеры там завязаны на РАЗМЕР
-     САМОГО ТАЙЛА (а не вьюпорта), чтобы буква/эмодзи в кружке и подпись
-     масштабировались под фактический размер тайла в сетке (п.3 задания), а
-     не оставались плоской константой независимо от того, 1 сейчас участник
-     на весь экран или 6 в сетке 3×2/2×3. `size` (не только `inline-size`) —
-     блочный размер (высота) тайла тоже всегда детерминирован (либо явный
-     grid-template-rows из layoutTilesGrid, либо aspect-ratio от ширины), так
-     что и cqh-запросы по высоте (см. .tile-placeholder ниже — на самых
-     мелких тайлах, напр. 6 участников на телефоне, иначе аватар+имя не
-     помещались бы по высоте) можно использовать безопасно. */
+  /* Size-query container (cqw/cqh) for the placeholder with no video — see
+     .tile-placeholder-avatar/-name below: their sizes are tied to the SIZE
+     OF THE TILE ITSELF (not the viewport), so the letter/emoji in the circle and the caption
+     scale with the tile's actual size in the grid (task item 3), rather
+     than staying a flat constant regardless of whether there's currently 1 participant
+     fullscreen or 6 in a 3x2/2x3 grid. `size` (not just `inline-size`) —
+     the block size (height) of the tile is also always deterministic (either an explicit
+     grid-template-rows from layoutTilesGrid, or an aspect-ratio derived from width), so
+     cqh queries by height (see .tile-placeholder below — on the
+     smallest tiles, e.g. 6 participants on a phone, otherwise the avatar+name
+     wouldn't fit in height) can also be used safely. */
   container-type: size;
-  /* Клик тоглит максимизацию (см. static/room.js: createTile/maximizeTile) —
-     курсор везде pointer, а не только когда видео видно (:has(.tile-video
-     не -hidden) избыточно сложно для того же результата: клик по заглушке
-     просто ничего не делает, это не требует другого курсора). */
+  /* A click toggles maximization (see static/room.js: createTile/maximizeTile) —
+     the cursor is pointer everywhere, not only when the video is visible (:has(.tile-video
+     not -hidden) is unnecessarily complex for the same result: a click on the placeholder
+     simply does nothing, which doesn't require a different cursor). */
   cursor: pointer;
 }
 
-/* ---------- Максимизация тайла на всю страницу (клик по тайлу с видео) ----------
-   Простой fixed-оверлей, а НЕ Fullscreen API: это тоггл «на всю страницу» (в
-   пределах вкладки), а не «на весь экран» — F11-подобный режим никто не
-   просил и он неожиданно вынес бы пользователя из браузерного окна.
-   Полноэкранный показ шаринга экрана (#screen-fullscreen-button,
-   requestFullscreenCompat) — другая сцена и другой (настоящий Fullscreen
-   API) механизм, они не конфликтуют: этот оверлей просто рисуется выше всего
-   по z-index и не претендует на top-layer браузера. Без родителя
-   .tiles-grid--spotlight (см. выше) это ПРЕЖНЕЕ поведение — inset: 0 на весь
-   вьюпорт (комната из одного/двух человек, никого показывать в ленте). */
+/* ---------- Maximizing a tile to full page (clicking a tile with video) ----------
+   A simple fixed overlay, NOT the Fullscreen API: this is a "full page" toggle (within
+   the tab), not "fullscreen" — nobody asked for an F11-like mode
+   and it would unexpectedly kick the user out of the browser window.
+   Fullscreen screen-share display (#screen-fullscreen-button,
+   requestFullscreenCompat) is a different stage and a different (real Fullscreen
+   API) mechanism — they don't conflict: this overlay is simply drawn above everything
+   by z-index and doesn't claim the browser's top layer. Without a
+   .tiles-grid--spotlight parent (see above) this is the PREVIOUS behavior — inset: 0 covering
+   the whole viewport (a room of one/two people, nobody to show in a strip). */
 .tile--maximized {
   position: fixed;
   inset: 0;
-  z-index: 65; /* выше share-popup (60) — максимизированный тайл главнее любого попапа поверх него */
+  z-index: 65; /* above share-popup (60) — a maximized tile takes priority over any popup on top of it */
   border-radius: 0;
   border: none;
   background: #000;
@@ -847,15 +847,15 @@ body {
 .tile-video {
   width: 100%;
   height: 100%;
-  /* Раньше было cover (обрезает кадр ради заполнения тайла) — сменено на
-     contain: карточка теперь honest-16:9 (см. best-fit в static/room.js:
-     layoutTilesGrid), и обрезать чужое видео ради заполнения нашей сетки не
-     нужно — при несовпадении аспекта (не 16:9 камера) лучше чёрные поля
-     (letterbox на фоне карточки), чем срезанные края лица. Тот же object-fit,
-     что раньше был только у .tile--maximized — теперь везде одинаково,
-     отдельного override для максимизации больше не нужно. Зеркало своего
-     видео (.tile-video--mirror ниже) — обычный transform, object-fit на него
-     не влияет. */
+  /* Used to be cover (crops the frame to fill the tile) — changed to
+     contain: the card is now honest-16:9 (see best-fit in static/room.js:
+     layoutTilesGrid), and cropping someone else's video just to fill our grid is
+     not needed — when aspect ratios don't match (a non-16:9 camera), black bars
+     (letterboxing on the card's background) are better than cropped edges of a face. The same object-fit
+     that used to apply only to .tile--maximized is now consistent everywhere,
+     so a separate override for maximization is no longer needed. Mirroring one's own
+     video (.tile-video--mirror below) is a plain transform, object-fit
+     doesn't affect it. */
   object-fit: contain;
   display: block;
 }
@@ -864,10 +864,10 @@ body {
   transform: scaleX(-1);
 }
 
-/* Заглушка без видео — на весь тайл, аватар-круг и имя КРУПНО под ним (см.
-   .tile-placeholder-avatar/-letter/-name ниже). Раньше .tile-placeholder САМА
-   была кругом с градиентом — теперь это просто flex-контейнер, круг переехал
-   в .tile-placeholder-avatar. */
+/* Placeholder without video — fills the whole tile, an avatar circle and the name LARGE below it (see
+   .tile-placeholder-avatar/-letter/-name below). .tile-placeholder used to BE
+   the circle with a gradient itself — now it's just a flex container, the circle moved
+   into .tile-placeholder-avatar. */
 .tile-placeholder {
   width: 100%;
   height: 100%;
@@ -875,24 +875,24 @@ body {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  /* cqh (не фиксированный var(--space-3)) — на очень невысоких тайлах
-     (напр. 6 участников на телефоне, см. п.6 задания: 2×3 на мобильном)
-     аватар-круг + зазор + имя иначе не помещались бы в высоту тайла и
-     обрезались бы (.tile: overflow: hidden). Верхняя граница — тот же
-     var(--space-3), что и раньше, для обычных некрупных сеток. */
+  /* cqh (not a fixed var(--space-3)) — on very short tiles
+     (e.g. 6 participants on a phone, see task item 6: 2x3 on mobile)
+     the avatar circle + gap + name wouldn't otherwise fit the tile's height and
+     would get clipped (.tile: overflow: hidden). The upper bound is the same
+     var(--space-3) as before, for regular non-large grids. */
   gap: clamp(2px, 6cqh, var(--space-3));
 }
 
-/* Круг-аватар — заметно крупнее прежнего (было 30%/2.8rem) и строго круглый
-   (aspect-ratio: 1 + border-radius: 50%, min/max-width держат его круглым
-   при любой ширине тайла). font-size — clamp() от cqw (inline-size .tile,
-   см. container-type там же), а не фиксированный rem: буква/эмодзи растёт и
-   уменьшается вместе с реальным размером тайла (в т.ч. в сетке 3×2/2×3 из
-   п.6 задания), но не вылезает за пределы circle ни при 1 тайле на весь
-   экран (максимум зажат сверху), ни при 6 мелких тайлах на телефоне
-   (минимум зажат снизу, чтобы буква не схлопнулась в точку). position:
-   relative — якорь для короны лидера над кругом (.tile-crown--placeholder
-   ниже, см. п.4 задания и static/room.js: createTile). */
+/* The avatar circle — noticeably larger than before (was 30%/2.8rem) and strictly round
+   (aspect-ratio: 1 + border-radius: 50%, min/max-width keep it round
+   at any tile width). font-size — clamp() based on cqw (inline-size of .tile,
+   see container-type in the same place), not a fixed rem: the letter/emoji grows and
+   shrinks together with the tile's actual size (including in the 3x2/2x3 grid from
+   task item 6), but never exceeds the circle's bounds either at 1 tile fullscreen
+   (the maximum is clamped from above), or at 6 small tiles on a phone
+   (the minimum is clamped from below so the letter doesn't collapse to a dot). position:
+   relative — anchor for the leader crown above the circle (.tile-crown--placeholder
+   below, see task item 4 and static/room.js: createTile). */
 .tile-placeholder-avatar {
   position: relative;
   width: 34%;
@@ -915,23 +915,23 @@ body {
   line-height: 1;
 }
 
-/* Корона лидера НАД кругом-аватаром (см. п.4 задания) — абсолютно
-   позиционирована относительно самого круга (родитель — .tile-placeholder-avatar,
-   см. выше), центрирована по горизонтали. transform: translate(-50%, -62%) —
-   бейджем на верхнем крае круга (центр короны чуть выше границы), а не
-   целиком вынесена над ним: на обычных тайлах (1-4 участника, либо 5-6 на
-   десктопе) места достаточно и для полностью вынесенной короны, но на самых
-   мелких тайлах (6 участников на телефоне, 2×3, см. п.6 задания — там
-   аватар+имя и так занимают всю высоту тайла впритык, см. .tile-placeholder:
-   gap) вариант «целиком сверху» обрезался бы верхней границей тайла
-   (.tile: overflow: hidden). Бейдж-оверлей — стандартный компромисс для этого
-   случая (как непрочитанные-бейджи поверх иконок) и всё равно читается как
-   «корона над кругом» на глаз. Размер — тоже cqw, синхронно с буквой в круге,
-   но с более узким диапазоном (корона не должна доминировать над самим
-   аватаром). Селектор через родителя (не просто .tile-crown--placeholder) —
-   это поднимает специфичность выше, чем у общего правила .tile-crown ниже
-   (оба иначе имели бы одну специфичность, и порядок в файле решал бы, кто
-   победит, — хрупко). */
+/* The leader crown ABOVE the avatar circle (see task item 4) — absolutely
+   positioned relative to the circle itself (parent is .tile-placeholder-avatar,
+   see above), centered horizontally. transform: translate(-50%, -62%) —
+   badges onto the circle's top edge (the crown's center is slightly above the border), rather than
+   fully lifted above it: on regular tiles (1-4 participants, or 5-6 on
+   desktop) there's enough room for a fully lifted crown too, but on the
+   smallest tiles (6 participants on a phone, 2x3, see task item 6 — there
+   avatar+name already occupy the tile's full height snugly, see .tile-placeholder:
+   gap) the "fully above" option would get clipped by the tile's top border
+   (.tile: overflow: hidden). A badge overlay is the standard compromise for this
+   case (like unread badges over icons) and still reads as
+   "crown above circle" visually. Size — also cqw, in sync with the letter in the circle,
+   but with a narrower range (the crown shouldn't dominate the
+   avatar itself). Selecting through the parent (not just .tile-crown--placeholder) —
+   raises the specificity above the general .tile-crown rule below
+   (otherwise both would have the same specificity, and file order would decide who
+   wins — fragile). */
 .tile-placeholder-avatar .tile-crown--placeholder {
   position: absolute;
   top: 0;
@@ -941,12 +941,12 @@ body {
   height: clamp(28px, 18cqw, 52px);
 }
 
-/* Имя под аватаром — крупно (не мелкая подпись). В углу тайла (.tile-name)
-   имя в этом режиме не дублируется, см. .tile-name.hidden в
-   static/room.js: setTileVideoVisible/createTile. font-size — тоже clamp от
-   cqh (см. .tile-placeholder/.tile: container-type выше) по той же причине,
-   что и gap: на самых мелких тайлах (6 участников на телефоне) имя должно
-   ужаться, а не обрезаться по высоте вместе с аватаром. */
+/* The name under the avatar — large (not a small caption). In this mode the name
+   isn't duplicated in the tile's corner (.tile-name), see .tile-name.hidden in
+   static/room.js: setTileVideoVisible/createTile. font-size — also a clamp based on
+   cqh (see .tile-placeholder/.tile: container-type above) for the same reason
+   as gap: on the smallest tiles (6 participants on a phone) the name must
+   shrink rather than get clipped in height along with the avatar. */
 .tile-placeholder-name {
   color: #fff;
   font-weight: 600;
@@ -970,12 +970,12 @@ body {
   font-size: 0.8rem;
 }
 
-/* Имя (+ корона лидера инлайн перед ним, см. static/room.js: createTile) —
-   верхний левый угол во время видео (нижний левый занимала подпись раньше);
-   правый верхний/нижний остаются за .tile-mic-off/.tile-speed без изменений.
-   Скрыт (класс .hidden), пока видео не идёт — см. setTileVideoVisible: на
-   заглушке имя уже крупно показано по центру (.tile-placeholder-name выше),
-   повторять его в углу незачем. */
+/* The name (+ the leader crown inline before it, see static/room.js: createTile) —
+   the top-left corner during video (the bottom-left used to hold the caption);
+   the top-right/bottom-right remain reserved for .tile-mic-off/.tile-speed unchanged.
+   Hidden (the .hidden class) while there's no video — see setTileVideoVisible: on
+   the placeholder, the name is already shown large in the center (.tile-placeholder-name above),
+   so there's no need to repeat it in the corner. */
 .tile-name {
   position: absolute;
   top: var(--space-2);
@@ -988,9 +988,9 @@ body {
   backdrop-filter: blur(2px);
   color: #fff;
   border-radius: var(--radius);
-  /* Крупнее прежнего (было 0.72rem) — просто имя без "You (...)"/роли
-     занимает меньше места, есть запас на увеличение шрифта (см. п.5
-     задания и static/room.js: createTile/tileDisplayName). */
+  /* Larger than before (was 0.72rem) — a plain name without "You (...)"/role
+     takes up less room, leaving margin to increase the font size (see task item 5
+     and static/room.js: createTile/tileDisplayName). */
   font-size: 0.85rem;
   font-weight: 600;
   max-width: calc(100% - var(--space-4));
@@ -1003,7 +1003,7 @@ body {
   min-width: 0;
 }
 
-/* ---------- Приглашение в пустой комнате ---------- */
+/* ---------- Invitation in an empty room ---------- */
 
 .invite-cta {
   display: flex;
@@ -1046,10 +1046,10 @@ body {
   background: var(--bg-elevated-2);
 }
 
-/* Тонкие ненавязчивые баннеры реконнекта сигналинга/version-skew (см.
-   static/room.js) — обычный поток документа (НЕ fixed, НЕ полноэкранный
-   оверлей), сразу под верхней панелью комнаты: mesh/медиа/чат продолжают
-   работать, баннер только информирует. */
+/* Thin, unobtrusive signaling-reconnect/version-skew banners (see
+   static/room.js) — regular document flow (NOT fixed, NOT a full-screen
+   overlay), right below the room's top bar: the mesh/media/chat continue
+   to work, the banner only informs. */
 .top-banner {
   display: flex;
   align-items: center;
@@ -1104,7 +1104,7 @@ body {
   box-shadow: var(--shadow);
 }
 
-/* ---------- Панель управления: плавающая пилюля ---------- */
+/* ---------- Control panel: floating pill ---------- */
 
 .control-panel {
   position: fixed;
@@ -1141,7 +1141,7 @@ body {
   padding: 0;
   font-family: inherit;
   cursor: pointer;
-  /* Убивает задержку/double-tap zoom на тач-устройствах. */
+  /* Kills the delay/double-tap zoom on touch devices. */
   touch-action: manipulation;
   transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease, transform 0.1s ease;
 }
@@ -1205,12 +1205,12 @@ body {
   cursor: not-allowed;
 }
 
-/* ---------- Попап «Поделиться» ---------- */
+/* ---------- "Share" popup ---------- */
 
 .share-popup {
   position: fixed;
   inset: 0;
-  z-index: 60; /* выше .overlay (50) и чата (25/30) — модальный поверх всего */
+  z-index: 60; /* above .overlay (50) and chat (25/30) — a modal on top of everything */
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1275,7 +1275,7 @@ body {
 
 .share-popup-qr {
   display: block;
-  /* Читаемый размер на любом экране: ~60vw, но не крупнее 280px и не мельче 160px. */
+  /* A readable size on any screen: ~60vw, but no larger than 280px and no smaller than 160px. */
   width: clamp(160px, 60vw, 280px);
   height: clamp(160px, 60vw, 280px);
   background: #fff;
@@ -1284,9 +1284,9 @@ body {
   box-sizing: border-box;
 }
 
-/* QR теперь рендерится локально как инлайновый <svg> внутри .share-popup-qr
-   (см. static/vendor/qrcode.js, static/room.js: renderShareQr) — растягиваем
-   его на весь контейнер вместо фиксированных px-атрибутов самого SVG. */
+/* The QR code is now rendered locally as an inline <svg> inside .share-popup-qr
+   (see static/vendor/qrcode.js, static/room.js: renderShareQr) — we stretch
+   it to fill the whole container instead of the SVG's own fixed px attributes. */
 .share-popup-qr svg {
   display: block;
   width: 100%;
@@ -1304,11 +1304,11 @@ body {
   padding: var(--space-2) var(--space-3);
 }
 
-/* Хэш опубликованной статики — ОТДЕЛЬНОЙ строкой под ссылкой/QR (НЕ часть
-   ни того, ни другого — см. static/room.js: renderShareBuildLine). Тот же
-   формат/раскладка, что в подвале лендинга (.build-footer выше): короткий
-   хэш + раскрывающийся полный (моноширинный шрифт даёт .build-full) +
-   ссылка «verify» рядом. */
+/* The published static-assets hash — a SEPARATE line under the link/QR (NOT part
+   of either — see static/room.js: renderShareBuildLine). The same
+   format/layout as the landing page footer (.build-footer above): a short
+   hash + an expandable full one (the monospace font comes from .build-full) +
+   a "verify" link next to it. */
 .share-popup-build {
   width: 100%;
   display: flex;
@@ -1338,10 +1338,10 @@ body {
   background: var(--accent-hover);
 }
 
-/* ---------- Чат ----------
-   Кнопка-тогл — обычная .control-button в пилюле управления (#chat-button в
-   room.html), значок непрочитанных — .chat-unread-badge поверх её правого
-   верхнего угла (см. position: relative на .control-button выше). */
+/* ---------- Chat ----------
+   The toggle button is a regular .control-button in the control pill (#chat-button in
+   room.html), the unread badge is .chat-unread-badge over its top-right
+   corner (see position: relative on .control-button above). */
 
 .chat-unread-badge {
   position: absolute;
@@ -1395,9 +1395,9 @@ body {
 .chat-title {
   font-weight: 600;
   font-size: 0.95rem;
-  /* Поле имени в шапке убрано (анонимность — см. static/chat.js) — flex:1
-     занимает освободившееся место, чтобы кнопка сворачивания осталась
-     прижатой к правому краю шапки. */
+  /* The name field in the header has been removed (anonymity — see static/chat.js) — flex:1
+     occupies the freed-up space so the collapse button stays
+     pinned to the right edge of the header. */
   flex: 1;
 }
 
@@ -1455,9 +1455,9 @@ body {
   color: var(--text-muted);
 }
 
-/* Пометка «(изменено)» рядом со временем у отредактированных сообщений —
-   производная от messageOverlays (см. chat.js: recomputeMessageMeta),
-   не отдельное поле конверта. */
+/* The "(edited)" mark next to the timestamp on edited messages —
+   derived from messageOverlays (see chat.js: recomputeMessageMeta),
+   not a separate envelope field. */
 .chat-message-meta-edited {
   font-style: italic;
   opacity: 0.75;
@@ -1475,8 +1475,8 @@ body {
   transition: box-shadow 0.2s ease;
 }
 
-/* Тумбстоун удалённого сообщения (kind='delete', см. chat.js) — тот же
-   пузырь-контейнер, но приглушённый курсив вместо текста/markdown. */
+/* Tombstone for a deleted message (kind='delete', see chat.js) — the same
+   bubble container, but a muted italic instead of text/markdown. */
 .chat-message-text--deleted {
   font-style: italic;
   color: var(--text-muted);
@@ -1494,11 +1494,11 @@ body {
   color: inherit;
   text-decoration: underline;
   text-decoration-color: currentColor;
-  /* overflow-wrap: break-word унаследован от .chat-message-text — этого
-     достаточно, чтобы очень длинная ссылка без пробелов не распирала пузырь.
-     word-break: break-all здесь был бы агрессивнее браузерного переноса по
-     словам и резал бы короткие ссылки посреди слова ("http" + "s://…") даже
-     когда они спокойно помещаются на строке целиком. */
+  /* overflow-wrap: break-word is inherited from .chat-message-text — this is
+     enough to keep a very long link with no spaces from stretching the bubble.
+     word-break: break-all here would be more aggressive than the browser's word
+     wrapping and would cut short links mid-word ("http" + "s://...") even
+     when they'd fit comfortably on one line as a whole. */
   overflow-wrap: anywhere;
 }
 
@@ -1508,7 +1508,7 @@ body {
   color: #fff;
 }
 
-/* Блок-цитата markdown (строки "> ") — левая полоска, чуть приглушённый текст. */
+/* Markdown blockquote (lines starting with "> ") — a left stripe, slightly muted text. */
 .chat-md-quote {
   border-left: 3px solid var(--border);
   padding-left: var(--space-2);
@@ -1521,16 +1521,16 @@ body {
   color: rgba(255, 255, 255, 0.85);
 }
 
-/* Кратковременная подсветка сообщения, к которому проскроллили по клику на реплай-цитату. */
+/* Brief highlight of the message that was scrolled to by clicking a reply quote. */
 .chat-message-text--flash {
   box-shadow: 0 0 0 2px var(--accent);
 }
 
-/* ---------- Форматирование (Ф4): спойлер, инлайн-код, блок кода ---------- */
+/* ---------- Formatting (F4): spoiler, inline code, code block ---------- */
 
-/* Спойлер (||...||, см. chat.js: buildSpoilerEl) — размыт и приглушён до
-   клика/Enter/Space, класс .revealed добавляется НАВСЕГДА (раскрытие в рамках
-   уже отрендеренного элемента не откатывается назад — как в Telegram). */
+/* Spoiler (||...||, see chat.js: buildSpoilerEl) — blurred and dimmed until
+   a click/Enter/Space, the .revealed class is added PERMANENTLY (revealing within
+   an already-rendered element doesn't roll back — same as Telegram). */
 .chat-md-spoiler {
   display: inline;
   border-radius: 4px;
@@ -1555,7 +1555,7 @@ body {
   background: transparent;
 }
 
-/* Инлайн-код (`...`) — моноширинный, лёгкий фон-плашка. */
+/* Inline code (`...`) — monospace, a light background chip. */
 .chat-inline-code {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Courier New', monospace;
   font-size: 0.86em;
@@ -1568,9 +1568,9 @@ body {
   background: rgba(255, 255, 255, 0.2);
 }
 
-/* Блок кода (```[lang]\n...\n```, см. chat.js: buildCodeBlockEl) — метка языка
-   и кнопка «копировать» в шапке, моноширинный <pre><code> со своим
-   горизонтальным скроллом (длинные строки НЕ распирают пузырь сообщения). */
+/* Code block (```[lang]\n...\n```, see chat.js: buildCodeBlockEl) — a language label
+   and a "copy" button in the header, a monospace <pre><code> with its own
+   horizontal scroll (long lines do NOT stretch the message bubble). */
 .chat-code-block {
   margin: 2px 0;
   border: 1px solid var(--border);
@@ -1653,14 +1653,14 @@ body {
   color: #fff;
 }
 
-/* ---------- Попап действий сообщения (волна 13) ----------
-   Заменяет ЦЕЛИКОМ hover-кнопки и on-tap action-row прошлых волн: в строке
-   сообщения по умолчанию нет вообще никаких кнопок — ни постоянных, ни по
-   hover, ни на мобильном, ни на десктопе. Единственный способ добраться до
-   действий (ответить/реакция/редактировать/удалить/копировать) — клик/тап по
-   самому сообщению (см. chat.js: openMessagePopover), который открывает этот
-   попап: на десктопе — компактной карточкой у сообщения, на мобильном
-   (≤640px, см. media-запрос ниже) — bottom-sheet снизу экрана. */
+/* ---------- Message actions popup (wave 13) ----------
+   Fully replaces the hover buttons and on-tap action row of previous waves: a
+   message row has no buttons at all by default — neither persistent, nor on
+   hover, nor on mobile, nor on desktop. The only way to reach the
+   actions (reply/react/edit/delete/copy) is clicking/tapping
+   the message itself (see chat.js: openMessagePopover), which opens this
+   popup: a compact card next to the message on desktop, a
+   bottom sheet from the bottom of the screen on mobile (≤640px, see the media query below). */
 .chat-message-popover {
   position: fixed;
   inset: 0;
@@ -1694,7 +1694,7 @@ body {
   gap: var(--space-1);
 }
 
-/* Ручка-индикатор свайпа — видна только в мобильном bottom-sheet (см. media-запрос ниже). */
+/* Swipe handle indicator — visible only in the mobile bottom sheet (see the media query below). */
 .chat-message-popover-handle {
   display: none;
 }
@@ -1749,7 +1749,7 @@ body {
   background: var(--bg-elevated-2);
 }
 
-/* Разбор реакций «кто/чем/когда» (см. chat.js: buildPopoverReactionsList) — скрыт целиком, если у сообщения нет ни одной реакции. */
+/* Reaction breakdown "who/what/when" (see chat.js: buildPopoverReactionsList) — hidden entirely if the message has no reactions at all. */
 .chat-message-popover-reactions {
   border-top: 1px solid var(--border);
   padding-top: var(--space-2);
@@ -1807,7 +1807,7 @@ body {
   margin-top: 2px;
 }
 
-/* Пункт меню действий — крупная строка (≥44px тач-цель), иконка + подпись. */
+/* Action menu item — a large row (≥44px touch target), icon + label. */
 .chat-message-action {
   display: flex;
   align-items: center;
@@ -1860,13 +1860,13 @@ body {
   background: rgba(229, 72, 77, 0.14);
 }
 
-/* Состояние подтверждения удаления (см. chat.js: buildDeleteButton). */
+/* Delete-confirmation state (see chat.js: buildDeleteButton). */
 .chat-message-action--confirm {
   color: var(--danger-hover);
   font-weight: 600;
 }
 
-/* Лёгкая рамка-подсказка на сообщении, для которого сейчас открыт попап — та же подсветка что и было у активного мобильного сообщения прошлой волны, теперь единая для десктопа и мобайла. */
+/* A light hint border on the message whose popup is currently open — the same highlight the previous wave's active mobile message had, now unified for desktop and mobile. */
 .chat-message--popover-open .chat-message-text {
   box-shadow: 0 0 0 1px var(--accent);
 }
@@ -1947,7 +1947,7 @@ body {
   background: var(--bg-elevated);
 }
 
-/* ---------- Редактирование (по образцу реплай-плашки выше, взаимоисключаются) ---------- */
+/* ---------- Editing (modeled on the reply banner above, mutually exclusive) ---------- */
 
 .chat-edit-bar {
   display: flex;
@@ -1989,13 +1989,13 @@ body {
   background: var(--bg-elevated);
 }
 
-/* ---------- Тулбар форматирования (см. chat.js:
+/* ---------- Formatting toolbar (see chat.js:
    updateFormatToolbarVisibility) ----------
-   Кнопка «Aa» и тулбар видны на ЛЮБОМ layout — десктоп дополнительно имеет
-   горячие клавиши (Cmd/Ctrl+B/I/…, см. chat.js), но без видимой кнопки
-   форматирование там было полностью недискаверабельно (баг: «нет кнопки —
-   нет форматирования»). На мобильном @media (max-width:640px) ниже только
-   донастраивает раскладку инпута — саму видимость кнопки больше не трогает. */
+   The "Aa" button and the toolbar are visible on ANY layout — desktop additionally has
+   keyboard shortcuts (Cmd/Ctrl+B/I/..., see chat.js), but without a visible button
+   formatting there was completely undiscoverable (bug: "no button —
+   no formatting"). On mobile, @media (max-width:640px) below only
+   fine-tunes the input layout — it no longer touches the button's visibility itself. */
 .chat-format-toggle-button {
   display: flex;
   flex-shrink: 0;
@@ -2031,10 +2031,10 @@ body {
   color: #fff;
 }
 
-/* Сам тулбар — строка кнопок над .chat-input-row (по образцу
-   .chat-reply-bar/.chat-edit-bar); flex-wrap, а не горизонтальный скролл —
-   гарантирует, что на 390px тулбар никогда не вылезет за экран (см. общее
-   требование «никакого горизонтального скролла» в шапке комнаты). */
+/* The toolbar itself — a row of buttons above .chat-input-row (modeled on
+   .chat-reply-bar/.chat-edit-bar); flex-wrap, not horizontal scroll —
+   guarantees the toolbar never overflows the screen at 390px (see the general
+   "no horizontal scroll" requirement at the top of the room file). */
 .chat-format-toolbar {
   display: flex;
   flex-wrap: wrap;
@@ -2077,7 +2077,7 @@ body {
   text-decoration: line-through;
 }
 
-/* ---------- Реакции ---------- */
+/* ---------- Reactions ---------- */
 
 .chat-message-reactions {
   display: flex;
@@ -2129,13 +2129,13 @@ body {
   flex-shrink: 0;
 }
 
-/* Кнопки инпута (📎/Aa/➤) обёрнуты в .chat-input-actions (см. chat.js:
-   buildDom), но в обычном (однострочном) режиме этот контейнер сам в
-   разметке не участвует — display:contents «растворяет» его, и кнопки
-   становятся обычными flex-item'ами .chat-input-row наравне с textarea.
-   Порядок среди них задаётся order (ниже), а не DOM-порядком — сама
-   разметка теперь textarea → .chat-input-actions (см. chat.js), но
-   визуально нужно 📎, Aa, textarea, ➤, как раньше. */
+/* The input buttons (📎/Aa/➤) are wrapped in .chat-input-actions (see chat.js:
+   buildDom), but in the regular (single-line) mode this container doesn't itself
+   participate in the layout — display:contents "dissolves" it, and the buttons
+   become regular flex items of .chat-input-row alongside the textarea.
+   Their order is set by `order` (below), not DOM order — the markup
+   itself is now textarea → .chat-input-actions (see chat.js), but
+   visually we still need 📎, Aa, textarea, ➤, as before. */
 .chat-input-actions {
   display: contents;
 }
@@ -2156,18 +2156,18 @@ body {
   order: 4;
 }
 
-/* Раскладка при разросшейся textarea (волна 14, см. chat.js:
-   autoGrowTextInput — класс навешивается/снимается по числу строк).
-   textarea растёт вверх по высоте (см. её правила ниже), и держать 📎/Aa/➤
-   в горизонтальном ряду рядом с ней становится тесно и неопрятно — вместо
-   этого правая тройка кнопок перестраивается в вертикальную колонку:
-   .chat-input-actions перестаёт быть «прозрачным» (display:contents) и
-   становится настоящим flex-контейнером с flex-direction:column, в который
-   попадают ровно те же кнопки (order внутри него сохраняет 📎 > Aa > ➤
-   сверху вниз — order — это свойство самого элемента, оно продолжает
-   действовать в любом флекс-контексте, в который элемент попадает).
-   justify-content:flex-end прижимает колонку к низу — так, что ➤ всегда на
-   уровне низа textarea. */
+/* Layout when the textarea has grown (wave 14, see chat.js:
+   autoGrowTextInput — the class is added/removed based on line count).
+   The textarea grows taller (see its rules below), and keeping 📎/Aa/➤
+   in a horizontal row next to it becomes cramped and messy — instead
+   the right-hand trio of buttons rearranges into a vertical column:
+   .chat-input-actions stops being "transparent" (display:contents) and
+   becomes a real flex container with flex-direction:column, containing
+   exactly the same buttons (order within it still keeps 📎 > Aa > ➤
+   top to bottom — order is a property of the element itself, it keeps
+   working in whatever flex context the element ends up in).
+   justify-content:flex-end pushes the column to the bottom — so ➤ is always at
+   the level of the textarea's bottom edge. */
 .chat-input-row--expanded {
   align-items: stretch;
 }
@@ -2182,18 +2182,18 @@ body {
   flex-shrink: 0;
 }
 
-/* Авторост (волна 13, «как в Telegram», см. chat.js: autoGrowTextInput) —
-   высота считается и проставляется через element.style.height В JS (растёт
-   по числу строк до MAX_INPUT_LINES, дальше — внутренний overflow-y:auto),
-   поэтому здесь НЕТ max-height. box-sizing:border-box (унаследован от
-   глобального ресета) — высота, которую ставит JS, включает border, поэтому
-   autoGrowTextInput() учитывает border отдельно (см. её комментарий).
-   Однострочный текст — ровно по центру поля: padding-top и padding-bottom
-   СИММЕТРИЧНЫ (var(--space-3) с обеих сторон) и в сумме с line-height дают
-   ту же min-height — то есть однострочному тексту НЕ достаётся лишнего
-   "слака" снизу (в отличие от прежней версии, где min-height был больше
-   естественной высоты строки+паддингов, и весь остаток становился видимым
-   только под текстом, тесто визуально смещало текст выше центра). */
+/* Auto-grow (wave 13, "like Telegram", see chat.js: autoGrowTextInput) —
+   the height is computed and set via element.style.height IN JS (it grows
+   with the line count up to MAX_INPUT_LINES, then falls back to internal overflow-y:auto),
+   so there is NO max-height here. box-sizing:border-box (inherited from
+   the global reset) — the height JS sets includes the border, so
+   autoGrowTextInput() accounts for the border separately (see its comment).
+   Single-line text is exactly centered in the field: padding-top and padding-bottom
+   are SYMMETRIC (var(--space-3) on both sides), and together with line-height they add up to
+   the same min-height — meaning single-line text does NOT get extra
+   "slack" at the bottom (unlike the previous version, where min-height was larger
+   than the line's natural height + padding, and the whole remainder became visible
+   only below the text, which visually shifted the text above center). */
 .chat-text-input {
   flex: 1;
   min-width: 0;
@@ -2215,8 +2215,8 @@ body {
   cursor: not-allowed;
 }
 
-/* Явный акцентный фокус-ринг вместо браузерного дефолта (который на разных
-   ОС/движках отличается по цвету и не всегда согласуется с тёмной темой). */
+/* An explicit accent focus ring instead of the browser default (which differs
+   in color across OSes/engines and doesn't always match the dark theme). */
 .chat-text-input:focus {
   outline: none;
   border-color: var(--accent);
@@ -2253,7 +2253,7 @@ body {
   cursor: not-allowed;
 }
 
-/* ---------- Прикрепление файлов (Ф3) ---------- */
+/* ---------- File attachments (F3) ---------- */
 
 .chat-attach-button {
   flex-shrink: 0;
@@ -2285,10 +2285,10 @@ body {
   cursor: not-allowed;
 }
 
-/* Карточка файла — тот же пузырь-контейнер, что и текстовое сообщение
-   (.chat-message-text), но без белого текста для собственных сообщений:
-   карточка всегда нейтрального цвета, у своих сообщений различие только по
-   выравниванию (align-self через .chat-message--own, унаследовано). */
+/* The file card — the same bubble container as a text message
+   (.chat-message-text), but without white text for one's own messages:
+   the card is always a neutral color, for one's own messages the only difference is
+   alignment (align-self via .chat-message--own, inherited). */
 .chat-file-card {
   display: flex;
   flex-direction: column;
@@ -2392,9 +2392,9 @@ body {
   background: var(--accent-hover);
 }
 
-/* Тонкая полоса прогресса приёма/отдачи — точечно обновляется через
-   .style.width на .chat-file-progress-bar (см. chat.js: setFileProgress),
-   без пересборки всей карточки на каждый чанк. */
+/* A thin send/receive progress bar — updated surgically via
+   .style.width on .chat-file-progress-bar (see chat.js: setFileProgress),
+   without rebuilding the whole card on every chunk. */
 .chat-file-progress {
   height: 4px;
   border-radius: 999px;
@@ -2417,7 +2417,7 @@ body {
   cursor: pointer;
 }
 
-/* Клик по картинке — оригинал в новой вкладке (см. chat.js: renderFileDoneBody, <a target=_blank>). */
+/* Clicking the image — opens the original in a new tab (see chat.js: renderFileDoneBody, <a target=_blank>). */
 .chat-file-media-link {
   display: block;
   align-self: flex-start;
@@ -2436,9 +2436,9 @@ body {
   max-width: 260px;
 }
 
-/* Мета-строка под инлайн-медиа (картинка/видео/аудио, см. chat.js:
-   buildFileMetaRow) — имя, размер, (длительность — только audio/video, по
-   loadedmetadata), кнопка «Скачать» прижата вправо через margin-left: auto. */
+/* The meta row under inline media (image/video/audio, see chat.js:
+   buildFileMetaRow) — name, size, (duration — audio/video only, from
+   loadedmetadata), the "Download" button is pushed right via margin-left: auto. */
 .chat-file-meta-row {
   display: flex;
   align-items: center;
@@ -2485,20 +2485,20 @@ body {
   }
 }
 
-/* ---------- Мобильная комната (телефон, портрет) ----------
-   Приблизительная высота нижней панели управления на узких экранах —
-   используется, чтобы сетка тайлов и bottom-sheet чата не заезжали под
-   панель. Не пиксель в пиксель — панель может быть чуть выше из-за
-   safe-area на «челюсти» iPhone — поэтому во всех расчётах ниже есть запас. */
+/* ---------- Mobile room (phone, portrait) ----------
+   Approximate height of the bottom control panel on narrow screens —
+   used so the tile grid and the chat bottom sheet don't slide under the
+   panel. Not pixel-perfect — the panel may be slightly taller because of
+   the safe area on the iPhone "notch" — so every calculation below has some margin. */
 @media (max-width: 640px) {
   .room-top-bar {
     padding: var(--space-2) var(--space-3);
   }
 
-  /* Узкий экран: логотип слева ужимается визуально малозначим, а центральная
-     колонка (счётчик + таймер) — самая широкая часть бара. Уменьшаем зазор и
-     сам текст чуть-чуть, чтобы "Участников: 3 / 6" + "2:59:47" гарантированно
-     не выталкивали друг друга на 390px (см. проверку скриншотами). */
+  /* Narrow screen: the logo on the left shrinks to visually minor, while the center
+     column (counter + timer) is the widest part of the bar. We shrink the gap and
+     the text itself slightly, so "Participants: 3 / 6" + "2:59:47" are guaranteed
+     not to push each other out at 390px (see the screenshot check). */
   .room-top-bar-center {
     gap: var(--space-1);
   }
@@ -2514,7 +2514,7 @@ body {
     padding: var(--space-3) var(--space-3) 116px;
   }
 
-  /* Сетка тайлов — 2 колонки в портретной ориентации телефона. */
+  /* The tile grid — 2 columns in phone portrait orientation. */
   .tiles-grid {
     grid-template-columns: repeat(2, 1fr);
     gap: var(--space-2);
@@ -2528,11 +2528,11 @@ body {
     flex: 0 0 124px;
   }
 
-  /* Спотлайт на мобильном (см. .tiles-grid--spotlight выше, десктопный
-     вариант — вертикальная лента справа) — лента становится ГОРИЗОНТАЛЬНОЙ
-     и переезжает вниз: row вместо column, скролл по X вместо Y. Тот же приём
-     (максимизированный тайл — position:fixed, исключён из flex-потока;
-     остальные — обычные flex-элементы, прижаты к нижнему краю). */
+  /* Spotlight on mobile (see .tiles-grid--spotlight above, the desktop
+     version is a vertical strip on the right) — the strip becomes HORIZONTAL
+     and moves to the bottom: row instead of column, scroll on X instead of Y. The same trick
+     (the maximized tile — position:fixed, excluded from the flex flow;
+     the rest — regular flex items, pushed against the bottom edge). */
   .tiles-grid--spotlight {
     flex-direction: row;
     align-items: flex-end;
@@ -2542,12 +2542,12 @@ body {
 
   .tiles-grid--spotlight .tile {
     width: auto;
-    height: 100px; /* 100–120px по заданию; ширина следует из aspect-ratio 16:9 */
+    height: 100px; /* 100-120px per the task; width follows from aspect-ratio 16:9 */
   }
 
   .tiles-grid--spotlight .tile--maximized {
     right: 0;
-    bottom: 110px; /* высота тайла ленты (100px) + gap (var(--space-2)) + запас */
+    bottom: 110px; /* strip tile height (100px) + gap (var(--space-2)) + margin */
   }
 
   .control-panel {
@@ -2566,13 +2566,13 @@ body {
     height: 22px;
   }
 
-  /* Открытый чат на телефоне — не bottom-sheet поверх комнаты, а отдельный
-     полноэкранный вид (своя шапка, список сообщений на всю высоту, инпут
-     снизу с safe-area). 100dvh, а не vh — vh не учитывает наезд/уход
-     мобильной клавиатуры и адресной строки браузера, из-за vh экран «прыгал»
-     бы при открытии клавиатуры для ввода сообщения. Панель управления при
-     этом ничего специально прятать не нужно: чат перекрывает весь вьюпорт
-     (inset: 0) и по z-index выше (.chat-panel: 25 > .control-panel: 20). */
+  /* Open chat on a phone — not a bottom sheet over the room, but a separate
+     full-screen view (its own header, a full-height message list, an input
+     at the bottom with safe-area). 100dvh, not vh — vh doesn't account for the
+     mobile keyboard and browser address bar appearing/disappearing; with vh the screen would "jump"
+     when the keyboard opens to type a message. The control panel
+     doesn't need to be specially hidden here: the chat covers the whole viewport
+     (inset: 0) and is higher by z-index (.chat-panel: 25 > .control-panel: 20). */
   .chat-panel {
     top: 0;
     left: 0;
@@ -2590,8 +2590,8 @@ body {
     padding-top: calc(var(--space-3) + env(safe-area-inset-top));
   }
 
-  /* Крестик закрытия — крупная тач-цель на весь экран, а не мелкая иконка
-     сворачивания боковой панели. */
+  /* The close cross — a large, full-screen-sized touch target, rather than the small
+     collapse icon of a side panel. */
   .chat-collapse-button {
     width: 44px;
     height: 44px;
@@ -2606,8 +2606,8 @@ body {
     padding-bottom: calc(var(--space-3) + env(safe-area-inset-bottom));
   }
 
-  /* Мобайл: текст сообщений 16px (заодно не даёт iOS зумить страницу при
-     фокусе — тот же порог применяем к textarea ниже), инпут и кнопки крупнее. */
+  /* Mobile: message text is 16px (this also stops iOS from zooming the page on
+     focus — we apply the same threshold to the textarea below), the input and buttons are larger. */
   .chat-message-text {
     font-size: 1rem;
   }
@@ -2625,12 +2625,12 @@ body {
     height: 48px;
   }
 
-  /* Попап действий сообщения (волна 13) — на мобильном раскрывается
-     bottom-sheet'ом снизу экрана (не компактной карточкой у сообщения, как
-     на десктопе, см. базовые правила выше): позиция задаётся ЦЕЛИКОМ CSS
-     (fixed внизу, на всю ширину) — JS (positionMessagePopoverDesktop) на
-     мобильном layout инлайновые top/left не проставляет вовсе, поэтому
-     конфликта специфичности с этими правилами нет. */
+  /* The message actions popup (wave 13) — on mobile it opens as a
+     bottom sheet from the bottom of the screen (not a compact card next to the message like
+     on desktop, see the base rules above): the position is set ENTIRELY by CSS
+     (fixed at the bottom, full width) — the JS (positionMessagePopoverDesktop) doesn't set
+     inline top/left at all in the mobile layout, so there's
+     no specificity conflict with these rules. */
   .chat-message-popover-card {
     position: fixed;
     left: 0;
@@ -2658,7 +2658,7 @@ body {
     height: 44px;
   }
 
-  /* Крупные тач-цели (≥44px) для пунктов меню действий. */
+  /* Large touch targets (≥44px) for the action menu items. */
   .chat-message-action {
     min-height: 48px;
     font-size: 1rem;
@@ -2676,9 +2676,9 @@ body {
   }
 }
 
-/* ---------- Лендинг: уважает системную светлую тему.
-   Комната остаётся тёмной сценой всегда, независимо от prefers-color-scheme —
-   переменные ниже переопределяются только внутри body.page-landing. ---------- */
+/* ---------- Landing page: respects the system light theme.
+   The room always remains a dark stage, regardless of prefers-color-scheme —
+   the variables below are overridden only inside body.page-landing. ---------- */
 @media (prefers-color-scheme: light) {
   body.page-landing {
     --bg: #f4f5f7;
@@ -2691,9 +2691,9 @@ body {
   }
 }
 
-/* ---------- Модалка входа в комнату (анонимность — см. static/room.js) ----------
-   Показывается первой, до подключения к сигналингу; z-index выше .overlay
-   (50), чтобы не оказаться под ним, если оба почему-то видимы одновременно. */
+/* ---------- Join-room modal (anonymity — see static/room.js) ----------
+   Shown first, before connecting to signaling; z-index above .overlay
+   (50), so it doesn't end up beneath it if both are somehow visible at the same time. */
 .join-modal {
   position: fixed;
   inset: 0;
@@ -2726,7 +2726,7 @@ body {
   font-size: 1.25rem;
 }
 
-/* ---------- Тост (смена лидера и т.п.) ---------- */
+/* ---------- Toast (leader change, etc.) ---------- */
 
 .toast {
   position: fixed;
@@ -2745,12 +2745,12 @@ body {
   box-shadow: var(--shadow);
 }
 
-/* ---------- Корона лидера на тайле ---------- */
-/* Раньше была отдельным абсолютно позиционированным элементом в верхнем
-   левом углу тайла — теперь живёт ВНУТРИ .tile-name (см. static/room.js:
-   createTile), инлайн перед именем, в той же плашке: обычный маленький
-   flex-элемент без своего position/top/left, flex-shrink: 0, чтобы длинное
-   имя не сжимало иконку. */
+/* ---------- Leader crown on a tile ---------- */
+/* Used to be a separate absolutely positioned element in the top-left
+   corner of the tile — now it lives INSIDE .tile-name (see static/room.js:
+   createTile), inline before the name, in the same chip: a regular small
+   flex item with no position/top/left of its own, flex-shrink: 0 so a long
+   name doesn't squeeze the icon. */
 .tile-crown {
   width: 16px;
   height: 16px;
@@ -2765,10 +2765,10 @@ body {
   display: block;
 }
 
-/* ---------- Индикатор «микрофон выключен/отсутствует» на тайле ---------- */
-/* Правый верхний угол. Видим по умолчанию (см. static/room.js:
-   createTile) — до первого stream-info/включения мика трек либо выключен,
-   либо его ещё вовсе нет, оба случая по заданию показывают значок. */
+/* ---------- "Microphone off/missing" indicator on a tile ---------- */
+/* Top-right corner. Visible by default (see static/room.js:
+   createTile) — before the first stream-info/mic activation the track is either off,
+   or doesn't exist yet at all; per the task, both cases show the icon. */
 .tile-mic-off {
   position: absolute;
   top: var(--space-2);
@@ -2790,13 +2790,13 @@ body {
   display: block;
 }
 
-/* ---------- Бейдж скорости на тайле (см. static/room.js: updateTileSpeedBadges) ---------- */
-/* Правый нижний угол — единственный свободный: оба верхних заняты именем
-   (+короной лидера инлайн) и индикатором «мик выключен» (см. выше). Скрыт по
-   умолчанию (createTile) — показывается только когда для этого пира уже
-   посчитана хотя бы одна скорость. pointer-events: none —
-   клик по тайлу тоглит максимизацию (см. static/room.js: createTile), бейдж
-   не должен его перехватывать. */
+/* ---------- Speed badge on a tile (see static/room.js: updateTileSpeedBadges) ---------- */
+/* Bottom-right corner — the only free spot: both top corners are taken by the name
+   (+ the leader crown inline) and the "mic off" indicator (see above). Hidden by
+   default (createTile) — shown only once at least one speed value
+   has been computed for this peer. pointer-events: none —
+   clicking the tile toggles maximization (see static/room.js: createTile), the badge
+   must not intercept that. */
 .tile-speed {
   position: absolute;
   right: var(--space-2);
@@ -2818,7 +2818,7 @@ body {
   padding: var(--space-1) var(--space-3);
 }
 
-/* ---------- Заявки лобби (только у лидера) ---------- */
+/* ---------- Lobby requests (leader only) ---------- */
 
 .join-requests {
   position: fixed;
@@ -2899,12 +2899,12 @@ body {
   }
 }
 
-/* ---------- Настройки комнаты (попап десктоп / bottom-sheet мобайл) ---------- */
+/* ---------- Room settings (desktop popup / mobile bottom sheet) ---------- */
 
 .settings-panel {
   position: fixed;
   inset: 0;
-  z-index: 40; /* ниже share-popup (60)/join-modal(55), выше пилюли/чата */
+  z-index: 40; /* below share-popup (60)/join-modal (55), above the pill/chat */
   display: flex;
   align-items: center;
   justify-content: center;
@@ -2934,10 +2934,10 @@ body {
   padding: var(--space-8) var(--space-6) var(--space-6);
 }
 
-/* Десктоп (см. брейкпоинт max-width:640px ниже — там мобильный bottom-sheet):
-   секция «Соединение и приватность» подросла (двухэтажные peer-строки со
-   статами + новая строка серверного трафика) — 400px стало тесно, строки
-   трафика заворачиваются. Шире, но не «простор ради простора». */
+/* Desktop (see the max-width:640px breakpoint below — that's the mobile bottom sheet):
+   the "Connection and privacy" section has grown (two-row peer entries with
+   stats + a new server-traffic row) — 400px became cramped, the
+   traffic rows wrap. Wider, but not "spaciousness for its own sake". */
 @media (min-width: 641px) {
   .settings-panel-card {
     max-width: 560px;
@@ -2973,8 +2973,8 @@ body {
   font-size: 0.92rem;
 }
 
-/* Строка с выбором устройства (селект вместо тумблера) — «Устройства»,
-   видна всем участникам (см. static/room.html). */
+/* The device-selection row (a select instead of a toggle) — "Devices",
+   visible to all participants (see static/room.html). */
 .settings-row--select {
   cursor: default;
 }
@@ -3017,8 +3017,8 @@ body {
   background: var(--bg-elevated-2);
   border: 1px solid var(--border);
   transition: background-color 0.15s ease, border-color 0.15s ease;
-  /* Визуальная накладка НАД инпутом (DOM-порядок) — без этого перехватывает
-     клики/тапы на себя вместо чекбокса (найдено вручную при скриншот-прогоне). */
+  /* Visual overlay ABOVE the input (DOM order) — without this it intercepts
+     clicks/taps on itself instead of the checkbox (found manually during a screenshot pass). */
   pointer-events: none;
 }
 
@@ -3066,8 +3066,8 @@ body {
   }
 }
 
-/* ---------- «Соединение и приватность» (см. static/room.js:
-   refreshConnectionSection) — видна ВСЕМ участникам, ниже «Устройств». ---------- */
+/* ---------- "Connection and privacy" (see static/room.js:
+   refreshConnectionSection) — visible to ALL participants, below "Devices". ---------- */
 
 .settings-crypto-row {
   display: flex;
@@ -3084,15 +3084,15 @@ body {
   color: var(--text-muted);
 }
 
-/* Ш1 теоретически выключен (RoomCrypto.getCryptoInfo().active === false) —
-   строка красная, тревожная, а не просто нейтрально серая. */
+/* S1 is theoretically disabled (RoomCrypto.getCryptoInfo().active === false) —
+   the row is red, alarming, rather than just neutral gray. */
 .settings-crypto-row--off {
   color: var(--danger);
 }
 
-/* Хэш опубликованной статики (опционально, см. static/room.js:
-   renderSettingsBuildRow) — та же форензическая точка сверки, что в подвале
-   лендинга и попапе «Поделиться» (docs/security.md, «Published Build Hash»). */
+/* The published static-assets hash (optional, see static/room.js:
+   renderSettingsBuildRow) — the same forensic verification point as in the landing
+   page footer and the "Share" popup (docs/security.md, "Published Build Hash"). */
 .settings-build-row {
   font-size: 0.78rem;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -3117,7 +3117,7 @@ body {
   align-items: flex-start;
   gap: var(--space-2);
   min-height: 44px;
-  padding-block: 6px; /* воздух сверху/снизу теперь, когда строка двухэтажная (имя+режим / статы) */
+  padding-block: 6px; /* vertical breathing room now that the row is two-tiered (name+mode / stats) */
   font-size: 0.88rem;
 }
 
@@ -3133,12 +3133,12 @@ body {
   font-style: italic;
 }
 
-/* Цветная точка режима соединения: зелёная — P2P, жёлтая — TURN-релей,
-   оранжевая — серверный fallback, серая — ещё устанавливается.
-   margin-top — раньше точка центрировалась по единственной строке текста;
-   при двухэтажном контенте (имя+режим сверху, статы снизу) center по всей
-   высоте row тянет её вниз, поэтому выравниваем вручную по высоте первой
-   строки (align-items родителя теперь flex-start, см. .settings-peer-row). */
+/* The connection-mode color dot: green — P2P, yellow — TURN relay,
+   orange — server fallback, gray — still establishing.
+   margin-top — the dot used to be centered against a single line of text;
+   with two-tiered content (name+mode on top, stats below), centering across the
+   row's full height pulls it down, so we align it manually to the height of the first
+   line (the parent's align-items is now flex-start, see .settings-peer-row). */
 .settings-peer-dot {
   flex-shrink: 0;
   width: 10px;
@@ -3168,9 +3168,9 @@ body {
   overflow-wrap: anywhere;
 }
 
-/* Трафик in/out + RTT под именем пира (см. static/room.js: formatPeerStatsLine)
-   — приглушённая вторая строка, мельче основного текста, tabular-nums чтобы
-   цифры не «дрожали» по ширине на каждом тике обновления. */
+/* in/out traffic + RTT under the peer's name (see static/room.js: formatPeerStatsLine)
+   — a muted second line, smaller than the main text, tabular-nums so the
+   digits don't "jitter" in width on every update tick. */
 .settings-peer-stats {
   font-size: 0.75rem;
   color: var(--text-muted);

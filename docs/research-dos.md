@@ -1,658 +1,691 @@
-# Исследование: защита от DoS «забивания» комнат/слотов с одного IP
+# Research: Defending Against DoS "Hammering" of Rooms/Slots from a Single IP
 
-> Статус: анализ, ничего не реализовано. 2026-07-16.
-> Вопрос: какие анти-DoS механизмы уже есть в коде (`src/state.rs`, `src/ws.rs`,
-> `src/main.rs`), насколько они закрывают сценарий «злоумышленник забивает
-> комнаты/слоты с одного IP» (и его вариации — распределённо, спуфинг IP,
-> зомби-соединения), и что стоит улучшить — в приложении и на уровне
-> Cloudflare, который сегодня уже стоит перед прод-инстансом
-> (`chat.fedorov.it` / `chat-api.fedorov.it`, см. `docs/self-hosting.md`).
+> Status: analysis, nothing implemented. 2026-07-16.
+> Question: what anti-DoS mechanisms already exist in the code (`src/state.rs`, `src/ws.rs`,
+> `src/main.rs`), how well do they close off the scenario "an attacker hammers
+> rooms/slots from a single IP" (and its variations — distributed, IP
+> spoofing, zombie connections), and what's worth improving — at the
+> application level and at the Cloudflare level, which already sits in front
+> of the prod instance today
+> (`chat.fedorov.it` / `chat-api.fedorov.it`, see `docs/self-hosting.md`).
 
 <!-- toc -->
 
-- [1. Инвентаризация: что уже есть в коде](#1-инвентаризация-что-уже-есть-в-коде)
-- [2. Определение IP клиента и его надёжность](#2-определение-ip-клиента-и-его-надёжность)
-- [3. Векторы «забивания» — по нарастающей изощрённости](#3-векторы-забивания--по-нарастающей-изощрённости)
-- [4. Меры защиты по уровням](#4-меры-защиты-по-уровням)
-- [5. Приоритизированные рекомендации](#5-приоритизированные-рекомендации)
-- [6. Self-hosted vs публичный инстанс](#6-self-hosted-vs-публичный-инстанс)
-- [7. Выводы одним взглядом](#7-выводы-одним-взглядом)
+- [1. Inventory: What's Already in the Code](#1-inventory-whats-already-in-the-code)
+- [2. Determining the Client IP and Its Reliability](#2-determining-the-client-ip-and-its-reliability)
+- [3. "Hammering" Vectors — In Increasing Order of Sophistication](#3-hammering-vectors--in-increasing-order-of-sophistication)
+- [4. Defenses by Layer](#4-defenses-by-layer)
+- [5. Prioritized Recommendations](#5-prioritized-recommendations)
+- [6. Self-Hosted vs. Public Instance](#6-self-hosted-vs-public-instance)
+- [7. Conclusions at a Glance](#7-conclusions-at-a-glance)
 
 <!-- /toc -->
 
-## 1. Инвентаризация: что уже есть в коде
+## 1. Inventory: What's Already in the Code
 
-Все цифры и места — проверены по факту в `src/state.rs`/`src/ws.rs`/`src/main.rs`
-на момент написания, не выдуманы. См. также `docs/security.md` §4 (H2)/§7
-(M3)/§8/§9 — эта секция во многом пересказывает те же факты, но с точными
-координатами и акцентом именно на «забивание слотов с одного IP», которого в
-`security.md` нет отдельным разделом.
+All the numbers and locations here were verified against the actual `src/state.rs`/`src/ws.rs`/`src/main.rs`
+at the time of writing, not invented. See also `docs/security.md` §4 (H2)/§7
+(M3)/§8/§9 — this section largely retells the same facts, but with precise
+coordinates and a focus specifically on "hammering slots from a single IP,"
+which isn't a separate section in `security.md`.
 
-### 1.1 Лимит на создание комнат (H2) — `ROOM_CREATION_IP_LIMIT`/`ROOM_CREATION_IP_WINDOW`
+### 1.1 Room Creation Limit (H2) — `ROOM_CREATION_IP_LIMIT`/`ROOM_CREATION_IP_WINDOW`
 
-- **Значения**: 10 запросов за 60 секунд с одного IP (`src/state.rs:62-63`).
-- **Где применяется**: только `POST /api/rooms` (`create_room`, `src/main.rs:339`)
-  — `PUT /api/rooms/{id}` (восстановление после рестарта, `restore_room`,
-  `src/main.rs:425`) этот лимит **не** проверяет вовсе (только глобальный
-  `MAX_ROOMS`, см. ниже) — не баг, а осознанный выбор: восстановление по уже
-  известному id не даёт злоумышленнику новых возможностей сверх тех, что даёт
-  `POST` (см. комментарий `src/main.rs:415-424`), но для полноты картины стоит
-  отметить: `PUT` теоретически можно дёргать сколь угодно часто с одного IP
-  без per-IP лимита вовсе, если атакующий знает/угадывает валидные по формату
-  `room_id` (8 симв. из ограниченного алфавита — угадать конкретный существующий
-  практически нереально, но сам факт отсутствия лимита стоит держать в уме).
-- **Как реализовано**: скользящее окно (`VecDeque<Instant>`) в общей карте
-  `IpRateLimitMap` (`type IpRateLimitMap = Arc<Mutex<HashMap<String,
-  VecDeque<Instant>>>>`, `src/state.rs:158`), функция `check_ip_rate_limit`
-  (`src/state.rs:286-305`): чистит устаревшие метки этого IP, отказывает, если
-  их уже `>= limit` в пределах окна, иначе регистрирует новую и разрешает.
-  Карта дополнительно **самоочищается** от IP, у которых все метки устарели
-  (тот же проход, `retain` на строке 289) — не растёт бесконечно числом
-  когда-либо постучавшихся адресов.
-- **Отдельный бюджет** от лимита попадания в лобби (см. 1.2) — своя карта
-  `AppState::room_creation_ips` (`src/state.rs:172`), не общая.
+- **Values**: 3 requests per 60 seconds from a single IP (`src/state.rs:62-63`).
+- **Where it's applied**: only `POST /api/rooms` (`create_room`, `src/main.rs:339`)
+  — `PUT /api/rooms/{id}` (restoring after a restart, `restore_room`,
+  `src/main.rs:425`) doesn't check this limit **at all** (only the global
+  `MAX_ROOMS`, see below) — not a bug, but a deliberate choice: restoring by an
+  already-known id gives an attacker no new capability beyond what `POST`
+  already gives (see the comment at `src/main.rs:415-424`), but for
+  completeness it's worth noting: `PUT` can theoretically be hit as often as
+  desired from a single IP with no per-IP limit at all, if the attacker
+  knows/guesses format-valid `room_id`s (8 chars from a limited alphabet —
+  guessing a specific existing one is practically infeasible, but the absence
+  of a limit is worth keeping in mind).
+- **How it's implemented**: a sliding window (`VecDeque<Instant>`) in a shared
+  map `IpRateLimitMap` (`type IpRateLimitMap = Arc<Mutex<HashMap<String,
+  VecDeque<Instant>>>>`, `src/state.rs:158`), function `check_ip_rate_limit`
+  (`src/state.rs:286-305`): purges stale timestamps for this IP, denies if
+  there are already `>= limit` within the window, otherwise records a new one
+  and allows the request. The map additionally **self-cleans** IPs whose every
+  timestamp has expired (same pass, `retain` on line 289) — it doesn't grow
+  unbounded with every address that has ever knocked.
+- **A separate budget** from the lobby-entry limit (see 1.2) — its own map
+  `AppState::room_creation_ips` (`src/state.rs:172`), not shared.
 
-### 1.2 Лимит на попадание в лобби (M3) — `PENDING_JOIN_IP_LIMIT`/`PENDING_JOIN_IP_WINDOW`
+### 1.2 Lobby Entry Limit (M3) — `PENDING_JOIN_IP_LIMIT`/`PENDING_JOIN_IP_WINDOW`
 
-- **Значения**: те же числа, 10/60с (`src/state.rs:75-76`), но это **не** тот
-  же механизм, что 1.1 — отдельная карта `AppState::pending_join_ips`
-  (`src/state.rs:175`), отдельный бюджет. Обоснование раздельности — в
-  комментарии `src/state.rs:65-74`: создание своей комнаты и заявка на вход в
-  чужую (по ссылке) — разные по природе действия одного IP (например, NAT с
-  несколькими людьми), общий бюджет ударил бы по легитимному использованию.
-- **Где применяется**: только когда у комнаты включено `lobby_enabled=true`
-  (`src/ws.rs:334-388`, проверка на строке 345) — **по умолчанию `lobby_enabled:
-  false`** (`src/protocol.rs:61`), то есть этот лимит вообще не участвует в
-  защите комнаты, если лидер не включил лобби явно. Это ключевой факт для
-  §3.2 ниже.
-- **Область действия — глобальная по IP, не по комнате**: карта одна на весь
-  `AppState`, значит 10 попыток встать в ЛЮБОЕ лобби ЛЮБОЙ комнаты за 60с
-  суммарно с одного IP, а не 10 на каждую комнату отдельно. Отдельно от этого
-  — `MAX_PENDING=10` (`src/state.rs:42`) — потолок очереди ожидания **одной
-  конкретной комнаты** (не бюджет IP).
+- **Values**: 10 requests per 60 seconds (`src/state.rs:75-76`) — no longer
+  the same numbers as 1.1 now that `ROOM_CREATION_IP_LIMIT` has been
+  tightened to 3/60s, but this was never the same mechanism as 1.1 to begin
+  with — a separate map `AppState::pending_join_ips`
+  (`src/state.rs:175`), a separate budget. The rationale for keeping them
+  separate is in the comment at `src/state.rs:65-74`: creating your own room
+  and requesting to join someone else's (via a link) are different in nature
+  even for the same IP (e.g. a NAT with several people behind it) — a shared
+  budget would hurt legitimate use.
+- **Where it's applied**: only when a room has `lobby_enabled=true`
+  (`src/ws.rs:334-388`, checked on line 345) — **`lobby_enabled: false` by
+  default** (`src/protocol.rs:61`), meaning this limit doesn't factor into a
+  room's defense at all unless the leader explicitly turns the lobby on. This
+  is a key fact for §3.2 below.
+- **Scope — global per IP, not per room**: there's one map for the whole
+  `AppState`, meaning 10 attempts to enter ANY lobby of ANY room within 60s
+  total from one IP, not 10 per room individually. Separately from this
+  — `MAX_PENDING=10` (`src/state.rs:42`) — the queue ceiling for **one
+  specific room's** waiting room (not an IP budget).
 
-### 1.3 Глобальный потолок числа комнат — `MAX_ROOMS`
+### 1.3 Global Room Count Ceiling — `MAX_ROOMS`
 
-- **Значение**: env `MAX_ROOMS`, дефолт 500 (`DEFAULT_MAX_ROOMS`,
-  `src/state.rs:54`). Читается один раз через обычную переменную (не
-  `LazyLock`, в отличие от `MAX_PARTICIPANTS`/`MAX_ROOM_LIFETIME`) и кладётся в
-  `AppState::max_rooms` при старте (`src/main.rs:220-223, 227`).
-- **Где применяется**: `create_room` (`src/main.rs:351`) и `restore_room`
-  (`src/main.rs:444`) — обе проверки под тем же локом `rooms`, что и вставка,
-  явно чтобы гонка двух одновременных запросов не проскочила обе проверки и не
-  превысила потолок вместе (комментарий `src/main.rs:348-350`). При достижении
-  — `503 Service Unavailable` для **всех**, не только для конкретного IP —
-  это разделяемый глобальный ресурс, задевающий одинаково честных и
-  злонамеренных создателей комнат.
+- **Value**: env `MAX_ROOMS`, default 500 (`DEFAULT_MAX_ROOMS`,
+  `src/state.rs:54`). Read once via a plain variable (not a
+  `LazyLock`, unlike `MAX_PARTICIPANTS`/`MAX_ROOM_LIFETIME`) and stored in
+  `AppState::max_rooms` at startup (`src/main.rs:220-223, 227`).
+- **Where it's applied**: `create_room` (`src/main.rs:351`) and `restore_room`
+  (`src/main.rs:444`) — both checks under the same `rooms` lock as the
+  insertion, explicitly so a race between two simultaneous requests can't slip
+  past both checks and exceed the ceiling together (comment at
+  `src/main.rs:348-350`). Once reached — `503 Service Unavailable` for
+  **everyone**, not just the offending IP — this is a shared global resource,
+  hitting honest and malicious room creators alike.
 
-### 1.4 `MAX_PARTICIPANTS` и `MAX_PENDING`
+### 1.4 `MAX_PARTICIPANTS` and `MAX_PENDING`
 
-- `MAX_PARTICIPANTS`: env, дефолт 6 (`DEFAULT_MAX_PARTICIPANTS`,
-  `src/state.rs:37`, читается `LazyLock`'ом в `src/main.rs:119-124`) — потолок
-  живых участников **одной** комнаты. Проверяется в `JoinRoom`
-  (`src/ws.rs:390`) и в `handle_approve` (`src/ws.rs:638`).
-- `MAX_PENDING`: константа 10 (`src/state.rs:42`) — потолок очереди лобби
-  **одной** комнаты (не per-IP, см. 1.2).
-- **Важно**: ни на `JoinRoom` (прямой вход, минуя лобби — то есть **дефолтный
-  путь**, поскольку `lobby_enabled=false` по умолчанию), ни на `handle_approve`
-  никакого per-IP лимита не наложено вовсе — единственная защита слота
-  комнаты — сам потолок `MAX_PARTICIPANTS` этой конкретной комнаты. Разбор
-  последствий — §3.2 (вектор «захват слотов чужой комнаты»), это главная дыра
-  этого документа.
+- `MAX_PARTICIPANTS`: env, default 6 (`DEFAULT_MAX_PARTICIPANTS`,
+  `src/state.rs:37`, read via `LazyLock` in `src/main.rs:119-124`) — the
+  ceiling on live participants in **one** room. Checked in `JoinRoom`
+  (`src/ws.rs:390`) and in `handle_approve` (`src/ws.rs:638`).
+- `MAX_PENDING`: constant 10 (`src/state.rs:42`) — the ceiling on **one**
+  room's lobby queue (not per-IP, see 1.2).
+- **Important**: neither `JoinRoom` (direct entry, bypassing the lobby — i.e.
+  the **default path**, since `lobby_enabled=false` by default) nor
+  `handle_approve` has any per-IP limit whatsoever — the only protection for a
+  room's slots is that specific room's `MAX_PARTICIPANTS` ceiling itself.
+  The consequences are examined in §3.2 (the "hijacking a stranger's room
+  slots" vector), the main hole documented in this file.
 
-### 1.5 Relay rate-limit и payload caps — и важная неточность в коде/доках
+### 1.5 Relay Rate Limit and Payload Caps — and a Notable Inaccuracy in the Code/Docs
 
-- **Relay rate-limit**: `RELAY_RATE_LIMIT=100` сообщений за
-  `RELAY_RATE_WINDOW=10` секунд (`src/ws.rs:78-79`) — один общий счётчик НА
-  СОЕДИНЕНИЕ (не на IP), покрывающий `Offer`/`Answer`/`IceCandidate`/
-  `StreamInfo`/`NameAnnounce` суммарно (`check_relay_rate_limit`,
-  `src/ws.rs:753-755`, вызывается во всех соответствующих ветках
-  `handle_message`, например `src/ws.rs:410, 422, 434, 446`, и в
+- **Relay rate limit**: `RELAY_RATE_LIMIT=100` messages per
+  `RELAY_RATE_WINDOW=10` seconds (`src/ws.rs:78-79`) — one shared counter PER
+  CONNECTION (not per IP), covering `Offer`/`Answer`/`IceCandidate`/
+  `StreamInfo`/`NameAnnounce` combined (`check_relay_rate_limit`,
+  `src/ws.rs:753-755`, called from every relevant branch of
+  `handle_message`, e.g. `src/ws.rs:410, 422, 434, 446`, and in
   `handle_name_announce`, `src/ws.rs:868`).
-- **Payload caps**: `RELAY_MAX_BYTES=16*1024` (16KB, `src/ws.rs:64`) для
+- **Payload caps**: `RELAY_MAX_BYTES=16*1024` (16KB, `src/ws.rs:64`) for
   `sdp`/`candidate`/`info`; `NAME_ANNOUNCE_MAX_BYTES=2*1024` (2KB,
-  `src/ws.rs:57`) для зашифрованного анонса имени; `WS_MAX_MESSAGE_SIZE`/
-  `WS_MAX_FRAME_SIZE=64*1024` (64KB, `src/ws.rs:86-87`) — кап на уровне
-  транспорта, применяется через `WebSocketUpgrade::max_message_size`/
-  `max_frame_size` (`src/ws.rs:153-154`), проверено по API axum 0.8.
-- **Расхождение с задачей и с `docs/security.md`**: в задаче и в
-  `docs/security.md` §4/§6 фигурирует «chat 10/10с» и «8KB chat cap» как
-  отдельный, более строгий лимит специально для чат-сообщений. **Это не
-  соответствует текущему коду**: комментарий `src/ws.rs:73-77` действительно
-  упоминает несуществующую константу `CHAT_RATE_LIMIT` («chat у себя
-  ДОПОЛНИТЕЛЬНО подчиняется более строгому специфическому лимиту
-  (`CHAT_RATE_LIMIT`, 10/10с)»), но:
-  - в `ClientMessage` (`src/protocol.rs:73` и далее) **нет варианта `Chat`
-    вовсе** — только `JoinRoom`/`Offer`/`Answer`/`IceCandidate`/`StreamInfo`/
+  `src/ws.rs:57`) for the encrypted name announcement; `WS_MAX_MESSAGE_SIZE`/
+  `WS_MAX_FRAME_SIZE=64*1024` (64KB, `src/ws.rs:86-87`) — a transport-level
+  cap, applied via `WebSocketUpgrade::max_message_size`/
+  `max_frame_size` (`src/ws.rs:153-154`), verified against the axum 0.8 API.
+- **Discrepancy with the task and with `docs/security.md`**: the task and
+  `docs/security.md` §4/§6 mention a "chat 10/10s" and an "8KB chat cap" as a
+  separate, stricter limit specifically for chat messages. **This doesn't
+  match the current code**: the comment at `src/ws.rs:73-77` does indeed
+  mention a nonexistent constant `CHAT_RATE_LIMIT` ("chat additionally
+  is ADDITIONALLY subject to a stricter, chat-specific limit
+  (`CHAT_RATE_LIMIT`, 10/10s)"), but:
+  - `ClientMessage` (`src/protocol.rs:73` onward) has **no `Chat` variant at
+    all** — only `JoinRoom`/`Offer`/`Answer`/`IceCandidate`/`StreamInfo`/
     `ShareStart`/`ShareStop`/`UpdateSettings`/`Approve`/`Reject`/`Leave`/
     `NameAnnounce`;
-  - модульный комментарий `src/protocol.rs:10-15` прямо говорит: «Протокол
-    v3+ (Ф0/Ф1): чат ходит ИСКЛЮЧИТЕЛЬНО по mesh RTCDataChannel... Прежний
-    адресный fallback-релей чата через сервер удалён»;
-  - `grep -rn "CHAT_RATE_LIMIT\|ClientMessage::Chat"` по всему `src/`
-    находит ровно одно упоминание — тот самый устаревший комментарий на
-    `src/ws.rs:74`, и больше ничего.
+  - the module-level comment at `src/protocol.rs:10-15` states directly:
+    "Protocol v3+ (F0/F1): chat travels EXCLUSIVELY over the mesh
+    RTCDataChannel... The former addressed server-relay fallback for chat has
+    been removed";
+  - `grep -rn "CHAT_RATE_LIMIT\|ClientMessage::Chat"` across all of `src/`
+    finds exactly one mention — that same stale comment at
+    `src/ws.rs:74`, and nothing else.
 
-  Итог: сервер сегодня чат **вообще не релеит** (ни один байт содержимого
-  чата не проходит через сигналинг-сервер) — упомянутый в задаче «8KB chat»/
-  «chat 10/10с» — это **вычищенный код с забытым комментарием**, а не
-  действующий механизм. Для анализа DoS это хорошая новость (нет отдельного
-  вектора флуда через чат-релей — он физически отсутствует), но сам факт
-  устаревшего комментария/документации стоит когда-нибудь почистить (не
-  входит в объём этого анализа — только фиксирую находку).
+  Bottom line: the server today doesn't relay chat **at all** (not a single
+  byte of chat content ever passes through the signaling server) — the "8KB
+  chat"/"chat 10/10s" mentioned in the task is **code that was removed with a
+  forgotten comment**, not an active mechanism. For a DoS analysis this is
+  good news (no separate chat-relay flood vector — it's physically absent),
+  but the stale comment/documentation is worth cleaning up at some point (out
+  of scope for this analysis — just noting the finding).
 
-### 1.6 Реапер — `EMPTY_ROOM_TTL`/`MAX_ROOM_LIFETIME`/`REAPER_INTERVAL`
+### 1.6 The Reaper — `EMPTY_ROOM_TTL`/`MAX_ROOM_LIFETIME`/`REAPER_INTERVAL`
 
-- **`EMPTY_ROOM_TTL_SECONDS`**: env, дефолт 120 секунд (`src/main.rs:207-210`)
-  — как долго живёт комната без единого участника (включая только что
-  созданную через `POST`, где никто не подключился) перед удалением.
-- **`MAX_ROOM_LIFETIME_SECONDS`**: env, дефолт 10800с = 3 часа
-  (`DEFAULT_MAX_ROOM_LIFETIME_SECONDS`, `src/state.rs:58`, `LazyLock` в
-  `src/main.rs:102-108`) — жёсткий потолок жизни комнаты **независимо** от
-  того, есть ли в ней живые участники; при достижении всем участникам и
-  ожидающим в лобби шлётся `room-expired`, затем комната удаляется
-  (`reap_rooms`, `src/state.rs:218-242`, ветка `src/state.rs:224-233`).
-- **`REAPER_INTERVAL`**: константа 1 секунда (`src/state.rs:50`) — как часто
-  тикает фоновая проверка; проход по всем комнатам синхронный, под коротким
-  локом, без `.await` внутри критической секции.
-- Уборка пустых комнат и уборка «протухших по возрасту» — **одна и та же**
-  фоновая задача (`reap_rooms`), не два разных механизма.
+- **`EMPTY_ROOM_TTL_SECONDS`**: env, default 120 seconds (`src/main.rs:207-210`)
+  — how long a room lives with zero participants (including one just created
+  via `POST` that no one connected to) before deletion.
+- **`MAX_ROOM_LIFETIME_SECONDS`**: env, default 10800s = 3 hours
+  (`DEFAULT_MAX_ROOM_LIFETIME_SECONDS`, `src/state.rs:58`, `LazyLock` in
+  `src/main.rs:102-108`) — a hard ceiling on a room's lifetime **regardless**
+  of whether it has live participants; on reaching it, every participant and
+  every lobby entrant is sent `room-expired`, then the room is deleted
+  (`reap_rooms`, `src/state.rs:218-242`, branch at `src/state.rs:224-233`).
+- **`REAPER_INTERVAL`**: constant 1 second (`src/state.rs:50`) — how often the
+  background check ticks; the pass over all rooms is synchronous, under a
+  short lock, with no `.await` inside the critical section.
+- Cleaning up empty rooms and cleaning up "expired by age" rooms are **the
+  same** background task (`reap_rooms`), not two separate mechanisms.
 
-### 1.7 Хартбит (ping/pong) — что защищает, а что нет
+### 1.7 Heartbeat (Ping/Pong) — What It Protects Against, and What It Doesn't
 
-- `PING_INTERVAL=20`с, `MAX_MISSED_PONGS=2` (`src/ws.rs:98-102`) — сервер сам
-  пингует каждые 20с; после двух подряд ping без единого ответа (и вообще без
-  ЛЮБОГО входящего от клиента) закрывает соединение сам, не дожидаясь
-  TCP-таймаута ОС (минуты).
-- **Критично для DoS-анализа**: это защита от **тихо оборвавшихся**
-  соединений (Wi-Fi отвалился, ноутбук ушёл в сон), а не от **активного**
-  злоумышленника. Клиент, который специально хочет держать слот подольше,
-  просто отвечает на пинги (или axum отвечает `Pong` за него автоматически на
-  сами `Ping`, а входящий `Pong`-ответ на НАШ `Ping` тоже сбрасывает счётчик,
-  `src/ws.rs:230-237`) — хартбит **не отличает** «человек, который честно
-  сидит в комнате» от «скрипт, который держит соединение открытым ради
-  занятия слота». Отсюда: хартбит не даёт вообще никакой защиты против
-  умышленного удержания слота — только против случайно оборвавшихся
-  соединений. Важная предпосылка для §3 (вектор 2 и 6).
+- `PING_INTERVAL=20`s, `MAX_MISSED_PONGS=2` (`src/ws.rs:98-102`) — the server
+  itself pings every 20s; after two consecutive pings with no reply at all
+  (and no incoming message of ANY kind from the client), it closes the
+  connection itself, without waiting for the OS's TCP timeout (minutes).
+- **Critical for the DoS analysis**: this defends against connections that
+  **silently died** (Wi-Fi dropped, laptop went to sleep), not against an
+  **active** attacker. A client that deliberately wants to hold onto a slot
+  longer simply answers the pings (or axum answers `Pong` on its behalf
+  automatically for the pings themselves, and an incoming `Pong` reply to OUR
+  `Ping` also resets the counter, `src/ws.rs:230-237`) — the heartbeat
+  **cannot distinguish** "a person honestly sitting in the room" from "a
+  script holding the connection open to occupy a slot." Hence: the heartbeat
+  provides no protection whatsoever against deliberate slot-holding — only
+  against accidentally dropped connections. An important premise for §3
+  (vectors 2 and 6).
 
-### 1.8 `extract_client_ip` — источник IP клиента
+### 1.8 `extract_client_ip` — The Source of the Client IP
 
-Разобрано отдельно и подробно в §2 ниже (это отдельный, сквозной вопрос для
-всех per-IP лимитов сразу).
+Covered separately and in detail in §2 below (this is a separate, cross-cutting
+question relevant to all per-IP limits at once).
 
 ---
 
-## 2. Определение IP клиента и его надёжность
+## 2. Determining the Client IP and Its Reliability
 
-Функция `extract_client_ip` (`src/state.rs:252-273`), используется и в
-`create_room` (`src/main.rs:338`), и в `ws_handler`→`handle_message`
-(`src/ws.rs:149`, далее передаётся как `ip: &str` во все проверки):
+The function `extract_client_ip` (`src/state.rs:252-273`), used both in
+`create_room` (`src/main.rs:338`) and in `ws_handler`→`handle_message`
+(`src/ws.rs:149`, then passed as `ip: &str` into every check):
 
-1. `CF-Connecting-IP` — если заголовок есть и не пуст, берётся он;
-2. иначе первый адрес из `X-Forwarded-For` (если есть);
-3. иначе — адрес пира сокета (`peer_addr`, из `ConnectInfo<SocketAddr>` —
-   прямое TCP-подключение без proxy, доступно благодаря
+1. `CF-Connecting-IP` — if the header is present and non-empty, use it;
+2. otherwise the first address from `X-Forwarded-For` (if present);
+3. otherwise — the socket peer address (`peer_addr`, from
+   `ConnectInfo<SocketAddr>` — a direct TCP connection with no proxy,
+   available thanks to
    `into_make_service_with_connect_info::<SocketAddr>()`, `src/main.rs:280`).
 
-**Топология прода на сегодня** (по `registry/domains/fedorov.it.md` и
-`registry/projects/chat.md`): `chat-api.fedorov.it` — CNAME **proxied**
-(оранжевое облако) на Cloudflare Tunnel (`kubesolo-ingress`) внутри
-`contabo3858312`. Это существенно для оценки надёжности:
+**Prod topology today** (per `registry/domains/fedorov.it.md` and
+`registry/projects/chat.md`): `chat-api.fedorov.it` — a **proxied** CNAME
+(orange cloud) to a Cloudflare Tunnel (`kubesolo-ingress`) inside
+`contabo3858312`. This matters for assessing reliability:
 
-- **Cloudflare Tunnel не открывает никакого входящего порта на origin** —
-  `cloudflared` внутри кластера сам инициирует ИСХОДЯЩЕЕ соединение к
-  Cloudflare; попасть на backend, минуя Cloudflare edge, у внешнего клиента
-  структурно нет пути (в отличие от классической связки reverse-proxy + публично
-  открытый порт origin, где прямой обход возможен, если знать IP хоста). При
-  такой топологии `CF-Connecting-IP` **устанавливается самим Cloudflare edge**
-  и не может быть подделан клиентом «снаружи» — Cloudflare переписывает этот
-  заголовок при проходе через свою сеть, независимо от того, что прислал
-  клиент.
-- **Но код это не проверяет и не может проверить** — `extract_client_ip`
-  безусловно доверяет заголовку `CF-Connecting-IP`/`X-Forwarded-For`, если он
-  просто присутствует, **не имея понятия**, кто на самом деле является
-  непосредственным TCP-пиром (сам Cloudflare, или что-то другое). Сегодня это
-  безопасно исключительно благодаря топологии (единственный путь к origin —
-  через Cloudflare Tunnel), а не благодаря коду. Если топология когда-нибудь
-  изменится (например, добро временно откроют NodePort/LoadBalancer с публичным
-  IP того же сервиса для дебага, или self-hoster поставит перед сервером свой
-  nginx без явной зачистки клиентских заголовков) — защита от спуфинга
-  исчезнет молча, без единой строчки кода, которая бы это заметила или
-  предупредила.
-- **Общий (не топологически специфичный) риск, уже признанный в
-  `docs/security.md` §9**: «Per-IP rate limiting is not attacker-proof... a
+- **A Cloudflare Tunnel opens no inbound port on the origin at all** —
+  `cloudflared` inside the cluster itself initiates an OUTBOUND connection to
+  Cloudflare; there's structurally no way for an external client to reach the
+  backend while bypassing the Cloudflare edge (unlike a classic
+  reverse-proxy + publicly exposed origin port setup, where a direct bypass is
+  possible if the host's IP is known). With this topology,
+  `CF-Connecting-IP` **is set by the Cloudflare edge itself** and cannot be
+  spoofed by a client "from outside" — Cloudflare rewrites this header as
+  traffic passes through its network, regardless of what the client sent.
+- **But the code doesn't verify this, and can't** — `extract_client_ip`
+  unconditionally trusts the `CF-Connecting-IP`/`X-Forwarded-For` header if
+  it's simply present, **having no idea** who the actual immediate TCP peer
+  is (Cloudflare itself, or something else). Today this is safe purely thanks
+  to the topology (the only path to the origin goes through the Cloudflare
+  Tunnel), not thanks to the code. If the topology ever changes (e.g. someone
+  temporarily opens a NodePort/LoadBalancer with a public IP for the same
+  service for debugging, or a self-hoster puts their own nginx in front of
+  the server without explicitly scrubbing client-supplied headers) — the
+  anti-spoofing protection disappears silently, with not a single line of
+  code to notice or warn about it.
+- **A general (not topology-specific) risk, already acknowledged in
+  `docs/security.md` §9**: "Per-IP rate limiting is not attacker-proof... a
   sufficiently motivated attacker behind a spoofable or absent proxy chain
-  could evade it» — этот документ подтверждает и уточняет данный дисклеймер:
-  риск реален не абстрактно, а конкретно потому, что `extract_client_ip` не
-  делает вообще никакой проверки «пришёл ли этот заголовок от доверенного
-  прокси» (нет allow-list IP-диапазонов Cloudflare, нет проверки, что
-  непосредственный peer сокета — известный узел Cloudflare/локальный
-  reverse-proxy).
-- **Self-hosted без Cloudflare или с другим прокси** — риск куда реальнее:
-  если оператор поднимает сервер за обычным nginx (или вовсе без прокси,
-  напрямую), а nginx настроен наивно (`proxy_set_header X-Forwarded-For
-  $proxy_add_x_forwarded_for` без обрезания уже пришедшего значения, либо
-  reverse-proxy передаёт заголовки как есть), внешний клиент может просто
-  прислать `CF-Connecting-IP: 1.2.3.4` (случайный на каждый запрос) — и
-  ВСЕ per-IP лимиты (1.1, 1.2) обходятся бесплатно: `check_ip_rate_limit`
-  честно считает каждый «новый» IP свежим и не ограниченным ничем.
+  could evade it" — this document confirms and sharpens that disclaimer: the
+  risk is real not abstractly, but specifically because `extract_client_ip`
+  performs absolutely no check of "did this header come from a trusted
+  proxy" (no allow-list of Cloudflare IP ranges, no verification that the
+  immediate socket peer is a known Cloudflare/local-reverse-proxy node).
+- **Self-hosted without Cloudflare or with a different proxy** — the risk is
+  far more real: if an operator runs the server behind a plain nginx (or with
+  no proxy at all, directly), and nginx is configured naively
+  (`proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for` without
+  trimming an already-present value, or the reverse proxy passes headers
+  through as-is), an external client can simply send
+  `CF-Connecting-IP: 1.2.3.4` (random on every request) — and ALL per-IP
+  limits (1.1, 1.2) are bypassed for free: `check_ip_rate_limit` faithfully
+  treats every "new" IP as fresh and unrestricted.
 
-**Вывод по §2**: сегодня, для актуальной прод-топологии (Cloudflare Tunnel),
-спуфинг `CF-Connecting-IP` внешним клиентом практически невозможен — Cloudflare
-физически стоит на пути каждого запроса и сама выставляет этот заголовок. Но
-это защита «по факту сетевой топологии», а не «по коду» — код одинаково
-доверяет заголовку в проде (где это безопасно) и в гипотетическом
-self-hosted-деплое за наивным прокси (где это НЕ безопасно). Разбор
-конкретно как усилить — §4.2/§4.3.
-
----
-
-## 3. Векторы «забивания» — по нарастающей изощрённости
-
-### 3.1 Один IP создаёт кучу комнат (`POST /api/rooms`) — ПРИОРИТЕТНЫЙ ВОПРОС ЗАКАЗЧИКА
-
-> `PUT`-брешь (в конце пункта) реализована 2026-07-16 — см. рекомендацию 3б в §5.
-
-> Заказчик уточнил: интересует в первую очередь именно **забивание созданием
-> комнат** с одного IP, а не занятие слотов join'ом (§3.2). Хорошая новость:
-> из всех векторов этого документа именно создание комнат защищено **лучше
-> всего** — единственный, где соло-атакующий одним IP структурно не может
-> навредить (расчёт ниже). Остаточный риск здесь — только распределённый
-> (§3.4) и мелкая брешь `PUT` (в конце пункта).
-
-- **Что исчерпывается**: в пределе — глобальный `MAX_ROOMS` (503 для всех);
-  по факту памяти почти не расходует (пустая `Room` — несколько десятков байт,
-  500 комнат — не проблема сама по себе).
-- **Ловит текущая защита**: да, `ROOM_CREATION_IP_LIMIT=10/60с` (§1.1).
-- **Расчёт по просимому в задаче сценарию**: максимум при идеальном
-  «прижимании» к лимиту скользящего окна — 10 запросов за каждые 60с
-  устойчиво = **до 600 комнат/час с одного IP** теоретически. Но:
-  - каждая созданная и не заполненная комната умирает через
-    `EMPTY_ROOM_TTL=120`с (§1.6);
-  - по формуле Литтла: среднее число одновременно живых (незаполненных)
-    комнат ОДНОГО такого атакующего IP ≈ скорость создания × время жизни =
-    (10 комнат / 60с) × 120с = **≈ 20 комнат одновременно**, даже если атакующий
-    жмёт лимит вечно и ни в одну не заходит;
-  - чтобы одному IP заполнить весь `MAX_ROOMS=500` только пустыми комнатами,
-    нужна скорость создания **в ~25 раз выше** разрешённой — то есть **соло
-    одним IP реапер справляется быстрее, чем атакующий успевает разогнаться до
-    глобального потолка**: при текущих настройках нет реалистичного способа
-    одному IP «выесть» `MAX_ROOMS` в одиночку, пока `ROOM_CREATION_IP_LIMIT`
-    и `EMPTY_ROOM_TTL` оба в силе.
-- **Что можно улучшить**: не требуется для одного IP — защита достаточна.
-  Единственная реальная угроза — распределённая версия (см. §3.4): чтобы
-  заполнить 500 слотов, распределённому атакующему нужно **всего ~25 разных
-  IP**, каждый жмущий свой лимит вечно (500 / 20 ≈ 25) — это дешёво для
-  любого, у кого есть десяток-другой VPS/проксей, и per-IP лимит здесь
-  структурно бессилен (см. §3.4).
-- Дополнительно: `PUT /api/rooms/{id}` не проверяет `ROOM_CREATION_IP_LIMIT`
-  вовсе (§1.1) — теоретическая, но не практическая дыра (нужно знать/угадать
-  валидный по формату id, что не даёт реального контроля числом
-  восстановленных комнат сверх `MAX_ROOMS`, тот же лок и та же проверка
-  потолка на строке `src/main.rs:444`). Тем не менее для симметрии на пути
-  создания стоит навесить тот же per-IP лимит и на `PUT` (см. §5,
-  рекомендация 3б) — дёшево и закрывает единственный «create-подобный»
-  маршрут без учёта IP.
-
-**Итог по приоритетному вектору (создание одним IP):** реалистичной угрозы
-нет — `ROOM_CREATION_IP_LIMIT` + `EMPTY_ROOM_TTL` + `MAX_ROOMS` в связке уже
-делают соло-флуд создания бессмысленным (реапер освобождает быстрее, чем один
-IP успевает разогнаться). Всё, что осмысленно добавить на этом маршруте:
-(1) закрыть `PUT`-маршрут тем же лимитом, (2) продублировать лимит на
-Cloudflare-edge для публичного инстанса, чтобы флуд гасился ДО origin, и
-(3) держать `MAX_ROOMS` как последний рубеж против распределённого варианта.
-Само значение `ROOM_CREATION_IP_LIMIT=10/60с` можно при желании ужесточить
-(например 5/60с) — для честного пользователя создать больше 5 комнат в минуту
-не бытовой сценарий, а атакующему это вдвое сужает окно; правка тривиальная
-(одна константа), обратная совместимость не страдает.
-
-### 3.2 Один IP занимает слоты чужой комнаты по ссылке (join до `MAX_PARTICIPANTS`) — ГЛАВНАЯ ДЫРА
-
-> Реализовано 2026-07-16 — см. рекомендацию 1 в §5.
-
-- **Что исчерпывается**: слоты **конкретной** комнаты (`MAX_PARTICIPANTS`,
-  дефолт 6) — не глобальный ресурс, а адресный отказ в обслуживании
-  конкретным легитимным гостям, знающим ссылку.
-- **Ловит текущая защита**: **нет, если `lobby_enabled=false` (дефолт)**.
-  Как показано в §1.4: ветка прямого входа (`JoinRoom` без лобби,
-  `src/ws.rs:390-398`) не вызывает `check_ip_rate_limit` ни в каком виде —
-  единственная проверка — `room.participants.len() >= *crate::MAX_PARTICIPANTS`
-  (обычный, не per-IP счётчик). Если лидер оставил настройки по умолчанию (а
-  дефолт именно такой, `src/protocol.rs:61`), то злоумышленник с одним IP,
-  зная (или подобравший по слитой/просмотренной через плечо) ссылку, может:
-  1. открыть `MAX_PARTICIPANTS` (обычно 6) WS-соединений;
-  2. на каждом отправить `join-room` с новым сгенерированным `peer_id`;
-  3. **все 6 слотов комнаты заняты за доли секунды**, без единого
-     срабатывания rate-limit — join-флуд не подчиняется ни `RELAY_RATE_LIMIT`
-     (тот считает только `Offer`/`Answer`/`IceCandidate`/`StreamInfo`/
-     `NameAnnounce`, не `JoinRoom`), ни `PENDING_JOIN_IP_LIMIT` (только для
-     лобби);
-  4. дальше атакующему достаточно **честно отвечать на ping/pong** (§1.7),
-     чтобы держать слоты сколь угодно долго — хартбит структурно не отличает
-     живого зловреда от живого человека;
-  5. реальным гостям, идущим по той же ссылке позже, сервер отвечает
-     `RoomFull` (`src/ws.rs:391`) — комната недоступна для всех, для кого она
-     создавалась, при том что для сервера всё выглядит как штатная,
-     легитимная нагрузка.
-  Стоимость атаки — **шесть обычных WebSocket-подключений с одного IP**, ноль
-  специальных инструментов, ноль обхода каких-либо проверок (просто их
-  нет на этом пути).
-- **Если `lobby_enabled=true`** — картина иная и заметно лучше: заявки идут
-  через `pending`, там действует `PENDING_JOIN_IP_LIMIT=10/60с` (§1.2) — тот
-  же атакующий за одну попытку максимум поставит 10 заявок в очередь (и то
-  распределённо по любым комнатам, бюджет общий), но **не займёт реальные
-  слоты сам** — их одобряет лидер вручную. Лобби здесь — уже сегодня
-  единственный настоящий барьер против этого вектора, а не какая-то
-  теоретическая рекомендация — это подтверждено кодом, не только интуицией.
-- **Обострение с фичей «лимит от лидера»** (см.
-  `docs/research-room-limit.md` §3, раздел «DoS-угол» — там уже отмечено и
-  корректно оценено, не дублирую полный разбор здесь): если лидер выставит
-  небольшой собственный `maxParticipants` (например, 2 для приватного
-  разговора на двоих) БЕЗ включённого лобби, тот же вектор становится **в
-  разы дешевле** — одного паразитного соединения достаточно, чтобы вечно
-  занимать единственный «третий» слот. Тот документ прямо рекомендует
-  UI-подсказку «маленький лимит без лобби не даёт приватности» — согласен с
-  этим выводом и не повторяю его здесь; важно только зафиксировать, что
-  корень проблемы — не в фиче лимита лидера, а в том, что базовый join-флуд
-  БЕЗ per-IP лимита существует уже сегодня, независимо от того, реализуют
-  ли фичу из `research-room-limit.md` вообще.
-- **Что можно улучшить**: добавить per-IP лимит непосредственно на
-  `JoinRoom`-в-комнату (не только на попадание в pending) — детали в §4.2.
-
-### 3.3 Один IP открывает кучу WS-соединений без входа в комнату
-
-- **Что исчерпывается**: файловые дескрипторы процесса, память (по одной
-  `tokio::task` + `mpsc::UnboundedSender/Receiver` на соединение), — ресурсы
-  самого сервера, а не какой-либо конкретной комнаты.
-- **Ловит текущая защита**: **нет вообще, ни в каком виде.**
-  `ws_handler` (`src/ws.rs:136-156`) проверяет только (опционально) `Origin`
-  против `CORS_ORIGIN`, если тот задан (по умолчанию — не задан, проверки
-  нет) — никакого per-IP лимита ни на частоту WS-хендшейков, ни на число
-  одновременно открытых соединений с одного IP. Роутер в `main.rs` тоже не
-  навешивает ни `tower::limit::ConcurrencyLimitLayer`, ни любой другой лимит
-  общего числа соединений — единственный практический потолок — `ulimit -n`
-  процесса и память ОС. WS-соединение, которое ничего не делает (не шлёт
-  `join-room`), не задевает ни один из существующих счётчиков — оно даже не
-  попадает ни в `room_creation_ips`, ни в `pending_join_ips`.
-- **Что можно улучшить**: per-IP потолок на число ОДНОВРЕМЕННО открытых (не
-  вошедших в комнату) WS-соединений — простой gauge-счётчик, инкремент на
-  апгрейде, декремент в `cleanup`/при выходе из `handle_socket`; либо более
-  грубо — общий rate-limit на сам факт WS-апгрейда per IP (тот же механизм,
-  что 1.1/1.2, третья по счёту карта). Подробности — §4.2.
-
-### 3.4 Много IP (ботнет/распределённо)
-
-- **Что исчерпывается**: то же самое, что в 3.1-3.3, но per-IP лимиты
-  бессильны почти по определению — они считают по IP, а IP много.
-- **Что остаётся из защит**: единственные механизмы, НЕ завязанные на IP —
-  глобальный `MAX_ROOMS=500` (§1.3, останавливает флуд создания комнат, но
-  ценой отказа всем при достижении — фактически превращает атаку «забить
-  комнаты» в «положить сервис для всех новых пользователей» — 503 не более
-  избирательный, чем сама атака) и реапер по времени (§1.6, ограничивает
-  worst-case длительность накопленного ущерба, но не сам факт временной
-  недоступности). Для вектора 3.2 (захват слотов конкретной комнаты)
-  распределённость даже не нужна атакующему — там per-IP лимита и так нет
-  (см. 3.2), а `MAX_PARTICIPANTS` — не per-IP величина вовсе.
-- **Вывод**: на уровне приложения распределённая атака в принципе не может
-  быть решена per-IP-механизмами — это структурный потолок подхода, не
-  недоработка. Единственный реалистичный рубеж против ботнета — сетевой слой
-  ПЕРЕД сервером (Cloudflare WAF/rate-limiting/Bot Fight Mode/Turnstile,
-  разбор — §4.3) — там огромные ботнеты видны по паттернам (гео,
-  fingerprint, репутация IP по всей сети Cloudflare), чего у нашего
-  собственного сервера просто нет и не может быть в его текущем масштабе и
-  архитектуре.
-
-### 3.5 Спуфинг `CF-Connecting-IP`/`X-Forwarded-For` для обхода per-IP лимитов
-
-Подробный разбор — §2. Краткий вывод здесь: **для актуальной прод-топологии
-(Cloudflare Tunnel) — риск низкий**, потому что нет пути к origin, минуя
-Cloudflare edge, который сам выставляет заголовок. **Для self-hosted без
-Cloudflare или с наивным прокси перед сервером — риск реальный и полный**:
-код доверяет заголовку безусловно, без проверки, что он пришёл от
-доверенного узла (нет allow-list IP-диапазонов Cloudflare, нет проверки
-источника заголовка) — это стирает эффект абсолютно всех per-IP лимитов
-(§1.1, 1.2, и любых будущих из §4.2) до нуля почти бесплатно для атакующего.
-
-### 3.6 Медленные/зомби-соединения, удержание слота в хартбит-окне
-
-Кратко (полный разбор реконнект-специфичного случая — в
-`docs/research-room-limit.md`, раздел про реконнект-зомби, не дублирую):
-хартбит (§1.7) обнаруживает только **тихо оборвавшиеся** соединения за
-20-40с; активно удерживаемое злоумышленником соединение (отвечает на пинги)
-не детектируется вообще, сколько угодно долго — до `MAX_ROOM_LIFETIME` (3
-часа), когда реапер прибьёт **всю** комнату целиком (не только атакующего).
-Отдельно — окно ~40-60с (`PING_INTERVAL × MAX_MISSED_PONGS` плюс задержка до
-следующего тика) между реальным исчезновением клиента и освобождением его
-слота: для дефолтного `MAX_PARTICIPANTS=6` это несущественно (запасных
-слотов много), но усиливает вектор 3.2 в маленьких/лимитированных комнатах —
-атакующий может «дёргать» соединение (открыл-закрыл-открыл), и каждый цикл
-даёт ему до минуты гарантированно занятого слота почти бесплатно, без
-необходимости держать соединение живым непрерывно.
+**Conclusion for §2**: today, for the actual prod topology (Cloudflare
+Tunnel), spoofing `CF-Connecting-IP` as an external client is practically
+impossible — Cloudflare physically sits in the path of every request and
+sets this header itself. But this is protection "by virtue of network
+topology," not "by virtue of the code" — the code trusts the header equally
+in prod (where it's safe) and in a hypothetical self-hosted deployment behind
+a naive proxy (where it is NOT safe). Concrete hardening options are
+discussed in §4.2/§4.3.
 
 ---
 
-## 4. Меры защиты по уровням
+## 3. "Hammering" Vectors — In Increasing Order of Sophistication
 
-### 4.1 Уже в коде — оценка достаточности
+### 3.1 A Single IP Creates a Bunch of Rooms (`POST /api/rooms`) — THE CUSTOMER'S TOP-PRIORITY QUESTION
 
-| Механизм | Значения | Достаточность |
+> The `PUT` gap (at the end of this section) was closed on 2026-07-16 — see recommendation 3b in §5.
+
+> The customer clarified: what they're primarily interested in is
+> **hammering via room creation** from a single IP, not seizing slots via
+> joining (§3.2). Good news: of all the vectors in this document, room
+> creation is protected **best of all** — the only one where a lone attacker
+> with one IP structurally can't cause harm (calculation below). The
+> remaining risk here is only the distributed variant (§3.4) and the small
+> `PUT` gap (at the end of this section).
+
+- **What gets exhausted**: in the limit — the global `MAX_ROOMS` (503 for
+  everyone); in practice it barely uses any memory (an empty `Room` is a few
+  dozen bytes, 500 rooms is not a problem in itself).
+- **Does the current defense catch it**: yes, `ROOM_CREATION_IP_LIMIT=3/60s` (§1.1).
+- **Calculation for the scenario asked about in the task**: the maximum with
+  perfect "pressing" against the sliding-window limit — 3 requests every 60s
+  sustained = **up to 180 rooms/hour** from one IP theoretically. But:
+  - every room created and never filled dies after
+    `EMPTY_ROOM_TTL=120`s (§1.6);
+  - by Little's Law: the average number of simultaneously live (unfilled)
+    rooms from ONE such attacking IP ≈ creation rate × lifetime =
+    (3 rooms / 60s) × 120s = **≈ 6 rooms at once**, even if the attacker
+    presses the limit forever and never joins any of them;
+  - for a single IP to fill the entire `MAX_ROOMS=500` with nothing but empty
+    rooms would require a creation rate **~83 times higher** than what's
+    allowed — meaning **the reaper, solo against one IP, clears rooms faster
+    than the attacker can ramp up toward the global ceiling**: with current
+    settings there's no realistic way for a single IP to "eat" `MAX_ROOMS` on
+    its own, as long as both `ROOM_CREATION_IP_LIMIT` and `EMPTY_ROOM_TTL`
+    remain in effect.
+- **What could be improved**: nothing needed for a single IP — the defense is
+  sufficient. The only real threat is the distributed version (see §3.4): to
+  fill 500 slots, a distributed attacker needs only **about ~83 distinct
+  IPs**, each pressing its own limit forever (500 / 6 ≈ 83) — cheap for
+  anyone with a handful of VPS instances/proxies, and per-IP limiting is
+  structurally powerless here (see §3.4).
+- Additionally: `PUT /api/rooms/{id}` doesn't check `ROOM_CREATION_IP_LIMIT`
+  at all (§1.1) — a theoretical, not practical, hole (you'd need to
+  know/guess a format-valid id, which doesn't give real control over the
+  number of restored rooms beyond `MAX_ROOMS`, the same lock and the same
+  ceiling check on line `src/main.rs:444`). Still, for symmetry with the
+  creation path it's worth putting the same per-IP limit on `PUT` too (see
+  §5, recommendation 3b) — cheap, and it closes the one "create-like" route
+  that ignores IP.
+
+**Bottom line for the top-priority vector (single-IP creation):** there's no
+realistic threat — `ROOM_CREATION_IP_LIMIT` + `EMPTY_ROOM_TTL` + `MAX_ROOMS`
+together already make solo creation-flooding pointless (the reaper frees
+capacity faster than a single IP can ramp up). What's still worth adding on
+this route: (1) close the `PUT` route with the same limit, (2) duplicate the
+limit at the Cloudflare edge for the public instance, so the flood is
+absorbed BEFORE it reaches the origin, and (3) keep `MAX_ROOMS` as the last
+line of defense against the distributed variant. The
+`ROOM_CREATION_IP_LIMIT=3/60s` value itself already reflects a deliberate
+tightening — for a legitimate user, creating more than 3 rooms a minute
+isn't a typical scenario, and it leaves an attacker very little room to
+maneuver; the constant is trivial to adjust further (a single value) without
+breaking backward compatibility, should an even tighter bound ever be
+needed.
+
+### 3.2 A Single IP Occupies a Stranger's Room's Slots via a Link (Joining Up to `MAX_PARTICIPANTS`) — THE MAIN HOLE
+
+> Implemented on 2026-07-16 — see recommendation 1 in §5.
+
+- **What gets exhausted**: the slots of a **specific** room
+  (`MAX_PARTICIPANTS`, default 6) — not a global resource, but a targeted
+  denial of service against specific legitimate guests who know the link.
+- **Does the current defense catch it**: **no, if `lobby_enabled=false`
+  (the default)**. As shown in §1.4: the direct-join branch (`JoinRoom`
+  without a lobby, `src/ws.rs:390-398`) never calls `check_ip_rate_limit` in
+  any form — the only check is
+  `room.participants.len() >= *crate::MAX_PARTICIPANTS` (a plain, non-per-IP
+  counter). If the leader left the settings at their default (and that
+  default is exactly this, `src/protocol.rs:61`), an attacker with a single
+  IP who knows (or picked up over someone's shoulder, or from a leak) the
+  link can:
+  1. open `MAX_PARTICIPANTS` (typically 6) WS connections;
+  2. send a `join-room` on each with a freshly generated `peer_id`;
+  3. **all 6 of the room's slots are taken within a fraction of a second**,
+     without tripping a single rate limit — join-flooding is subject to
+     neither `RELAY_RATE_LIMIT` (which only counts
+     `Offer`/`Answer`/`IceCandidate`/`StreamInfo`/`NameAnnounce`, not
+     `JoinRoom`), nor `PENDING_JOIN_IP_LIMIT` (lobby only);
+  4. from there, the attacker only needs to **honestly answer ping/pong**
+     (§1.7) to hold the slots indefinitely — the heartbeat structurally
+     cannot distinguish a live attacker from a live human;
+  5. real guests following the same link later get `RoomFull` from the
+     server (`src/ws.rs:391`) — the room is unavailable to everyone it was
+     created for, while from the server's point of view this all looks like
+     ordinary, legitimate load.
+  The cost of the attack is **six ordinary WebSocket connections from one
+  IP**, zero special tools, zero bypassing of any check (there simply are
+  none on this path).
+- **If `lobby_enabled=true`** — the picture is different, and noticeably
+  better: requests go through `pending`, where `PENDING_JOIN_IP_LIMIT=10/60s`
+  (§1.2) applies — the same attacker can queue at most 10 requests per
+  attempt (and even that's shared across any rooms, one global budget), but
+  **can't seize real slots themselves** — the leader approves them manually.
+  The lobby is already, today, the only real barrier against this vector,
+  not some theoretical recommendation — this is confirmed by the code, not
+  just intuition.
+- **Made worse by the "leader-set limit" feature** (see
+  `docs/research-room-limit.md` §3, the "DoS angle" section — already noted
+  and correctly assessed there, not duplicating the full analysis here): if
+  the leader sets a small custom `maxParticipants` (e.g. 2, for a private
+  one-on-one conversation) WITHOUT enabling the lobby, this same vector
+  becomes **several times cheaper** — a single parasitic connection is
+  enough to permanently occupy the sole remaining "third" slot. That
+  document explicitly recommends a UI hint that "a small limit without a
+  lobby doesn't give you privacy" — agreed, and not repeating it here; it's
+  just worth noting that the root cause isn't the leader-limit feature
+  itself, but the fact that basic join-flooding WITHOUT a per-IP limit
+  already exists today, regardless of whether the feature from
+  `research-room-limit.md` ever ships.
+- **What could be improved**: add a per-IP limit directly on
+  `JoinRoom`-into-a-room (not just on entering the pending lobby) — details
+  in §4.2.
+
+### 3.3 A Single IP Opens a Bunch of WS Connections Without Joining a Room
+
+- **What gets exhausted**: the process's file descriptors, memory (one
+  `tokio::task` + `mpsc::UnboundedSender/Receiver` per connection) — the
+  server's own resources, not any specific room's.
+- **Does the current defense catch it**: **not at all, in any form.**
+  `ws_handler` (`src/ws.rs:136-156`) only (optionally) checks `Origin`
+  against `CORS_ORIGIN`, if one is set (by default — none is set, so no
+  check happens) — no per-IP limit on the rate of WS handshakes, nor on the
+  number of connections simultaneously open from one IP. The router in
+  `main.rs` doesn't apply `tower::limit::ConcurrencyLimitLayer` or any other
+  overall connection-count limit either — the only practical ceiling is the
+  process's `ulimit -n` and the OS's memory. A WS connection that does
+  nothing (never sends `join-room`) doesn't touch a single existing
+  counter — it doesn't even register in `room_creation_ips` or
+  `pending_join_ips`.
+- **What could be improved**: a per-IP ceiling on the number of
+  SIMULTANEOUSLY open (not yet joined to a room) WS connections — a simple
+  gauge counter, incremented on upgrade, decremented in `cleanup`/on exit
+  from `handle_socket`; or, more bluntly — a general rate limit on the mere
+  fact of a WS upgrade per IP (the same mechanism as 1.1/1.2, a third map).
+  Details in §4.2.
+
+### 3.4 Many IPs (Botnet/Distributed)
+
+- **What gets exhausted**: the same as in 3.1-3.3, but per-IP limits are
+  powerless almost by definition — they count by IP, and there are many IPs.
+- **What defenses remain**: the only mechanisms NOT tied to IP are the
+  global `MAX_ROOMS=500` (§1.3, stops room-creation flooding, but at the
+  cost of denial for everyone once reached — effectively turning a
+  "hammer the rooms" attack into "take the service down for all new
+  users" — a 503 that's no more selective than the attack itself) and the
+  time-based reaper (§1.6, bounds the worst-case duration of accumulated
+  damage, but not the fact of temporary unavailability itself). For vector
+  3.2 (seizing a specific room's slots), the attacker doesn't even need to
+  be distributed — there's no per-IP limit there anyway (see 3.2), and
+  `MAX_PARTICIPANTS` isn't a per-IP quantity at all.
+- **Conclusion**: at the application level, a distributed attack fundamentally
+  cannot be solved with per-IP mechanisms — that's a structural ceiling of
+  the approach, not a shortcoming. The only realistic line of defense
+  against a botnet is the network layer IN FRONT OF the server (Cloudflare
+  WAF/rate limiting/Bot Fight Mode/Turnstile, discussed in §4.3) — there,
+  large botnets are visible through patterns (geography, fingerprint, IP
+  reputation across Cloudflare's whole network) that our own server simply
+  doesn't have and can't have at its current scale and architecture.
+
+### 3.5 Spoofing `CF-Connecting-IP`/`X-Forwarded-For` to Bypass Per-IP Limits
+
+Detailed analysis — §2. Short conclusion here: **for the actual prod
+topology (Cloudflare Tunnel) — the risk is low**, because there's no path to
+the origin bypassing the Cloudflare edge, which sets the header itself.
+**For self-hosted without Cloudflare or with a naive proxy in front of the
+server — the risk is real and total**: the code trusts the header
+unconditionally, with no check that it came from a trusted node (no
+allow-list of Cloudflare IP ranges, no verification of the header's origin)
+— this erases the effect of literally every per-IP limit (§1.1, 1.2, and any
+future ones from §4.2) down to zero, at nearly zero cost to the attacker.
+
+### 3.6 Slow/Zombie Connections, Holding a Slot Within the Heartbeat Window
+
+Briefly (the full analysis of the reconnect-specific case is in
+`docs/research-room-limit.md`, the section on reconnect zombies, not
+duplicating it here): the heartbeat (§1.7) only detects connections that
+**died silently**, within 20-40s; a connection actively held open by an
+attacker (one that answers pings) isn't detected at all, for as long as the
+attacker likes — up to `MAX_ROOM_LIFETIME` (3 hours), when the reaper kills
+**the entire room** (not just the attacker). Separately — there's a ~40-60s
+window (`PING_INTERVAL × MAX_MISSED_PONGS` plus the delay until the next
+tick) between a client actually disappearing and their slot being freed: for
+the default `MAX_PARTICIPANTS=6` this is minor (plenty of spare slots), but
+it amplifies vector 3.2 in small/limited rooms — an attacker can "twitch" the
+connection (open-close-open), and each cycle guarantees them up to a minute
+of an occupied slot almost for free, with no need to keep the connection
+alive continuously.
+
+---
+
+## 4. Defenses by Layer
+
+### 4.1 Already in the Code — Assessment of Sufficiency
+
+| Mechanism | Values | Sufficiency |
 |---|---|---|
-| `ROOM_CREATION_IP_LIMIT` | 10/60с, per IP | Достаточно для одного IP (§3.1); бессилен для ботнета (§3.4) |
-| `PENDING_JOIN_IP_LIMIT` | 10/60с, per IP, глобальный бюджет | Достаточно, но применяется только при `lobby_enabled=true` (не дефолт) |
-| `MAX_ROOMS` | 500, глобальный | Останавливает неограниченный рост, но сам становится точкой отказа для всех при достижении |
-| `MAX_PARTICIPANTS`/`MAX_PENDING` | 6 / 10, per room | Ограничивают размер урона одной комнаты, не мешают атаке его нанести |
-| Relay rate-limit + payload caps | 100/10с, 16KB/2KB/64KB | Достаточно против флуда сигналингом; не относится к join-флуду (другой путь кода) |
-| Реапер (`EMPTY_ROOM_TTL`/`MAX_ROOM_LIFETIME`) | 120с / 3ч | Хорошо ограничивает накопление МУСОРА (пустых комнат), не защищает занятые слоты |
-| Хартбит | 20с × 2 | Защита от тихого обрыва, НЕ от умышленного удержания (§1.7, §3.6) |
-| `extract_client_ip` | CF-Connecting-IP → XFF → socket | Надёжно в текущей топологии (CF Tunnel), не проверяется кодом явно (§2) |
-| **Join-в-комнату (не лобби)** | **нет вообще** | **Дыра — §3.2, главная находка этого документа** |
-| **Лимит одновременных «пустых» WS-соединений на IP** | **нет вообще** | **Дыра — §3.3** |
+| `ROOM_CREATION_IP_LIMIT` | 3/60s, per IP | Sufficient for a single IP (§3.1); powerless against a botnet (§3.4) |
+| `PENDING_JOIN_IP_LIMIT` | 10/60s, per IP, global budget | Sufficient, but only applies when `lobby_enabled=true` (not the default) |
+| `MAX_ROOMS` | 500, global | Stops unbounded growth, but itself becomes a single point of failure for everyone once reached |
+| `MAX_PARTICIPANTS`/`MAX_PENDING` | 6 / 10, per room | Limit the damage a single room can suffer, don't prevent the attack from inflicting it |
+| Relay rate limit + payload caps | 100/10s, 16KB/2KB/64KB | Sufficient against signaling flooding; doesn't cover join-flooding (a different code path) |
+| Reaper (`EMPTY_ROOM_TTL`/`MAX_ROOM_LIFETIME`) | 120s / 3h | Effectively bounds accumulation of GARBAGE (empty rooms), doesn't protect occupied slots |
+| Heartbeat | 20s × 2 | Protects against silent disconnects, NOT against deliberate holding (§1.7, §3.6) |
+| `extract_client_ip` | CF-Connecting-IP → XFF → socket | Reliable in the current topology (CF Tunnel), not verified explicitly by the code (§2) |
+| **Joining-a-room (not the lobby)** | **none at all** | **A hole — §3.2, this document's main finding** |
+| **Limit on simultaneous "empty" WS connections per IP** | **none at all** | **A hole — §3.3** |
 
-### 4.2 Дешёвые улучшения в приложении
+### 4.2 Cheap Application-Level Improvements
 
-Все — небольшие, аддитивные изменения по образцу уже существующих
-механизмов (не требуют новых зависимостей, используют тот же
-`IpRateLimitMap`/`check_ip_rate_limit`, что уже есть):
+All of these are small, additive changes following the pattern of mechanisms
+that already exist (no new dependencies needed, they reuse the existing
+`IpRateLimitMap`/`check_ip_rate_limit`):
 
-1. **Per-IP лимит на `JoinRoom`-в-комнату (не только на pending)** — самое
-   приоритетное. Третья карта в `AppState` (`room_join_ips` или расширение
-   существующей `pending_join_ips`, чтобы бюджет считался ОБЩИМ для «встать в
-   pending» и «войти прямым `join-room`» — они решают тот же класс проблемы —
-   но это отдельное архитектурное решение, не обязательно объединять) с тем
-   же скользящим окном, вызывается на ветке прямого входа `src/ws.rs:390`
-   ДО проверки `room.participants.len() >= *crate::MAX_PARTICIPANTS`, по
-   аналогии с уже существующей проверкой на строке 345 для лобби. Оценка:
-   ~1 час (код) + документация.
-2. **Лимит одновременных «пустых» WS-соединений на IP** — gauge-счётчик
-   (`Arc<Mutex<HashMap<String, usize>>>`, отдельная структура от
-   `IpRateLimitMap`, так как это не скользящее окно, а текущее количество)
-   инкрементируется на апгрейде, декрементируется при закрытии
-   `handle_socket`, если счётчик для IP превышает разумный потолок (например,
-   10-20) — отказ до апгрейда. Оценка: ~1.5-2 часа (нужно аккуратно
-   гарантировать декремент на всех путях выхода — Drop guard или явный вызов
-   в конце `handle_socket`, что уже частично прикрыто структурой функции).
-3. **Более быстрый реап зомби-соединений** — уменьшить `PING_INTERVAL`
-   (например до 10с) и/или `MAX_MISSED_PONGS` (например до 1) сокращает окно
-   §3.6 вдвое-втрое, но НЕ решает саму проблему (умышленно удерживаемое
-   соединение так и продолжит отвечать на пинги) — это снижает урон только от
-   «дёргающего» варианта атаки, не от устойчивого удержания. Стоимость —
-   тривиальная (константы), но помогает мало относительно вектора 3.2 —
-   низкий приоритет именно для DoS (хотя и полезно само по себе для UX
-   быстрых реконнектов).
-4. **Экспоненциальный бэкофф на повторные отказы** — например, IP, который
-   регулярно упирается в `ROOM_CREATION_IP_LIMIT`/будущий join-лимит,
-   получает удлиняющееся окно отказа (а не фиксированное скользящее). Более
-   сложно в реализации корректно (нужно отдельное состояние «штрафа» на IP,
-   не просто окно попыток) и даёт довольно скромный выигрыш относительно
-   сложности — см. §4.4 «что не надо делать».
-5. **Доверенный источник IP** — на уровне кода: если сервер эксплицитно
-   ожидает работать только за Cloudflare (текущий прод), можно (а) сверять
-   непосредственный peer сокета (`peer_addr`) с опубликованным диапазоном IP
-   Cloudflare (https://www.cloudflare.com/ips/) и доверять
-   `CF-Connecting-IP`/`X-Forwarded-For` **только** если запрос действительно
-   пришёл от одного из этих диапазонов, иначе — падать на `peer_addr`; либо
-   (б) добро проще — Cloudflare Tunnel и так гарантирует это на уровне сети
-   (§2), так что для ЭТОГО конкретного деплоя (а) — избыточная работа. Но
-   если сервер задуман как переиспользуемый self-hosted артефакт (он именно
-   так и задуман, см. `docs/self-hosting.md`), стоит хотя бы явно
-   задокументировать (не в коде, а в `self-hosting.md`) требование «либо
-   держите Cloudflare (или другой доверенный прокси) перед сервером, либо не
-   рассчитывайте, что per-IP лимиты защищают хоть от чего-то» — это дешевле
-   кода и честнее по отношению к самостоятельным операторам.
+1. **A per-IP limit on `JoinRoom`-into-a-room (not just on pending)** — the
+   highest priority. A third map in `AppState` (`room_join_ips`, or an
+   extension of the existing `pending_join_ips` so the budget is SHARED
+   between "enter pending" and "join directly via `join-room`" — they solve
+   the same class of problem — but that's a separate architectural decision,
+   not necessarily worth merging) with the same sliding window, invoked on
+   the direct-join branch `src/ws.rs:390` BEFORE the check
+   `room.participants.len() >= *crate::MAX_PARTICIPANTS`, following the
+   pattern of the existing check on line 345 for the lobby. Estimate:
+   ~1 hour (code) + documentation.
+2. **A limit on simultaneous "empty" WS connections per IP** — a gauge
+   counter (`Arc<Mutex<HashMap<String, usize>>>`, a separate structure from
+   `IpRateLimitMap`, since this is a current count, not a sliding window),
+   incremented on upgrade, decremented on `handle_socket` closing; if the
+   counter for an IP exceeds a reasonable ceiling (e.g. 10-20), reject before
+   the upgrade. Estimate: ~1.5-2 hours (needs to carefully guarantee the
+   decrement on every exit path — a Drop guard or an explicit call at the
+   end of `handle_socket`, which the function's structure already partly
+   covers).
+3. **Faster reaping of zombie connections** — shrinking `PING_INTERVAL`
+   (e.g. to 10s) and/or `MAX_MISSED_PONGS` (e.g. to 1) cuts the §3.6 window
+   by half to a third, but does NOT solve the underlying problem (a
+   deliberately held connection will keep answering pings) — this only
+   reduces the damage from the "twitching" variant of the attack, not from
+   sustained holding. Cost — trivial (constants), but it helps little
+   relative to vector 3.2 — low priority specifically for DoS purposes
+   (though useful in its own right for fast-reconnect UX).
+4. **Exponential backoff on repeated denials** — e.g. an IP that regularly
+   hits `ROOM_CREATION_IP_LIMIT`/a future join limit gets a progressively
+   longer denial window (rather than a fixed sliding window). More complex
+   to implement correctly (needs separate per-IP "penalty" state, not just a
+   window of attempts) and yields a fairly modest gain relative to the
+   complexity — see §4.4 "what not to do."
+5. **A trusted IP source** — at the code level: if the server explicitly
+   expects to run only behind Cloudflare (the current prod setup), it could
+   (a) check the immediate socket peer (`peer_addr`) against Cloudflare's
+   published IP ranges (https://www.cloudflare.com/ips/) and only trust
+   `CF-Connecting-IP`/`X-Forwarded-For` if the request genuinely came from
+   one of those ranges, falling back to `peer_addr` otherwise; or (b) simpler
+   still — the Cloudflare Tunnel already guarantees this at the network
+   level anyway (§2), so for THIS specific deployment, (a) is redundant
+   work. But if the server is meant to be a reusable self-hosted artifact
+   (which it is, see `docs/self-hosting.md`), it's worth at least explicitly
+   documenting (not in code, but in `self-hosting.md`) the requirement
+   "either keep Cloudflare (or another trusted proxy) in front of the
+   server, or don't count on per-IP limits protecting you from anything" —
+   this is cheaper than code, and more honest toward independent operators.
 
-### 4.3 Инфраструктурный слой — Cloudflare перед `chat.fedorov.it`/`chat-api.fedorov.it`
+### 4.3 Infrastructure Layer — Cloudflare in Front of `chat.fedorov.it`/`chat-api.fedorov.it`
 
-Проверено веб-поиском (2026), с источниками:
+Verified via web search (2026), with sources:
 
-- **Rate Limiting Rules (WAF)**: на Free-плане — **1 правило**, на Pro — 2, на
-  Business — 5, на Enterprise — 100 ([Cloudflare docs, Rate limiting
-  rules](https://developers.cloudflare.com/waf/rate-limiting-rules/)). Даже
-  одно правило — уже полезно: можно ограничить именно `POST /api/rooms` (или
-  сам факт GET-запроса на `/ws` — начальный WS-хендшейк это обычный HTTP GET
-  с `Upgrade`-заголовком, который проходит через WAF ДО апгрейда) по пути +
-  счётчик по IP — это дублирует §1.1 на уровне edge, ДО того как трафик вообще
-  дойдёт до Rust-процесса (снижает нагрузку на сам origin при флуде, а не
-  только ограничивает эффект). Free-плейн умеет матчить по `Path` и считать по
-  `IP` — этого достаточно для этой задачи.
-- **Turnstile (CAPTCHA)**: бесплатно на всех планах, без ограничения по числу
-  запросов/сайт-кеев (до 20 виджетов на аккаунт), без «стены» на 10000
-  проверок ([Cloudflare Turnstile
-  plans](https://developers.cloudflare.com/turnstile/plans/)). Может быть
-  навешан на кнопку создания комнаты (`POST /api/rooms`) на фронте — требует
-  изменения и фронта (виджет), и бэкенда (проверка `siteverify` перед
-  созданием комнаты, новый исходящий HTTP-вызов к Cloudflare из Rust-сервиса)
-  — не бесплатно по трудозатратам, хотя финансово бесплатно.
-- **Bot Fight Mode**: бесплатно на Free-плане. **Важная практическая
-  оговорка, специфичная именно для этого проекта**: Cloudflare прямо
-  документирует, что Bot Fight Mode/Super Bot Fight Mode может **сломать
-  легитимный трафик через Cloudflare Tunnel** («websocket: bad handshake»),
-  если правило `Definitely Automated` не выставлено в `Allow` — то есть
-  включать Bot Fight Mode «в лоб» на зоне, где `chat-api.fedorov.it` идёт
-  через tunnel и WS-апгрейд, может **сломать WS-хендшейк для настоящих
-  пользователей**, а не только для ботов. Если когда-либо включать эту
-  функцию для данного домена — обязательно сначала настроить исключение для
-  собственного трафика (или протестировать очень аккуратно на
-  staging-поддомене), это не «включил и забыл».
-- **Итого по CF**: реалистичный, дешёвый набор для публичного прод-инстанса —
-  1 rate-limiting правило на `POST /api/rooms` (и опционально второе, если
-  когда-нибудь перейти на Pro, на сам `/ws`-хендшейк) плюс, при желании,
-  Turnstile перед созданием комнаты. Bot Fight Mode — включать с осторожностью
-  и тестированием именно из-за Tunnel-специфичной ломкости.
+- **Rate Limiting Rules (WAF)**: on the Free plan — **1 rule**, on Pro — 2, on
+  Business — 5, on Enterprise — 100 ([Cloudflare docs, Rate limiting
+  rules](https://developers.cloudflare.com/waf/rate-limiting-rules/)). Even
+  one rule is already useful: you can limit exactly `POST /api/rooms` (or
+  the mere fact of a GET request to `/ws` — the initial WS handshake is an
+  ordinary HTTP GET with an `Upgrade` header, which passes through the WAF
+  BEFORE the upgrade) by path + a per-IP counter — this duplicates §1.1 at
+  the edge, BEFORE the traffic even reaches the Rust process (reducing load
+  on the origin itself during a flood, not just limiting the effect). The
+  Free plan can match on `Path` and count by `IP` — that's enough for this
+  purpose.
+- **Turnstile (CAPTCHA)**: free on all plans, with no limit on the number of
+  requests/site keys (up to 20 widgets per account), with no "wall" at
+  10,000 verifications ([Cloudflare Turnstile
+  plans](https://developers.cloudflare.com/turnstile/plans/)). It could be
+  attached to the room-creation button (`POST /api/rooms`) on the frontend —
+  requires changes both to the frontend (the widget) and the backend
+  (verifying `siteverify` before creating a room, a new outbound HTTP call
+  to Cloudflare from the Rust service) — not free in terms of effort, even
+  though it's free financially.
+- **Bot Fight Mode**: free on the Free plan. **An important practical
+  caveat, specific to this project**: Cloudflare explicitly documents that
+  Bot Fight Mode/Super Bot Fight Mode can **break legitimate traffic through
+  a Cloudflare Tunnel** ("websocket: bad handshake") if the
+  `Definitely Automated` rule isn't set to `Allow` — meaning enabling Bot
+  Fight Mode outright on a zone where `chat-api.fedorov.it` goes through a
+  tunnel and a WS upgrade could **break the WS handshake for real users**,
+  not just bots. If this feature is ever enabled for this domain — an
+  exception for our own traffic must be configured first (or it should be
+  tested very carefully on a staging subdomain), this isn't "flip it on and
+  forget it."
+- **Bottom line for CF**: a realistic, cheap set for a public prod instance —
+  1 rate-limiting rule on `POST /api/rooms` (and optionally a second one, if
+  ever upgrading to Pro, on the `/ws` handshake itself) plus, if desired,
+  Turnstile before room creation. Bot Fight Mode — enable with caution and
+  testing, specifically because of the Tunnel-specific fragility.
 
-### 4.4 Что НЕ надо делать (оверинжиниринг для этого масштаба)
+### 4.4 What NOT to Do (Over-Engineering for This Scale)
 
-- **Полноценный WAF/ML-детектор аномалий на своей стороне** — при масштабе
-  проекта (личный сервер, единицы-десятки одновременных пользователей,
-  комнаты в памяти без БД) это категорически избыточно; всё, что нужно
-  «умного» в детекции паттернов — уже есть у Cloudflare бесплатно на edge, не
-  надо повторять это внутри Rust-процесса.
-- **Распределённый rate-limit (Redis/etcd) вместо `Mutex<HashMap>`** — при
-  одной реплике (`Recreate`-деплой, см. карточку проекта в реестре) in-memory
-  структуры полностью достаточны; готовиться к горизонтальному масштабированию
-  сигналинг-сервера с состоянием в памяти — отдельная, гораздо более крупная
-  архитектурная тема (session affinity/sticky routing или вынос состояния
-  комнат вовне), не связанная с DoS-защитой как таковой.
-- **CAPTCHA на КАЖДОЕ действие** (join, не только create) — сломает основной
-  UX-предложение продукта («звонок по ссылке за секунды, без трения», см.
-  `docs/PRD.md`) ради защиты от угрозы, которая для join уже дешевле и точнее
-  закрывается лобби (§3.2) — не соразмерная цена.
-- **Экспоненциальный бэкофф со сложным состоянием штрафов** (см. §4.2 п.4) —
-  усложняет код заметно больше, чем скользящее окно, при умеренном приросте
-  защиты — приоритет ниже, чем закрытие дыры 3.2/3.3 сначала.
-- **Проверка Cloudflare IP-диапазонов в коде** (§4.2 п.5а) — оправдана только
-  если проект реально нацелен на множество независимых self-hosted
-  инсталляций за разными провайдерами; при текущем единственном прод-деплое
-  за Cloudflare Tunnel — сетевая топология уже даёт ту же гарантию бесплатно
-  (§2), кодовая проверка была бы дополнительной защитой «на будущее», не
-  устраняющей текущий риск.
-
----
-
-## 5. Приоритизированные рекомендации
-
-1. **[Высокий приоритет, дешёво] Per-IP лимит на прямой `JoinRoom`-в-комнату**
-   (§4.2 п.1) — закрывает самую реальную и самую дешёвую для атакующего дыру
-   этого документа (§3.2): сегодня ЛЮБАЯ комната с настройками по умолчанию
-   (`lobby_enabled=false`) забивается шестью обычными соединениями с одного
-   IP без единой проверки. ~1 час работы, использует существующий механизм
-   `check_ip_rate_limit` без изменений в нём самом.
-   > Реализовано 2026-07-16 (`JOIN_ROOM_IP_LIMIT`, дефолт 20/60с).
-2. **[Средний приоритет, дешёво] Лимит одновременных «пустых»
-   WS-соединений на IP** (§4.2 п.2) — закрывает вектор истощения FD/памяти
-   (§3.3), которого сегодня нет вообще ни в каком виде. ~1.5-2 часа.
-3. **[Средний приоритет, инфраструктура, почти бесплатно по времени] Одно
-   Cloudflare Rate Limiting правило на `POST /api/rooms`** (§4.3) — дублирует
-   §1.1 на edge, снижает нагрузку на origin ДО того, как флуд его достигнет;
-   бесплатно на Free-плане, настраивается за 10 минут в дашборде. Это ключевая
-   мера против ПРИОРИТЕТНОГО для заказчика вектора создания комнат (§3.1),
-   особенно против распределённого варианта (§3.4), где per-IP лимит в коде
-   структурно бессилен, а edge может резать по совокупным сигналам (ASN,
-   репутация IP, Bot Score).
-3б. **[Низкий приоритет, дёшево] Распространить `ROOM_CREATION_IP_LIMIT` на
-   `PUT /api/rooms/{id}`** (§3.1) — единственный create-подобный маршрут без
-   учёта IP сегодня; ~15 минут, тот же `check_ip_rate_limit`. Опционально
-   там же ужесточить константу до 5/60с.
-   > Реализовано 2026-07-16 (без ужесточения константы — осталась 10/60с).
-4. **[Низкий приоритет] Явная документация про доверие к `CF-Connecting-IP`
-   в `self-hosting.md`** (§4.2 п.5б) — не код, а абзац для будущих
-   self-hosted операторов: «per-IP лимиты полагаются на то, что перед
-   сервером стоит доверенный прокси, выставляющий этот заголовок
-   самостоятельно — без него они бесполезны против минимально мотивированного
-   атакующего». Полчаса работы, закрывает риск непонимания, а не сам риск.
-5. **[Низкий приоритет, опционально] Turnstile на создание комнаты** (§4.3)
-   — только если реально наблюдается автоматизированный флуд `POST
-   /api/rooms` сверх того, что уже гасят §1.1 + рекомендация 3; для текущего
-   масштаба проекта — скорее «на будущее иметь в кармане», чем делать сейчас.
-6. **Не трогать** хартбит-константы и не строить бэкофф-механику ради этой
-   конкретной угрозы (§4.4) — усилия туда несоразмерны выигрышу относительно
-   пп. 1-2.
+- **A full-blown WAF/ML anomaly detector on our own side** — at this
+  project's scale (a personal server, single-to-low-tens of concurrent
+  users, rooms held in memory with no DB) this is categorically excessive;
+  everything "smart" needed for pattern detection is already available from
+  Cloudflare for free at the edge — no need to reimplement it inside the
+  Rust process.
+- **A distributed rate limit (Redis/etcd) instead of `Mutex<HashMap>`** —
+  with a single replica (`Recreate` deployment, see the project's registry
+  card), in-memory structures are entirely sufficient; preparing for
+  horizontal scaling of a stateful signaling server is a separate, much
+  larger architectural topic (session affinity/sticky routing, or moving
+  room state out-of-process), unrelated to DoS defense as such.
+- **CAPTCHA on EVERY action** (joining, not just creating) — would break the
+  product's core UX pitch ("a call via link in seconds, with no friction,"
+  see `docs/PRD.md`) in exchange for defending against a threat that, for
+  joining, is already cheaper and more precisely closed off by the lobby
+  (§3.2) — not a proportionate cost.
+- **Exponential backoff with complex penalty state** (see §4.2 item 4) —
+  complicates the code noticeably more than a sliding window, for a modest
+  gain in protection — lower priority than closing hole 3.2/3.3 first.
+- **Checking Cloudflare IP ranges in the code** (§4.2 item 5a) — only
+  justified if the project genuinely targets many independent self-hosted
+  installations behind different providers; with the current single prod
+  deployment behind a Cloudflare Tunnel, the network topology already gives
+  the same guarantee for free (§2); a code-level check would be additional
+  "future-proofing," not something removing a current risk.
 
 ---
 
-## 6. Self-hosted vs публичный инстанс
+## 5. Prioritized Recommendations
 
-| | Публичный инстанс (текущий прод, `chat.fedorov.it` за Cloudflare) | Self-hosted (произвольный оператор, `docs/self-hosting.md`) |
+1. **[High priority, cheap] Per-IP limit on direct `JoinRoom`-into-a-room**
+   (§4.2 item 1) — closes the most real and cheapest-for-the-attacker hole in
+   this document (§3.2): today ANY room with default settings
+   (`lobby_enabled=false`) can be hammered by six ordinary connections from
+   one IP, with no check whatsoever. ~1 hour of work, reuses the existing
+   `check_ip_rate_limit` mechanism unchanged.
+   > Implemented on 2026-07-16 (`JOIN_ROOM_IP_LIMIT`, default 20/60s).
+2. **[Medium priority, cheap] A limit on simultaneous "empty" WS connections
+   per IP** (§4.2 item 2) — closes the FD/memory exhaustion vector (§3.3),
+   which today has no protection whatsoever, in any form. ~1.5-2 hours.
+3. **[Medium priority, infrastructure, nearly free in terms of time] One
+   Cloudflare Rate Limiting rule on `POST /api/rooms`** (§4.3) — duplicates
+   §1.1 at the edge, reducing load on the origin BEFORE a flood reaches it;
+   free on the Free plan, takes 10 minutes to configure in the dashboard.
+   This is a key defense against the customer's top-priority vector, room
+   creation (§3.1), especially against the distributed variant (§3.4), where
+   a per-IP limit in the code is structurally powerless, while the edge can
+   filter on aggregate signals (ASN, IP reputation, Bot Score).
+3b. **[Low priority, cheap] Extend `ROOM_CREATION_IP_LIMIT` to
+   `PUT /api/rooms/{id}`** (§3.1) — currently the only create-like route that
+   ignores IP; ~15 minutes, reusing `check_ip_rate_limit`. Optionally
+   tighten the constant to 5/60s there too.
+   > Implemented on 2026-07-16; the constant has since been tightened to 3/60s
+   > (matching the current `ROOM_CREATION_IP_LIMIT` default).
+4. **[Low priority] Explicit documentation about trusting `CF-Connecting-IP`
+   in `self-hosting.md`** (§4.2 item 5b) — not code, but a paragraph for
+   future self-hosted operators: "per-IP limits rely on a trusted proxy in
+   front of the server setting this header itself — without one, they're
+   useless against even a minimally motivated attacker." Half an hour of
+   work, closes the risk of misunderstanding, not the risk itself.
+5. **[Low priority, optional] Turnstile on room creation** (§4.3) — only if
+   automated flooding of `POST /api/rooms` is actually observed beyond what
+   §1.1 + recommendation 3 already absorb; for the project's current scale —
+   more of a "nice to have in your back pocket" than something to do now.
+6. **Don't touch** the heartbeat constants, and don't build backoff machinery
+   for this specific threat (§4.4) — the effort there is disproportionate to
+   the payoff relative to items 1-2.
+
+---
+
+## 6. Self-Hosted vs. Public Instance
+
+| | Public instance (current prod, `chat.fedorov.it` behind Cloudflare) | Self-hosted (an arbitrary operator, `docs/self-hosting.md`) |
 |---|---|---|
-| Надёжность `extract_client_ip` | Высокая — Cloudflare Tunnel физически исключает обход edge (§2) | Зависит целиком от того, что оператор поставил перед сервером — по умолчанию (без прокси) `peer_addr` надёжен, но с наивным прокси легко ломается |
-| Доступность инфраструктурного слоя (§4.3) | Да, уже есть, бесплатно на Free-плане, стоит включить (рекомендация 3) | Нет по умолчанию — self-hoster должен сам поставить Cloudflare (или другой WAF) перед сервером, если хочет тот же уровень защиты; это не входит в «из коробки» |
-| Приоритет дырки 3.2 (join-флуд) | Такой же реальный, как везде — лобби/лимит из рекомендации 1 нужны независимо от наличия Cloudflare (Cloudflare не отличит легитимный `join-room` от паразитного — это прикладная логика, не HTTP-паттерн) | Такой же |
-| Кому «перекладывать» защиту на инфраструктуру — нормально ли | Да — Cloudflare уже часть архитектуры проекта (см. `registry/projects/chat.md`, Ш2), разумно использовать то, что уже есть бесплатно | Нет предположения по умолчанию — self-hosting-документация должна явно называть уровень защиты «из коробки» (только §1, без §4.3) как базовый, а внешний WAF/rate-limit — как настоятельно рекомендуемое, но опциональное усиление, а не подразумеваемое |
+| Reliability of `extract_client_ip` | High — the Cloudflare Tunnel physically rules out bypassing the edge (§2) | Depends entirely on what the operator put in front of the server — by default (no proxy) `peer_addr` is reliable, but easily broken with a naive proxy |
+| Availability of the infrastructure layer (§4.3) | Yes, already there, free on the Free plan, worth enabling (recommendation 3) | Not by default — the self-hoster must set up Cloudflare (or another WAF) in front of the server themselves for the same level of protection; this isn't part of the "out of the box" experience |
+| Priority of hole 3.2 (join-flooding) | Just as real as anywhere — the lobby/limit from recommendation 1 are needed regardless of Cloudflare (Cloudflare can't distinguish a legitimate `join-room` from a parasitic one — that's application logic, not an HTTP pattern) | The same |
+| Is it fine to "offload" protection onto infrastructure | Yes — Cloudflare is already part of the project's architecture (see `registry/projects/chat.md`, S2), it makes sense to use what's already there for free | No default assumption — the self-hosting documentation should explicitly call the "out of the box" level of protection (only §1, without §4.3) the baseline, with an external WAF/rate limit as a strongly recommended, but optional, hardening step, not something implied |
 
-Практический вывод: рекомендации 1-2 из §5 (уровень приложения) нужны **в
-любом случае**, независимо от инфраструктуры — они закрывают дыру, которую
-никакой WAF не увидит (join-флуд выглядит как обычный трафик на уровне HTTP/
-WS). Рекомендация 3 (Cloudflare rate-limit) — бонус, доступный конкретно
-этому проду сегодня практически бесплатно, но не подменяет пп. 1-2, и
-self-hosting-документация не должна создавать у операторов без Cloudflare
-ложного ощущения, что все угрозы этого документа уже закрыты.
+Practical conclusion: recommendations 1-2 from §5 (application level) are
+needed **regardless of** infrastructure — they close a hole that no WAF will
+ever see (join-flooding looks like ordinary traffic at the HTTP/WS level).
+Recommendation 3 (Cloudflare rate limit) is a bonus, available to this
+specific prod deployment today at essentially no cost, but it doesn't
+replace items 1-2, and the self-hosting documentation shouldn't give
+operators without Cloudflare the false impression that every threat in this
+document is already closed off.
 
 ---
 
-## 7. Выводы одним взглядом
+## 7. Conclusions at a Glance
 
-**Главная дыра**: при настройках по умолчанию (`lobby_enabled=false`, то
-есть в большинстве реальных комнат) любой, кто знает ссылку на комнату, может
-занять все `MAX_PARTICIPANTS` (обычно 6) слотов шестью обычными
-WebSocket-подключениями с одного IP — сервер сегодня **не проверяет никакого
-per-IP лимита на прямой вход в комнату** (только на попадание в лобби, а
-лобби по умолчанию выключено). Атака дешёвая (несколько сокетов, ноль
-специальных инструментов), удержание слотов — практически бесконечное
-(хартбит не отличает злоумышленника от честного участника, §1.7/§3.6), и она
-становится ещё дешевле, если/когда лидер сможет выставлять свой маленький
-`maxParticipants` (см. `docs/research-room-limit.md`).
+**The main hole**: with default settings (`lobby_enabled=false`, i.e. in most
+real-world rooms), anyone who knows a room's link can occupy all
+`MAX_PARTICIPANTS` (typically 6) slots with six ordinary WebSocket
+connections from one IP — the server today **checks no per-IP limit on
+direct entry into a room** (only on entering the lobby, and the lobby is off
+by default). The attack is cheap (a handful of sockets, zero special tools),
+and holding the slots is effectively indefinite (the heartbeat can't tell an
+attacker from an honest participant, §1.7/§3.6), and it gets even cheaper
+if/when a leader can set their own small `maxParticipants` (see
+`docs/research-room-limit.md`).
 
-**Топ-3 рекомендации**:
+**Top 3 recommendations**:
 
-1. Добавить per-IP лимит на прямой `JoinRoom`-в-комнату (не только на
-   попадание в pending-лобби) — тот же механизм `check_ip_rate_limit`, что
-   уже используется для лобби и создания комнат, просто на новом пути кода.
-   ~1 час.
-2. Добавить лимит числа одновременных «пустых» (не вошедших в комнату)
-   WS-соединений на IP — сегодня нет вообще никакого ограничения, кроме
-   `ulimit` ОС. ~1.5-2 часа.
-3. Включить одно бесплатное Cloudflare Rate Limiting правило на `POST
-   /api/rooms` (Free-плейн даёт 1 правило) — дублирует существующую
-   прикладную защиту на edge, бесплатно и быстро, но не заменяет пп. 1-2.
+1. Add a per-IP limit on direct `JoinRoom`-into-a-room (not just on entering
+   the pending lobby) — the same `check_ip_rate_limit` mechanism already
+   used for the lobby and for room creation, just on a new code path.
+   ~1 hour.
+2. Add a limit on the number of simultaneous "empty" (not joined to a room)
+   WS connections per IP — today there's no limit whatsoever besides the
+   OS's `ulimit`. ~1.5-2 hours.
+3. Enable one free Cloudflare Rate Limiting rule on `POST
+   /api/rooms` (the Free plan gives 1 rule) — duplicates the existing
+   application-level defense at the edge, free and fast, but doesn't replace
+   items 1-2.
 
 Sources:
 - [Rate limiting rules · Cloudflare WAF docs](https://developers.cloudflare.com/waf/rate-limiting-rules/)

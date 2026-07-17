@@ -11,22 +11,23 @@
 </head>
 <body class="page-room">
   <div class="room-page">
-    <!-- Модалка входа: показывается ПЕРВОЙ, до любого подключения к
-         сигналингу — имя вводится заново при каждом заходе (анонимность, см.
-         docs/privacy.md, «Anonymity»), join-room уходит только после клика
-         «Войти» (заодно даёт user-gesture для AudioContext, см.
-         static/common.js). При авто-reconnect модалка повторно не
-         показывается — имя уже есть в памяти вкладки. Поле предзаполняется
-         сгенерированным именем (static/namegen.js: NameGen.userName(), см.
-         static/room.js: showJoinModal) — можно сразу жать «Войти»; стереть
-         поле — остаться анонимом, как и раньше. -->
+    <!-- Join modal: shown FIRST, before any connection to signaling — the
+         name is entered anew on every visit (anonymity, see
+         docs/privacy.md, "Anonymity"), join-room is only sent after
+         clicking "Join" (this also provides a user gesture for
+         AudioContext, see static/common.js). On auto-reconnect the modal is
+         not shown again — the name is already in the tab's memory. The
+         field is prefilled with a generated name (static/namegen.js:
+         NameGen.userName(), see static/room.js: showJoinModal) — you can
+         just click "Join" right away; clearing the field — stay anonymous,
+         as before. -->
     <div id="join-modal" class="join-modal">
       <div class="join-modal-card">
         <h2>Join the room</h2>
-        <!-- Инпут имени + кнопка «сгенерировать заново» (см. static/room.js:
-             showJoinModal/joinNameRegenButtonEl) — та же пара, что на
-             лендинге у имени комнаты (static/index.html/landing.js), только
-             тянет NameGen.userName(). -->
+        <!-- Name input + "regenerate" button (see static/room.js:
+             showJoinModal/joinNameRegenButtonEl) — the same pair as the
+             room name on the landing page (static/index.html/landing.js),
+             just pulling from NameGen.userName(). -->
         <div class="input-with-regen">
           <input
             id="join-name-input"
@@ -42,8 +43,8 @@
       </div>
     </div>
 
-    <!-- Оверлей текущего состояния: подключение / ожидание одобрения лобби /
-         вход отклонён / комната не найдена / заполнена / обрыв связи. -->
+    <!-- Current-state overlay: connecting / waiting for lobby approval /
+         entry denied / room not found / full / connection lost. -->
     <div id="overlay" class="overlay hidden">
       <div id="overlay-spinner" class="spinner"></div>
       <h2 id="overlay-title">Connecting…</h2>
@@ -51,32 +52,37 @@
       <button id="overlay-action-button" class="retry-button hidden">Create a new one</button>
     </div>
 
-    <!-- Ненавязчивый тост (смена лидера и т.п.) — см. static/room.js: showToast(). -->
+    <!-- Unobtrusive toast (leader change, etc.) — see static/room.js: showToast(). -->
     <div id="toast" class="toast hidden"></div>
 
     <div class="room-top-bar">
       <span class="room-logo">Video call</span>
       <div class="room-top-bar-center">
         <span id="participant-count" class="participant-count">Participants: 1 / 6</span>
-        <!-- Таймер длительности созвона (см. static/room.js: startRoomTimer) —
-             count-up M:SS (после часа — H:MM:SS) от roomAgeSeconds из joined
-             (время с подключения ПЕРВОГО участника комнаты, общее для всех);
-             скрыт до первого joined (см. static/style.css: .room-timer). -->
+        <!-- Call duration timer (see static/room.js: startRoomTimer) —
+             count-up M:SS (after an hour — H:MM:SS) from roomAgeSeconds in
+             joined (time since the FIRST room participant connected, the
+             same for everyone); hidden until the first joined (see
+             static/style.css: .room-timer). -->
         <span id="room-timer" class="room-timer hidden"></span>
-        <!-- SAS «отпечаток комнаты» (5 эмодзи, см. static/crypto.js: deriveSas,
-             static/room.js: renderTopbarSas) — единственное место в UI, где
-             живёт SAS (раньше дублировался в шапке чат-панели, убрано —
-             см. docs/sas-verification.md §9). Кнопка: клик раскрывает попап
-             #topbar-sas-popup с крупными эмодзи, hex-кодом и пояснением.
-             ВАЖНО: класть только внутрь .room-top-bar-center (flex+wrap) —
-             .room-top-bar это грид 1fr auto 1fr, 4-й прямой потомок сломал бы
-             центрирование (см. style.css). Попап — absolute внутри этого же
-             контейнера (см. .topbar-sas-popup), из грид-раскладки не считается. -->
+        <!-- SAS "room fingerprint" (5 emoji, see static/crypto.js:
+             deriveSas, static/room.js: renderTopbarSas) — the only place in
+             the UI where the SAS lives (used to be duplicated in the chat
+             panel header, removed — see docs/sas-verification.md §9).
+             Button: click expands the #topbar-sas-popup popup with large
+             emoji, the hex code, and an explanation.
+             IMPORTANT: only place it inside .room-top-bar-center
+             (flex+wrap) — .room-top-bar is a 1fr auto 1fr grid, a 4th
+             direct child would break the centering (see style.css). The
+             popup is absolute inside this same container (see
+             .topbar-sas-popup), so it doesn't count toward the grid
+             layout. -->
         <button type="button" id="topbar-sas" class="topbar-sas hidden" aria-label="Room verification code" title=""></button>
         <div id="topbar-sas-popup" class="topbar-sas-popup hidden">
-          <!-- Прозрачный полноэкранный перехватчик кликов «мимо» (тот же
-               приём, что у .share-popup-backdrop/.chat-message-popover-backdrop,
-               только без затемнения — это информационная плашка, а не модалка). -->
+          <!-- Transparent fullscreen click-outside interceptor (the same
+               trick as .share-popup-backdrop/.chat-message-popover-backdrop,
+               just without the dimming — this is an informational panel,
+               not a modal). -->
           <div id="topbar-sas-popup-backdrop" class="topbar-sas-popup-backdrop"></div>
           <div class="topbar-sas-popup-card" role="dialog" aria-label="Room verification code details">
             <div id="topbar-sas-popup-emoji" class="topbar-sas-popup-emoji"></div>
@@ -88,31 +94,33 @@
       <span class="room-top-bar-spacer" aria-hidden="true"></span>
     </div>
 
-    <!-- Тонкий ненавязчивый баннер авто-reconnect'а сигналинга (НЕ
-         полноэкранный оверлей — mesh/медиа/чат продолжают работать во время
-         переподключения, см. static/room.js). -->
+    <!-- Thin unobtrusive signaling auto-reconnect banner (NOT a fullscreen
+         overlay — mesh/media/chat keep working during reconnection, see
+         static/room.js). -->
     <div id="reconnect-banner" class="top-banner hidden">
       <span class="top-banner-spinner" aria-hidden="true"></span>
       <span>Reconnecting…</span>
     </div>
 
-    <!-- Баннер version-skew (стандарт Романа): задеплоена новая версия,
-         предлагаем обновить страницу. Крестика/дисмисса нет намеренно. -->
+    <!-- Version-skew banner (Roman's standard): a new version has been
+         deployed, prompting to refresh the page. There's deliberately no
+         close/dismiss button. -->
     <div id="version-banner" class="top-banner hidden">
       <span>A new version is available — please refresh the page.</span>
       <button id="version-banner-reload-button" class="top-banner-button" type="button">Refresh</button>
     </div>
 
     <div class="room-stage">
-      <!-- Главная зона: экран крупно, когда кто-то шарит. -->
+      <!-- Main area: the screen shown large when someone is sharing. -->
       <div id="screen-stage" class="screen-stage hidden">
         <video id="screen-video" class="screen-video" autoplay playsinline></video>
-        <!-- Заглушка вместо живого превью СВОЕГО же захвата: показ своего
-             видео в этой же вкладке при захвате «всего экрана» рекурсивно
-             ловит само это превью («зеркальный коридор» — шлейф из курсоров и
-             видимая заморозка буфера, особенно в fullscreen). Meet/Zoom по
-             той же причине никогда не показывают шарящему живое превью его
-             же захвата. См. static/room.js: showLocalScreenPreview. -->
+        <!-- Placeholder instead of a live preview of ONE'S OWN capture:
+             showing your own video in this same tab while capturing "the
+             whole screen" recursively picks up this very preview (a "hall
+             of mirrors" — a trail of cursors and visible buffer freezing,
+             especially in fullscreen). Meet/Zoom for the same reason never
+             show the sharer a live preview of their own capture. See
+             static/room.js: showLocalScreenPreview. -->
         <div id="screen-self-placeholder" class="screen-self-placeholder hidden">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <rect x="2" y="4" width="20" height="14" rx="2"></rect>
@@ -122,9 +130,9 @@
           <p>You are sharing your screen</p>
         </div>
         <div id="screen-caption" class="screen-caption"></div>
-        <!-- Развернуть показ экрана на весь экран (Fullscreen API на
-             контейнере сцены, см. static/room.js) — крестик/Esc выходит
-             штатными средствами браузера. -->
+        <!-- Expand the screen share to fullscreen (Fullscreen API on the
+             stage container, see static/room.js) — close/Esc exits via the
+             browser's native means. -->
         <button id="screen-fullscreen-button" class="screen-fullscreen-button" type="button" aria-pressed="false" aria-label="Fullscreen" title="Fullscreen">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M8 3H5a2 2 0 0 0-2 2v3"></path>
@@ -135,10 +143,10 @@
         </button>
       </div>
 
-      <!-- Сетка тайлов участников (свой тайл — первым). -->
+      <!-- Grid of participant tiles (own tile comes first). -->
       <div id="tiles-grid" class="tiles-grid"></div>
 
-      <!-- Пустая комната (только свой тайл) — ненавязчивый призыв позвать людей. -->
+      <!-- Empty room (only own tile) — an unobtrusive call-to-action to invite people. -->
       <div id="invite-cta" class="invite-cta hidden">
         <p>Invite participants to start the conversation</p>
         <button id="invite-cta-button" class="invite-cta-button" type="button">
@@ -148,21 +156,22 @@
       </div>
     </div>
 
-    <!-- Ненавязчивые сообщения (отказ доступа к устройству, экран занят и т.п.). -->
+    <!-- Unobtrusive messages (device access denied, screen busy, etc.). -->
     <div id="room-message" class="room-message hidden"></div>
 
-    <!-- Заявки лобби (только у лидера, только пока lobbyEnabled=true и есть
-         ожидающие) — карточки над пилюлей управления, см. static/room.js:
-         renderJoinRequests(). -->
+    <!-- Lobby join requests (only for the leader, only while
+         lobbyEnabled=true and there are pending ones) — cards above the
+         control panel pill, see static/room.js: renderJoinRequests(). -->
     <div id="join-requests" class="join-requests hidden"></div>
 
     <div class="control-panel">
-      <!-- Шестерёнка настроек — видна ВСЕМ участникам (секция «Устройства» —
-           выбор микрофона/камеры, доступна каждому); секция «Комната»
-           (лобби + права гостей) внутри панели скрыта для не-лидера (см.
-           static/room.js: updateSettingsButtonVisibility(), #settings-room-section).
-           Бейдж — число заявок в лобби, ждущих решения (виден только лидеру,
-           у остальных всегда 0). -->
+      <!-- Settings gear — visible to ALL participants (the "Devices"
+           section — microphone/camera selection, available to everyone);
+           the "Room" section (lobby + guest permissions) inside the panel
+           is hidden for non-leaders (see static/room.js:
+           updateSettingsButtonVisibility(), #settings-room-section).
+           Badge — number of pending lobby requests awaiting a decision
+           (visible only to the leader, always 0 for everyone else). -->
       <button id="settings-button" class="control-button" type="button" aria-pressed="false" aria-label="Settings" title="Settings">
         <span class="control-button-icon" aria-hidden="true">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -202,10 +211,10 @@
           </svg>
         </span>
       </button>
-      <!-- Кнопка «Экран» прячется скриптом (room.js), если у браузера нет
-           navigator.mediaDevices.getDisplayMedia — так на мобильных
-           (Android Chrome, iOS Safari), где веб-API захвата экрана не
-           реализовано в принципе. -->
+      <!-- The "Screen" button is hidden by the script (room.js) if the
+           browser has no navigator.mediaDevices.getDisplayMedia — this is
+           the case on mobile (Android Chrome, iOS Safari), where the
+           screen-capture web API isn't implemented at all. -->
       <button id="screen-button" class="control-button" type="button" aria-pressed="false" aria-label="Screen" title="Share screen">
         <span class="control-button-icon" aria-hidden="true">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -245,7 +254,7 @@
       </button>
     </div>
 
-    <!-- Попап «Поделиться»: QR-код (серверный SVG) + ссылка текстом + копирование. -->
+    <!-- "Share" popup: QR code (server-side SVG) + link as text + copy. -->
     <div id="share-popup" class="share-popup hidden" role="dialog" aria-modal="true" aria-labelledby="share-popup-title">
       <div id="share-popup-backdrop" class="share-popup-backdrop"></div>
       <div class="share-popup-card">
@@ -256,21 +265,24 @@
           </svg>
         </button>
         <h2 id="share-popup-title">Share the room</h2>
-        <!-- QR рендерится ЛОКАЛЬНО в браузере (см. static/vendor/qrcode.js,
-             static/room.js: renderShareQr) — никакого похода на сервер за
-             картинкой: ссылка комнаты (включая PSK-токен #t и expiry #e,
-             см. docs/e2e-encryption.md) не должна покидать вкладку ради QR. -->
+        <!-- QR is rendered LOCALLY in the browser (see
+             static/vendor/qrcode.js, static/room.js: renderShareQr) — no
+             trip to the server for the image: the room link (including the
+             PSK token #t and expiry #e, see docs/e2e-encryption.md) must
+             not leave the tab for the sake of a QR code. -->
         <div id="share-popup-qr" class="share-popup-qr" role="img" aria-label="QR code with the room link"></div>
         <div id="share-popup-link" class="share-popup-link"></div>
-        <!-- Хэш опубликованной статики — ОТДЕЛЬНОЙ строкой текста, для
-             сверки (форензический якорь, см. docs/security.md, «Published
-             Build Hash»). НЕ часть ссылки/QR выше — те несут только
-             `<origin>/r/<id>#t=<token>&e=<expiry>` (см. static/room.js:
-             buildShareLink/renderShareQr). Скрыт, пока /build-hash.json не подтянулся или
-             недоступен (dev/self-hosted, см. static/room.js: loadBuildHash).
-             Формат — как в подвале лендинга (static/index.html): короткий
-             хэш + раскрывающийся полный + ссылка «verify» на GitHub Releases
-             (см. static/room.js: renderShareBuildLine, .build-* в style.css). -->
+        <!-- Hash of the published static assets — as a SEPARATE line of
+             text, for verification (forensic anchor, see docs/security.md,
+             "Published Build Hash"). NOT part of the link/QR above — those
+             only carry `<origin>/r/<id>#t=<token>&e=<expiry>` (see
+             static/room.js: buildShareLink/renderShareQr). Hidden until
+             /build-hash.json has loaded or if it's unavailable
+             (dev/self-hosted, see static/room.js: loadBuildHash). Format —
+             same as the landing page footer (static/index.html): short
+             hash + expandable full hash + "verify" link to GitHub Releases
+             (see static/room.js: renderShareBuildLine, .build-* in
+             style.css). -->
         <div id="share-popup-build" class="share-popup-build hidden">
           <details class="build-details">
             <summary class="build-summary">build: <span id="share-popup-build-short"></span></summary>
@@ -289,13 +301,13 @@
       </div>
     </div>
 
-    <!-- Настройки: попап на десктопе, bottom-sheet на мобильном (см.
-         media-запрос в style.css). Секция «Устройства» (выбор микрофона/
-         камеры) видна ВСЕМ участникам; секция «Комната» (лобби + лимит
-         участников + права гостей, #settings-room-section) — только лидеру,
-         скрывается/показывается через static/room.js:
-         updateSettingsButtonVisibility(). Изменение прав/лимита шлёт
-         update-settings, см. static/room.js. -->
+    <!-- Settings: a popup on desktop, a bottom-sheet on mobile (see the
+         media query in style.css). The "Devices" section (microphone/
+         camera selection) is visible to ALL participants; the "Room"
+         section (lobby + participant limit + guest permissions,
+         #settings-room-section) — leader only, hidden/shown via
+         static/room.js: updateSettingsButtonVisibility(). Changing
+         permissions/limit sends update-settings, see static/room.js. -->
     <div id="settings-panel" class="settings-panel hidden" role="dialog" aria-modal="true" aria-labelledby="settings-panel-title">
       <div id="settings-panel-backdrop" class="settings-panel-backdrop"></div>
       <div class="settings-panel-card">
@@ -330,10 +342,10 @@
             </span>
           </label>
 
-          <!-- Опции заполняются в JS (populateMaxParticipantsOptions,
-               static/room.js), а не статично в разметке — от 2 до лучшего
-               известного настоящего серверного потолка (не текущего суженного
-               лидером значения), см. комментарий у этой функции. -->
+          <!-- Options are populated in JS (populateMaxParticipantsOptions,
+               static/room.js), not statically in the markup — from 2 up to
+               the best known actual server ceiling (not the current value
+               narrowed by the leader), see the comment on that function. -->
           <label class="settings-row settings-row--select">
             <span class="settings-row-label">Max participants</span>
             <select id="setting-max-participants" class="settings-select"></select>
@@ -374,10 +386,11 @@
           </label>
         </div>
 
-        <!-- «Соединение и приватность» — видна ВСЕМ участникам (в отличие от
-             #settings-room-section выше). Наполняется/обновляется в
-             static/room.js: refreshConnectionSection() — при открытии панели
-             и каждые 5с, пока она открыта (таймер чистится при закрытии). -->
+        <!-- "Connection and privacy" — visible to ALL participants (unlike
+             #settings-room-section above). Populated/updated in
+             static/room.js: refreshConnectionSection() — when the panel is
+             opened and every 5s while it stays open (the timer is cleared
+             on close). -->
         <div id="settings-conn-section">
           <div class="settings-section-label">Connection and privacy</div>
 
@@ -389,11 +402,12 @@
             <span id="settings-crypto-text"></span>
           </div>
 
-          <!-- Хэш опубликованной статики (опционально, см. static/room.js:
-               loadBuildHash/renderSettingsBuildRow) — та же форензическая
-               точка сверки, что в подвале лендинга и попапе «Поделиться»,
-               см. docs/security.md, «Published Build Hash». Скрыт, если
-               /build-hash.json недоступен (dev/self-hosted). -->
+          <!-- Hash of the published static assets (optional, see
+               static/room.js: loadBuildHash/renderSettingsBuildRow) — the
+               same forensic verification point as in the landing page
+               footer and the "Share" popup, see docs/security.md,
+               "Published Build Hash". Hidden if /build-hash.json is
+               unavailable (dev/self-hosted). -->
           <div id="settings-build-row" class="settings-build-row hidden">
             <span id="settings-build-text"></span>
           </div>

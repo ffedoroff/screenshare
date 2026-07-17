@@ -1,7 +1,7 @@
 {
-  "name": "Созвон",
-  "short_name": "Созвон",
-  "description": "Видеозвонки и шаринг экрана без установки — комнаты-встречи в браузере.",
+  "name": "Video call",
+  "short_name": "Video call",
+  "description": "Video calls and screen sharing with no install — meeting rooms in your browser.",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#0f1114",

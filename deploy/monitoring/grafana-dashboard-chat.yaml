@@ -1,18 +1,18 @@
-# Grafana-дашборд «chat» (см. src/metrics.rs) — по образцу
-# grafana-dashboard-code-ranker (тот же формат ConfigMap + provider-механизм,
-# см. `grafana-dashboards-provider` в ns `monitoring`: sidecar-провижининг
-# читает JSON-дашборды из `/var/lib/grafana/dashboards`, куда каждый такой
-# ConfigMap проецируется как отдельный файл через projected volume в
-# Deployment `grafana` (ns `monitoring`) — см. ниже, «Как применить»).
+# Grafana dashboard "chat" (see src/metrics.rs) — modeled after
+# grafana-dashboard-code-ranker (same ConfigMap format + provider mechanism,
+# see `grafana-dashboards-provider` in ns `monitoring`: the sidecar provisioner
+# reads JSON dashboards from `/var/lib/grafana/dashboards`, where each such
+# ConfigMap is projected as a separate file via a projected volume in the
+# `grafana` Deployment (ns `monitoring`) — see below, "How to Apply").
 #
-# Датасорс `PBFA97CFB590B2093` — тот же Prometheus-датасорс, что уже
-# используют остальные дашборды кластера (code-ranker/store/node-exporter) —
-# см. `grafana-datasources` в ns `monitoring`.
+# Datasource `PBFA97CFB590B2093` — the same Prometheus datasource already
+# used by the other dashboards in the cluster (code-ranker/store/node-exporter) —
+# see `grafana-datasources` in ns `monitoring`.
 #
-# Namespace фиксирован (`chat-prod`) прямо в PromQL-запросах панелей, а не
-# через $namespace-переменную (как у code-ranker, где есть stage+prod) —
-# у chat всего один namespace, лишняя переменная только добавляла бы клик
-# лишний раз без всякой пользы.
+# The namespace is hardcoded (`chat-prod`) directly in the panels' PromQL
+# queries, rather than via a $namespace variable (like code-ranker, which has
+# stage+prod) — chat has only one namespace, an extra variable would just add
+# an extra click with no benefit.
 apiVersion: v1
 data:
   chat.json: |-
@@ -52,7 +52,7 @@ data:
           },
           "id": 3000,
           "panels": [],
-          "title": "chat — комнаты, участники, WS-соединения",
+          "title": "chat — rooms, participants, WS connections",
           "type": "row"
         },
         {
@@ -128,11 +128,11 @@ data:
               "range": true,
               "instant": false,
               "refId": "A",
-              "legendFormat": "комнаты",
+              "legendFormat": "rooms",
               "interval": ""
             }
           ],
-          "title": "Комнаты (chat_rooms)",
+          "title": "Rooms (chat_rooms)",
           "type": "timeseries"
         },
         {
@@ -208,11 +208,11 @@ data:
               "range": true,
               "instant": false,
               "refId": "A",
-              "legendFormat": "участники",
+              "legendFormat": "participants",
               "interval": ""
             }
           ],
-          "title": "Участники (chat_participants)",
+          "title": "Participants (chat_participants)",
           "type": "timeseries"
         },
         {
@@ -288,11 +288,11 @@ data:
               "range": true,
               "instant": false,
               "refId": "A",
-              "legendFormat": "в лобби",
+              "legendFormat": "in lobby",
               "interval": ""
             }
           ],
-          "title": "Ожидают в лобби (chat_pending)",
+          "title": "Waiting in Lobby (chat_pending)",
           "type": "timeseries"
         },
         {
@@ -368,11 +368,11 @@ data:
               "range": true,
               "instant": false,
               "refId": "A",
-              "legendFormat": "создано/с",
+              "legendFormat": "created/s",
               "interval": ""
             }
           ],
-          "title": "Комнат создано (rate, $grain)",
+          "title": "Rooms Created (rate, $grain)",
           "type": "timeseries"
         },
         {
@@ -448,11 +448,11 @@ data:
               "range": true,
               "instant": false,
               "refId": "A",
-              "legendFormat": "WS-соединения",
+              "legendFormat": "WS connections",
               "interval": ""
             }
           ],
-          "title": "WS-соединения (chat_websocket_connections)",
+          "title": "WS Connections (chat_websocket_connections)",
           "type": "timeseries"
         }
       ],

@@ -53,7 +53,7 @@ and states known gaps plainly rather than implying full coverage.
 | Recovering plaintext of a past meeting's relayed signaling after the link leaks **later** (after the meeting ended) | **Mitigated (forward secrecy)** | Encryption keys are derived from a fresh per-tab ephemeral ECDH keypair that's never persisted anywhere and dies with the tab; the link's static token `t` only ever authenticated, it never encrypted (see [`e2e-encryption.md` §2.3](e2e-encryption.md#23-ephemeral-per-tab-keys--pairwise-derivation-forward-secrecy)). Chat/media never touch the server either way (P2P, DTLS-E2E — nothing server-side to recover) |
 | A link leaking **during** the room's still-live session | **Not mitigated — inherent to the model** | Grants exactly the same access it always did: whoever has a working `t`/`e` can join and derive keys with every current participant ([§9](#9-known-boundaries)) |
 | A leaked/guessed room id or link granting access | Inherent to the model, mitigated by entropy | The link itself is the only credential; room ids are drawn from a large enough space that guessing one is impractical (see [`privacy.md`](privacy.md)) |
-| A compromised/malicious static-file host (Ш2 split-origin, [`self-hosting.md` §1.2](self-hosting.md#12-split-origin-frontend--signaling-separated)) silently serving tampered frontend JS | **Forensic checkpoint only, not preventive** | Reproducible SHA-256 of the deployed bundle, published to an independent channel (GitHub Release) the static host doesn't control (§10, [§10.4](#104-what-this-doesnt-protect-against) for exactly what this doesn't cover) |
+| A compromised/malicious static-file host (S2 split-origin, [`self-hosting.md` §1.2](self-hosting.md#12-split-origin-frontend--signaling-separated)) silently serving tampered frontend JS | **Forensic checkpoint only, not preventive** | Reproducible SHA-256 of the deployed bundle, published to an independent channel (GitHub Release) the static host doesn't control (§10, [§10.4](#104-what-this-doesnt-protect-against) for exactly what this doesn't cover) |
 | An active MITM (malicious relay, or an attacker controlling link delivery) handing different link tokens (`t`) to different participants and bridging the halves | **Detected by human out-of-band comparison** | Commit-before-reveal SAS: five emoji per room that agree across honest participants unless bridged; residual attack is a `2^-30` blind guess (§11, [`sas-verification.md`](sas-verification.md)) |
 
 ## 3. H1 — Ephemeral TURN Credentials
@@ -241,7 +241,7 @@ Stated plainly, not buried:
 
 **What this is, stated plainly upfront**: a **forensic checkpoint**, not a
 cryptographic guarantee. It gives anyone who suspects the deployed frontend
-has been tampered with (by whoever operates the static host — the Ш2
+has been tampered with (by whoever operates the static host — the S2
 split-origin topology, [`self-hosting.md` §1.2](self-hosting.md#12-split-origin-frontend--signaling-separated))
 a way to compare what's actually being served against a value published
 through an **independent channel**: a GitHub Release, created by CI, that
@@ -313,7 +313,7 @@ Cloudflare Pages serves) and before it's pushed to Cloudflare:
 ### 10.2 Recomputing the Hash Yourself
 
 From the root of an extracted/rebuilt `pages-dist/` (i.e., after running the
-same steps the workflow does — see the "Собрать pages-dist/" step in
+same steps the workflow does — see the "Build pages-dist/" step in
 [`../.github/workflows/deploy-prod.yml`](../.github/workflows/deploy-prod.yml)),
 run:
 
@@ -374,7 +374,7 @@ Stated plainly, not buried:
   [`self-hosting.md`](self-hosting.md)) removes the split-trust problem
   entirely — there's no third-party static host whose honesty needs
   checking in the first place. Everything in this section exists for the
-  split-origin (Ш2) topology in
+  split-origin (S2) topology in
   [`self-hosting.md` §1.2](self-hosting.md#12-split-origin-frontend--signaling-separated),
   where the operator has intentionally chosen not to run their own static
   hosting.

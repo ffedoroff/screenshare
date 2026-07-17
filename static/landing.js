@@ -1,47 +1,51 @@
-// landing.js — логика главной страницы: создание комнаты.
+// landing.js — logic of the main page: room creation.
 //
-// Анонимность: никакого localStorage/sessionStorage/cookies нигде на этой
-// странице. Имя участника здесь больше не спрашивается вовсе — его спросит
-// модалка входа в самой комнате (см. static/room.js), при КАЖДОМ заходе
-// заново, а не один раз здесь. `POST /api/rooms` возвращает {roomId,
-// leaderToken} — leaderToken кладём во фрагмент ссылки (#lt=...), а не в путь
-// и не в query: фрагмент никогда не уходит на сервер ни при обычной
-// навигации браузера, ни в Referer — токен долетает только до room.js на
-// этой же странице (см. там же — читается и сразу вычищается из адресной
-// строки через history.replaceState, прежде чем показать что-либо ещё).
+// Anonymity: no localStorage/sessionStorage/cookies anywhere on this
+// page. The participant's name is no longer asked here at all — it will be
+// asked by the join modal in the room itself (see static/room.js), freshly
+// on EVERY visit, not just once here. `POST /api/rooms` returns {roomId,
+// leaderToken} — we put leaderToken in the link fragment (#lt=...), not in
+// the path and not in the query: the fragment never goes to the server
+// either during normal browser navigation or in the Referer — the token
+// only reaches room.js on this same page (see there — it's read and
+// immediately wiped from the address bar via history.replaceState, before
+// anything else is shown).
 //
-// E2E v2 («вариант E», см. docs/research-p2p-key-handoff.md §6.5–6.6 и
-// static/crypto.js): здесь же, рядом с leaderToken, генерируются ДВА
-// параметра нового фрагмента —
-//   - `t` — статический PSK-токен (16 случайных байт, base64url,
-//     RoomCrypto.generateRoomToken()). Он НИКОГДА не шифрует трафик сам —
-//     только аутентифицирует эфемерные попарные ключи, которые каждая
-//     вкладка выводит САМА при входе (см. static/room.js, static/crypto.js).
-//   - `e` — момент истечения ссылки, unix-секунды в base36:
+// E2E v2 ("variant E", see docs/research-p2p-key-handoff.md §6.5-6.6 and
+// static/crypto.js): right here, next to leaderToken, TWO parameters of the
+// new fragment are generated —
+//   - `t` — the static PSK token (16 random bytes, base64url,
+//     RoomCrypto.generateRoomToken()). It NEVER encrypts traffic by itself —
+//     it only authenticates the ephemeral pairwise keys that each tab
+//     derives ITSELF on join (see static/room.js, static/crypto.js).
+//   - `e` — the link's expiry moment, unix seconds in base36:
 //     `floor(Date.now()/1000) + lifetimeSeconds + 300`. `lifetimeSeconds`
-//     берём из ответа `POST /api/rooms` (тот же `MAX_ROOM_LIFETIME_SECONDS`,
-//     которым сервер реально ограничивает жизнь комнаты — см. src/main.rs);
-//     если поля в ответе почему-то нет (старый сервер) — фолбэк 10800 (3ч).
-//     +300 — 5 минут запаса поверх серверного лимита на случай рассинхрона
-//     часов клиента и сервера (см. static/room.js — сравнение делается там,
-//     при входе, с тем же зазором). `e` зашивается в вывод K_auth (см.
-//     static/crypto.js: deriveAuthKey) — подделать/продлить его без `t`
-//     невозможно.
-// Ключа `k` больше нет — вся комната теперь без единого общего секрета
-// шифрования, только PSK-аутентификация + PFS (см. static/crypto.js).
-// room.js парсит `t`/`e` (и `n` ниже) разом из фрагмента.
+//     is taken from the `POST /api/rooms` response (the same
+//     `MAX_ROOM_LIFETIME_SECONDS` that the server actually uses to limit
+//     the room's lifetime — see src/main.rs); if the field is missing from
+//     the response for some reason (old server) — fallback to 10800 (3h).
+//     +300 — 5 minutes of margin on top of the server limit in case the
+//     client's and server's clocks are out of sync (see static/room.js —
+//     the comparison happens there, on join, with the same margin). `e` is
+//     baked into the K_auth derivation (see static/crypto.js:
+//     deriveAuthKey) — it cannot be forged/extended without `t`.
+// The `k` key no longer exists — the whole room now has no single shared
+// encryption secret at all, only PSK authentication + PFS (see
+// static/crypto.js). room.js parses `t`/`e` (and `n` below) together from
+// the fragment.
 //
-// Четвёртый (необязательный) параметр фрагмента — `n` — имя комнаты, введённое
-// в #room-name-input (предзаполнен NameGen.roomName(), см. static/namegen.js;
-// свободно редактируется). Это имя видят ВСЕ участники комнаты, а не только
-// создатель: оно кладётся ПОСЛЕДНИМ параметром того же фрагмента
-// (#lt=...&t=...&e=...&n=...), но, в отличие от одноразового `lt`, `n` НЕ
-// вычищается из адресной строки — room.js пересобирает фрагмент как
-// `#t=...&e=...&n=...` (см. там же) и точно так же кладёт `n` в
-// buildShareLink(), так что invite-ссылка несёт имя комнаты и любой гость,
-// зашедший по ней, видит его в шапке/заголовке вкладки — и оно переживает F5.
-// Сервер `n`, как и `t`/`e`, всё равно никогда не видит: фрагмент на сервер
-// не уходит ни при обычной навигации, ни в Referer.
+// The fourth (optional) fragment parameter — `n` — is the room name entered
+// into #room-name-input (prefilled with NameGen.roomName(), see
+// static/namegen.js; freely editable). This name is seen by ALL room
+// participants, not just the creator: it is placed as the LAST parameter of
+// the same fragment (#lt=...&t=...&e=...&n=...), but unlike the one-time
+// `lt`, `n` is NOT wiped from the address bar — room.js reassembles the
+// fragment as `#t=...&e=...&n=...` (see there) and puts `n` into
+// buildShareLink() the same way, so the invite link carries the room name
+// and any guest who joins via it sees it in the top bar/tab title — and it
+// survives F5. The server never sees `n` either, just like `t`/`e`: the
+// fragment never goes to the server, neither during normal navigation nor
+// in the Referer.
 
 'use strict';
 
@@ -53,14 +57,15 @@ const buildFullEl = document.getElementById('landing-build-full');
 const roomNameInputEl = document.getElementById('room-name-input');
 const roomNameRegenButtonEl = document.getElementById('room-name-regen-button');
 
-// Предзаполняем красивым сгенерированным именем (см. static/namegen.js) —
-// пользователь может им и ограничиться (просто нажать Create room), либо
-// стереть/отредактировать перед созданием комнаты.
+// Prefill with a nice generated name (see static/namegen.js) — the user can
+// just stick with it (simply click Create room), or erase/edit it before
+// creating the room.
 roomNameInputEl.value = NameGen.roomName();
 
-// Кнопка «сгенерировать заново» рядом с инпутом — просто перекатывает новое
-// имя комнаты (см. static/namegen.js: roomName()). type="button" в разметке —
-// клик не сабмитит ничего (тут и формы-то нет, но на всякий случай явно).
+// The "regenerate" button next to the input just rerolls a new room name
+// (see static/namegen.js: roomName()). type="button" in the markup — the
+// click doesn't submit anything (there's no form here anyway, but explicit
+// just in case).
 roomNameRegenButtonEl.addEventListener('click', () => {
   roomNameInputEl.value = NameGen.roomName();
 });
@@ -75,9 +80,10 @@ createButton.addEventListener('click', async () => {
   showMessage('');
 
   try {
-    // Ш2: через window.API_BASE (см. static/config.js) — на Cloudflare Pages
-    // фронт и API живут на разных хостах, same-origin '/api/rooms' бил бы
-    // в сам Pages-хост, где такого пути нет.
+    // Step 2: via window.API_BASE (see static/config.js) — on Cloudflare
+    // Pages the front-end and the API live on different hosts, a
+    // same-origin '/api/rooms' would hit the Pages host itself, where no
+    // such path exists.
     const res = await fetch(`${window.API_BASE}/api/rooms`, { method: 'POST' });
     if (!res.ok) throw new Error(`server responded with status ${res.status}`);
     const data = await res.json();
@@ -88,23 +94,25 @@ createButton.addEventListener('click', async () => {
       throw new Error('response is missing leaderToken');
     }
 
-    // E2E v2: `t` — статический PSK-токен ссылки, `e` — момент истечения в
-    // base36 (см. комментарий шапки файла и static/crypto.js: deriveAuthKey).
-    // Фолбэк 10800с (3ч), если сервер почему-то не прислал lifetimeSeconds
-    // (см. src/main.rs::create_room) — тот же дефолт, что и у самого сервера
-    // (DEFAULT_MAX_ROOM_LIFETIME_SECONDS), так что оверлей «Link expired» на
-    // клиенте (см. static/room.js) не сработает раньше времени.
+    // E2E v2: `t` — the link's static PSK token, `e` — the expiry moment in
+    // base36 (see the file header comment and static/crypto.js:
+    // deriveAuthKey). Fallback of 10800s (3h) if the server for some reason
+    // didn't send lifetimeSeconds (see src/main.rs::create_room) — the same
+    // default as the server itself uses (DEFAULT_MAX_ROOM_LIFETIME_SECONDS),
+    // so the "Link expired" overlay on the client (see static/room.js)
+    // doesn't trigger prematurely.
     const roomToken = RoomCrypto.generateRoomToken();
     const tokenB64 = RoomCrypto.bytesToBase64url(roomToken);
     const lifetimeSeconds =
       typeof data.lifetimeSeconds === 'number' && data.lifetimeSeconds > 0 ? data.lifetimeSeconds : 10800;
     const expiryB36 = (Math.floor(Date.now() / 1000) + lifetimeSeconds + 300).toString(36);
 
-    // maxlength=40 режет по UTF-16-единицам, а не по code point —
-    // вставка/автозамена может располовинить суррогатную пару эмодзи и
-    // оставить одинокий суррогат. toWellFormed() (там, где есть) чинит это
-    // штатно; на движках без него — ручная regex-вычистка одиноких
-    // суррогатов (высокий без низкого следом / низкий без высокого перед).
+    // maxlength=40 truncates by UTF-16 code units, not by code point —
+    // pasting/autocorrect can split an emoji surrogate pair in half and
+    // leave a lone surrogate. toWellFormed() (where available) fixes this
+    // properly; on engines without it — a manual regex cleanup of lone
+    // surrogates (a high surrogate not followed by a low one / a low
+    // surrogate not preceded by a high one).
     const rawRoomName = roomNameInputEl.value.trim();
     const roomName = rawRoomName
       ? (typeof rawRoomName.toWellFormed === 'function'
@@ -125,26 +133,28 @@ createButton.addEventListener('click', async () => {
   }
 });
 
-// --- Build-хэш опубликованной статики (форензический якорь, см.
-// docs/security.md, «Published Build Hash») ---
+// --- Build hash of the published static assets (forensic anchor, see
+// docs/security.md, "Published Build Hash") ---
 //
-// /build-hash.json лежит РЯДОМ со страницей — корень бандла на Cloudflare
-// Pages (см. .github/workflows/deploy-prod.yml, job deploy-pages), same-origin
-// fetch, никакого window.API_BASE. В dev/self-hosted сборке файла нет
-// вообще (сервер отдаёт 404 — там просто нет такого маршрута, см.
-// src/main.rs) — тогда footer молча остаётся скрытым, ничего не падает.
-// Хэш живёт только в памяти вкладки (обычная переменная, без
-// localStorage/sessionStorage — анонимность страницы это не нарушает,
-// значение не привязано к пользователю).
+// /build-hash.json sits RIGHT NEXT to the page — bundle root on Cloudflare
+// Pages (see .github/workflows/deploy-prod.yml, job deploy-pages),
+// same-origin fetch, no window.API_BASE at all. In the dev/self-hosted
+// build the file doesn't exist at all (the server returns 404 — there's
+// simply no such route, see src/main.rs) — then the footer stays silently
+// hidden, nothing breaks.
+// The hash lives only in the tab's memory (a plain variable, no
+// localStorage/sessionStorage — this doesn't break the page's anonymity,
+// the value isn't tied to the user).
 //
-// ВАЖНО: хэш — НЕ криптогарантия (см. docs/security.md, §10.4) — хостер
-// статики теоретически может подменить и сам build-hash.json. Реальная
-// сверка — с GitHub Release (ссылка «verify» ниже), а не с тем, что
-// показывает эта же страница.
+// IMPORTANT: the hash is NOT a cryptographic guarantee (see
+// docs/security.md, §10.4) — the static asset host could in theory tamper
+// with build-hash.json itself too. The real verification is against the
+// GitHub Release (the "verify" link below), not against what this same
+// page displays.
 async function loadBuildHash() {
   try {
     const res = await fetch('/build-hash.json');
-    if (!res.ok) return; // dev/self-hosted без build-hash.json — штатно, footer остаётся скрытым
+    if (!res.ok) return; // dev/self-hosted without build-hash.json — expected, footer stays hidden
     const data = await res.json();
     if (!data || typeof data.hash !== 'string' || !data.hash) return;
     buildShortEl.textContent = `${data.hash.slice(0, 10)}…`;
@@ -152,8 +162,8 @@ async function loadBuildHash() {
     buildFooterEl.title = data.hash;
     buildFooterEl.classList.remove('hidden');
   } catch (err) {
-    // Сеть/парсинг — тихо: это ненавязчивый индикатор, а не критичная часть UI.
-    console.warn('Не удалось загрузить build-hash.json:', err);
+    // Network/parsing — silent: this is an unobtrusive indicator, not a critical part of the UI.
+    console.warn('Failed to load build-hash.json:', err);
   }
 }
 

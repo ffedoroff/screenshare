@@ -15,13 +15,13 @@
 //
 //---------------------------------------------------------------------
 //
-// Вендорено без изменений из npm-пакета qrcode-generator (kazuhikoarase),
-// версия 1.4.4, файл qrcode.js — см. static/room.js (openSharePopup /
-// renderShareQr): попап «Поделиться» рендерит QR ЛОКАЛЬНО (createSvgTag),
-// без похода на сервер и без стороннего CDN — ссылка комнаты (включая
-// секретный #k) никогда не покидает вкладку ради генерации картинки.
-// Классический script (не ES-модуль) — определяет глобальный `qrcode`,
-// как и остальные static/*.js в этом проекте (bus.js, rtc.js и т.д.).
+// Vendored unchanged from the npm package qrcode-generator (kazuhikoarase),
+// version 1.4.4, file qrcode.js — see static/room.js (openSharePopup /
+// renderShareQr): the "Share" popup renders the QR LOCALLY (createSvgTag),
+// without a round trip to the server and without a third-party CDN — the room
+// link (including the secret #k) never leaves the tab to generate the image.
+// A classic script (not an ES module) — defines the global `qrcode`,
+// like the other static/*.js files in this project (bus.js, rtc.js, etc.).
 //
 //---------------------------------------------------------------------
 

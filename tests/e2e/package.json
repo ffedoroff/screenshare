@@ -2,7 +2,7 @@
   "name": "screenshare-e2e",
   "private": true,
   "version": "1.0.0",
-  "description": "Браузерный e2e-тест реального медиапотока и чата (использует системный Chrome через playwright-core)",
+  "description": "Browser e2e test for real media stream and chat (uses system Chrome via playwright-core)",
   "type": "module",
   "scripts": {
     "test": "node basic.spec.mjs"

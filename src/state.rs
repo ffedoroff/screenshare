@@ -1,19 +1,21 @@
-//! Состояние комнат, целиком в памяти процесса. Никакого хранилища на диске:
-//! всё (участники, настройки) живёт ровно до тех пор, пока жив процесс и жива
-//! сама комната — реапер или рестарт стирают всё без следа. Чат (см.
-//! `static/chat.js`) сервер вообще не хранит — история живёт только в
-//! памяти вкладок участников, здесь для неё нет ни поля, ни буфера. Имена
-//! участников сервер тоже не хранит вовсе (см. `Participant`/`PendingParticipant`
-//! ниже, docs/research-minimize-state.md §3) — имя ходит отдельным
-//! зашифрованным `name-announce` напрямую между пирами.
+//! Room state, entirely in process memory. No storage on disk:
+//! everything (participants, settings) lives exactly as long as the process
+//! and the room itself are alive — a reaper pass or a restart wipes
+//! everything without a trace. Chat (see `static/chat.js`) is not stored by
+//! the server at all — history lives only in participants' tab memory,
+//! there's no field or buffer for it here. Participant names aren't stored
+//! by the server either (see `Participant`/`PendingParticipant` below,
+//! docs/research-minimize-state.md §3) — the name travels as a separate
+//! encrypted `name-announce` directly between peers.
 //!
-//! Выбор синхронизации: `std::sync::Mutex` поверх `HashMap`, а не tokio-мьютекс
-//! и не акторная схема. Обоснование: все критические секции короткие и не
-//! содержат `.await` (отправка в `UnboundedSender` синхронна и не блокирует,
-//! а удаление устаревших комнат в реапере — тоже чисто синхронная операция
-//! над `HashMap`), поэтому обычный мьютекс проще и быстрее асинхронного, а
-//! contention при нашем масштабе (единицы комнат по ≤`MAX_PARTICIPANTS`
-//! участников, по умолчанию 6) пренебрежим.
+//! Synchronization choice: `std::sync::Mutex` over a `HashMap`, not a tokio
+//! mutex and not an actor scheme. Rationale: all critical sections are short
+//! and contain no `.await` (sending on an `UnboundedSender` is synchronous
+//! and doesn't block, and removing stale rooms in the reaper is also a
+//! purely synchronous operation over a `HashMap`), so a plain mutex is
+//! simpler and faster than an async one, and contention at our scale (a
+//! handful of rooms with ≤`MAX_PARTICIPANTS` participants each, default 6)
+//! is negligible.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -27,288 +29,307 @@ use uuid::Uuid;
 
 use crate::protocol::{RoomSettings, ServerMessage};
 
-/// Потолок числа участников в комнате одновременно, если env
-/// `MAX_PARTICIPANTS` не задан (см. `crate::MAX_PARTICIPANTS` в `main.rs` —
-/// `LazyLock`, тот же приём, что у `MAX_ROOM_LIFETIME`/`MAX_ROOMS`). Это
-/// РЕКОМЕНДУЕМЫЙ дефолт, не жёсткий потолок протокола (протокол v2:
-/// симметричная комната, роли broadcaster/viewer больше не существует,
-/// участников может быть сколько угодно с точки зрения сервера) — 6 выбрано
-/// потому что комната — полный WebRTC-mesh (каждый шлёт медиа каждому
-/// напрямую), и это разумная зона комфорта по трафику/CPU НА СТОРОНЕ
-/// КЛИЕНТОВ (n-1 исходящих копий у каждого) — самого сервера это число не
-/// напрягает вовсе, он лишь релеит сигналинг. См. docs/self-hosting.md, §6.
+/// Ceiling on the number of participants in a room at once, if the env var
+/// `MAX_PARTICIPANTS` isn't set (see `crate::MAX_PARTICIPANTS` in
+/// `main.rs` — a `LazyLock`, the same trick as `MAX_ROOM_LIFETIME`/
+/// `MAX_ROOMS`). This is a RECOMMENDED default, not a hard protocol ceiling
+/// (protocol v2: symmetric room, the broadcaster/viewer roles no longer
+/// exist, there can be as many participants as the server cares to allow) —
+/// 6 was chosen because a room is a full WebRTC mesh (everyone sends media
+/// to everyone else directly), and this is a reasonable comfort zone for
+/// traffic/CPU ON THE CLIENT SIDE (n-1 outgoing copies for each) — the
+/// server itself isn't strained by this number at all, it only relays
+/// signaling. See docs/self-hosting.md, §6.
 pub const DEFAULT_MAX_PARTICIPANTS: usize = 6;
 
-/// Максимум ожидающих одобрения в лобби одновременно (см.
-/// `RoomSettings::lobby_enabled`) — не участники комнаты, отдельный, более
-/// щедрый лимит, чтобы не запирать людей в толчее перед началом созвона.
+/// Maximum number waiting for lobby approval at once (see
+/// `RoomSettings::lobby_enabled`) — not room participants, a separate, more
+/// generous limit so people aren't locked out in a crowd before a call
+/// starts.
 pub const MAX_PENDING: usize = 10;
 
-/// Как часто реапер проверяет комнаты на протухание. Сознательно чаще, чем
-/// «раз в 5 секунд» могло бы показаться достаточным: TTL пустой комнаты в
-/// тестах — 2 секунды, и с более редким тиком удаление легко перехлёстывает
-/// за отведённое тестам время ожидания. Накладные расходы пренебрежимы —
-/// комнат единицы, сама проверка — линейный проход по `HashMap` под коротким
-/// локом без единого `.await`.
+/// How often the reaper checks rooms for staleness. Deliberately more often
+/// than "once every 5 seconds" might seem to be enough: the empty-room TTL
+/// in tests is 2 seconds, and with a less frequent tick, deletion easily
+/// overruns the wait time tests allot for it. The overhead is negligible —
+/// there are only a handful of rooms, and the check itself is a linear pass
+/// over a `HashMap` under a short lock with not a single `.await`.
 pub const REAPER_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Потолок числа комнат одновременно, если env `MAX_ROOMS` не задан (H2,
-/// DoS-защита: без потолка HashMap комнат мог бы расти неограниченно).
+/// Ceiling on the number of rooms at once, if the env var `MAX_ROOMS` isn't
+/// set (H2, DoS protection: without a ceiling the rooms `HashMap` could grow
+/// unbounded).
 pub const DEFAULT_MAX_ROOMS: usize = 500;
 
-/// Лимит долгота созвона по умолчанию, если env `MAX_ROOM_LIFETIME_SECONDS`
-/// не задан: 3 часа. См. docs/security.md, «Meeting Duration Ceiling».
+/// Default call-duration limit, if the env var
+/// `MAX_ROOM_LIFETIME_SECONDS` isn't set: 3 hours. See docs/security.md,
+/// "Meeting Duration Ceiling".
 pub const DEFAULT_MAX_ROOM_LIFETIME_SECONDS: u64 = 10800;
 
-/// Per-IP лимит на `POST /api/rooms` (и, деля с ним бюджет, `PUT
-/// /api/rooms/{id}` — см. `main.rs::restore_room`): не более этого числа
-/// запросов за окно с одного IP. Прод-дефолт — 3/60с (сознательно жёстко:
-/// создание комнаты — редкое для легитимного пользователя действие, в
-/// отличие от, скажем, join-room; см. также `PENDING_JOIN_IP_LIMIT` ниже про
-/// то, почему у соседних по смыслу лимитов бюджеты раздельные).
+/// Per-IP limit on `POST /api/rooms` (and, sharing its budget, `PUT
+/// /api/rooms/{id}` — see `main.rs::restore_room`): no more than this many
+/// requests per window from a single IP. Production default — 3/60s
+/// (deliberately strict: creating a room is a rare action for a legitimate
+/// user, unlike, say, join-room; see also `PENDING_JOIN_IP_LIMIT` below for
+/// why semantically adjacent limits have separate budgets).
 ///
-/// Значение читается из env `ROOM_CREATION_IP_LIMIT` в `main.rs`
-/// (`crate::ROOM_CREATION_IP_LIMIT`, тот же `LazyLock`-приём, что у
-/// `crate::JOIN_ROOM_IP_LIMIT`) — configurability здесь, как и у
-/// `JOIN_ROOM_IP_LIMIT`, ради тестируемости: signaling.test.mjs и e2e-тесты
-/// создают много комнат с одного IP (localhost) за прогон и легко упёрлись бы
-/// в жёсткий прод-дефолт 3/60с — тестовые серверы поднимают лимит через env
-/// далеко за пределы того, что файл способен нафлудить, а сам прод-дефолт
-/// проверяется отдельным изолированным серверным процессом с реальным
-/// значением (см. соответствующий раздел signaling.test.mjs).
-/// `ROOM_CREATION_IP_WINDOW`, в отличие от лимита, не configurable — окно
-/// менять не просили, поднятого лимита у тестовых серверов достаточно.
+/// The value is read from the env var `ROOM_CREATION_IP_LIMIT` in
+/// `main.rs` (`crate::ROOM_CREATION_IP_LIMIT`, the same `LazyLock` trick as
+/// `crate::JOIN_ROOM_IP_LIMIT`) — configurability here, as with
+/// `JOIN_ROOM_IP_LIMIT`, exists for testability: signaling.test.mjs and the
+/// e2e tests create lots of rooms from a single IP (localhost) per run and
+/// would easily hit the strict production default of 3/60s — test servers
+/// raise the limit via env far beyond what a file is capable of flooding,
+/// and the production default itself is checked by a separate, isolated
+/// server process with the real value (see the corresponding section of
+/// signaling.test.mjs). `ROOM_CREATION_IP_WINDOW`, unlike the limit, is not
+/// configurable — nobody asked to change the window, the raised limit is
+/// enough for test servers.
 pub const DEFAULT_ROOM_CREATION_IP_LIMIT: usize = 3;
 pub const ROOM_CREATION_IP_WINDOW: Duration = Duration::from_secs(60);
 
-/// Per-IP лимит на попадание в лобби (M3): своя, отдельная от
-/// `ROOM_CREATION_IP_LIMIT`, карта и бюджет — обоснование: создание комнаты и
-/// заявка на вход в чужую комнату (по чужой ссылке) — разные по своей природе
-/// действия одного и того же IP (например, один участник тесно из общего NAT
-/// открывает несколько вкладок с приглашением) — общий с созданием комнат
-/// бюджет означал бы, что штурмующий лобби одной комнаты case мог случайно
-/// исчерпать лимит и на создание СВОИХ ЖЕ комнат тем же человеком за тем же
-/// NAT, что избыточно бьёт по легитимному использованию. Числа те же (10 за
-/// 60с) — не потому что механизм общий, а потому что степень «щедрости»
-/// разумна для обоих случаев одинаково.
+/// Per-IP limit on entering the lobby (M3): its own map and budget, separate
+/// from `ROOM_CREATION_IP_LIMIT` — rationale: creating a room and requesting
+/// to join someone else's room (via a shared link) are actions of a
+/// different nature for the same IP (e.g. one participant behind a shared
+/// NAT opens several tabs with an invite) — a shared budget with room
+/// creation would mean that someone storming one room's lobby could
+/// accidentally exhaust the limit for creating THEIR OWN rooms as the same
+/// person behind the same NAT, which is an excessive hit to legitimate use.
+/// The numbers are the same (10 per 60s) — not because the mechanism is
+/// shared, but because the same degree of "generosity" is reasonable for
+/// both cases.
 pub const PENDING_JOIN_IP_LIMIT: usize = 10;
 pub const PENDING_JOIN_IP_WINDOW: Duration = Duration::from_secs(60);
 
-/// Per-IP лимит на прямой `join-room` В КОМНАТУ (H2, DoS-защита,
-/// docs/research-dos.md §3.2 — «главная дыра»): до этой правки прямой вход
-/// (лобби выключено, дефолт) не проверялся вообще никак — единственной
-/// проверкой была общая, НЕ per-IP, ёмкость комнаты
-/// (`room.participants.len() >= MAX_PARTICIPANTS`), поэтому один IP мог
-/// открыть `MAX_PARTICIPANTS` WS-соединений и забить чужую комнату по ссылке
-/// за доли секунды, ничего не нарушая формально. Своя ОТДЕЛЬНАЯ карта и
-/// бюджет — то же обоснование раздельности, что у `PENDING_JOIN_IP_LIMIT`
-/// выше: create-комнаты/попадание-в-лобби/прямой-вход-в-комнату — разные по
-/// природе действия одного и того же IP, общий бюджет ударил бы по
-/// легитимному использованию одного из них при флуде на другом.
+/// Per-IP limit on a direct `join-room` INTO A ROOM (H2, DoS protection,
+/// docs/research-dos.md §3.2 — "the main hole"): before this fix, a direct
+/// join (lobby disabled, the default) wasn't checked at all — the only
+/// check was the overall, NOT per-IP, room capacity
+/// (`room.participants.len() >= MAX_PARTICIPANTS`), so a single IP could
+/// open `MAX_PARTICIPANTS` WS connections and fill someone else's room via a
+/// link in a fraction of a second, without formally violating anything. Its
+/// own SEPARATE map and budget — the same rationale for separateness as
+/// `PENDING_JOIN_IP_LIMIT` above: create-room/enter-lobby/direct-room-entry
+/// are actions of a different nature for the same IP, a shared budget would
+/// hit legitimate use of one of them when another is being flooded.
 ///
-/// Значение читается из env `JOIN_ROOM_IP_LIMIT` в `main.rs`
-/// (`crate::JOIN_ROOM_IP_LIMIT`, тот же `LazyLock`-приём, что у
-/// `crate::MAX_PARTICIPANTS`) — в отличие от `PENDING_JOIN_IP_LIMIT` ниже
-/// (по-прежнему захардкожен) configurability здесь осознанно НЕ ради
-/// прод-гибкости, а ради тестируемости: HTTP-эндпоинты (`POST`/`PUT /api/rooms`) тестовый клиент
-/// может изолировать по IP через заголовок `CF-Connecting-IP` на каждый
-/// отдельный запрос (см. `createRoom()` в tests/signaling.test.mjs), а
-/// WS-хендшейк глобальным `WebSocket` рантайма (без сторонних пакетов)
-/// произвольных заголовков не поддерживает вовсе — единственный способ не
-/// дать этому лимиту столкнуться с ОСТАЛЬНЫМИ разделами того же файла
-/// (которые все делят один и тот же IP — адрес пира сокета) — поднять лимит
-/// у основного тестового процесса через env, а сам лимит по-настоящему
-/// проверять в отдельном изолированном серверном процессе с дефолтным
-/// значением. `JOIN_ROOM_IP_WINDOW`, в отличие от лимита, не configurable —
-/// поднятого лимита у основного тестового процесса достаточно, окно ни на
-/// что не влияет, пока лимит недостижим.
+/// The value is read from the env var `JOIN_ROOM_IP_LIMIT` in `main.rs`
+/// (`crate::JOIN_ROOM_IP_LIMIT`, the same `LazyLock` trick as
+/// `crate::MAX_PARTICIPANTS`) — unlike `PENDING_JOIN_IP_LIMIT` below (still
+/// hardcoded), configurability here is deliberately NOT for production
+/// flexibility, but for testability: the test client can isolate the HTTP
+/// endpoints (`POST`/`PUT /api/rooms`) by IP via the `CF-Connecting-IP`
+/// header on each individual request (see `createRoom()` in
+/// tests/signaling.test.mjs), while a WS handshake via the runtime's global
+/// `WebSocket` (with no third-party packages) doesn't support arbitrary
+/// headers at all — the only way to keep this limit from colliding with the
+/// OTHER sections of the same file (which all share the same IP — the
+/// socket peer address) is to raise the limit for the main test process via
+/// env, and actually verify the limit itself in a separate, isolated server
+/// process with the default value. `JOIN_ROOM_IP_WINDOW`, unlike the limit,
+/// is not configurable — the raised limit is enough for the main test
+/// process, the window doesn't matter as long as the limit is unreachable.
 ///
-/// ВАЖНО — реконнект НЕ считается за join для целей этого бюджета: см.
-/// `crate::ws::reconnect_participant` и комментарий в обработчике
-/// `ClientMessage::JoinRoom` — если предъявленный `peerId` уже занимает слот
-/// полноценного участника ЭТОЙ ЖЕ комнаты (типичный случай — клиент лишь
-/// ненадолго потерял сигналинг и переподключается быстрее, чем сервер
-/// хартбитом обнаружил обрыв, см. docs/research-room-limit.md §4), это
-/// обрабатывается отдельным путём ДО проверки этого лимита и не тратит из
-/// него ни единицы — иначе легитимный реконнект мог бы сам себя же вытеснить
-/// в редком, но реальном случае быстрых повторных обрывов сигналинга.
+/// IMPORTANT — a reconnect does NOT count as a join for the purposes of
+/// this budget: see `crate::ws::reconnect_participant` and the comment in
+/// the `ClientMessage::JoinRoom` handler — if the presented `peerId`
+/// already holds a full-participant slot of THIS SAME room (the typical
+/// case — a client merely lost signaling briefly and reconnects faster than
+/// the server's heartbeat detected the drop, see
+/// docs/research-room-limit.md §4), this is handled via a separate path
+/// BEFORE checking this limit and doesn't spend a single unit of it —
+/// otherwise a legitimate reconnect could push itself out in a rare but
+/// real case of rapid repeated signaling drops.
 pub const DEFAULT_JOIN_ROOM_IP_LIMIT: usize = 20;
 pub const JOIN_ROOM_IP_WINDOW: Duration = Duration::from_secs(60);
 
-/// Канал для отправки сообщений конкретному WebSocket-соединению.
-/// Писатель сокета читает из парного `UnboundedReceiver`.
+/// Channel for sending messages to a specific WebSocket connection. The
+/// socket's writer reads from the paired `UnboundedReceiver`.
 pub type PeerTx = mpsc::UnboundedSender<ServerMessage>;
 
-/// Один участник комнаты: канал для рассылки ему сообщений + момент входа
-/// (для детерминированного выбора нового лидера — см. `Room::leader_id` —
-/// при уходе прежнего лидера им становится участник с самым ранним
-/// `joined_at`) + эфемерный публичный ключ (E2E v2, см.
-/// docs/research-p2p-key-handoff.md §6.5–6.6) — опак для сервера, хранится
-/// только чтобы отдать его остальным участникам (`peers[]`/`peer-joined`/
-/// `waiting.leaderEpub`), сам сервер его не парсит и не использует.
+/// One room participant: a channel for sending them messages + the moment
+/// they joined (for deterministic selection of a new leader — see
+/// `Room::leader_id` — when the previous leader leaves, the participant
+/// with the earliest `joined_at` becomes leader) + an ephemeral public key
+/// (E2E v2, see docs/research-p2p-key-handoff.md §6.5–6.6) — opaque to the
+/// server, stored only so it can be handed to the other participants
+/// (`peers[]`/`peer-joined`/`waiting.leaderEpub`); the server itself doesn't
+/// parse or use it.
 ///
-/// Поля `name` здесь больше НЕТ (было в v2 всегда `None`/`null` — имя ходит
-/// отдельным зашифрованным `name-announce`, см. комментарий модуля
-/// `protocol.rs`; удалено как мёртвое состояние, см.
-/// docs/research-minimize-state.md §3). Проводные поля (`ClientMessage::JoinRoom::name`,
-/// `PeerInfo::name`, `ServerMessage::PeerJoined::name`) остались в схеме
-/// протокола ради обратной совместимости десериализации — сервер их больше
-/// не хранит и всегда подставляет `None`/`null` при формировании исходящих
-/// сообщений (см. `crate::ws::admit_participant`).
+/// There is no longer a `name` field here (in v2 it was always
+/// `None`/`null` — the name travels as a separate encrypted
+/// `name-announce`, see the `protocol.rs` module comment; removed as dead
+/// state, see docs/research-minimize-state.md §3). The wire fields
+/// (`ClientMessage::JoinRoom::name`, `PeerInfo::name`,
+/// `ServerMessage::PeerJoined::name`) remain in the protocol schema for
+/// deserialization backward compatibility — the server no longer stores
+/// them and always fills in `None`/`null` when building outgoing messages
+/// (see `crate::ws::admit_participant`).
 pub struct Participant {
     pub tx: PeerTx,
     pub epub: Option<String>,
     pub joined_at: Instant,
 }
 
-/// Один ожидающий одобрения в лобби (см. `RoomSettings::lobby_enabled`) — НЕ
-/// участник комнаты (не считается в лимите участников, живёт в
-/// отдельной карте `Room::pending` с отдельным лимитом `MAX_PENDING`). `epub` — тот же
-/// смысл, что у `Participant::epub` (E2E v2) — отдаётся лидеру в
-/// `join-request`, чтобы он мог принять от ожидающего `name-announce`.
+/// One person waiting for lobby approval (see
+/// `RoomSettings::lobby_enabled`) — NOT a room participant (doesn't count
+/// against the participant limit, lives in a separate map, `Room::pending`,
+/// with its own limit `MAX_PENDING`). `epub` — same meaning as
+/// `Participant::epub` (E2E v2) — handed to the leader in `join-request` so
+/// they can accept a `name-announce` from the waiting peer.
 ///
-/// `name` тоже убран — то же обоснование, что у `Participant` выше.
+/// `name` is also removed here — same rationale as `Participant` above.
 pub struct PendingParticipant {
     pub tx: PeerTx,
     pub epub: Option<String>,
     pub joined_at: Instant,
 }
 
-/// Комната: до `crate::MAX_PARTICIPANTS` (env `MAX_PARTICIPANTS`, рекомендуемый
-/// дефолт 6 — см. `DEFAULT_MAX_PARTICIPANTS`) равноправных участников,
-/// соединяющихся mesh (сервер сам медиа не трогает — только сигналинг). Максимум один из
-/// участников может в моменте шарить экран (`screen_owner`).
+/// A room: up to `crate::MAX_PARTICIPANTS` (env `MAX_PARTICIPANTS`,
+/// recommended default 6 — see `DEFAULT_MAX_PARTICIPANTS`) equal
+/// participants connecting mesh-style (the server itself doesn't touch
+/// media — only signaling). At most one of the participants can be sharing
+/// their screen at a time (`screen_owner`).
 ///
-/// Права и лидер (см. docs/permissions-and-leader.md): ровно один участник —
-/// лидер (`leader_id`); при его уходе сервер сам детерминированно назначает
-/// нового (участника с самым ранним `joined_at`) — кворум не нужен,
-/// членство и порядок входа целиком серверные. `leader_token` — одноразовый
-/// токен из `POST /api/rooms`, предъявивший его первым при `join-room`
-/// становится лидером и сжигает токен; `PUT /api/rooms/{id}` токен не
-/// выдаёт вовсе (первый вошедший в восстановленную комнату — лидер).
+/// Permissions and leader (see docs/permissions-and-leader.md): exactly one
+/// participant is the leader (`leader_id`); when they leave, the server
+/// itself deterministically assigns a new one (the participant with the
+/// earliest `joined_at`) — no quorum needed, membership and join order are
+/// entirely server-side. `leader_token` — a one-time token from `POST
+/// /api/rooms`; whoever presents it first in `join-room` becomes the leader
+/// and burns the token; `PUT /api/rooms/{id}` never issues a token at all
+/// (whoever joins a restored room first is the leader).
 pub struct Room {
     pub participants: HashMap<String, Participant>,
-    /// peerId участника, который сейчас шарит экран (если шарит хоть кто-то).
+    /// peerId of the participant currently sharing their screen (if anyone
+    /// is).
     pub screen_owner: Option<String>,
-    /// Когда комната опустела (последний участник вышел), либо когда она
-    /// была создана пустой через `POST /api/rooms`. `None`, пока в комнате
-    /// есть хоть один участник. Реапер удаляет комнату, если она пуста
-    /// дольше `EMPTY_ROOM_TTL` с этого момента; новый `join-room` в живую
-    /// (но помеченную) комнату снимает отметку.
+    /// When the room became empty (the last participant left), or when it
+    /// was created empty via `POST /api/rooms`. `None` as long as the room
+    /// has at least one participant. The reaper deletes the room if it has
+    /// been empty for longer than `EMPTY_ROOM_TTL` from this moment; a new
+    /// `join-room` into a live (but marked) room clears the mark.
     pub emptied_at: Option<Instant>,
-    /// peerId текущего лидера. `None` только пока в комнате нет ни одного
-    /// участника (свежесозданная/восстановленная/только что опустевшая
-    /// комната) — как только кто-то входит, лидер назначается.
+    /// peerId of the current leader. `None` only while the room has no
+    /// participants at all (freshly created/restored/just-emptied room) —
+    /// as soon as someone joins, a leader is assigned.
     pub leader_id: Option<String>,
-    /// Одноразовый токен лидера. `Some` до первого предъявления валидным
-    /// `join-room.leaderToken` (сжигается сразу), либо `None` изначально
-    /// (комната восстановлена через `PUT`, без токена).
+    /// One-time leader token. `Some` until first presented with a valid
+    /// `join-room.leaderToken` (burned immediately), or `None` from the
+    /// start (room restored via `PUT`, without a token).
     pub leader_token: Option<String>,
-    /// Настройки комнаты (права гостей + lobby), меняет только лидер.
+    /// Room settings (guest permissions + lobby), only the leader changes
+    /// them.
     pub settings: RoomSettings,
-    /// Ожидающие одобрения лидера (лобби) по peerId. НЕ участники комнаты.
+    /// Waiting for the leader's approval (lobby), by peerId. NOT room
+    /// participants.
     pub pending: HashMap<String, PendingParticipant>,
-    /// Момент создания/восстановления комнаты (лимит длительности созвона,
-    /// см. docs/security.md, «Meeting Duration Ceiling») — ставится при `POST
-    /// /api/rooms` и при `PUT`-восстановлении. Для восстановленной комнаты
-    /// отсчёт идёт с момента восстановления, а не какого-то исходного
-    /// создания (память о нём не переживает рестарт сервера) — это осознанно
-    /// «продлевает» жизнь комнаты на рестарте, тот же trade-off, что и у
-    /// `emptied_at`/TTL пустой комнаты.
+    /// Moment the room was created/restored (call duration limit, see
+    /// docs/security.md, "Meeting Duration Ceiling") — set on `POST
+    /// /api/rooms` and on `PUT` restoration. For a restored room, the
+    /// countdown runs from the moment of restoration, not from some
+    /// original creation (memory of that doesn't survive a server restart)
+    /// — this deliberately "extends" the room's life across a restart, the
+    /// same trade-off as `emptied_at`/the empty-room TTL.
     pub created_at: Instant,
-    /// Момент входа ПЕРВОГО за всю жизнь комнаты участника — источник
-    /// серверного поля `Joined::room_age_seconds` (таймер «сколько длится
-    /// созвон» count-up на фронте, см. `crate::ws::room_age_seconds`).
-    /// `None`, пока в комнату ещё никто не вошёл; ставится РОВНО ОДИН РАЗ
-    /// (см. `crate::ws::admit_participant`) и больше никогда не меняется —
-    /// даже если комната полностью опустеет и снова заполнится в пределах
-    /// TTL пустой комнаты, отсчёт возраста продолжается от исходного первого
-    /// входа, а не обнуляется: с точки зрения пользователя это та же самая
-    /// (не пересозданная) комната, и «сколько мы уже тут» — разумно мерить от
-    /// первого реального появления кого-либо, а не от того, что кто-то
-    /// временно вышел и вернулся. Как и `created_at`, рестарт сервера этот
-    /// момент не переживает — комната пересоздаётся (`PUT
-    /// /api/rooms/{id}`) с чистого листа, и отсчёт возраста начинается заново
-    /// с первого входа после рестарта — тот же trade-off, что уже описан у
-    /// `created_at`/`emptied_at` (эфемерное состояние, ничего страшного).
+    /// Moment the FIRST participant, over the whole life of the room,
+    /// joined — the source for the server-side `Joined::room_age_seconds`
+    /// field (the frontend's "how long has this call been going" count-up
+    /// timer, see `crate::ws::room_age_seconds`). `None` while nobody has
+    /// joined the room yet; set EXACTLY ONCE (see
+    /// `crate::ws::admit_participant`) and never changes afterward — even
+    /// if the room becomes completely empty and fills up again within the
+    /// empty-room TTL, the age countdown continues from the original first
+    /// join rather than resetting: from the user's point of view it's the
+    /// same (not recreated) room, and "how long have we been here" is
+    /// reasonably measured from the first time anyone actually showed up,
+    /// not from someone temporarily leaving and coming back. Like
+    /// `created_at`, this moment doesn't survive a server restart — the room
+    /// is recreated (`PUT /api/rooms/{id}`) from a blank slate, and the age
+    /// countdown starts over from the first join after the restart — the
+    /// same trade-off already described for `created_at`/`emptied_at`
+    /// (ephemeral state, nothing to worry about).
     pub first_joined_at: Option<Instant>,
 }
 
 impl Room {
-    /// Эффективный потолок числа участников ЭТОЙ комнаты (см.
-    /// docs/research-room-limit.md §2.2): собственный лимит лидера
-    /// (`settings.max_participants`, `Some`), если он его выставил, иначе —
-    /// серверный потолок (`crate::MAX_PARTICIPANTS`). Используется ВЕЗДЕ
-    /// вместо прямого сравнения с `crate::MAX_PARTICIPANTS` — при `join-room`
-    /// (`src/ws.rs`), при `approve` (`handle_approve`) и в `Joined::max_participants`
-    /// (`admit_participant`). Если лидер снизил лимит ниже текущей занятости —
-    /// это не какое-то отдельное состояние, а просто означает, что ЛЮБОЙ
-    /// следующий вход (`join-room`/`approve`) получит отказ, пока состав не
-    /// поредеет сам естественным образом (см. §2.2 исследования — уже
-    /// вошедших сервер никогда не выгоняет).
+    /// Effective participant-count ceiling for THIS room (see
+    /// docs/research-room-limit.md §2.2): the leader's own limit
+    /// (`settings.max_participants`, `Some`), if they set one, otherwise —
+    /// the server-wide ceiling (`crate::MAX_PARTICIPANTS`). Used EVERYWHERE
+    /// instead of comparing directly against `crate::MAX_PARTICIPANTS` — on
+    /// `join-room` (`src/ws.rs`), on `approve` (`handle_approve`), and in
+    /// `Joined::max_participants` (`admit_participant`). If the leader
+    /// lowered the limit below current occupancy — this isn't some separate
+    /// state, it just means that ANY subsequent entry
+    /// (`join-room`/`approve`) will be rejected until the roster naturally
+    /// thins out on its own (see research §2.2 — the server never kicks out
+    /// those already in).
     pub fn effective_max_participants(&self) -> usize {
         self.settings.max_participants.unwrap_or(*crate::MAX_PARTICIPANTS)
     }
 }
 
-/// Общее состояние всех комнат.
+/// Shared state of all rooms.
 pub type SharedRooms = Arc<Mutex<HashMap<String, Room>>>;
 
-/// Скользящее окно меток времени по IP: сколько раз этот IP постучался за
-/// последние `window`. Общий тип для обоих per-IP лимитов (создание комнат,
-/// заявки в лобби) — см. `check_ip_rate_limit`.
+/// Sliding window of timestamps by IP: how many times this IP has knocked
+/// in the last `window`. A shared type for both per-IP limits (room
+/// creation, lobby requests) — see `check_ip_rate_limit`.
 pub type IpRateLimitMap = Arc<Mutex<HashMap<String, VecDeque<Instant>>>>;
 
-/// Состояние приложения, разделяемое между всеми обработчиками axum:
-/// комнаты целиком в памяти, никакого внешнего хранилища.
+/// Application state, shared between all axum handlers: rooms entirely in
+/// memory, no external storage.
 #[derive(Clone)]
 pub struct AppState {
     pub rooms: SharedRooms,
-    /// Потолок числа комнат одновременно (H2, DoS-защита) — env `MAX_ROOMS`,
-    /// дефолт см. `DEFAULT_MAX_ROOMS`. `POST /api/rooms` и `PUT`-восстановление
-    /// при достижении отвечают `503`.
+    /// Ceiling on the number of rooms at once (H2, DoS protection) — env
+    /// `MAX_ROOMS`, default see `DEFAULT_MAX_ROOMS`. `POST /api/rooms` and
+    /// `PUT` restoration respond with `503` once it's reached.
     pub max_rooms: usize,
-    /// Per-IP лимит на `POST /api/rooms` (H2, DoS-защита): своя карта и свой
-    /// бюджет, отдельный от `pending_join_ips` — см. комментарий у
-    /// `PENDING_JOIN_IP_LIMIT` о том, почему бюджеты не общие.
+    /// Per-IP limit on `POST /api/rooms` (H2, DoS protection): its own map
+    /// and budget, separate from `pending_join_ips` — see the comment on
+    /// `PENDING_JOIN_IP_LIMIT` for why the budgets aren't shared.
     pub room_creation_ips: IpRateLimitMap,
-    /// Per-IP лимит на попадание в лобби (M3, чтобы лобби не забить) — своя
-    /// карта, отдельный бюджет от `room_creation_ips`.
+    /// Per-IP limit on entering the lobby (M3, so the lobby can't be
+    /// flooded) — its own map, a budget separate from `room_creation_ips`.
     pub pending_join_ips: IpRateLimitMap,
-    /// Per-IP лимит на прямой `join-room` в комнату (H2, docs/research-dos.md
-    /// §3.2 — «главная дыра») — своя карта, отдельный бюджет и от
-    /// `room_creation_ips`, и от `pending_join_ips` (см. `DEFAULT_JOIN_ROOM_IP_LIMIT`
-    /// выше).
+    /// Per-IP limit on directly `join-room`-ing into a room (H2,
+    /// docs/research-dos.md §3.2 — "the main hole") — its own map, a budget
+    /// separate from both `room_creation_ips` and `pending_join_ips` (see
+    /// `DEFAULT_JOIN_ROOM_IP_LIMIT` above).
     pub join_room_ips: IpRateLimitMap,
-    /// Канал активного broadcast-уведомления о шатдауне (SIGTERM/SIGINT, см.
-    /// `crate::shutdown_signal`) — каждое `ws::handle_socket` подписывается
-    /// на него при старте (`subscribe()`) и, получив сигнал, сам шлёт `Close`
-    /// в свой сокет и завершает цикл, вместо того чтобы пассивно доживать до
-    /// `terminationGracePeriodSeconds`/`SIGKILL` (см. docs/research-ops.md
-    /// §1.0/§1.6 — «дешёвое улучшение», ~30-40с простоя сигналинга при
-    /// активном созвоне в момент деплоя сводится к доле секунды). `broadcast`,
-    /// а не `watch`/`Notify`: нужно одноразовое уведомление «пора закрываться»
-    /// каждому подписчику, а не текущее состояние.
+    /// Channel for the active shutdown broadcast notification (SIGTERM/
+    /// SIGINT, see `crate::shutdown_signal`) — every `ws::handle_socket`
+    /// subscribes to it at startup (`subscribe()`) and, upon receiving the
+    /// signal, sends a `Close` on its own socket and ends its loop, instead
+    /// of passively living until `terminationGracePeriodSeconds`/`SIGKILL`
+    /// (see docs/research-ops.md §1.0/§1.6 — a "cheap improvement", ~30-40s
+    /// of signaling downtime during an active call at deploy time is cut
+    /// down to a fraction of a second). `broadcast`, not `watch`/`Notify`:
+    /// what's needed is a one-time "time to shut down" notification for
+    /// every subscriber, not current state.
     pub shutdown: ShutdownSignal,
 }
 
-/// См. `AppState::shutdown`.
+/// See `AppState::shutdown`.
 pub type ShutdownSignal = tokio::sync::broadcast::Sender<()>;
 
-/// Отправить сообщение пиру; ошибка (пир уже отвалился) сознательно
-/// игнорируется — чистку сделает его собственный обработчик сокета.
+/// Send a message to a peer; an error (the peer already dropped off) is
+/// deliberately ignored — its own socket handler will do the cleanup.
 pub fn send_to(tx: &PeerTx, msg: ServerMessage) {
     let _ = tx.send(msg);
 }
 
-/// Внутренний идентификатор пира — обычный UUID.
+/// Internal peer identifier — a plain UUID.
 pub fn generate_peer_id() -> String {
     Uuid::new_v4().to_string()
 }
 
-/// Короткий человекочитаемый roomId для URL: 8 символов из алфавита
-/// без похожих друг на друга знаков (нет 0/o, 1/l/i). Энтропию берём из
-/// UUIDv4, чтобы не тянуть отдельный крейт rand.
+/// Short human-readable roomId for URLs: 8 characters from an alphabet with
+/// no look-alike characters (no 0/o, 1/l/i). Entropy is drawn from a
+/// UUIDv4, to avoid pulling in a separate rand crate.
 pub fn generate_room_id() -> String {
     const ALPHABET: &[u8] = b"23456789abcdefghjkmnpqrstuvwxyz";
     Uuid::new_v4()
@@ -319,35 +340,38 @@ pub fn generate_room_id() -> String {
         .collect()
 }
 
-/// Фоновая задача: раз в `REAPER_INTERVAL` проходит по всем комнатам и
-/// удаляет:
-///   - любую комнату старше `max_lifetime` (лимит длительности созвона, см.
-///     docs/security.md, «Meeting Duration Ceiling») — НЕЗАВИСИМО от того, есть ли
-///     в ней участники: перед удалением рассылает `room-expired` всем
-///     участникам И всем ожидающим в лобби (писатель их сокетов сам закроет
-///     соединение вслед за этим сообщением, см. `ws.rs::handle_socket`);
-///   - комнаты, которые пусты (без единого участника) дольше `empty_ttl` —
-///     как раньше, без рассылки (участников там уже нет, а `pending` в этот
-///     момент уже пуст — см. `ws::cleanup_peer`, драйнится, когда комната
-///     опустевает).
+/// Background task: once every `REAPER_INTERVAL`, walks all rooms and
+/// deletes:
+///   - any room older than `max_lifetime` (the call duration limit, see
+///     docs/security.md, "Meeting Duration Ceiling") — REGARDLESS of
+///     whether it has participants: before deleting it, sends
+///     `room-expired` to all participants AND everyone waiting in the lobby
+///     (their socket's writer will close the connection itself right after
+///     this message, see `ws.rs::handle_socket`);
+///   - rooms that are empty (no participants at all) for longer than
+///     `empty_ttl` — as before, without a broadcast (there are no
+///     participants left there, and `pending` is already empty at this
+///     point — see `ws::cleanup_peer`, it's drained when the room becomes
+///     empty).
 ///
-/// Инвариант конкурентности: весь проход по комнатам — синхронный
-/// (`HashMap::retain`), лок держится только на время самого прохода, без
-/// `.await` внутри критической секции (рассылка `send_to` — это просто
-/// `UnboundedSender::send`, не блокирует и не ждёт).
+/// Concurrency invariant: the whole pass over the rooms is synchronous
+/// (`HashMap::retain`), the lock is held only for the duration of the pass
+/// itself, with no `.await` inside the critical section (the `send_to`
+/// broadcast is just an `UnboundedSender::send`, it doesn't block or wait).
 ///
-/// Заодно (после `retain`, тем же самым локом — см. обоснование ниже)
-/// пересчитывает и выставляет гейджи `chat_rooms`/`chat_participants`/
-/// `chat_pending` (см. `crate::metrics`). Выбор именно ЗДЕСЬ, а не на
-/// каждый `create_room`/`join-room`/`cleanup_peer`: реапер и так раз в
-/// `REAPER_INTERVAL` берёт лок на всё множество комнат и линейно проходит
-/// его целиком — досчитать суммы `participants.len()`/`pending.len()` по
-/// уже открытым записям стоит буквально ничего дополнительно, а обновлять
-/// три гейджа на каждое отдельное подключение/отключение означало бы
-/// лишний `metrics::gauge!` (атомарная операция, но их много) на куда более
-/// горячем пути и не даёт видимой пользы: Prometheus всё равно скрейпит раз
-/// в несколько секунд, секундная задержка обновления от `REAPER_INTERVAL`
-/// (1с) для дашборда не заметна.
+/// While at it (after `retain`, under the same lock — see the rationale
+/// below), it also recomputes and sets the `chat_rooms`/`chat_participants`/
+/// `chat_pending` gauges (see `crate::metrics`). Doing it HERE rather than
+/// on every `create_room`/`join-room`/`cleanup_peer`: the reaper already
+/// takes the lock on the whole set of rooms once every `REAPER_INTERVAL`
+/// and does a linear pass over all of it — tallying up
+/// `participants.len()`/`pending.len()` sums over already-open records
+/// costs essentially nothing extra, whereas updating three gauges on every
+/// single connect/disconnect would mean an extra `metrics::gauge!` (an
+/// atomic operation, but there are many of them) on a much hotter path, with
+/// no visible benefit: Prometheus scrapes every few seconds regardless, and
+/// a one-second update delay from `REAPER_INTERVAL` (1s) is imperceptible
+/// for a dashboard.
 pub async fn reap_rooms(rooms: SharedRooms, empty_ttl: Duration, max_lifetime: Duration) {
     let mut interval = tokio::time::interval(REAPER_INTERVAL);
     loop {
@@ -355,7 +379,7 @@ pub async fn reap_rooms(rooms: SharedRooms, empty_ttl: Duration, max_lifetime: D
         let mut rooms_guard = rooms.lock().unwrap();
         rooms_guard.retain(|room_id, room| {
             if room.created_at.elapsed() >= max_lifetime {
-                info!(room = %room_id, "комната старше лимита длительности созвона — удалена реапером (room-expired)");
+                info!(room = %room_id, "room older than the call duration limit — removed by reaper (room-expired)");
                 for p in room.participants.values() {
                     send_to(&p.tx, ServerMessage::RoomExpired {});
                 }
@@ -367,7 +391,7 @@ pub async fn reap_rooms(rooms: SharedRooms, empty_ttl: Duration, max_lifetime: D
             let expired_empty = room.participants.is_empty()
                 && room.emptied_at.is_some_and(|t| t.elapsed() >= empty_ttl);
             if expired_empty {
-                info!(room = %room_id, "комната пуста дольше TTL — удалена реапером");
+                info!(room = %room_id, "room empty longer than TTL — removed by reaper");
             }
             !expired_empty
         });
@@ -384,14 +408,15 @@ pub async fn reap_rooms(rooms: SharedRooms, empty_ttl: Duration, max_lifetime: D
     }
 }
 
-/// IP клиента для per-IP лимитов (H2/M3): `CF-Connecting-IP` (Cloudflare
-/// подставляет реальный IP клиента даже через собственный proxy/tunnel) →
-/// фолбэк первый адрес из `X-Forwarded-For` (на случай другого reverse-proxy
-/// перед сервером) → фолбэк адрес пира сокета (прямое подключение без
-/// proxy — например, локальный запуск). Не строгая защита от подделки (клиент
-/// или недоверенный проксик может слать любой `CF-Connecting-IP`), но для
-/// rate-limit этого достаточно — цель не аутентификация, а срезать грубый
-/// флуд с одного адреса.
+/// Client IP for per-IP limits (H2/M3): `CF-Connecting-IP` (Cloudflare
+/// fills in the real client IP even through its own proxy/tunnel) →
+/// fallback to the first address in `X-Forwarded-For` (in case of another
+/// reverse proxy in front of the server) → fallback to the socket peer
+/// address (direct connection without a proxy — e.g. a local run). Not a
+/// strict defense against spoofing (a client or an untrusted proxy can send
+/// any `CF-Connecting-IP`), but that's enough for a rate limit — the goal
+/// isn't authentication, just cutting off crude flooding from a single
+/// address.
 pub fn extract_client_ip(headers: &HeaderMap, peer_addr: Option<SocketAddr>) -> String {
     if let Some(ip) = headers
         .get("CF-Connecting-IP")
@@ -415,17 +440,19 @@ pub fn extract_client_ip(headers: &HeaderMap, peer_addr: Option<SocketAddr>) -> 
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// Скользящий счётчик по IP: не более `limit` попаданий за `window` с одного
-/// IP. Тот же приём, что чат-rate-limit в `ws.rs` (`VecDeque<Instant>`), но
-/// на уровне целого `AppState`, а не одного соединения, и индексированный по
-/// IP, а не по соединению — используется для `POST /api/rooms`
-/// (`room_creation_ips`) и попадания в лобби (`pending_join_ips`).
+/// Sliding counter by IP: no more than `limit` hits per `window` from a
+/// single IP. The same trick as the chat rate limit in `ws.rs`
+/// (`VecDeque<Instant>`), but at the level of the whole `AppState` rather
+/// than a single connection, and indexed by IP rather than by connection —
+/// used for `POST /api/rooms` (`room_creation_ips`) and entering the lobby
+/// (`pending_join_ips`).
 ///
-/// Заодно чистит карту от IP, у которых все метки уже устарели — иначе она
-/// росла бы бесконечно числом РАЗЛИЧНЫХ IP, когда-либо постучавшихся хоть
-/// раз. Полный проход по карте на каждый вызов — сознательно простой вариант:
-/// по масштабу проекта (личный сервер, единицы-десятки одновременных IP)
-/// это дешевле отдельной фоновой задачи уборки.
+/// While at it, also cleans the map of IPs whose timestamps have all gone
+/// stale — otherwise it would grow forever in the number of DISTINCT IPs
+/// that have ever knocked even once. A full pass over the map on every call
+/// is a deliberately simple choice: at this project's scale (a personal
+/// server, a handful to a few dozen concurrent IPs) it's cheaper than a
+/// separate background cleanup task.
 pub fn check_ip_rate_limit(map: &IpRateLimitMap, ip: &str, limit: usize, window: Duration) -> bool {
     let now = Instant::now();
     let mut guard = map.lock().unwrap();

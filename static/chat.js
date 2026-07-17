@@ -1,223 +1,223 @@
-// chat.js — панель текстового чата комнаты (Ф1: чат на mesh RTCDataChannel;
-// Ф2: форматирование текста, реплаи и реакции — см. ниже).
+// chat.js — room text chat panel (Wave 1: chat over mesh RTCDataChannel;
+// Wave 2: text formatting, replies and reactions — see below).
 //
-// Транспорт: ТОЛЬКО P2P-шина (см. bus.js/rtc.js) — broadcast конверта всем
-// пирам с открытым DataChannel. Серверного релея чата НЕТ: пирам без ещё
-// открытого канала конверт ждёт в локальной очереди и уходит по шине при её
-// открытии (см. sendEnvelopeToPeer/notifyBusOpen). См. docs/chat.md §12.
+// Transport: ONLY the P2P bus (see bus.js/rtc.js) — broadcasting the envelope to all
+// peers with an open DataChannel. There is NO server-side chat relay: for peers whose
+// channel isn't open yet, the envelope waits in a local queue and goes out over the bus once it
+// opens (see sendEnvelopeToPeer/notifyBusOpen). See docs/chat.md §12.
 //
-// Шифрование: конверт по шине уходит КАК ЕСТЬ — P2P DataChannel уже E2E за
-// счёт DTLS (см. static/crypto.js, docs/e2e-encryption.md §3.2). Прикладного
-// слоя шифрования у чата нет и не нужно; K_chat и контентные эпохи (Ш3) были
-// нужны только прежнему серверному fallback-пути и удалены вместе с ним.
+// Encryption: the envelope goes out over the bus AS IS — the P2P DataChannel is already E2E
+// thanks to DTLS (see static/crypto.js, docs/e2e-encryption.md §3.2). Chat has no
+// application-level encryption layer and doesn't need one; K_chat and content epochs (Wave 3) were
+// only needed for the former server-side fallback path and were removed along with it.
 //
-// Конверт сообщения (РАСШИРЯЕМЫЙ — расширения будущих волн должны лечь без
-// ломки формата):
+// Message envelope (EXTENSIBLE — extensions from future waves must land without
+// breaking the format):
 //   { v: 1, id, lamport, from, name, kind: 'text', text, replyTo, ts }
-// `replyTo` — id сообщения, на которое отвечают (null, если не реплай).
-// `ts` — клиентское время создания (мс, Date.now()), поле не входит в
-// протокольный минимум, добавлено сверх него исключительно для отображения
-// времени в ленте (та же функция, что была у серверного ts раньше) — сервер
-// его не трогает, это чисто клиентское расширение внутри уже опакового для
-// сервера конверта.
+// `replyTo` — id of the message being replied to (null if not a reply).
+// `ts` — client-side creation time (ms, Date.now()); this field is not part of the
+// protocol minimum, added on top of it purely for displaying
+// time in the feed (the same function the server-side ts used to serve) — the server
+// doesn't touch it, it's a purely client-side extension inside an envelope already
+// opaque to the server.
 //
-// Реакции (Ф2) — отдельный kind, тот же транспорт (broadcast по шине),
-// тот же общий буфер истории, что и текстовые сообщения:
+// Reactions (Wave 2) — a separate kind, same transport (broadcast over the bus),
+// same shared history buffer as text messages:
 //   { v: 1, id, lamport, from, name, kind: 'reaction', target, emoji, op, ts }
-// `target` — id сообщения, к которому относится реакция; `emoji` — один из
-// фиксированного набора (см. REACTION_EMOJIS); `op` — 'add'|'remove'
-// (повторный клик своей же реакции шлёт 'remove' — toggle на стороне
-// отправителя, применяется у всех одинаково по (lamport, from)).
+// `target` — id of the message the reaction refers to; `emoji` — one of a
+// fixed set (see REACTION_EMOJIS); `op` — 'add'|'remove'
+// (clicking your own reaction again sends 'remove' — a toggle on the
+// sender's side, applied identically for everyone based on (lamport, from)).
 //
-// Служебные kind этой фазы: 'history-request' (без доп. полей) и
-// 'history-response' { messages: [конверты] }. Неизвестный kind — молча
-// игнорируется (forward-compat). Буфер истории (см. HISTORY_CAP) хранит
-// вперемешку и text-, и reaction-конверты — состояние реакций (map msgId ->
-// emoji -> Set<peerId>) всегда пересчитывается заново по всему буферу в
-// порядке (lamport, from), поэтому результат не зависит от порядка доставки
-// по сети (см. recomputeReactions).
+// Service kinds of this phase: 'history-request' (no extra fields) and
+// 'history-response' { messages: [envelopes] }. An unknown kind is silently
+// ignored (forward-compat). The history buffer (see HISTORY_CAP) stores
+// text and reaction envelopes interleaved — reaction state (map msgId ->
+// emoji -> Set<peerId>) is always recomputed from scratch over the whole buffer in
+// (lamport, from) order, so the result doesn't depend on network delivery
+// order (see recomputeReactions).
 //
-// Редактирование и удаление — тем же приёмом (производное состояние,
-// пересчитываемое из буфера), тот же общий буфер истории/транспорт:
+// Editing and deletion — using the same approach (derived state,
+// recomputed from the buffer), the same shared history buffer/transport:
 //   { v: 1, id, lamport, from, name, kind: 'edit', target, text, ts }
 //   { v: 1, id, lamport, from, name, kind: 'delete', target, ts }
-// `target` — id сообщения (text или file-offer), которое правят/удаляют.
-// Конверт применяется, ТОЛЬКО ЕСЛИ envelope.from совпадает с `from`
-// оригинального сообщения (иначе молча игнорируется — см.
-// recomputeMessageMeta); оригинал ищется в том же буфере `messages`, поэтому
-// если он уже вытеснен из HISTORY_CAP, авторство проверить нечем и правка/
-// удаление тоже игнорируются (безопасный дефолт). 'edit' применим только к
-// kind='text' (у file-offer текста нет, редактировать нечего). Несколько
-// edit-конвертов на один target — побеждает последний в порядке (lamport,
-// from), т.к. `messages` уже отсортирован этим же компаратором и пересчёт
-// просто идёт по порядку, перезаписывая предыдущее значение (тот же приём,
-// что и в recomputeReactions). 'delete' на target — финальное состояние:
-// как только валидный delete применён, ПОСЛЕДУЮЩИЕ (с бОльшим lamport) edit
-// на тот же target больше не применяются — удаление их не отменяет.
-// edit/delete-конверты хранятся в общем буфере 50 наравне с text/reaction/
-// file-offer и точно так же уезжают опоздавшим в history-response —
-// опоздавший пересчитывает то же самое messageOverlays по всему реплею и
-// поэтому сразу видит финальное состояние (отредактированный текст или
-// тумбстоун), а не оригинал.
+// `target` — id of the message (text or file-offer) being edited/deleted.
+// The envelope is applied ONLY IF envelope.from matches the `from` of
+// the original message (otherwise it's silently ignored — see
+// recomputeMessageMeta); the original is looked up in the same `messages` buffer, so
+// if it has already been evicted from HISTORY_CAP, authorship can't be verified and the edit/
+// delete are likewise ignored (safe default). 'edit' only applies to
+// kind='text' (file-offer has no text, nothing to edit). For multiple
+// edit envelopes on the same target — the last one in (lamport,
+// from) order wins, since `messages` is already sorted by this same comparator and the recompute
+// simply proceeds in order, overwriting the previous value (the same technique
+// as in recomputeReactions). 'delete' on a target is a final state:
+// once a valid delete has been applied, SUBSEQUENT edits (with a higher lamport)
+// on the same target no longer apply — deletion is not undone by them.
+// edit/delete envelopes are stored in the same 50-slot shared buffer alongside text/reaction/
+// file-offer and likewise go out to a latecomer in history-response —
+// the latecomer recomputes the same messageOverlays over the whole replay and
+// therefore immediately sees the final state (the edited text or a
+// tombstone), not the original.
 //
-// Передача файлов (Ф3) — строго P2P, сервер байты файла никогда не видит:
+// File transfer (Wave 3) — strictly P2P, the server never sees the file bytes:
 //   { v: 1, id, lamport, from, name, kind: 'file-offer', fileId, fileName,
 //     size, mime, ts }
-// Оффер — обычный конверт по тому же транспорту (broadcast по шине)
-// и в том же общем буфере истории, что text/reaction
-// — опоздавший видит карточку файла из реплея истории точно так же, как
-// историческое текстовое сообщение (см. mergeHistory). Сам файл (File-объект)
-// живёт только у отправителя, в памяти вкладки (fileSendMap: fileId -> File)
-// — сервер и буфер истории носят только метаданные, не содержимое.
-// Своя карточка у отправителя — сразу 'done': раз File уже целиком у нас
-// (fileSendMap), нет причины ждать никакого P2P-обмена ради собственного
-// превью/Download — objectUrl создаётся из этого же File локально, синхронно,
-// в handleFilesSelected (в отличие от получателя, который получает objectUrl
-// только в beginReceivingFile.onclose, после реальной передачи байт по
-// отдельному каналу, см. ниже). Статусы отдачи ('sending'/'sent' из
-// beginSendingFile, по одной раздаче на каждого запросившего получателя) на
-// это готовое состояние карточки не влияют — см. renderFileCardBody, там
-// проверка идёт по наличию objectUrl, а не по текущему status.
+// The offer is a regular envelope over the same transport (broadcast over the bus)
+// and in the same shared history buffer as text/reaction
+// — a latecomer sees the file card from the history replay just like a
+// historical text message (see mergeHistory). The file itself (the File object)
+// lives only on the sender's side, in the tab's memory (fileSendMap: fileId -> File)
+// — the server and the history buffer carry only metadata, not content.
+// The sender's own card is 'done' immediately: since the File is already fully in our
+// possession (fileSendMap), there's no reason to wait for any P2P exchange for our own
+// preview/download — the objectUrl is created from this same File locally, synchronously,
+// in handleFilesSelected (unlike the receiver, who only gets the objectUrl
+// in beginReceivingFile.onclose, after the actual byte transfer over a
+// separate channel, see below). Delivery statuses ('sending'/'sent' from
+// beginSendingFile, one delivery per requesting receiver) don't affect
+// this already-ready card state — see renderFileCardBody, where the
+// check is based on the presence of objectUrl, not the current status.
 //
-// Получатель, чтобы реально скачать файл, шлёт АДРЕСНЫЙ (не broadcast)
-// конверт отправителю:
+// To actually download the file, the receiver sends an ADDRESSED (not broadcast)
+// envelope to the sender:
 //   { v: 1, id, lamport, from, name, kind: 'file-request', fileId, ts }
-// Этот kind никогда не попадает в буфер истории (транзитный, как
-// history-request/response). Получив его, отправитель (если ещё держит File
-// с таким fileId) открывает ОТДЕЛЬНЫЙ DataChannel на существующем
-// RTCPeerConnection этой пары — pc.createDataChannel(`file-${fileId}-${кому}`)
-// — получатель ловит его через pc.ondatachannel по точному совпадению label
-// (см. RtcPeer.createFileChannel/onFileChannel в rtc.js). Первым сообщением
-// канала идёт JSON-мета { fileId, size, mime, name }, дальше — бинарные чанки
-// по FILE_CHUNK_SIZE байт (ArrayBuffer), с backpressure по bufferedAmount;
-// отправитель закрывает канал по завершении, получатель собирает Blob и
-// сверяет итоговый размер. Оффер без P2P-канала до отправителя (канал не
-// открылся или отправитель уже вышел) — карточка честно показывает
-// недоступность вместо попытки скачивания через сервер (сервер байты файла не гоняет
-// НИКОГДА — см. handleFileRequest/requestFileDownload/beginSendingFile/
-// beginReceivingFile ниже).
+// This kind never lands in the history buffer (transient, like
+// history-request/response). Upon receiving it, the sender (if still holding the File
+// with that fileId) opens a SEPARATE DataChannel on the existing
+// RTCPeerConnection for that pair — pc.createDataChannel(`file-${fileId}-${to}`)
+// — the receiver catches it via pc.ondatachannel by an exact label match
+// (see RtcPeer.createFileChannel/onFileChannel in rtc.js). The first message on the
+// channel is JSON metadata { fileId, size, mime, name }, followed by binary chunks
+// of FILE_CHUNK_SIZE bytes (ArrayBuffer), with backpressure based on bufferedAmount;
+// the sender closes the channel upon completion, the receiver assembles a Blob and
+// verifies the final size. An offer with no P2P channel to the sender (the channel didn't
+// open, or the sender has already left) — the card honestly shows
+// unavailability instead of attempting to download via the server (the server never
+// shuttles file bytes — see handleFileRequest/requestFileDownload/beginSendingFile/
+// beginReceivingFile below).
 //
-// Lamport-часы: на отправку — свой счётчик +1; на приём — max(свой,
-// полученный)+1. Порядок в ленте — сортировка по (lamport, from), поэтому
-// одинаков у всех участников независимо от порядка доставки по сети.
+// Lamport clock: on send — own counter +1; on receive — max(own,
+// received)+1. Order in the feed — sorted by (lamport, from), so it's
+// the same for all participants regardless of network delivery order.
 //
-// Своё сообщение рендерится сразу локально (оптимистично, без ожидания
-// эха — эха от сервера больше нет в принципе, весь путь P2P).
+// Own message is rendered immediately, locally (optimistically, without waiting
+// for an echo — there's no echo from the server anymore, the whole path is P2P).
 //
-// История: буфер последних 50 конвертов (text+reaction) в памяти вкладки (не
-// персистентный, живёт до закрытия/перезагрузки страницы). Новичок после
-// joined запрашивает историю у первого пира в joined.peers; если за 3с канал
-// к нему не открылся или ответа нет — пробует следующего. Пустая комната
-// (никого в joined.peers) — пустая история, спрашивать не у кого.
+// History: a buffer of the last 50 envelopes (text+reaction) in the tab's memory (not
+// persistent, lives until the page is closed/reloaded). A newcomer, after
+// joined, requests history from the first peer in joined.peers; if within 3s the channel
+// to it hasn't opened or there's no response — tries the next one. An empty room
+// (nobody in joined.peers) — empty history, nobody to ask.
 //
-// Rate-limit — клиентский, мягкий: не чаще 10 сообщений за 10с, блокирует
-// отправку с сообщением в панели. Серверного rate-limit у чата нет — чат
-// сервер не видит. Реакции этим лимитом не ограничены — это лёгкие
-// toggle-события, не полноценные сообщения.
+// Rate limit — client-side, soft: no more than 10 messages per 10s, blocks
+// sending with a message in the panel. There is no server-side rate limit for chat — the
+// server doesn't see the chat. Reactions aren't limited by this — they're lightweight
+// toggle events, not full messages.
 //
-// Форматирование текста (kind=text) — см. renderMessageBody/appendInlineNodes
-// ниже (Ф4, Telegram-подобный синтаксис, двойные маркеры): **жирный**,
-// __курсив__ И *курсив* (обе формы), ~~зачёркнутый~~, ||спойлер|| (блюр,
-// раскрытие по клику/Enter/Space — класс .revealed), `инлайн-код` (не
-// разбирается дальше), тройные бэктики ```[lang]\n...\n``` — блок кода
-// (<pre><code>, метка языка, кнопка «копировать», внутри тоже не
-// разбирается), "> " в начале строки — блок-цитата (уже было), http(s)-ссылки
-// и именованные [текст](url)-ссылки кликабельны без карточек-превью — никаких
-// сетевых запросов по ссылке ради приватности. Вложенность — где осмысленно
-// (форматирование внутри цитаты и внутри спойлера — оба рекурсивно прогоняют
-// свой контент через appendInlineNodes), но НЕ внутри инлайн-кода/код-блока
-// (код есть код). КРИТИЧНО: рендер строит DOM-ноды через
-// createElement/textContent — никакого innerHTML с пользовательскими данными
-// нигде в этом файле (innerHTML используется только для статичной, не
-// зависящей от пользовательского ввода разметки — сама панель и попап
-// реакций). Десктопные горячие клавиши для этих же маркеров — см.
-// wrapSelectionWithMarkers/handleFormattingShortcut ниже (Cmd/Ctrl+B/I,
-// Cmd/Ctrl+Shift+X/P/M/K); мобильный тулбар по выделению — следующая волна,
-// не здесь.
+// Text formatting (kind=text) — see renderMessageBody/appendInlineNodes
+// below (Wave 4, Telegram-like syntax, double markers): **bold**,
+// __italic__ AND *italic* (both forms), ~~strikethrough~~, ||spoiler|| (blur,
+// revealed on click/Enter/Space — .revealed class), `inline code` (not
+// parsed further), triple backticks ```[lang]\n...\n``` — code block
+// (<pre><code>, language label, "copy" button, also not
+// parsed inside), "> " at the start of a line — blockquote (already existed), http(s) links
+// and named [text](url) links are clickable without preview cards — no
+// network requests on link click, for the sake of privacy. Nesting — where meaningful
+// (formatting inside a quote and inside a spoiler — both recursively run
+// their content through appendInlineNodes), but NOT inside inline code/code block
+// (code is code). CRITICAL: rendering builds DOM nodes via
+// createElement/textContent — no innerHTML with user-supplied data
+// anywhere in this file (innerHTML is used only for static markup not
+// dependent on user input — the panel itself and the reactions
+// popup). Desktop hotkeys for these same markers — see
+// wrapSelectionWithMarkers/handleFormattingShortcut below (Cmd/Ctrl+B/I,
+// Cmd/Ctrl+Shift+X/P/M/K); mobile toolbar on selection — a future wave,
+// not here.
 //
-// Реплаи — пункт «Ответить» в попапе действий сообщения (см. заголовок ниже,
-// раздел про попап) открывает компактную плашку над инпутом; отправка кладёт
-// replyTo в конверт. Сообщение с replyTo рендерит над текстом цитату
-// оригинала (имя + обрезанный текст) из локального буфера; клик по цитате —
-// плавный скролл к оригиналу с кратким подсвечиванием (см.
+// Replies — the "Reply" item in the message action popup (see the header below,
+// the section on the popup) opens a compact bar above the input; sending puts
+// replyTo in the envelope. A message with replyTo renders a quote of the
+// original above the text (name + truncated text) from the local buffer; clicking the quote —
+// smooth-scrolls to the original with brief highlighting (see
 // scrollToMessageAndHighlight).
 //
-// Попап действий сообщения (волна 13, заменяет on-tap action-row и
-// hover-кнопки прошлых волн целиком, и на мобильном, и на десктопе) — строка
-// сообщения в ленте несёт ТОЛЬКО текст/время/чипы реакций, никаких кнопок.
-// Клик/тап по самому сообщению открывает единый попап (см.
-// openMessagePopover/closeMessagePopover/toggleMessagePopover): на мобильном
-// — bottom-sheet снизу экрана, на десктопе — компактная карточка у
-// сообщения (см. positionMessagePopoverDesktop). Внутри — палитра
-// эмодзи-реакций (тап ставит/снимает реакцию и закрывает попап), разбор
-// «кто/чем/когда» уже поставленных реакций (см. buildPopoverReactionsList —
-// имя участника берётся тем же способом, что и подпись сообщения, см.
-// displayName), и список действий (Ответить/Редактировать[своё,
-// text]/Удалить[своё]/Копировать текст, см. populatePopoverActions).
-// Одновременно открыт попап только для одного сообщения — activePopoverMsgId.
+// Message action popup (wave 13, entirely replaces the on-tap action row and
+// hover buttons of past waves, both on mobile and desktop) — the
+// message row in the feed carries ONLY text/time/reaction chips, no buttons.
+// Click/tap on the message itself opens a single unified popup (see
+// openMessagePopover/closeMessagePopover/toggleMessagePopover): on mobile
+// — a bottom-sheet from the bottom of the screen, on desktop — a compact card near
+// the message (see positionMessagePopoverDesktop). Inside it — the
+// emoji-reaction palette (a tap sets/removes a reaction and closes the popup), a breakdown
+// of "who/which/when" for reactions already placed (see buildPopoverReactionsList —
+// the participant's name is derived the same way as the message caption, see
+// displayName), and a list of actions (Reply/Edit[own,
+// text]/Delete[own]/Copy text, see populatePopoverActions).
+// Only one message can have its popup open at a time — activePopoverMsgId.
 //
-// Панель — синглтон на страницу: DOM создаётся один раз при первом вызове
-// ChatPanel.create(), повторные вызовы переиспользуют ту же разметку, но
-// сбрасывают историю и перевешивают обработчики на новую сессию (новый
-// signaling/bus/peerId — например, после page.reload()).
+// The panel is a per-page singleton: the DOM is created once on the first
+// ChatPanel.create() call; subsequent calls reuse the same markup but
+// reset the history and rebind handlers for the new session (new
+// signaling/bus/peerId — e.g. after page.reload()).
 //
-// Кнопка-тогл (открыть/закрыть чат, значок непрочитанных) — часть разметки
-// пилюли управления (#chat-button в room.html), а не создаётся здесь: её
-// элемент передаётся в ChatPanel.create({ toggleButton }) вызывающей
-// стороной. Сама панель (.chat-panel) по-прежнему создаётся и живёт в body.
+// Toggle button (open/close chat, unread badge) — part of the
+// control pill's markup (#chat-button in room.html), not created here: its
+// element is passed into ChatPanel.create({ toggleButton }) by the caller.
+// The panel itself (.chat-panel) is still created and lives in body.
 //
-// Анонимность: поля ввода имени в шапке чата больше нет — имя фиксируется
-// один раз за сессию модалкой входа комнаты (см. static/room.js) и передаётся
-// сюда параметром `name` в ChatPanel.create()/attach(). Никакого
-// localStorage/sessionStorage здесь и во всём файле нет.
+// Anonymity: there is no longer a name input field in the chat header — the name is fixed
+// once per session by the room join modal (see static/room.js) and passed
+// in here as the `name` parameter of ChatPanel.create()/attach(). There is no
+// localStorage/sessionStorage here or anywhere in this file.
 //
-// Права гостей (см. docs/permissions-and-leader.md, «Chat — Cooperative
-// Only»): при `guestChat=false` инпут дизейблится (см. room.js:
-// ChatPanel.setChatForbidden) и получатели игнорируют входящие
-// 'text'/'file-offer' конверты от НЕ-лидеров (см. dispatchEnvelope ниже).
-// Это КООПЕРАТИВНАЯ защита (чат сервер не видит вовсе): модифицированный
-// клиент получателя может её игнорировать и отрендерить конверт всё равно —
-// так и задумано, см. docs/permissions-and-leader.md.
+// Guest permissions (see docs/permissions-and-leader.md, "Chat — Cooperative
+// Only"): when `guestChat=false` the input is disabled (see room.js:
+// ChatPanel.setChatForbidden) and receivers ignore incoming
+// 'text'/'file-offer' envelopes from NON-leaders (see dispatchEnvelope below).
+// This is a COOPERATIVE safeguard (the server doesn't see the chat at all): a
+// modified receiver client can ignore it and render the envelope anyway —
+// that's by design, see docs/permissions-and-leader.md.
 //
-// H3 — привязка личности (identity binding): envelope.from — САМОЗАЯВЛЕННОЕ
-// поле, отправитель волен вписать туда что угодно (в т.ч. чужой peerId).
-// Транспорт (шина) при этом ЗНАЕТ истинного отправителя независимо от
-// содержимого конверта: это peerId той самой пары RtcPeer, чей DataChannel
-// принёс сообщение (см. bus.js: _dispatch(peerId, obj), room.js:
-// onBusMessage) — `fromPeerId`, приходящий в dispatchEnvelope НИЖЕ, подделать
-// нельзя (не самозаявленный, а транспортный факт).
-// Без сверки этих двух источников правды ЛЮБОЙ участник мог бы прислать
-// text/reaction/edit/delete/file-offer с envelope.from = чужой peerId и
-// отрендериться (или отредактировать/удалить чужое сообщение — см.
-// recomputeMessageMeta) от чужого имени: рендер и проверка авторства
-// edit/delete брали именно envelope.from, а сверки с истинным отправителем
-// не было вовсе. Решение — НОРМАЛИЗАЦИЯ, а не отказ: dispatchEnvelope
-// принудительно перезаписывает envelope.from = fromPeerId (транспортный,
-// истинный) ДО какой-либо обработки, для всех kind, несущих авторство (см.
-// SELF_ASSERTED_FROM_KINDS ниже) — так самозаявленное поле физически не
-// может разойтись с истиной к моменту, когда до него дотянется рендер или
-// recomputeMessageMeta/recomputeReactions. Отказ (reject) был бы проще, но
-// нормализация надёжнее: она чинит поле для ВСЕХ последующих потребителей
-// (истории, реплаев, "own"-классификации в renderMessageEl) одним изменением
-// в одной точке входа, а не заставляет каждого потребителя дублировать
-// сверку самостоятельно.
+// H3 — identity binding: envelope.from is a SELF-ASSERTED
+// field, the sender is free to put anything in it (including someone else's peerId).
+// The transport (bus) nonetheless KNOWS the true sender regardless of the
+// envelope's content: it's the peerId of the very RtcPeer pair whose DataChannel
+// carried the message (see bus.js: _dispatch(peerId, obj), room.js:
+// onBusMessage) — the `fromPeerId` arriving in dispatchEnvelope BELOW cannot be
+// forged (it's not self-asserted, it's a transport-level fact).
+// Without cross-checking these two sources of truth, ANY participant could send
+// text/reaction/edit/delete/file-offer with envelope.from = someone else's peerId and
+// render (or edit/delete someone else's message — see
+// recomputeMessageMeta) under someone else's name: the rendering and edit/delete
+// authorship check used envelope.from directly, with no
+// cross-check against the true sender at all. The fix is NORMALIZATION, not rejection:
+// dispatchEnvelope forcibly overwrites envelope.from = fromPeerId (the transport-level,
+// true value) BEFORE any processing, for all kinds that carry authorship (see
+// SELF_ASSERTED_FROM_KINDS below) — this way the self-asserted field physically
+// cannot diverge from the truth by the time rendering or
+// recomputeMessageMeta/recomputeReactions gets to it. Rejecting the envelope would be simpler, but
+// normalization is more robust: it fixes the field for ALL downstream consumers
+// (history, replies, "own" classification in renderMessageEl) with one change
+// at a single entry point, instead of making every consumer duplicate
+// the check itself.
 //
-// history-response — намеренное ИСКЛЮЧЕНИЕ из этой нормализации: сам конверт
-// history-response несёт `from` ответившего (это нормализуется как обычно —
-// он kind='history-response', не входит в SELF_ASSERTED_FROM_KINDS, но и не
-// нуждается: авторство самого ответа проверяется отдельно, см.
-// handleHistoryResponse — resolve срабатывает только для fromPeerId, которого
-// мы САМИ запросили, см. historyResponseWaiters), а вот `messages` внутри —
-// чужие исторические конверты, вложенные как ДАННЫЕ, а не как "письмо от
-// меня": тот, кто отвечает на history-request, не является их автором, и
-// нормализовать их `from` на fromPeerId ответившего было бы неверно —
-// потеряли бы разницу между "кто ответил" и "кто написал". mergeHistory (см.
-// ниже) поэтому НЕ проверяет авторство вложенных сообщений против транспорта
-// — это известное, осознанное ограничение кооперативной модели (тот, кто
-// отвечает на history-request, технически может вложить исторический
-// конверт с любым `from`, включая чужой) — того же порядка допущение, что и
-// остальные кооперативные защиты этого файла (модифицированный клиент может
-// солгать, сервер P2P-байты не видит и не проверяет).
+// history-response is an intentional EXCEPTION to this normalization: the
+// history-response envelope itself carries the `from` of the responder (this is normalized as usual —
+// it's kind='history-response', not part of SELF_ASSERTED_FROM_KINDS, though it doesn't even
+// need it: the authorship of the response itself is checked separately, see
+// handleHistoryResponse — resolve fires only for the fromPeerId that
+// WE ourselves requested, see historyResponseWaiters); but the `messages` inside it are
+// someone else's historical envelopes, embedded as DATA, not as "a message from
+// me": whoever answers a history-request is not their author, and
+// normalizing their `from` to the responder's fromPeerId would be wrong —
+// it would lose the distinction between "who responded" and "who wrote it". mergeHistory (see
+// below) therefore does NOT check the authorship of embedded messages against the transport
+// — this is a known, deliberate limitation of the cooperative model (whoever
+// answers a history-request can technically embed a historical
+// envelope with any `from`, including someone else's) — an assumption of the same kind as
+// the rest of this file's cooperative safeguards (a modified client can
+// lie, and the server neither sees nor verifies the P2P bytes).
 
 'use strict';
 
@@ -230,28 +230,28 @@ const ChatPanel = (() => {
   const REPLY_PREVIEW_MAX_LEN = 60;
   const HIGHLIGHT_DURATION_MS = 1200;
   const REACTION_EMOJIS = ['👍', '👎', '❤️', '😂', '😮', '😢'];
-  // Автоувеличение инпута (волна 13, требование «как в Telegram»): textarea
-  // растёт по мере строк до этого предела, дальше — внутренний скролл (см.
+  // Input auto-grow (wave 13, "Telegram-like" requirement): the textarea
+  // grows with the number of lines up to this limit, beyond that — internal scroll (see
   // autoGrowTextInput).
   const MAX_INPUT_LINES = 13;
-  // Та же граница, что и в style.css (@media (max-width: 640px)) — мобильный
-  // UX волны 11 (полноэкранный чат, тап-активация действий сообщения, см.
-  // isMobileLayout/applyVisualViewportSizing ниже) переключается ровно по
-  // ней, чтобы JS-состояние и CSS-разметка не расходились на границе
-  // ширины. Тулбар форматирования (см. updateFormatToolbarVisibility) на
-  // эту границу больше не завязан — он общий для всех layout.
+  // Same breakpoint as in style.css (@media (max-width: 640px)) — the mobile
+  // UX of wave 11 (fullscreen chat, tap-activated message actions, see
+  // isMobileLayout/applyVisualViewportSizing below) switches at exactly
+  // this point, so the JS state and CSS markup don't diverge at the width
+  // boundary. The formatting toolbar (see updateFormatToolbarVisibility) is no
+  // longer tied to this boundary — it's shared across all layouts.
   const MOBILE_BREAKPOINT_QUERY = '(max-width: 640px)';
 
-  // --- Передача файлов (Ф3) ---
-  const FILE_SIZE_LIMIT_BYTES = 25 * 1024 * 1024; // 25МБ — жёсткий лимит на файл
-  const FILE_CHUNK_SIZE = 16 * 1024; // 16КБ на чанк
-  const FILE_BUFFERED_LOW_THRESHOLD = 256 * 1024; // bufferedamountlow срабатывает ниже этого
-  const FILE_BUFFERED_HIGH_WATERMARK = 1024 * 1024; // ждём слива, если накопилось больше
-  const FILE_REQUEST_TIMEOUT_MS = 8000; // сколько ждём открытия файлового канала после запроса
+  // --- File transfer (Wave 3) ---
+  const FILE_SIZE_LIMIT_BYTES = 25 * 1024 * 1024; // 25MB — hard per-file limit
+  const FILE_CHUNK_SIZE = 16 * 1024; // 16KB per chunk
+  const FILE_BUFFERED_LOW_THRESHOLD = 256 * 1024; // bufferedamountlow fires below this
+  const FILE_BUFFERED_HIGH_WATERMARK = 1024 * 1024; // wait for drain if this much has accumulated
+  const FILE_REQUEST_TIMEOUT_MS = 8000; // how long we wait for the file channel to open after a request
 
-  // Статичная, не зависящая от пользовательских данных разметка — безопасна
-  // для innerHTML (см. критичное требование к рендеру сообщений выше, оно
-  // касается ТОЛЬКО пользовательского текста).
+  // Static markup independent of user data — safe
+  // for innerHTML (see the critical requirement on message rendering above, it
+  // applies ONLY to user-supplied text).
   const REPLY_ICON_SVG = `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
     <polyline points="9 14 4 9 9 4"></polyline>
     <path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H13"></path>
@@ -261,15 +261,15 @@ const ChatPanel = (() => {
     <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path>
   </svg>`;
 
-  // Действие «Копировать текст» в попапе сообщения (см. buildCopyButton).
+  // The "Copy text" action in the message popup (see buildCopyButton).
   const COPY_ICON_SVG = `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
     <rect x="9" y="9" width="13" height="13" rx="2"></rect>
     <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
   </svg>`;
 
-  // Редактирование/удаление своих сообщений — кнопки в .chat-message-actions
-  // (см. renderMessageEl/renderFileOfferEl), тот же стиль SVG-иконок, что и
-  // REPLY_ICON_SVG выше.
+  // Editing/deleting own messages — buttons in .chat-message-actions
+  // (see renderMessageEl/renderFileOfferEl), same SVG icon style as
+  // REPLY_ICON_SVG above.
   const EDIT_ICON_SVG = `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
     <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
     <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
@@ -280,12 +280,12 @@ const ChatPanel = (() => {
     <line x1="10" y1="11" x2="10" y2="17"></line>
     <line x1="14" y1="11" x2="14" y2="17"></line>
   </svg>`;
-  // Сколько ждём второй (подтверждающий) клик по кнопке удаления, прежде чем
-  // откатить её обратно в исходное состояние (см. buildDeleteButton).
+  // How long we wait for the second (confirming) click on the delete button before
+  // reverting it back to its initial state (see buildDeleteButton).
   const DELETE_CONFIRM_MS = 3000;
 
-  // Иконки файловой карточки по категории mime — статичная разметка, не
-  // зависит от пользовательских данных, безопасна для innerHTML.
+  // File card icons by mime category — static markup, independent
+  // of user data, safe for innerHTML.
   const FILE_ICON_IMAGE_SVG = `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
     <rect x="3" y="3" width="18" height="18" rx="2"></rect>
     <circle cx="8.5" cy="8.5" r="1.5"></circle>
@@ -332,18 +332,18 @@ const ChatPanel = (() => {
   }
 
   /**
-   * Убрать markdown-маркеры (**жирный**, __курсив__/*курсив*, ~~зачёркнутый~~,
-   * ||спойлер||, `код`, ```код-блок```, "> " цитата, [текст](url)) из текста
-   * для PLAIN-TEXT превью — реплай-плашка над инпутом (startReply) и цитата
-   * оригинала в самом сообщении (buildReplyQuoteEl) не рендерят разметку
-   * (места мало, важнее компактность), поэтому маркеры не должны "протекать"
-   * в них сырыми звёздочками. Тот же синтаксис, что renderMessageBody/
-   * INLINE_MD_RE рендерят полноценно — здесь просто снятие маркеров, без
-   * построения DOM. Спойлер намеренно заменяется словом «спойлер», а не
-   * своим (скрытым) содержимым — превью не должно "спойлерить" раньше клика
-   * пользователя по самому сообщению. Код-блок заменяется своим текстом
-   * (переводы строк внутри схлопываются в пробел, как и переводы строк между
-   * блоками сообщения) — превью однострочное.
+   * Strip markdown markers (**bold**, __italic__/*italic*, ~~strikethrough~~,
+   * ||spoiler||, `code`, ```code block```, "> " quote, [text](url)) from the text
+   * for a PLAIN-TEXT preview — the reply bar above the input (startReply) and the
+   * original's quote inside the message itself (buildReplyQuoteEl) don't render
+   * markup (little space, compactness matters more), so markers must not "leak"
+   * into them as raw asterisks. Same syntax that renderMessageBody/
+   * INLINE_MD_RE render in full — here it's just marker stripping, without
+   * building any DOM. A spoiler is deliberately replaced with the word "spoiler",
+   * not with its (hidden) content — the preview shouldn't "spoil" it before the
+   * user clicks the message itself. A code block is replaced with its own text
+   * (newlines inside are collapsed to a space, same as newlines between
+   * message blocks) — the preview is single-line.
    */
   function stripMarkdownForPreview(text) {
     let result = String(text || '').replace(/```[^\n`]*\n([\s\S]*?)```/g, (_, code) =>
@@ -363,12 +363,12 @@ const ChatPanel = (() => {
       .replace(/\*(?!\s)([^*]+?)(?<!\s)\*/g, '$1');
   }
 
-  /** CSS.escape с фоллбэком — как в scrollToMessageAndHighlight, вынесено сюда для переиспользования файловыми карточками. */
+  /** CSS.escape with a fallback — like in scrollToMessageAndHighlight, factored out here for reuse by file cards. */
   function escapeForSelector(value) {
     return typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(value) : value;
   }
 
-  /** Человекочитаемый размер файла: "512 Б", "12.3 КБ", "1.4 МБ" и т.п. */
+  /** Human-readable file size: "512 B", "12.3 KB", "1.4 MB" etc. */
   function humanFileSize(bytes) {
     const n = Number(bytes) || 0;
     if (n < 1024) return `${n} B`;
@@ -382,7 +382,7 @@ const ChatPanel = (() => {
     return `${value.toFixed(value < 10 ? 1 : 0)} ${units[unitIndex]}`;
   }
 
-  /** Человекочитаемая длительность (аудио/видео, из `loadedmetadata` уже полученного blob) в формате "М:СС". */
+  /** Human-readable duration (audio/video, from `loadedmetadata` of an already-received blob) in "M:SS" format. */
   function humanDuration(seconds) {
     if (!Number.isFinite(seconds) || seconds < 0) return '';
     const total = Math.round(seconds);
@@ -391,13 +391,13 @@ const ChatPanel = (() => {
     return `${m}:${String(s).padStart(2, '0')}`;
   }
 
-  /** uuid v4 (crypto.randomUUID — везде, где живёт RTCPeerConnection, доступен). */
+  /** uuid v4 (crypto.randomUUID is available everywhere RTCPeerConnection lives). */
   function genId() {
     if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
       return crypto.randomUUID();
     }
-    // Фоллбэк на случай окружения без crypto.randomUUID — не криптостойкий,
-    // но здесь важна лишь уникальность в пределах комнаты, не секретность.
+    // Fallback for environments without crypto.randomUUID — not cryptographically
+    // strong, but here only uniqueness within the room matters, not secrecy.
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
       const r = (Math.random() * 16) | 0;
       const v = c === 'x' ? r : (r & 0x3) | 0x8;
@@ -405,7 +405,7 @@ const ChatPanel = (() => {
     });
   }
 
-  /** Порядок в ленте: (lamport, from) — стабильный и одинаковый у всех. */
+  /** Order in the feed: (lamport, from) — stable and identical for everyone. */
   function compareOrder(a, b) {
     if (a.lamport !== b.lamport) return a.lamport - b.lamport;
     if (a.from < b.from) return -1;
@@ -414,59 +414,59 @@ const ChatPanel = (() => {
   }
 
   /**
-   * Мобильный layout прямо сейчас (та же граница, что и style.css: см.
-   * MOBILE_BREAKPOINT_QUERY выше) — используется, чтобы JS-поведение
-   * (тап-активация действий сообщения, VisualViewport-подгонка панели)
-   * применялось РОВНО там же, где CSS переключает вёрстку на полноэкранный
-   * мобильный вид, а не по отдельному, потенциально рассинхронизированному
-   * порогу. Тулбар форматирования сюда больше не относится (общий для всех
-   * layout, см. updateFormatToolbarVisibility). matchMedia
-   * недоступен только в совсем экзотических/тестовых окружениях без DOM —
-   * тогда просто считаем layout десктопным (безопасный дефолт: ничего не
-   * меняется относительно поведения до этой волны).
+   * Mobile layout right now (same breakpoint as style.css: see
+   * MOBILE_BREAKPOINT_QUERY above) — used so that JS behavior
+   * (tap-activated message actions, VisualViewport-based panel sizing) is
+   * applied at EXACTLY the same point where CSS switches the layout to fullscreen
+   * mobile view, rather than at a separate, potentially out-of-sync
+   * threshold. The formatting toolbar no longer belongs here (it's shared across all
+   * layouts, see updateFormatToolbarVisibility). matchMedia
+   * is unavailable only in very exotic/test environments without a DOM —
+   * in that case we just treat the layout as desktop (safe default: nothing
+   * changes relative to the behavior before this wave).
    */
   function isMobileLayout() {
     return typeof window.matchMedia === 'function' && window.matchMedia(MOBILE_BREAKPOINT_QUERY).matches;
   }
 
-  // --- Рендер markdown-подмножества в тексте сообщения ---
+  // --- Rendering the markdown subset in message text ---
   //
-  // Только createElement/textContent — никакого innerHTML с пользовательскими
-  // данными (см. заголовок файла). Вложенность инлайн-разметки — только там,
-  // где осмысленно: цитата (buildReplyQuoteEl/renderMessageBody) и спойлер
-  // (buildSpoilerEl) рекурсивно прогоняют СВОЁ содержимое через
-  // appendInlineNodes — то есть **жирный** внутри "> цитаты" или внутри
-  // ||спойлера|| рендерится полноценно. Инлайн-код и код-блок — НЕ
-  // прогоняются повторно никогда (код есть код, см. buildCodeBlockEl).
+  // Only createElement/textContent — no innerHTML with user-supplied
+  // data (see the file header). Nested inline markup — only where it's
+  // meaningful: a quote (buildReplyQuoteEl/renderMessageBody) and a spoiler
+  // (buildSpoilerEl) recursively run THEIR OWN content through
+  // appendInlineNodes — meaning **bold** inside a "> quote" or inside a
+  // ||spoiler|| is rendered in full. Inline code and code blocks are NEVER
+  // run through it again (code is code, see buildCodeBlockEl).
   //
-  // Порядок альтернатив в регэкспе важен: на каждой стартовой позиции regex
-  // пробует альтернативы слева направо. Инлайн-код проверяется ПЕРВЫМ — его
-  // содержимое должно достаться целиком одному матчу, не быть растащенным
-  // другими маркерами. "**" (жирный) и "__" (курсив-подчёркивание) проверяются
-  // раньше одиночного "*" (курсив) — иначе жирный никогда бы не совпал.
-  // Именованная ссылка "[текст](url)" проверяется раньше голой ссылки, иначе
-  // голая альтернатива забрала бы "url)" без скобок. Символ-маркер исключён
-  // из содержимого класса символов ([^*]/[^_]/[^~]/[^|]) — это не только
-  // упрощает жадность, но и не даёт одиночному "*" случайно "прыгнуть" через
-  // границу уже распознанного **...**. Лукэхеды/лукбихайнды на пробел у краёв
-  // (*(?!\s)...(?<!\s)*) отсекают самый частый ложный срабатывающий случай —
-  // одиночные "*" как умножение/разделитель ("5 * 3 * 2"), не образующие
-  // настоящей пары курсива.
+  // The order of alternatives in the regex matters: at each starting position the regex
+  // tries the alternatives left to right. Inline code is checked FIRST — its
+  // content must be captured whole by a single match, not carved up by
+  // other markers. "**" (bold) and "__" (italic-underscore) are checked
+  // before a single "*" (italic) — otherwise bold would never match.
+  // A named link "[text](url)" is checked before a bare link, otherwise
+  // the bare-link alternative would grab "url)" without the parens. The marker
+  // character is excluded from the character class's content ([^*]/[^_]/[^~]/[^|]) —
+  // this not only simplifies greediness but also prevents a lone "*" from accidentally
+  // "jumping" across the boundary of an already-recognized **...**. The lookaheads/
+  // lookbehinds for whitespace at the edges (*(?!\s)...(?<!\s)*) rule out the most
+  // common false-positive case — a lone "*" used as multiplication/separator
+  // ("5 * 3 * 2"), which doesn't form a genuine italic pair.
   const INLINE_MD_RE =
     /`([^`]+?)`|\*\*(?!\s)([^*]+?)(?<!\s)\*\*|__(?!\s)([^_]+?)(?<!\s)__|~~(?!\s)([^~]+?)(?<!\s)~~|\|\|(?!\s)([^|]+?)(?<!\s)\|\||\*(?!\s)([^*]+?)(?<!\s)\*|\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s<>"')]+)/g;
 
   /**
-   * Разобрать одну строку (без переводов строк) на текстовые узлы +
-   * инлайн-элементы и добавить их в `parent`. Спойлер (см. buildSpoilerEl)
-   * рекурсивно вызывает ЭТУ ЖЕ функцию, находясь ВНУТРИ тела текущего цикла
-   * — если бы регэксп был одним общим объектом с мутируемым lastIndex
-   * (как было раньше), рекурсивный вызов сбросил бы lastIndex ИЗ-ПОД
-   * внешнего цикла, который на следующей итерации начал бы матчиться заново
-   * с начала строки и НИКОГДА не дошёл бы до конца line — вечный цикл,
-   * замораживающий вкладку (обнаружено эмпирически: клик «Отправить» с
-   * сообщением вида "||спойлер||" вешал страницу намертво). Поэтому здесь —
-   * СВОЙ экземпляр RegExp на каждый вызов (в т.ч. рекурсивный), никакого
-   * общего мутируемого состояния между уровнями рекурсии.
+   * Parse a single line (no line breaks) into text nodes +
+   * inline elements and append them to `parent`. A spoiler (see buildSpoilerEl)
+   * recursively calls THIS SAME function while INSIDE the body of the current loop
+   * — if the regex were a single shared object with a mutable lastIndex
+   * (as it used to be), the recursive call would reset lastIndex OUT FROM UNDER
+   * the outer loop, which on the next iteration would start matching again
+   * from the beginning of the line and NEVER reach the end of `line` — an infinite loop
+   * that freezes the tab (found empirically: clicking "Send" with a
+   * message like "||spoiler||" hung the page dead). That's why here —
+   * we use OUR OWN RegExp instance on every call (including recursive ones), no
+   * shared mutable state between recursion levels.
    */
   function appendInlineNodes(parent, line) {
     if (line === '') return;
@@ -478,7 +478,7 @@ const ChatPanel = (() => {
         parent.appendChild(document.createTextNode(line.slice(lastIndex, match.index)));
       }
       if (match[1] !== undefined) {
-        // Инлайн-код — textContent напрямую, БЕЗ рекурсии (см. заголовок).
+        // Inline code — textContent directly, WITHOUT recursion (see the header).
         const code = document.createElement('code');
         code.className = 'chat-inline-code';
         code.textContent = match[1];
@@ -524,13 +524,13 @@ const ChatPanel = (() => {
   }
 
   /**
-   * Спойлер (||...||) — размыт до клика/Enter/Space (см. .chat-md-spoiler в
-   * style.css), раскрывается НАВСЕГДА в рамках отрендеренного элемента (класс
-   * .revealed добавляется, не убирается обратно — как в клиенте Telegram).
-   * Содержимое рендерится РЕКУРСИВНО через appendInlineNodes (см. заголовок
-   * файла выше) — форматирование под спойлером (например **жирный**) тоже
-   * работает. role="button"+tabindex — доступность с клавиатуры (только
-   * десктопный ввод в этой волне, мобильный тулбар — следующая).
+   * Spoiler (||...||) — blurred until click/Enter/Space (see .chat-md-spoiler in
+   * style.css), reveals PERMANENTLY within the rendered element (the
+   * .revealed class is added, never removed again — like in the Telegram client).
+   * Content is rendered RECURSIVELY via appendInlineNodes (see the file
+   * header above) — formatting under a spoiler (e.g. **bold**) also
+   * works. role="button"+tabindex — keyboard accessibility (only
+   * desktop input in this wave, mobile toolbar — next wave).
    */
   function buildSpoilerEl(content) {
     const span = document.createElement('span');
@@ -551,13 +551,13 @@ const ChatPanel = (() => {
   }
 
   /**
-   * Скопировать произвольный текст в буфер обмена — сперва через
-   * navigator.clipboard (нужен secure-контекст, у нас всегда https/
-   * localhost), фоллбэк — скрытый textarea + document.execCommand('copy')
-   * для окружений без Clipboard API. Общая для кнопки «Копировать» код-блока
-   * (см. copyCodeToClipboard/buildCodeBlockEl) и действия «Копировать текст»
-   * в попапе сообщения (см. buildCopyButton) — обе просто различаются
-   * визуальной обратной связью на СВОЕЙ кнопке, сам механизм копирования один.
+   * Copy arbitrary text to the clipboard — first via
+   * navigator.clipboard (needs a secure context, we always have https/
+   * localhost), fallback — a hidden textarea + document.execCommand('copy')
+   * for environments without the Clipboard API. Shared by the code block's "Copy"
+   * button (see copyCodeToClipboard/buildCodeBlockEl) and the "Copy text"
+   * action in the message popup (see buildCopyButton) — the two only differ
+   * in the visual feedback on THEIR OWN button, the copy mechanism itself is the same.
    */
   function copyTextToClipboard(text, onDone) {
     if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
@@ -567,7 +567,7 @@ const ChatPanel = (() => {
     }
   }
 
-  /** Кнопка «Копировать» код-блока (см. buildCodeBlockEl) — обёртка над copyTextToClipboard с визуальной обратной связью на этой конкретной кнопке. */
+  /** The code block's "Copy" button (see buildCodeBlockEl) — a wrapper over copyTextToClipboard with visual feedback on this specific button. */
   function copyCodeToClipboard(code, buttonEl) {
     const showCopied = () => {
       const prevText = buttonEl.textContent;
@@ -584,10 +584,10 @@ const ChatPanel = (() => {
   function fallbackCopyToClipboard(code, onDone) {
     const textarea = document.createElement('textarea');
     textarea.value = code;
-    // Вне видимой области, но не display:none (Safari не копирует из
-    // невидимых/нерендерящихся элементов) — offset-позиционирование через
-    // CSSOM (element.style), не инлайн-атрибут — CSP это не нарушает (см.
-    // заголовок файла: то же допущение, что и у .style.width полосы прогресса).
+    // Off-screen, but not display:none (Safari doesn't copy from
+    // invisible/non-rendering elements) — offset positioning via
+    // CSSOM (element.style), not an inline attribute — this doesn't violate CSP (see
+    // the file header: the same assumption as for the progress bar's .style.width).
     textarea.style.position = 'fixed';
     textarea.style.top = '0';
     textarea.style.left = '0';
@@ -605,10 +605,10 @@ const ChatPanel = (() => {
   }
 
   /**
-   * Блок кода (```[lang]\n...\n```, см. renderMessageBody) — <pre><code>
-   * моноширинным шрифтом, метка языка (если указан) и кнопка «копировать».
-   * `code` — textContent напрямую, БЕЗ appendInlineNodes (код есть код, см.
-   * заголовок файла) — символы-маркеры внутри не интерпретируются.
+   * Code block (```[lang]\n...\n```, see renderMessageBody) — <pre><code>
+   * in a monospace font, a language label (if given), and a "copy" button.
+   * `code` — textContent directly, WITHOUT appendInlineNodes (code is code, see
+   * the file header) — marker characters inside are not interpreted.
    */
   function buildCodeBlockEl(lang, code) {
     const wrap = document.createElement('div');
@@ -641,15 +641,15 @@ const ChatPanel = (() => {
   }
 
   /**
-   * Отрендерить полное тело сообщения в `container` (обычно .chat-message-text).
-   * Блочные конструкции распознаются построчно СВЕРХУ ВНИЗ, до инлайн-парсера:
-   * тройные бэктики ```[lang]``` … ``` — блок кода (см. buildCodeBlockEl,
-   * содержимое НЕ прогоняется через инлайн-парсер — код есть код); строки,
-   * начинающиеся ровно с "> ", группируются в блок-цитату (левая полоска, см.
-   * .chat-md-quote в style.css, содержимое прогоняется через
-   * appendInlineNodes — жирный/курсив и т.п. внутри цитаты работают);
-   * остальные строки — обычный инлайн-форматированный текст. Переводы строк
-   * между блоками — <br>.
+   * Render the full message body into `container` (usually .chat-message-text).
+   * Block-level constructs are recognized line by line, TOP TO BOTTOM, before the inline parser:
+   * triple backticks ```[lang]``` … ``` — a code block (see buildCodeBlockEl,
+   * content is NOT run through the inline parser — code is code); lines
+   * starting with exactly "> " are grouped into a blockquote (left bar, see
+   * .chat-md-quote in style.css, content is run through
+   * appendInlineNodes — bold/italic etc. inside a quote works);
+   * other lines — regular inline-formatted text. Line breaks
+   * between blocks — <br>.
    */
   function renderMessageBody(container, text) {
     const lines = String(text || '').split('\n');
@@ -659,9 +659,9 @@ const ChatPanel = (() => {
       const line = lines[i];
       const fenceMatch = /^```(\S*)$/.exec(line.replace(/\s+$/, ''));
       if (fenceMatch) {
-        // Ищем закрывающую тройку бэктиков среди СЛЕДУЮЩИХ строк. Не нашли
-        // до конца сообщения — незакрытый фенс, откатываемся и рендерим эту
-        // строку как обычный текст (а не проглатываем всё до конца).
+        // Look for a closing triple-backtick fence among the FOLLOWING lines. If not
+        // found by the end of the message — an unclosed fence, back off and render this
+        // line as plain text (instead of swallowing everything to the end).
         let j = i + 1;
         const codeLines = [];
         let closed = false;
@@ -705,8 +705,8 @@ const ChatPanel = (() => {
     }
   }
 
-  // Единственный экземпляр панели на страницу (DOM переиспользуется между
-  // подключениями, см. attach()).
+  // The single panel instance per page (the DOM is reused across
+  // connections, see attach()).
   let singleton = null;
 
   function buildDom(variant, toggleButton) {
@@ -755,18 +755,18 @@ const ChatPanel = (() => {
         </div>
       </div>
     `;
-    panel.querySelector('.chat-attach-button').innerHTML = ATTACH_ICON_SVG; // статичная разметка
+    panel.querySelector('.chat-attach-button').innerHTML = ATTACH_ICON_SVG; // static markup
 
-    // Попап действий сообщения (волна 13) — ЕДИНАЯ точка входа для всех
-    // действий (ответить/реакция/редактировать/удалить/копировать) и разбора
-    // реакций «кто/чем/когда»; открывается тапом/кликом по самому сообщению
-    // (см. messagesEl click-делегирование ниже). Общий на панель (синглтон,
-    // не по одному на сообщение) — на мобильном раскрывается bottom-sheet'ом
-    // снизу (см. style.css: @media max-width:640px), на десктопе —
-    // компактным поповером у сообщения (см. positionMessagePopoverDesktop).
-    // Ряд эмодзи-реакций строится один раз (статичный, фиксированный набор —
-    // безопасно строить через textContent), список действий и разбор
-    // реакций — каждый раз заново при открытии (зависят от конкретного msg).
+    // Message action popup (wave 13) — a SINGLE entry point for all
+    // actions (reply/react/edit/delete/copy) and for the "who/which/when"
+    // breakdown of reactions; opened by a tap/click on the message itself
+    // (see the messagesEl click delegation below). Shared per panel (a singleton,
+    // not one per message) — on mobile it opens as a bottom-sheet
+    // from the bottom (see style.css: @media max-width:640px), on desktop —
+    // a compact popover near the message (see positionMessagePopoverDesktop).
+    // The emoji-reaction row is built once (static, fixed set —
+    // safe to build via textContent), the action list and the reaction
+    // breakdown are rebuilt each time it opens (they depend on the specific msg).
     const messagePopover = document.createElement('div');
     messagePopover.className = 'chat-message-popover hidden';
     messagePopover.innerHTML = `
@@ -827,14 +827,14 @@ const ChatPanel = (() => {
 
   /**
    * @param {object} opts
-   * @param {object} opts.signaling — Signaling (см. common.js), для приёма серверных ошибок ('error').
-   * @param {object} opts.bus — Bus (см. bus.js), единственный транспорт чата (P2P).
-   * @param {string} opts.peerId — свой peerId.
-   * @param {?string} opts.name — своё отображаемое имя (фиксируется на сессию, как раньше).
+   * @param {object} opts.signaling — Signaling (see common.js), for receiving server-side errors ('error').
+   * @param {object} opts.bus — Bus (see bus.js), the sole chat transport (P2P).
+   * @param {string} opts.peerId — our own peerId.
+   * @param {?string} opts.name — our own display name (fixed for the session, as before).
    * @param {string} opts.variant
    * @param {HTMLElement} opts.toggleButton
-   * @param {() => string[]} opts.getPeerIds — актуальный список peerId остальных участников (для рассылки).
-   * @param {string[]} opts.initialPeerIds — peerId остальных участников на момент joined, в порядке из joined.peers (для запроса истории).
+   * @param {() => string[]} opts.getPeerIds — the current list of the other participants' peerIds (for broadcasting).
+   * @param {string[]} opts.initialPeerIds — the other participants' peerIds at the time of joined, in joined.peers order (for requesting history).
    */
   function create({
     signaling,
@@ -899,77 +899,77 @@ const ChatPanel = (() => {
     let bus = null;
     let peerId = null;
     let myName = null;
-    // Очередь исходящего чата, накопленная, пока P2P-шина к адресату ещё не
-    // открыта — сливается в notifyBusOpen() (room.js зовёт её из onBusOpen).
-    // Пришла на смену серверному fallback-релею чата: чат ходит только по шине
-    // (DTLS-E2E), а до её открытия конверт ждёт локально, а не уходит через
-    // сервер (см. docs/chat.md).
+    // Outgoing chat queue, accumulated while the P2P bus to the recipient isn't
+    // open yet — flushed in notifyBusOpen() (room.js calls it from onBusOpen).
+    // Replaces the former server-side fallback chat relay: chat travels only over the bus
+    // (DTLS-E2E), and until it opens the envelope waits locally instead of going through the
+    // server (see docs/chat.md).
     let pendingBusSends = [];
     let getPeerIds = () => [];
-    // Права гостей (см. docs/permissions-and-leader.md, «Chat — Partially
-    // Server-Enforced»): getLeaderId/getGuestChatAllowed
-    // — колбэки room.js, читающие ЖИВЫЕ leaderId/roomSettings.guestChat на
-    // момент вызова (не снимок на момент attach) — используются в
-    // isIncomingEnvelopeAllowed ниже для игнорирования входящих text/file-offer
-    // конвертов от не-лидеров, когда guestChat=false (см. заголовок файла).
+    // Guest permissions (see docs/permissions-and-leader.md, "Chat — Partially
+    // Server-Enforced"): getLeaderId/getGuestChatAllowed
+    // — room.js callbacks that read the LIVE leaderId/roomSettings.guestChat at
+    // call time (not a snapshot taken at attach) — used in
+    // isIncomingEnvelopeAllowed below to ignore incoming text/file-offer
+    // envelopes from non-leaders when guestChat=false (see the file header).
     let getLeaderId = () => null;
     let getGuestChatAllowed = () => true;
     let unreadCount = 0;
     let errorTimer = null;
-    // Отправку (СВОЙ инпут) дизейблит room.js через publicApi.setChatForbidden
-    // при guestChat=false — независимо от connectionLost (см. disableInput/
-    // enableInput ниже), оба состояния учитываются вместе в applyInputState.
+    // Sending (OUR OWN input) is disabled by room.js via publicApi.setChatForbidden
+    // when guestChat=false — independent of connectionLost (see disableInput/
+    // enableInput below), both states are taken into account together in applyInputState.
     let connectionLost = false;
     let forbiddenByLeader = false;
 
-    // --- Состояние протокола чата ---
+    // --- Chat protocol state ---
     let lamportClock = 0;
-    // Единый буфер истории (капается до HISTORY_CAP) — хранит вперемешку
-    // конверты kind='text' и kind='reaction', отсортирован по compareOrder.
-    // Именно этот массив целиком уходит в history-response (см.
-    // handleHistoryRequest) и целиком пересчитывает reactions при любом
-    // изменении (см. recomputeReactions).
+    // The single history buffer (capped at HISTORY_CAP) — holds
+    // kind='text' and kind='reaction' envelopes interleaved, sorted by compareOrder.
+    // This exact array is sent whole in history-response (see
+    // handleHistoryRequest) and is recomputed whole for reactions on any
+    // change (see recomputeReactions).
     let messages = [];
     let seenIds = new Set();
-    // msgId -> Map(emoji -> Set<peerId>) — производное состояние, всегда
-    // пересчитывается заново из `messages` (см. recomputeReactions), поэтому
-    // не зависит от порядка доставки/реплея истории.
+    // msgId -> Map(emoji -> Set<peerId>) — derived state, always
+    // recomputed from scratch from `messages` (see recomputeReactions), so it
+    // doesn't depend on delivery order/history replay order.
     let reactions = new Map();
-    // msgId -> { deleted: boolean, editText: string|null } — производное
-    // состояние редактирования/удаления, тоже всегда пересчитывается заново
-    // из `messages` (см. recomputeMessageMeta), см. комментарий в шапке файла.
+    // msgId -> { deleted: boolean, editText: string|null } — derived
+    // edit/delete state, likewise always recomputed from scratch
+    // from `messages` (see recomputeMessageMeta), see the comment in the file header.
     let messageOverlays = new Map();
-    let sendTimes = []; // клиентский rate-limit: метки времени своих отправок
+    let sendTimes = []; // client-side rate limit: timestamps of our own sends
     let historyResponseWaiters = new Map(); // peerId -> resolve(messages[])
-    let replyTarget = null; // конверт сообщения, на которое сейчас отвечаем (или null)
-    let editTarget = null; // конверт СВОЕГО сообщения, которое сейчас редактируем (или null) — взаимоисключается с replyTarget
-    // Попап действий сообщения (волна 13, заменяет on-tap action-row и
-    // hover-кнопки прошлых волн) — msgId сообщения, для которого сейчас
-    // открыт попап (ответить/реакция/редактировать/удалить/копировать +
-    // разбор реакций), или null. Не более одного одновременно — открытие
-    // для нового сообщения переиспользует тот же DOM-синглтон (см.
-    // openMessagePopover). Работает ОДИНАКОВО на мобильном (bottom-sheet) и
-    // десктопе (компактный поповер у сообщения) — единая точка входа, без
-    // отдельного hover-состояния.
+    let replyTarget = null; // the envelope of the message we're currently replying to (or null)
+    let editTarget = null; // the envelope of OUR OWN message we're currently editing (or null) — mutually exclusive with replyTarget
+    // Message action popup (wave 13, replaces the on-tap action row and
+    // hover buttons of past waves) — the msgId of the message whose
+    // popup is currently open (reply/react/edit/delete/copy +
+    // reaction breakdown), or null. No more than one at a time — opening
+    // it for a new message reuses the same DOM singleton (see
+    // openMessagePopover). Works IDENTICALLY on mobile (bottom-sheet) and
+    // desktop (compact popover near the message) — a single entry point, without
+    // a separate hover state.
     let activePopoverMsgId = null;
-    // Тулбар форматирования (волна 11, общий для всех layout) —
-    // принудительно открыт кнопкой «Aa» (см. formatToggleButton ниже);
-    // помимо этого тулбар также показывается САМ, пока в textInput есть
-    // непустое выделение (см. updateFormatToolbarVisibility/document
+    // Formatting toolbar (wave 11, shared across all layouts) —
+    // forced open by the "Aa" button (see formatToggleButton below);
+    // besides that, the toolbar also shows up ON ITS OWN as long as textInput has a
+    // non-empty selection (see updateFormatToolbarVisibility/document
     // 'selectionchange').
     let formatToolbarForcedOpen = false;
 
-    // --- Состояние передачи файлов (Ф3) ---
-    // fileId -> File — файлы, которые МЫ отправили (держим, пока живёт вкладка/сессия),
-    // чтобы ответить на file-request отправкой по отдельному DataChannel.
+    // --- File transfer state (Wave 3) ---
+    // fileId -> File — files WE sent (kept alive as long as the tab/session lives),
+    // to answer a file-request by sending over a separate DataChannel.
     let fileSendMap = new Map();
-    // fileId -> { status, progress, objectUrl, blobSize } — производное состояние
-    // карточки файла (и как отправителя, и как получателя), не хранится в конверте.
+    // fileId -> { status, progress, objectUrl, blobSize } — derived state
+    // of the file card (both as sender and as receiver), not stored in the envelope.
     // status: 'offer' | 'requesting' | 'transferring' | 'sending' | 'sent' | 'done'
     //       | 'unavailable' | 'no-p2p' | 'failed'.
     let fileStates = new Map();
-    // fileId -> { targetPeerId, expectedLabel, mime, name, size } — запрос на
-    // скачивание, которого мы ждём (открытия входящего файлового DataChannel).
+    // fileId -> { targetPeerId, expectedLabel, mime, name, size } — a download
+    // request we're waiting on (for an incoming file DataChannel to open).
     let pendingFileRequests = new Map();
 
     function isNearBottom() {
@@ -984,17 +984,17 @@ const ChatPanel = (() => {
     }
 
     /**
-     * Текст превью для реплая/цитаты (волна 13: реплай теперь доступен из
-     * попапа на ЛЮБОМ сообщении, включая file-offer, — см.
-     * populatePopoverActions/buildReplyActionButton, у file-offer текста нет
-     * вовсе, поэтому превью строится из имени файла со скрепкой).
+     * Preview text for a reply/quote (wave 13: replying is now available from
+     * the popup on ANY message, including file-offer — see
+     * populatePopoverActions/buildReplyActionButton; a file-offer has no text at
+     * all, so the preview is built from the file name with a paperclip).
      */
     function replyPreviewBodyText(msg) {
       if (msg.kind === 'file-offer') return `📎 ${msg.fileName}`;
       return msg.text;
     }
 
-    /** Найти ЛЮБОЕ редактируемое/удаляемое сообщение (text или file-offer) по id — для проверки авторства edit/delete. */
+    /** Find ANY editable/deletable message (text or file-offer) by id — for checking edit/delete authorship. */
     function findEditableOriginalById(id) {
       for (const msg of messages) {
         if ((msg.kind === 'text' || msg.kind === 'file-offer') && msg.id === id) return msg;
@@ -1003,15 +1003,15 @@ const ChatPanel = (() => {
     }
 
     /**
-     * Пересчитать map редактирования/удаления с нуля из `messages` — тот же
-     * приём, что и recomputeReactions: буфер уже отсортирован по (lamport,
-     * from), поэтому просто идём по порядку и перезаписываем состояние
-     * последним валидным edit/delete на каждый target (см. заголовок файла).
-     * Валидация авторства — envelope.from должен совпасть с from оригинала;
-     * оригинал не найден (уже вытеснен из HISTORY_CAP) — конверт игнорируется
-     * (безопасный дефолт, см. заголовок файла). Как только на target применён
-     * delete — последующие (с бОльшим lamport) edit больше не рассматриваются:
-     * удаление финально и не отменяется правками.
+     * Recompute the edit/delete map from scratch from `messages` — the same
+     * technique as recomputeReactions: the buffer is already sorted by (lamport,
+     * from), so we simply go in order and overwrite the state with the
+     * last valid edit/delete for each target (see the file header).
+     * Authorship check — envelope.from must match the original's from;
+     * if the original isn't found (already evicted from HISTORY_CAP), the envelope is ignored
+     * (safe default, see the file header). Once a delete has been applied
+     * to a target — subsequent edits (with a higher lamport) are no longer considered:
+     * deletion is final and isn't undone by edits.
      */
     function recomputeMessageMeta() {
       const next = new Map();
@@ -1019,18 +1019,18 @@ const ChatPanel = (() => {
         if (msg.kind !== 'edit' && msg.kind !== 'delete') continue;
         if (!msg.target || !msg.from) continue;
         const original = findEditableOriginalById(msg.target);
-        if (!original || original.from !== msg.from) continue; // не автор оригинала (или оригинал уже недоступен) — игнор
+        if (!original || original.from !== msg.from) continue; // not the original's author (or the original is no longer available) — ignore
         let overlay = next.get(msg.target);
         if (!overlay) {
           overlay = { deleted: false, editText: null };
           next.set(msg.target, overlay);
         }
-        if (overlay.deleted) continue; // удаление уже применено — последующие правки его не отменяют
+        if (overlay.deleted) continue; // deletion already applied — subsequent edits don't undo it
         if (msg.kind === 'delete') {
           overlay.deleted = true;
           overlay.editText = null;
         } else if (original.kind === 'text' && typeof msg.text === 'string') {
-          // 'edit' применим только к тексту — у file-offer текста нет.
+          // 'edit' only applies to text — file-offer has no text.
           overlay.editText = msg.text;
         }
       }
@@ -1038,13 +1038,13 @@ const ChatPanel = (() => {
     }
 
     /**
-     * Пересчитать map реакций с нуля из `messages`, применяя op'ы в порядке
-     * (lamport, from) — буфер уже так отсортирован. Значение на нижнем
-     * уровне — Map(peerId -> {name, ts}), а не просто Set<peerId>: имя и
-     * время нужны для разбора «кто/чем/когда» в попапе действий (см.
-     * buildPopoverReactionsList) — тем не менее Map поддерживает те же
-     * .has()/.size, что и Set, поэтому весь остальной код (чипы реакций,
-     * toggle) не меняется вовсе.
+     * Recompute the reactions map from scratch from `messages`, applying ops in
+     * (lamport, from) order — the buffer is already sorted this way. The value at the
+     * lower level is Map(peerId -> {name, ts}), not just Set<peerId>: the name and
+     * timestamp are needed for the "who/which/when" breakdown in the action popup (see
+     * buildPopoverReactionsList) — nevertheless Map supports the same
+     * .has()/.size as Set, so the rest of the code (reaction chips,
+     * toggle) doesn't change at all.
      */
     function recomputeReactions() {
       const next = new Map();
@@ -1128,7 +1128,7 @@ const ChatPanel = (() => {
       }
     }
 
-    /** `overlay` — messageOverlays.get(msg.id), передаётся вызывающей стороной, чтобы не пересчитывать/переискать здесь. */
+    /** `overlay` — messageOverlays.get(msg.id), passed in by the caller so it doesn't need to be recomputed/looked up here. */
     function buildMetaEl(msg, overlay) {
       const meta = document.createElement('div');
       meta.className = 'chat-message-meta';
@@ -1185,13 +1185,13 @@ const ChatPanel = (() => {
       messagesEl.appendChild(item);
     }
 
-    /** Строка попапа действий: иконка (статичный SVG) + подпись — единый вид для всех пунктов (см. populatePopoverActions). */
+    /** Action popup row: icon (static SVG) + label — the same look for all items (see populatePopoverActions). */
     function buildPopoverActionRow(iconSvg, label) {
       const btn = document.createElement('button');
       btn.type = 'button';
       const icon = document.createElement('span');
       icon.className = 'chat-message-action-icon';
-      icon.innerHTML = iconSvg; // статичная разметка, не пользовательские данные
+      icon.innerHTML = iconSvg; // static markup, not user data
       const labelEl = document.createElement('span');
       labelEl.className = 'chat-message-action-label';
       labelEl.textContent = label;
@@ -1200,7 +1200,7 @@ const ChatPanel = (() => {
       return { btn, labelEl };
     }
 
-    /** Карандаш — только на СВОИХ text-сообщениях (см. populatePopoverActions); file-offer редактировать нельзя. */
+    /** Pencil — only on OUR OWN text messages (see populatePopoverActions); a file-offer cannot be edited. */
     function buildEditButton(msg) {
       const { btn } = buildPopoverActionRow(EDIT_ICON_SVG, 'Edit');
       btn.className = 'chat-message-action chat-message-action--edit';
@@ -1211,10 +1211,10 @@ const ChatPanel = (() => {
     }
 
     /**
-     * Корзина — на СВОИХ text- и file-offer-сообщениях. Первый клик переводит
-     * кнопку в состояние подтверждения («Точно удалить?») на
-     * DELETE_CONFIRM_MS; второй клик в этом окне шлёт delete; таймаут без
-     * второго клика — откат в исходную подпись без отправки чего-либо.
+     * Trash can — on OUR OWN text and file-offer messages. The first click switches
+     * the button into a confirmation state ("Confirm delete?") for
+     * DELETE_CONFIRM_MS; a second click within that window sends delete; a timeout without
+     * a second click reverts to the original label without sending anything.
      */
     function buildDeleteButton(msg) {
       const { btn, labelEl } = buildPopoverActionRow(DELETE_ICON_SVG, 'Delete');
@@ -1252,16 +1252,16 @@ const ChatPanel = (() => {
       return btn;
     }
 
-    // --- Рендер карточки файла (Ф3) — kind='file-offer' ---
+    // --- File card rendering (Wave 3) — kind='file-offer' ---
     //
-    // В отличие от текстовых сообщений, тело карточки зависит не только от
-    // самого конверта (он неизменен), но и от производного состояния
-    // fileStates (запрошен ли файл, идёт ли передача, готов ли Blob) —
-    // поэтому тело строит отдельная renderFileCardBody(), вызываемая и при
-    // первом рендере, и при каждом смене статуса (см. setFileStatus).
-    // Прогресс внутри одного статуса обновляется точечно (setFileProgress),
-    // без пересборки DOM — иначе на каждый чанк (их могут быть сотни) была
-    // бы дорогая полная пересборка карточки.
+    // Unlike text messages, the card body depends not only on
+    // the envelope itself (which is immutable) but also on the derived
+    // fileStates (has the file been requested, is a transfer in progress, is a Blob ready) —
+    // so the body is built by a separate renderFileCardBody(), called both on the
+    // initial render and on every status change (see setFileStatus).
+    // Progress within a single status is updated in place (setFileProgress),
+    // without rebuilding the DOM — otherwise every chunk (there can be hundreds) would trigger
+    // an expensive full rebuild of the card.
     function renderFileOfferEl(msg) {
       const own = msg.from === peerId;
       const overlay = messageOverlays.get(msg.id);
@@ -1278,12 +1278,12 @@ const ChatPanel = (() => {
       item.appendChild(buildMetaEl(msg, overlay));
 
       if (isDeleted) {
-        // Тумбстоун вместо карточки. ВАЖНО: удаление офера — это только
-        // сокрытие карточки в ленте, оно НЕ отзывает уже переданные/принятые
-        // копии файла — получатели, успевшие скачать (Blob/objectUrl) до
-        // удаления, сохраняют доступ к своей локальной копии; это ожидаемое
-        // поведение строго P2P-модели (сервер файл не хранит и отозвать
-        // нечего, см. заголовок файла про Ф3).
+        // A tombstone instead of a card. IMPORTANT: deleting an offer only
+        // hides the card in the feed, it does NOT revoke copies of the file already
+        // transferred/received — receivers who managed to download it (Blob/objectUrl) before
+        // the deletion keep access to their local copy; this is expected
+        // behavior of the strictly P2P model (the server doesn't store the file, so there's
+        // nothing to revoke, see the file header on Wave 3).
         const text = document.createElement('div');
         text.className = 'chat-message-text chat-message-text--deleted';
         text.textContent = 'Message deleted';
@@ -1300,7 +1300,7 @@ const ChatPanel = (() => {
       messagesEl.appendChild(item);
     }
 
-    /** Найти конверт file-offer по fileId в текущем буфере (для точечных обновлений статуса/прогресса). */
+    /** Find the file-offer envelope by fileId in the current buffer (for targeted status/progress updates). */
     function findFileOfferByFileId(fileId) {
       for (const msg of messages) {
         if (msg.kind === 'file-offer' && msg.fileId === fileId) return msg;
@@ -1314,7 +1314,7 @@ const ChatPanel = (() => {
 
       const icon = document.createElement('span');
       icon.className = 'chat-file-icon';
-      icon.innerHTML = fileIconSvgForMime(msg.mime); // статичный набор SVG по категории mime, не пользовательские данные
+      icon.innerHTML = fileIconSvgForMime(msg.mime); // static set of SVGs by mime category, not user data
 
       const info = document.createElement('div');
       info.className = 'chat-file-info';
@@ -1344,23 +1344,23 @@ const ChatPanel = (() => {
       return wrap;
     }
 
-    /** Перестроить содержимое карточки `card` из msg + текущего fileStates.get(msg.fileId). */
+    /** Rebuild the contents of `card` from msg + the current fileStates.get(msg.fileId). */
     function renderFileCardBody(card, msg, own) {
       card.textContent = '';
       const state = fileStates.get(msg.fileId) || { status: 'offer', progress: 0 };
 
-      // Наличие objectUrl — самодостаточный признак «есть готовый Blob,
-      // показываем превью/Download», НЕЗАВИСИМО от текущего state.status.
-      // Это важно для своей (own) карточки: handleFilesSelected сразу
-      // проставляет ей status:'done' с objectUrl из собственного File, но
-      // status при этом может позже несколько раз смениться на 'sending'/
-      // 'sent' — beginSendingFile отдаёт файл каждому запросившему получателю
-      // отдельно и каждый раз перезатирает status (см. setFileStatus). Если
-      // здесь проверять status==='done', такая раздача откатывала бы готовую
-      // карточку отправителя обратно к «только заголовок». objectUrl в
-      // fileStates при этом не трогается (beginSendingFile его не передаёт
-      // в extra), так что проверка по нему одна и та же для своей и чужой
-      // (полученной) карточки.
+      // The presence of objectUrl is a self-sufficient signal of "a Blob is ready,
+      // show preview/Download", REGARDLESS of the current state.status.
+      // This matters for our own (own) card: handleFilesSelected immediately
+      // sets it to status:'done' with an objectUrl from our own File, but
+      // the status may later switch several times to 'sending'/
+      // 'sent' — beginSendingFile serves the file to each requesting receiver
+      // separately and overwrites the status each time (see setFileStatus). If
+      // we checked status==='done' here, such a delivery would roll the sender's
+      // already-ready card back to "header only". objectUrl in
+      // fileStates is left untouched by this (beginSendingFile doesn't pass it
+      // in extra), so checking against it gives the same behavior for our own and someone
+      // else's (received) card.
       if (state.objectUrl) {
         renderFileDoneBody(card, msg, state);
         return;
@@ -1397,12 +1397,12 @@ const ChatPanel = (() => {
         return;
       }
 
-      // status === 'offer' (начальное состояние без записи, ничего ещё не
-      // запрошено) — чужая карточка: кнопка «Скачать» (либо пояснение
-      // недоступности). Своя карточка сюда практически не попадает: у own
-      // fileStates.objectUrl проставляется синхронно в handleFilesSelected,
-      // то есть выше уже сработал ранний return по objectUrl; `own` здесь
-      // подстраховкой на случай, если состояние почему-то не создалось.
+      // status === 'offer' (the initial state with no record, nothing has been
+      // requested yet) — someone else's card: a "Download" button (or an
+      // unavailability note). Our own card practically never reaches here: for own,
+      // fileStates.objectUrl is set synchronously in handleFilesSelected,
+      // meaning the early return on objectUrl above already fired; the `own` check here
+      // is just a safety net in case the state somehow wasn't created.
       if (own) return;
 
       if (!getPeerIds().includes(msg.from)) {
@@ -1431,12 +1431,12 @@ const ChatPanel = (() => {
     }
 
     /**
-     * Строка меты под инлайн-медиа (картинка/видео/аудио) готовой карточки:
-     * имя файла + размер (+ пустой узел под длительность — заполняется
-     * позже событием loadedmetadata, см. вызывающий код) + кнопка «Скачать»
-     * из уже полученного objectUrl (сеть повторно не дёргаем — см. заголовок
-     * файла про Ф3: сервер байты не видит и не хранит, а сам файл уже у нас
-     * в виде Blob/ObjectURL).
+     * The meta row under the inline media (image/video/audio) of a ready card:
+     * file name + size (+ an empty node for duration — filled in
+     * later by the loadedmetadata event, see the calling code) + a "Download" button
+     * from the already-received objectUrl (no repeat network access — see the
+     * file header on Wave 3: the server neither sees nor stores the bytes, and the file itself
+     * is already ours as a Blob/ObjectURL).
      */
     function buildFileMetaRow(msg) {
       const meta = document.createElement('div');
@@ -1456,14 +1456,14 @@ const ChatPanel = (() => {
       return meta;
     }
 
-    /** Пустой узел под длительность — текст проставляется по loadedmetadata (см. renderFileDoneBody). */
+    /** Empty node for duration — text is set by loadedmetadata (see renderFileDoneBody). */
     function buildFileMetaDurationEl() {
       const durationEl = document.createElement('span');
       durationEl.className = 'chat-file-meta-duration';
       return durationEl;
     }
 
-    /** Компактная кнопка-ссылка «Скачать» из уже полученного objectUrl (см. buildFileMetaRow). */
+    /** Compact "Download" link-button from the already-received objectUrl (see buildFileMetaRow). */
     function buildFileMetaDownloadLink(msg, state) {
       const link = document.createElement('a');
       link.className = 'chat-file-download-link chat-file-download-link--compact';
@@ -1474,20 +1474,20 @@ const ChatPanel = (() => {
     }
 
     /**
-     * Финальный вид готовой (status='done') карточки — по mime полученного
-     * файла (см. заголовок файла, раздел B):
-     *  - image/* — инлайн-превью (клик по картинке — оригинал в новой
-     *    вкладке, как и было), под ней мета-строка (имя, размер, «Скачать»);
-     *  - video/* — <video controls preload=metadata>, длительность
-     *    проставляется по loadedmetadata (М:СС, см. humanDuration) —
-     *    невалидный/непроигрываемый контейнер просто не пришлёт это событие,
-     *    строка меты тогда остаётся без длительности (не ошибка);
-     *  - audio/* — <audio controls>, длительность так же по loadedmetadata;
-     *  - остальное — карточка-заголовок (иконка/имя/размер) + отдельная
-     *    ссылка-кнопка «Скачать» (как было раньше).
-     * objectUrl НЕ создаётся здесь заново на каждый ререндер — он уже лежит
-     * в fileStates (см. beginReceivingFile: URL.createObjectURL вызывается
-     * РОВНО ОДИН РАЗ при получении Blob), сюда просто передаётся `state`.
+     * The final look of a ready (status='done') card — based on the mime of the received
+     * file (see the file header, section B):
+     *  - image/* — an inline preview (clicking the picture opens the original in a new
+     *    tab, as before), with a meta row below it (name, size, "Download");
+     *  - video/* — <video controls preload=metadata>, duration is
+     *    set by loadedmetadata (M:SS, see humanDuration) —
+     *    an invalid/unplayable container simply won't fire this event,
+     *    the meta row then stays without a duration (not an error);
+     *  - audio/* — <audio controls>, duration likewise via loadedmetadata;
+     *  - everything else — a header card (icon/name/size) + a separate
+     *    "Download" link-button (as before).
+     * objectUrl is NOT recreated here on every re-render — it's already stored
+     * in fileStates (see beginReceivingFile: URL.createObjectURL is called
+     * EXACTLY ONCE upon receiving the Blob), `state` is simply passed in here.
      */
     function renderFileDoneBody(card, msg, state) {
       const mime = msg.mime || '';
@@ -1558,7 +1558,7 @@ const ChatPanel = (() => {
         return;
       }
 
-      // Прочее — карточка-заголовок (иконка по mime/имя/размер) + ссылка-кнопка.
+      // Everything else — a header card (icon by mime/name/size) + a link-button.
       card.appendChild(fileCardHeaderEl(msg));
       const link = document.createElement('a');
       link.className = 'chat-file-download-link';
@@ -1568,7 +1568,7 @@ const ChatPanel = (() => {
       card.appendChild(link);
     }
 
-    /** Точечно обновить только полосу прогресса (без пересборки карточки) — вызывается часто (на каждый чанк). */
+    /** Update only the progress bar in place (without rebuilding the card) — called frequently (on every chunk). */
     function setFileProgress(fileId, fraction) {
       const state = fileStates.get(fileId);
       if (!state) return;
@@ -1579,7 +1579,7 @@ const ChatPanel = (() => {
       if (bar) bar.style.width = `${Math.round(fraction * 100)}%`;
     }
 
-    /** Сменить статус карточки файла и пересобрать её тело (структурное изменение — не только прогресс). */
+    /** Change the file card's status and rebuild its body (a structural change — not just progress). */
     function setFileStatus(fileId, status, extra) {
       const prev = fileStates.get(fileId) || { progress: 0 };
       const next = Object.assign({}, prev, { status }, extra || {});
@@ -1588,12 +1588,12 @@ const ChatPanel = (() => {
       if (!msg) return;
       const safeMsgId = escapeForSelector(msg.id);
       const item = messagesEl.querySelector(`.chat-message[data-msg-id="${safeMsgId}"]`);
-      if (!item) return; // сейчас не отрисована (например, ушла из HISTORY_CAP) — не страшно
+      if (!item) return; // not currently rendered (e.g. evicted from HISTORY_CAP) — not a problem
       const card = item.querySelector('.chat-file-card');
       if (card) renderFileCardBody(card, msg, msg.from === peerId);
     }
 
-    /** Перерисовать всю ленту из `messages` (буфер маленький — до 50, полная перерисовка дешевле инкрементальной вставки в середину). Реакции — не самостоятельные пузыри в ленте, только текстовые сообщения и карточки файлов. */
+    /** Redraw the whole feed from `messages` (the buffer is small — up to 50, a full redraw is cheaper than incremental insertion in the middle). Reactions aren't standalone bubbles in the feed, only text messages and file cards are. */
     function renderAll(forceScrollBottom) {
       const wasNearBottom = isNearBottom();
       messagesEl.textContent = '';
@@ -1604,7 +1604,7 @@ const ChatPanel = (() => {
       if (forceScrollBottom || wasNearBottom) scrollToBottom();
     }
 
-    /** Вставить конверт (text или reaction) с дедупом по id и сортировкой по (lamport, from); капает буфер до HISTORY_CAP. Возвращает true, если реально вставлено (не дубликат). */
+    /** Insert an envelope (text or reaction) with dedup by id and sorting by (lamport, from); caps the buffer at HISTORY_CAP. Returns true if actually inserted (not a duplicate). */
     function insertMessage(msg) {
       if (seenIds.has(msg.id)) return false;
       seenIds.add(msg.id);
@@ -1640,30 +1640,30 @@ const ChatPanel = (() => {
     }
 
     /**
-     * VisualViewport-подгонка полноэкранной мобильной панели чата (жалоба
-     * владельца: системная клавиатура перекрывала часть чата и добавляла
-     * лишний скролл страницы вместо того, чтобы чат ужался в видимую
-     * область, см. style.css: @media (max-width:640px) .chat-panel, 100dvh).
-     * 100dvh реагирует на смену адресной строки/ориентации, но НЕ на
-     * появление клавиатуры на iOS — основной путь здесь поэтому
-     * VisualViewport API: пока чат открыт на мобильном layout, высота панели
-     * = visualViewport.height, верх панели = visualViewport.offsetTop (сдвиг
-     * видимой области относительно layout-вьюпорта) — так инпут (прижатый к
-     * низу панели) остаётся НАД клавиатурой, а не уезжает под неё. Список
-     * сообщений сам ужимается (flex:1 на .chat-messages) — здесь только
-     * подскролливаем его к низу, чтобы последнее сообщение оставалось
-     * видимым после сжатия видимой области.
+     * VisualViewport-based sizing of the fullscreen mobile chat panel (reported
+     * issue: the system keyboard covered part of the chat and added an
+     * extra page scroll instead of the chat shrinking to fit the visible
+     * area, see style.css: @media (max-width:640px) .chat-panel, 100dvh).
+     * 100dvh reacts to address-bar/orientation changes, but NOT to the
+     * keyboard appearing on iOS — the primary approach here is therefore
+     * the VisualViewport API: while the chat is open in mobile layout, the panel's height
+     * = visualViewport.height, the panel's top = visualViewport.offsetTop (the offset
+     * of the visible area relative to the layout viewport) — this keeps the input (anchored to
+     * the bottom of the panel) ABOVE the keyboard, instead of sliding under it. The message
+     * list shrinks on its own (flex:1 on .chat-messages) — here we just
+     * scroll it to the bottom so the last message stays
+     * visible after the visible area shrinks.
      *
-     * Фоллбэк (нет window.visualViewport — старые браузеры): сбрасываем
-     * инлайн-стили в пустую строку, дальше работает только CSS (100dvh) — не
-     * хуже поведения до этой волны.
+     * Fallback (no window.visualViewport — older browsers): reset the
+     * inline styles to an empty string, from then on only CSS (100dvh) applies — no
+     * worse than the behavior before this wave.
      *
-     * .chat-mobile-scroll-lock на body (см. style.css) — пока чат открыт на
-     * мобильном, страница НЕ скроллится ни при каких обстоятельствах: панель
-     * и так перекрывает весь вьюпорт (position:fixed; inset:0), но фокус
-     * textarea рядом с открывающейся клавиатурой на части браузеров
-     * провоцирует попытку "проскроллить поле в видимую область" на уровне
-     * документа — лок гарантированно её глушит.
+     * .chat-mobile-scroll-lock on body (see style.css) — while the chat is open on
+     * mobile, the page does NOT scroll under any circumstances: the panel
+     * already covers the whole viewport (position:fixed; inset:0), but focusing the
+     * textarea next to the opening keyboard triggers, in some browsers,
+     * an attempt to "scroll the field into view" at the document
+     * level — the lock reliably suppresses it.
      */
     function syncMobileChatViewport() {
       const isOpen = !panel.classList.contains('hidden');
@@ -1680,14 +1680,14 @@ const ChatPanel = (() => {
       scrollToBottom();
     }
 
-    // Слушатели VisualViewport ставятся РОВНО ОДИН РАЗ (createController —
-    // синглтон на страницу, см. заголовок файла) — 'resize' срабатывает и на
-    // появление/исчезновение клавиатуры, и на pinch-zoom; 'scroll' — когда
-    // видимая область сдвигается относительно layout-вьюпорта (например,
-    // браузер докручивает фокусированное поле в видимую часть). window
-    // 'resize'/'orientationchange' — фоллбэк-путь и смена ориентации:
-    // window.visualViewport в части браузеров тоже эмитит на это resize, но
-    // не везде гарантированно, поэтому подписываемся отдельно ещё и на них.
+    // VisualViewport listeners are set up EXACTLY ONCE (createController is
+    // a per-page singleton, see the file header) — 'resize' fires both on
+    // the keyboard showing/hiding and on pinch-zoom; 'scroll' fires when
+    // the visible area shifts relative to the layout viewport (e.g. the
+    // browser scrolls the focused field into the visible part). window
+    // 'resize'/'orientationchange' — a fallback path and orientation changes:
+    // in some browsers window.visualViewport also emits resize for this, but
+    // it's not guaranteed everywhere, so we subscribe to these separately as well.
     if (window.visualViewport) {
       window.visualViewport.addEventListener('resize', syncMobileChatViewport);
       window.visualViewport.addEventListener('scroll', syncMobileChatViewport);
@@ -1695,9 +1695,9 @@ const ChatPanel = (() => {
     window.addEventListener('resize', () => {
       syncMobileChatViewport();
       updateFormatToolbarVisibility();
-      // Ресайз десктоп<->мобайл (поворот/DevTools) — переположить открытый
-      // попап под новый layout (мобильный bottom-sheet <-> десктопный
-      // поповер у сообщения).
+      // Desktop<->mobile resize (rotation/DevTools) — reposition an open
+      // popup to fit the new layout (mobile bottom-sheet <-> desktop
+      // popover near the message).
       if (activePopoverMsgId && !messagePopover.classList.contains('hidden')) {
         const el = messagesEl.querySelector(`.chat-message[data-msg-id="${escapeForSelector(activePopoverMsgId)}"]`);
         positionMessagePopoverDesktop(el || panel);
@@ -1712,12 +1712,12 @@ const ChatPanel = (() => {
       if (!collapsed) {
         unreadCount = 0;
         updateUnreadBadge();
-        // Панель (и textarea внутри неё) до этого момента могла быть
-        // display:none (см. .chat-panel.hidden) — scrollHeight скрытого
-        // элемента всегда 0, поэтому autoGrowTextInput(), вызванный РАНЬШЕ
-        // (например, из clearMessages() при attach, панель тогда ещё
-        // закрыта), мог посчитать и проставить неверную (нулевую) высоту.
-        // Пересчитываем заново теперь, когда панель точно видима.
+        // Up to this point the panel (and the textarea inside it) could have been
+        // display:none (see .chat-panel.hidden) — scrollHeight of a hidden
+        // element is always 0, so autoGrowTextInput(), called EARLIER
+        // (e.g. from clearMessages() during attach, when the panel was still
+        // closed), could have computed and set the wrong (zero) height.
+        // Recompute now that the panel is definitely visible.
         autoGrowTextInput();
         scrollToBottom();
         textInput.focus();
@@ -1743,9 +1743,9 @@ const ChatPanel = (() => {
       }, 4000);
     }
 
-    // --- Реплаи: компактная плашка над инпутом ---
+    // --- Replies: compact bar above the input ---
     function startReply(msg) {
-      cancelEditAndClear(); // реплай и редактирование взаимоисключаются (см. заголовок файла)
+      cancelEditAndClear(); // reply and editing are mutually exclusive (see the file header)
       replyTarget = msg;
       replyBarText.textContent = `Reply to ${displayName(msg)}: ${truncateText(stripMarkdownForPreview(replyPreviewBodyText(msg)), REPLY_PREVIEW_MAX_LEN)}`;
       replyBar.classList.remove('hidden');
@@ -1760,8 +1760,8 @@ const ChatPanel = (() => {
 
     replyBarClose.addEventListener('click', cancelReply);
 
-    // --- Редактирование своего сообщения: плашка над инпутом, по образцу
-    // реплай-плашки выше, взаимоисключается с ней (см. заголовок файла). ---
+    // --- Editing your own message: a bar above the input, modeled after
+    // the reply bar above, mutually exclusive with it (see the file header). ---
     function startEdit(msg) {
       cancelReply();
       editTarget = msg;
@@ -1773,7 +1773,7 @@ const ChatPanel = (() => {
       closeMessagePopover();
       textInput.focus();
       const len = textInput.value.length;
-      textInput.setSelectionRange(len, len); // курсор в конец — иначе браузер ставит его в начало при программной установке value
+      textInput.setSelectionRange(len, len); // cursor to the end — otherwise the browser puts it at the start when value is set programmatically
     }
 
     function cancelEdit() {
@@ -1781,7 +1781,7 @@ const ChatPanel = (() => {
       editBar.classList.add('hidden');
     }
 
-    /** Esc/крестик — отменяет редактирование И очищает textarea (в отличие от cancelReply, который поле ввода не трогает). */
+    /** Esc/close button — cancels editing AND clears the textarea (unlike cancelReply, which doesn't touch the input field). */
     function cancelEditAndClear() {
       const wasEditing = !!editTarget;
       cancelEdit();
@@ -1794,19 +1794,19 @@ const ChatPanel = (() => {
     editBarClose.addEventListener('click', cancelEditAndClear);
 
     /**
-     * Есть ли в пути распространения события элемент, подходящий под
-     * `selector` — то же самое, что `event.target.closest(selector)`, НО
-     * устойчиво к тому, что сам `event.target` мог быть отсоединён от DOM
-     * ДРУГИМ обработчиком ЭТОГО ЖЕ события до того, как оно добубнило сюда
-     * (обнаружено эмпирически: клик по кнопке удаления — buildDeleteButton
-     * на первом клике синхронно делает `btn.textContent = '✓?'`, заменяя
-     * дочерний SVG-элемент — если event.target был именно этим SVG
-     * (обычная ситуация: клик приходится на иконку внутри кнопки), то к
-     * моменту, когда bubbling добирается до messagesEl/document,
-     * `event.target.closest(...)` возвращает null — SVG уже отсоединён от
-     * родителя). `event.composedPath()` — снимок пути НА МОМЕНТ
-     * ДИСПЕТЧЕРИЗАЦИИ события, снятый ДО того, как какой-либо обработчик
-     * успел что-либо изменить в DOM, поэтому не подвержен этой проблеме.
+     * Whether the event's propagation path contains an element matching
+     * `selector` — the same as `event.target.closest(selector)`, BUT
+     * robust to the fact that `event.target` itself may have been detached from the DOM
+     * by ANOTHER handler of THIS SAME event before it bubbled up to here
+     * (found empirically: clicking the delete button — buildDeleteButton
+     * synchronously does `btn.textContent = '✓?'` on the first click, replacing
+     * the child SVG element — if event.target was exactly that SVG
+     * (a common case: the click lands on the icon inside the button), then by the
+     * time bubbling reaches messagesEl/document,
+     * `event.target.closest(...)` returns null — the SVG is already detached from
+     * its parent). `event.composedPath()` is a snapshot of the path taken AT THE MOMENT
+     * OF DISPATCH, taken BEFORE any handler had a chance to change anything in the DOM,
+     * so it isn't affected by this problem.
      */
     function eventPathMatches(event, selector) {
       const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
@@ -1816,23 +1816,23 @@ const ChatPanel = (() => {
       return false;
     }
 
-    // --- Попап действий сообщения (волна 13) ---
+    // --- Message action popup (wave 13) ---
     //
-    // Заменяет ЦЕЛИКОМ и on-tap action-row мобильного UX прошлой волны, и
-    // hover-кнопки десктопа: единственный способ добраться до действий
-    // сообщения (ответить/реакция/редактировать/удалить/копировать) теперь —
-    // тап/клик по самому сообщению, ОДИНАКОВО на мобильном и десктопе (см.
-    // messagesEl click-делегирование ниже). В строке сообщения по умолчанию
-    // не остаётся вообще никаких кнопок — ни постоянных, ни по hover (жалоба
-    // владельца из прошлой волны была именно на визуальный шум действий,
-    // эта волна убирает его целиком, а не просто прячет за тапом).
+    // Entirely replaces both the on-tap action row of the previous wave's mobile UX and
+    // desktop's hover buttons: the only way to reach a message's actions
+    // (reply/react/edit/delete/copy) now is a
+    // tap/click on the message itself, IDENTICALLY on mobile and desktop (see
+    // the messagesEl click delegation below). By default the message row keeps
+    // no buttons at all — neither persistent ones nor hover ones (the reported
+    // issue from the previous wave was specifically about the visual noise of actions;
+    // this wave removes it entirely, rather than just hiding it behind a tap).
 
-    /** Найти ЛЮБОЕ сообщение (text или file-offer) по id — то же самое, что findEditableOriginalById, отдельное имя для читаемости в контексте попапа. */
+    /** Find ANY message (text or file-offer) by id — the same as findEditableOriginalById, a separate name for readability in the popup context. */
     function findAnyMessageById(id) {
       return findEditableOriginalById(id);
     }
 
-    /** Построить разбор реакций «кто/чем/когда» — список по эмодзи (в порядке REACTION_EMOJIS), внутри каждой группы — по времени реакции. */
+    /** Build the "who/which/when" reaction breakdown — a list grouped by emoji (in REACTION_EMOJIS order), within each group ordered by reaction time. */
     function buildPopoverReactionsList(msgId) {
       popoverReactionsListEl.textContent = '';
       const byEmoji = reactions.get(msgId);
@@ -1869,7 +1869,7 @@ const ChatPanel = (() => {
       popoverReactionsEl.classList.toggle('hidden', !any);
     }
 
-    /** Скопировать ТЕКУЩИЙ (с учётом правки) текст сообщения в буфер обмена — действие «Копировать» в попапе. */
+    /** Copy the CURRENT (edit-aware) message text to the clipboard — the "Copy" action in the popup. */
     function buildCopyButton(msg, overlay) {
       const { btn, labelEl } = buildPopoverActionRow(COPY_ICON_SVG, 'Copy text');
       btn.className = 'chat-message-action chat-message-action--copy';
@@ -1895,7 +1895,7 @@ const ChatPanel = (() => {
       return btn;
     }
 
-    /** Заполнить `.chat-message-popover-actions` действиями, подходящими под конкретное сообщение (own/kind/deleted). */
+    /** Fill `.chat-message-popover-actions` with actions appropriate for the specific message (own/kind/deleted). */
     function populatePopoverActions(msg, overlay) {
       popoverActionsEl.textContent = '';
       const own = msg.from === peerId;
@@ -1914,24 +1914,24 @@ const ChatPanel = (() => {
     }
 
     /**
-     * Позиционирование ТОЛЬКО для десктопа (>640px) — компактный поповер у
-     * сообщения. `.chat-message-popover` задуман как position:fixed;inset:0
-     * (см. style.css) — ПОЧТИ всегда containing block для абсолютно
-     * позиционированной `.chat-message-popover-card` оказывается вьюпортом
-     * целиком, НО не гарантированно: `.chat-panel--room` использует
-     * `backdrop-filter` (см. style.css), а filter/backdrop-filter на
-     * ПРЕДКЕ по спеке сами создают containing block для fixed-потомков —
-     * тогда `.chat-message-popover` фактически оказывается зажат в рамки
-     * `.chat-panel`, а не вьюпорта (обнаружено эмпирически при визуальной
-     * самопроверке: попап рендерился на сотни пикселей правее, чем ожидалось
-     * — карточка позиционировалась от границ ПАНЕЛИ, а расчёт координат
-     * предполагал границы ВЬЮПОРТА). Чтобы не зависеть от того, какой именно
-     * containing block достался в конкретном браузере/раскладке, координаты
-     * считаются относительно РЕАЛЬНОГО bounding rect самого
-     * `.chat-message-popover` (messagePopover.getBoundingClientRect()) — она
-     * и есть фактический containing block для absolute-карточки, кем бы он
-     * ни оказался. На мобильном (bottom-sheet) позицию целиком берёт на себя
-     * CSS — здесь инлайн-стили сбрасываются, чтобы не конфликтовать.
+     * Positioning ONLY for desktop (>640px) — a compact popover near the
+     * message. `.chat-message-popover` is designed as position:fixed;inset:0
+     * (see style.css) — the containing block for the absolutely
+     * positioned `.chat-message-popover-card` is ALMOST always the entire
+     * viewport, BUT not guaranteed: `.chat-panel--room` uses
+     * `backdrop-filter` (see style.css), and per spec filter/backdrop-filter on an
+     * ANCESTOR themselves create a containing block for fixed descendants —
+     * in that case `.chat-message-popover` ends up effectively confined to the bounds
+     * of `.chat-panel`, not the viewport (found empirically during a visual
+     * self-check: the popup rendered hundreds of pixels further right than expected
+     * — the card was positioned relative to the PANEL's edges, while the coordinate
+     * math assumed the VIEWPORT's edges). To avoid depending on which
+     * containing block ends up applying in a given browser/layout, coordinates
+     * are computed relative to the ACTUAL bounding rect of
+     * `.chat-message-popover` itself (messagePopover.getBoundingClientRect()) — it
+     * is the actual containing block for the absolutely positioned card, whatever it
+     * turns out to be. On mobile (bottom-sheet) positioning is handled entirely by
+     * CSS — inline styles are reset here to avoid conflicting with it.
      */
     function positionMessagePopoverDesktop(anchorEl) {
       if (isMobileLayout()) {
@@ -1961,7 +1961,7 @@ const ChatPanel = (() => {
       const msg = findAnyMessageById(msgId);
       if (!msg) return;
       const overlay = messageOverlays.get(msgId);
-      if (overlay && overlay.deleted) return; // тумбстоуну действия не положены
+      if (overlay && overlay.deleted) return; // a tombstone has no actions
 
       const prevId = activePopoverMsgId;
       activePopoverMsgId = msgId;
@@ -1999,9 +1999,9 @@ const ChatPanel = (() => {
       openMessagePopover(msgId, anchorEl);
     }
 
-    // Эмодзи-палитра внутри попапа — тап/клик по эмодзи ставит/снимает
-    // реакцию (toggle, см. sendReactionToggle) и закрывает весь попап
-    // (Telegram: выбор реакции — финальное действие, не промежуточный шаг).
+    // The emoji palette inside the popup — a tap/click on an emoji sets/removes
+    // the reaction (toggle, see sendReactionToggle) and closes the whole popup
+    // (Telegram-style: choosing a reaction is a final action, not an intermediate step).
     popoverEmojisEl.querySelectorAll('.chat-message-popover-emoji').forEach((btn) => {
       btn.addEventListener('click', () => {
         const emoji = btn.dataset.emoji;
@@ -2025,14 +2025,14 @@ const ChatPanel = (() => {
       }
     });
 
-    // Клик по телу сообщения открывает попап действий (повторный клик по
-    // уже открытому — закрывает, см. toggleMessagePopover). Клики по
-    // элементам с собственной клик-логикой (чип реакции, цитата реплая,
-    // ссылка, спойлер, кнопка/медиа-контрол внутри карточки файла) НЕ
-    // открывают попап дополнительно — тот же приём, что и в прошлой волне
-    // (см. eventPathMatches выше). Тумбстоуны (удалённые сообщения) действий
-    // не имеют — openMessagePopover сама не откроется (см. проверку overlay
-    // внутри), но и клик-делегирование их не запускает тоже, для ясности.
+    // A click on the message body opens the action popup (clicking again on an
+    // already-open one — closes it, see toggleMessagePopover). Clicks on
+    // elements with their own click logic (reaction chip, reply quote,
+    // link, spoiler, button/media control inside a file card) do NOT
+    // additionally open the popup — the same technique as in the previous wave
+    // (see eventPathMatches above). Tombstones (deleted messages) have no
+    // actions — openMessagePopover won't open on its own (see the overlay check
+    // inside it), but click delegation doesn't trigger for them either, for clarity.
     messagesEl.addEventListener('click', (event) => {
       if (
         eventPathMatches(
@@ -2048,18 +2048,18 @@ const ChatPanel = (() => {
       toggleMessagePopover(item.dataset.msgId, item);
     });
 
-    // Клик МИМО любого сообщения и мимо самого попапа закрывает попап (тап
-    // по шапке чата, пустому месту ленты, инпуту и т.п.). Клики ВНУТРИ
-    // сообщения обрабатывает messagesEl-делегирование выше (toggle) — сюда
-    // они тоже долетают по всплытию, но исключены явной проверкой ниже,
-    // иначе этот обработчик немедленно закрывал бы только что открытый попап.
+    // A click OUTSIDE any message and outside the popup itself closes the popup (a tap
+    // on the chat header, an empty spot in the feed, the input, etc.). Clicks INSIDE
+    // a message are handled by the messagesEl delegation above (toggle) — they
+    // also reach here via bubbling, but are excluded by the explicit check below,
+    // otherwise this handler would immediately close a popup that was just opened.
     document.addEventListener('click', (event) => {
       if (messagePopover.classList.contains('hidden')) return;
       if (eventPathMatches(event, '.chat-message-popover') || eventPathMatches(event, '.chat-message')) return;
       closeMessagePopover();
     });
 
-    // --- Rate-limit (клиентский, мягкий) — только для текстовых сообщений ---
+    // --- Rate limit (client-side, soft) — only for text messages ---
     function checkClientRateLimit() {
       const now = Date.now();
       while (sendTimes.length && now - sendTimes[0] > RATE_LIMIT_WINDOW_MS) sendTimes.shift();
@@ -2068,7 +2068,7 @@ const ChatPanel = (() => {
       return true;
     }
 
-    // --- Транспорт: broadcast конверта всем пирам (шина, где открыта; сервер-фоллбэк — где нет) ---
+    // --- Transport: broadcast the envelope to all peers (bus where open; server fallback where not) ---
     function broadcastEnvelope(envelope) {
       for (const targetPeerId of getPeerIds()) {
         sendEnvelopeToPeer(targetPeerId, envelope);
@@ -2076,13 +2076,13 @@ const ChatPanel = (() => {
     }
 
     /**
-     * Отправить конверт ОДНОМУ конкретному пиру (адресно) — исключительно по
-     * P2P-шине (DataChannel уже E2E за счёт DTLS, см. static/rtc.js). Если шина
-     * к адресату ещё не открыта, конверт КОПИТСЯ ЛОКАЛЬНО (pendingBusSends) и
-     * уходит при её открытии (см. notifyBusOpen) — серверного fallback-релея
-     * чата больше нет (см. docs/chat.md: чат работает только при P2P/TURN,
-     * медиа без него всё равно не существует). Никакого прикладного шифрования
-     * поверх DTLS чат не требует.
+     * Send an envelope to ONE specific peer (addressed) — exclusively over the
+     * P2P bus (the DataChannel is already E2E thanks to DTLS, see static/rtc.js). If the bus
+     * to the recipient isn't open yet, the envelope is QUEUED LOCALLY (pendingBusSends) and
+     * goes out once it opens (see notifyBusOpen) — there is no longer a server-side fallback
+     * relay for chat (see docs/chat.md: chat only works with P2P/TURN,
+     * media doesn't exist without it either way). Chat requires no application-level
+     * encryption on top of DTLS.
      */
     function sendEnvelopeToPeer(targetPeerId, envelope) {
       if (bus.isOpen(targetPeerId)) {
@@ -2092,7 +2092,7 @@ const ChatPanel = (() => {
       pendingBusSends.push({ targetPeerId, envelope });
     }
 
-    /** Слить локальную очередь исходящего, накопленную, пока шина к адресатам не открылась (см. sendEnvelopeToPeer) — вызывается из room.js (onBusOpen) через publicApi.notifyBusOpen, когда шина к кому-то открылась. Пробуем всё; что ещё не открылось — снова уходит в очередь. */
+    /** Flush the local outgoing queue accumulated while the bus to recipients wasn't open (see sendEnvelopeToPeer) — called from room.js (onBusOpen) via publicApi.notifyBusOpen, when the bus to someone has opened. We try everything; whatever still isn't open goes back into the queue. */
     function notifyBusOpen() {
       if (pendingBusSends.length === 0) return;
       const queued = pendingBusSends;
@@ -2103,19 +2103,19 @@ const ChatPanel = (() => {
     }
 
     /**
-     * Права гостей на стороне ПОЛУЧАТЕЛЯ (см. docs/permissions-and-leader.md,
-     * «Chat — Cooperative Only», и заголовок файла): при
-     * `guestChat=false` входящие 'text'/'file-offer' от
-     * кого угодно, кроме текущего лидера, молча игнорируются (единая точка
-     * входа — dispatchEnvelope).
-     * Остальные kind (reaction/edit/delete/history-*) этим ограничением не
-     * затрагиваются: это лёгкие производные операции над уже показанными
-     * сообщениями, не самостоятельный текст.
+     * Guest permissions on the RECEIVER side (see docs/permissions-and-leader.md,
+     * "Chat — Cooperative Only", and the file header): when
+     * `guestChat=false`, incoming 'text'/'file-offer' from
+     * anyone other than the current leader is silently ignored (a single entry
+     * point — dispatchEnvelope).
+     * Other kinds (reaction/edit/delete/history-*) are not affected by this
+     * restriction: they're lightweight derived operations on already-shown
+     * messages, not standalone text.
      *
-     * Кооперативная защита: модифицированный клиент получателя может этот
-     * фильтр не применять и отрендерить конверт всё равно — сервер P2P-байты
-     * не видит и запретить их доставку физически не может (см.
-     * docs/permissions-and-leader.md, «Chat — Cooperative Only»).
+     * Cooperative safeguard: a modified receiver client can skip this
+     * filter and render the envelope anyway — the server doesn't see the P2P bytes
+     * and physically cannot prevent their delivery (see
+     * docs/permissions-and-leader.md, "Chat — Cooperative Only").
      */
     function isIncomingEnvelopeAllowed(fromPeerId, envelope) {
       if (envelope.kind !== 'text' && envelope.kind !== 'file-offer') return true;
@@ -2123,20 +2123,20 @@ const ChatPanel = (() => {
       return fromPeerId === getLeaderId();
     }
 
-    // H3: kind, несущие самозаявленное авторство (envelope.from) — см.
-    // разбор в заголовке файла. file-request сюда намеренно НЕ входит: его
-    // обработчик (handleFileRequest) и так использует транспортный
-    // fromPeerId, а не envelope.from, для решения, кому открывать файловый
-    // канал — подмена envelope.from там ничего не даёт злоумышленнику.
+    // H3: kinds that carry self-asserted authorship (envelope.from) — see
+    // the discussion in the file header. file-request is deliberately NOT
+    // included here: its handler (handleFileRequest) already uses the transport-level
+    // fromPeerId, not envelope.from, to decide who to open the file
+    // channel for — forging envelope.from there gains an attacker nothing.
     const SELF_ASSERTED_FROM_KINDS = new Set(['text', 'reaction', 'edit', 'delete', 'file-offer']);
 
-    // --- Приём: единая точка для сообщений с шины ---
+    // --- Receiving: a single entry point for messages from the bus ---
     function dispatchEnvelope(fromPeerId, envelope) {
       if (!envelope || typeof envelope !== 'object' || typeof envelope.kind !== 'string') return;
-      // H3: нельзя доверять самозаявленному envelope.from — транспорт знает
-      // истину (см. заголовок файла). Перезаписываем ДО isIncomingEnvelopeAllowed
-      // и до switch ниже, чтобы ни рендер, ни проверка авторства edit/delete,
-      // ни "own"-классификация сообщения не могли увидеть подделанное значение.
+      // H3: the self-asserted envelope.from cannot be trusted — the transport knows
+      // the truth (see the file header). We overwrite it BEFORE isIncomingEnvelopeAllowed
+      // and before the switch below, so that neither rendering, nor the edit/delete
+      // authorship check, nor the message's "own" classification can ever see the forged value.
       if (SELF_ASSERTED_FROM_KINDS.has(envelope.kind) && typeof fromPeerId === 'string') {
         envelope.from = fromPeerId;
       }
@@ -2165,7 +2165,7 @@ const ChatPanel = (() => {
           handleHistoryResponse(fromPeerId, envelope);
           break;
         default:
-          // Неизвестный kind (будущие волны — файлы и т.п.) — молча игнорируем.
+          // Unknown kind (future waves — files, etc.) — ignore silently.
           break;
       }
     }
@@ -2193,7 +2193,7 @@ const ChatPanel = (() => {
       renderAll(false);
     }
 
-    /** kind='edit'|'delete' — авторство проверяется внутри recomputeMessageMeta (см. её заголовок и заголовок файла); чужой from на конверте молча не применится. */
+    /** kind='edit'|'delete' — authorship is checked inside recomputeMessageMeta (see its header and the file header); an envelope with someone else's from is silently not applied. */
     function handleIncomingEditOrDelete(envelope) {
       bumpLamportOnReceive(envelope.lamport);
       const inserted = insertMessage(envelope);
@@ -2202,7 +2202,7 @@ const ChatPanel = (() => {
       renderAll(false);
     }
 
-    // --- Передача файлов (Ф3) ---
+    // --- File transfer (Wave 3) ---
 
     function handleIncomingFileOffer(envelope) {
       bumpLamportOnReceive(envelope.lamport);
@@ -2216,14 +2216,14 @@ const ChatPanel = (() => {
     }
 
     /**
-     * Получатель жмёт «Скачать» — шлём адресный file-request отправителю и
-     * ждём, что он откроет файловый DataChannel. Никакого автоскачивания нет
-     * ни для одного mime-типа (в т.ч. картинок) — до клика получателя
-     * карточка любого файла показывает только имя и размер (см.
-     * renderFileCardBody, статус 'offer'), байты не запрашиваются сами по
-     * себе ни у живого оффера, ни при реплее истории (mergeHistory просто
-     * вставляет сообщение в буфер, тут ничего не вызывается).
-     * Идемпотентно: повторный вызов, пока уже что-то происходит/готово, — no-op.
+     * The receiver clicks "Download" — we send an addressed file-request to the sender and
+     * wait for them to open a file DataChannel. There is no auto-download
+     * for any mime type (including images) — until the receiver clicks,
+     * any file's card shows only the name and size (see
+     * renderFileCardBody, status 'offer'); bytes are never requested on their
+     * own, neither for a live offer nor during a history replay (mergeHistory just
+     * inserts the message into the buffer, nothing is called here).
+     * Idempotent: a repeat call while something is already in progress/ready is a no-op.
      */
     function requestFileDownload(msg) {
       const fileId = msg.fileId;
@@ -2267,10 +2267,10 @@ const ChatPanel = (() => {
       }, FILE_REQUEST_TIMEOUT_MS);
     }
 
-    /** Отправитель получил адресный file-request — если файл ещё у нас, открываем файловый канал этому пиру. */
+    /** The sender received an addressed file-request — if we still hold the file, open a file channel to that peer. */
     function handleFileRequest(fromPeerId, envelope) {
       const file = fileSendMap.get(envelope.fileId);
-      if (!file) return; // не мы держим этот файл (или уже неактуально) — молча игнорируем
+      if (!file) return; // we're not holding this file (or it's no longer relevant) — ignore silently
       beginSendingFile(fromPeerId, file, envelope.fileId);
     }
 
@@ -2285,19 +2285,19 @@ const ChatPanel = (() => {
     }
 
     /**
-     * Дождаться, пока весь буфер отправки СЛИТ (bufferedAmount === 0), перед
-     * закрытием канала. Грабли (обнаружены эмпирически на файле ~300КБ):
-     * channel.close() сразу после серии send() НЕ гарантирует, что уже
-     * поставленные в очередь, но ещё физически не отправленные байты долетят
-     * до собеседника — при достаточно большом файле (когда синхронный цикл
-     * send() успевает поставить в очередь больше одного SCTP-пакета) закрытие
-     * обрывает "хвост" данных: получатель стабильно видит receivedBytes=0
-     * (закрытие канала успевает раньше самого первого сообщения). Небольшие
-     * файлы (умещаются в один пакет) внешне "работали" и без этого ожидания —
-     * что и маскировало баг. 'bufferedamountlow' — событие ФРОНТА (срабатывает
-     * на переход через порог), поэтому если bufferedAmount успел стать 0 ДО
-     * того, как мы подписались, событие уже не придёт — опрашиваем сам
-     * bufferedAmount явно, а не полагаемся только на событие.
+     * Wait until the entire send buffer has DRAINED (bufferedAmount === 0), before
+     * closing the channel. A pitfall (found empirically on a ~300KB file):
+     * channel.close() immediately after a series of send() calls does NOT guarantee that bytes
+     * already queued but not yet physically sent will reach
+     * the peer — for a large enough file (when the synchronous send() loop
+     * manages to queue more than one SCTP packet), closing
+     * cuts off the "tail" of the data: the receiver consistently sees receivedBytes=0
+     * (the channel closes before even the very first message arrives). Small
+     * files (fitting in a single packet) appeared to "work" even without this wait —
+     * which is what masked the bug. 'bufferedamountlow' is an EDGE-triggered event
+     * (fires on crossing the threshold), so if bufferedAmount already reached 0 BEFORE
+     * we subscribed, the event will never arrive — we poll
+     * bufferedAmount explicitly instead of relying solely on the event.
      */
     function waitForBufferedAmountZero(channel) {
       return new Promise((resolve) => {
@@ -2314,17 +2314,17 @@ const ChatPanel = (() => {
       });
     }
 
-    /** Отправитель: открыть файловый DataChannel конкретному запросившему пиру и прогнать файл чанками с backpressure. */
+    /** Sender: open a file DataChannel to the specific requesting peer and stream the file in chunks with backpressure. */
     function beginSendingFile(requesterPeerId, file, fileId) {
       const rtc = bus.getPeer(requesterPeerId);
-      if (!rtc) return; // пир уже ушёл между запросом и открытием канала
+      if (!rtc) return; // the peer already left between the request and the channel opening
 
       const label = `file-${fileId}-${requesterPeerId}`;
       let channel;
       try {
         channel = rtc.createFileChannel(label);
       } catch (err) {
-        console.error(`Не удалось открыть файловый DataChannel (${label}):`, err);
+        console.error(`Failed to open file DataChannel (${label}):`, err);
         return;
       }
       channel.binaryType = 'arraybuffer';
@@ -2333,7 +2333,7 @@ const ChatPanel = (() => {
       setFileStatus(fileId, 'sending', { progress: 0 });
 
       channel.onerror = (event) => {
-        console.error(`Ошибка файлового DataChannel (отдача, fileId=${fileId}):`, event);
+        console.error(`File DataChannel error (sending, fileId=${fileId}):`, event);
       };
 
       channel.onopen = async () => {
@@ -2360,25 +2360,25 @@ const ChatPanel = (() => {
           }
           setFileStatus(fileId, 'sent', { progress: 1 });
         } catch (err) {
-          console.error(`Ошибка отправки файла (fileId=${fileId}):`, err);
+          console.error(`Error sending file (fileId=${fileId}):`, err);
         } finally {
           try {
             await waitForBufferedAmountZero(channel);
             channel.close();
           } catch (err) {
-            // канал мог уже закрыться/сломаться — не страшно
+            // the channel may have already closed/broken — not a problem
           }
         }
       };
     }
 
     /**
-     * Получатель: пришёл входящий файловый DataChannel (см. onFileChannel в
-     * rtc.js, диспетчеризуется room.js -> publicApi.handleIncomingFileChannel).
-     * Матчим по ТОЧНОМУ совпадению label с тем, что сами же и ожидали
-     * (сконструирован в requestFileDownload) — парсить fileId/peerId из
-     * строки label не нужно (оба id — uuid с дефисами, наивный split был бы
-     * неоднозначным).
+     * Receiver: an incoming file DataChannel has arrived (see onFileChannel in
+     * rtc.js, dispatched by room.js -> publicApi.handleIncomingFileChannel).
+     * We match by an EXACT label match against what we ourselves expected
+     * (constructed in requestFileDownload) — no need to parse fileId/peerId out of
+     * the label string (both ids are uuids with dashes, a naive split would be
+     * ambiguous).
      */
     function handleIncomingFileChannel(fromPeerId, channel) {
       for (const [fileId, req] of pendingFileRequests) {
@@ -2388,7 +2388,7 @@ const ChatPanel = (() => {
           return;
         }
       }
-      console.warn('Получен файловый DataChannel без ожидающего запроса, label=', channel.label);
+      console.warn('Received a file DataChannel with no matching pending request, label=', channel.label);
     }
 
     function beginReceivingFile(fileId, channel, req) {
@@ -2404,7 +2404,7 @@ const ChatPanel = (() => {
           try {
             meta = JSON.parse(event.data);
           } catch (err) {
-            console.error(`Некорректная JSON-мета файлового канала (fileId=${fileId}):`, event.data, err);
+            console.error(`Invalid JSON metadata on file channel (fileId=${fileId}):`, event.data, err);
           }
           return;
         }
@@ -2416,14 +2416,14 @@ const ChatPanel = (() => {
       };
 
       channel.onerror = (event) => {
-        console.error(`Ошибка файлового DataChannel (приём, fileId=${fileId}):`, event);
+        console.error(`File DataChannel error (receiving, fileId=${fileId}):`, event);
       };
 
       channel.onclose = () => {
         const total = typeof (meta && meta.size) === 'number' ? meta.size : req.size;
         if (typeof total === 'number' && receivedBytes < total) {
-          // Канал закрылся раньше, чем пришли все байты — почти всегда потому,
-          // что отправитель вышел из комнаты посреди передачи.
+          // The channel closed before all the bytes arrived — almost always because
+          // the sender left the room mid-transfer.
           setFileStatus(fileId, 'unavailable');
           return;
         }
@@ -2433,7 +2433,7 @@ const ChatPanel = (() => {
       };
     }
 
-    /** Выбор файлов (скрепка/drag&drop/paste) — проверка лимита размера, оптимистичная своя карточка, broadcast оффера. */
+    /** File selection (paperclip/drag&drop/paste) — size limit check, an optimistic own card, broadcasting the offer. */
     function handleFilesSelected(fileList) {
       if (!signaling || !bus) return;
       const files = Array.from(fileList || []);
@@ -2445,17 +2445,17 @@ const ChatPanel = (() => {
 
         const fileId = genId();
         fileSendMap.set(fileId, file);
-        // Своя карточка не должна ждать никакого P2P-обмена, чтобы показать
-        // превью/Download — File уже лежит у нас целиком (fileSendMap выше),
-        // поэтому создаём objectUrl из него локально и сразу переводим
-        // fileStates в 'done', тем же полем, что и у получателя после
-        // beginReceivingFile.onclose (см. renderFileDoneBody). Само сообщение
-        // ещё не вставлено в messages/DOM (insertMessage/renderAll — ниже),
-        // поэтому setFileStatus здесь просто прогревает fileStates: её
-        // собственная попытка перерисовать карточку молча no-op'ается
-        // (findFileOfferByFileId ничего не найдёт), а актуальный вид
-        // подхватится чуть ниже первым же renderAll(true) — см.
-        // renderFileCardBody (проверка по state.objectUrl, а не status).
+        // Our own card shouldn't have to wait for any P2P exchange to show a
+        // preview/Download — the File is already fully in our possession (fileSendMap above),
+        // so we create an objectUrl from it locally and immediately switch
+        // fileStates to 'done', using the same field as the receiver does after
+        // beginReceivingFile.onclose (see renderFileDoneBody). The message itself
+        // hasn't been inserted into messages/DOM yet (insertMessage/renderAll — below),
+        // so setFileStatus here just warms up fileStates: its
+        // own attempt to redraw the card silently no-ops
+        // (findFileOfferByFileId won't find anything), and the up-to-date look
+        // will be picked up shortly by the very first renderAll(true) — see
+        // renderFileCardBody (which checks state.objectUrl, not status).
         setFileStatus(fileId, 'done', { objectUrl: URL.createObjectURL(file), blobSize: file.size, progress: 1 });
 
         lamportClock += 1;
@@ -2493,7 +2493,7 @@ const ChatPanel = (() => {
 
     function handleHistoryResponse(fromPeerId, envelope) {
       const waiter = historyResponseWaiters.get(fromPeerId);
-      if (!waiter) return; // не ждали ответа от этого пира (или уже дождались) — игнорируем
+      if (!waiter) return; // we weren't waiting for a response from this peer (or already got one) — ignore
       waiter(Array.isArray(envelope.messages) ? envelope.messages : []);
     }
 
@@ -2514,7 +2514,7 @@ const ChatPanel = (() => {
       }
     }
 
-    // --- Запрос истории у соседей при входе в комнату ---
+    // --- Requesting history from neighbors when joining the room ---
     function waitForBusOpen(targetPeerId, timeoutMs) {
       return new Promise((resolve) => {
         if (bus.isOpen(targetPeerId)) {
@@ -2573,8 +2573,8 @@ const ChatPanel = (() => {
           return;
         }
       }
-      // Все кандидаты исчерпаны (никто не ответил вовремя) — история
-      // остаётся пустой у новичка, как и было бы в пустой комнате.
+      // All candidates exhausted (nobody responded in time) — the
+      // newcomer's history stays empty, as it would in an empty room.
     }
 
     function sendCurrentText() {
@@ -2587,8 +2587,8 @@ const ChatPanel = (() => {
         return;
       }
 
-      // Плашка редактирования открыта — эта отправка правит существующее
-      // сообщение (kind='edit'), а не создаёт новое (см. startEdit).
+      // The editing bar is open — this send edits an existing
+      // message (kind='edit') instead of creating a new one (see startEdit).
       if (editTarget) {
         sendEditMessage(text);
         return;
@@ -2610,15 +2610,15 @@ const ChatPanel = (() => {
       autoGrowTextInput();
       cancelReply();
 
-      // Своё сообщение — сразу и локально, оптимистично (эха от сервера
-      // больше нет: путь целиком P2P).
+      // Our own message — immediately and locally, optimistically (there's no
+      // echo from the server anymore: the path is entirely P2P).
       insertMessage(envelope);
       renderAll(true);
 
       broadcastEnvelope(envelope);
     }
 
-    /** Rate-limit уже проверен в sendCurrentText — единый счётчик на текст и правки. */
+    /** The rate limit was already checked in sendCurrentText — a single counter shared by text and edits. */
     function sendEditMessage(text) {
       const targetId = editTarget.id;
       lamportClock += 1;
@@ -2645,10 +2645,10 @@ const ChatPanel = (() => {
     }
 
     /**
-     * Вызывается из buildDeleteButton по второму (подтверждающему) клику.
-     * Не через клиентский rate-limit (см. заголовок файла: reaction-подобное
-     * лёгкое действие с собственным 3-секундным подтверждением через UI, а не
-     * полноценная отправка текста).
+     * Called from buildDeleteButton on the second (confirming) click.
+     * Not subject to the client-side rate limit (see the file header: a reaction-like
+     * lightweight action with its own 3-second UI confirmation, rather than a
+     * full-fledged text send).
      */
     function sendDeleteMessage(targetId) {
       lamportClock += 1;
@@ -2663,7 +2663,7 @@ const ChatPanel = (() => {
         ts: Date.now(),
       };
 
-      // Удаляем то, что прямо сейчас редактируем — закрываем плашку и чистим ввод.
+      // Deleting whatever we're currently editing — close the bar and clear the input.
       if (editTarget && editTarget.id === targetId) cancelEditAndClear();
 
       if (insertMessage(envelope)) {
@@ -2707,12 +2707,12 @@ const ChatPanel = (() => {
     collapseButton.addEventListener('click', () => setCollapsed(true));
 
     sendButton.addEventListener('click', sendCurrentText);
-    // Требование владельца («Telegram-подобно»): Enter — ВСЕГДА перенос
-    // строки, и на мобильном, и на десктопе — отправка только кнопкой
-    // (самолётик). Cmd/Ctrl+Enter — десктопное удобство для отправки, не
-    // заменяет одиночный Enter. Одиночный Enter здесь намеренно НЕ
-    // перехватывается (без event.preventDefault()) — обычный перенос строки
-    // остаётся полностью браузерным поведением textarea.
+    // Owner requirement ("Telegram-like"): Enter is ALWAYS a line
+    // break, both on mobile and desktop — sending only happens via the button
+    // (paper plane). Cmd/Ctrl+Enter is a desktop convenience for sending, it doesn't
+    // replace plain Enter. Plain Enter is deliberately NOT
+    // intercepted here (no event.preventDefault()) — a regular line break
+    // remains entirely native textarea browser behavior.
     textInput.addEventListener('keydown', (event) => {
       if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
         event.preventDefault();
@@ -2723,29 +2723,29 @@ const ChatPanel = (() => {
     });
 
     /**
-     * Автоувеличение textarea по числу строк (волна 13, «как в Telegram») —
-     * растёт до MAX_INPUT_LINES, дальше — внутренний скролл самой textarea
-     * (overflow-y:auto), панель ввода при этом не уезжает (растёт только
-     * сама textarea, кнопки прижаты снизу через align-items:flex-end на
-     * .chat-input-row, см. style.css). Пересчитывается на каждое input-
-     * событие и везде, где value меняется программно (edit/отправка/отмена
-     * редактирования/форматирующие горячие клавиши) — см. вызовы ниже.
-     * Высота считается через временный сброс в 'auto' (чтобы scrollHeight
-     * отражал РЕАЛЬНОЕ содержимое, а не текущую растянутую высоту) — border
-     * учитывается отдельно (scrollHeight не включает border, а
-     * box-sizing:border-box у .chat-text-input предполагает высоту ВМЕСТЕ с
-     * border, см. style.css).
+     * Auto-grow the textarea by number of lines (wave 13, "Telegram-like") —
+     * grows up to MAX_INPUT_LINES, beyond that — internal scroll on the textarea
+     * itself (overflow-y:auto), the input panel itself doesn't move (only
+     * the textarea itself grows, the buttons are anchored to the bottom via align-items:flex-end on
+     * .chat-input-row, see style.css). Recomputed on every input
+     * event and everywhere value changes programmatically (edit/send/cancel
+     * editing/formatting hotkeys) — see the calls below.
+     * Height is computed via a temporary reset to 'auto' (so scrollHeight
+     * reflects the ACTUAL content, not the current stretched height) — border
+     * is accounted for separately (scrollHeight doesn't include border, while
+     * box-sizing:border-box on .chat-text-input assumes height INCLUDING
+     * border, see style.css).
      *
-     * Раскладка строки ввода (волна 14): пока textarea умещается в одну
-     * строку — компактный горизонтальный ряд [📎][Aa][textarea][➤] (как и
-     * раньше). Как только она вырастает больше чем на одну строку, кнопки
-     * (📎/Aa/➤, обёрнутые в .chat-input-actions — см. buildDom) перестраиваются
-     * в вертикальную колонку справа от textarea, прижатую к низу: см.
-     * .chat-input-row--expanded в style.css (там же — почему это работает
-     * без переноса кнопок в DOM: .chat-input-actions в обычном режиме —
-     * display:contents, в expanded — настоящий flex-column). Число строк
-     * считаем от содержимого (scrollHeight за вычетом паддингов), а не от
-     * итоговой (уже ограниченной MAX_INPUT_LINES) высоты.
+     * Input row layout (wave 14): as long as the textarea fits on one
+     * line — a compact horizontal row [📎][Aa][textarea][➤] (as
+     * before). As soon as it grows past one line, the buttons
+     * (📎/Aa/➤, wrapped in .chat-input-actions — see buildDom) rearrange
+     * into a vertical column to the right of the textarea, anchored to the bottom: see
+     * .chat-input-row--expanded in style.css (also explained there — why this works
+     * without moving the buttons in the DOM: .chat-input-actions in normal mode is
+     * display:contents, in expanded mode a genuine flex-column). The number of lines
+     * is counted from the content (scrollHeight minus padding), not from the
+     * final (already capped at MAX_INPUT_LINES) height.
      */
     function autoGrowTextInput() {
       const style = getComputedStyle(textInput);
@@ -2768,15 +2768,15 @@ const ChatPanel = (() => {
       if (wasNearBottom) scrollToBottom();
     });
 
-    // --- Десктопные горячие клавиши форматирования (см. заголовок файла) ---
-    // Тулбар форматирования (по выделению/по кнопке «Aa», общий для всех
-    // layout) — см. блок ниже, после handleFormattingShortcut, переиспользует
-    // ЭТИ ЖЕ функции-обёртки.
+    // --- Desktop formatting hotkeys (see the file header) ---
+    // The formatting toolbar (by selection/by the "Aa" button, shared across all
+    // layouts) — see the block below, after handleFormattingShortcut, reuses
+    // these SAME wrapper functions.
     /**
-     * Обернуть текущее выделение textInput парой маркеров (**, __, ~~, ||,
-     * `); нет выделения — вставить пустую пару и поставить курсор МЕЖДУ
-     * маркерами (а не оставлять плейсхолдер), как и требует спека горячих
-     * клавиш.
+     * Wrap textInput's current selection in a pair of markers (**, __, ~~, ||,
+     * `); no selection — insert an empty pair and place the cursor BETWEEN the
+     * markers (rather than leaving a placeholder), as required by the hotkey
+     * spec.
      */
     function wrapSelectionWithMarkers(before, after) {
       const start = textInput.selectionStart;
@@ -2793,10 +2793,10 @@ const ChatPanel = (() => {
     }
 
     /**
-     * Cmd/Ctrl+Shift+K — обернуть выделение в markdown-ссылку [текст](url) с
-     * подстановкой URL через window.prompt (нет выделения — плейсхолдер
-     * «ссылка» вместо текста). Отмена промпта (null/пусто) — no-op, ничего не
-     * вставляем.
+     * Cmd/Ctrl+Shift+K — wrap the selection in a markdown link [text](url), with
+     * the URL supplied via window.prompt (no selection — a "link"
+     * placeholder instead of text). Canceling the prompt (null/empty) is a no-op, nothing gets
+     * inserted.
      */
     function insertLinkMarkdown() {
       const start = textInput.selectionStart;
@@ -2817,11 +2817,11 @@ const ChatPanel = (() => {
     }
 
     /**
-     * Cmd/Ctrl+B/I — жирный/курсив без Shift; Cmd/Ctrl+Shift+X/P/M/K —
-     * зачёркнутый/спойлер/инлайн-код/ссылка. metaKey — Mac (Cmd), ctrlKey —
-     * Windows/Linux (Ctrl); оба ловятся одинаково, реального смысла их
-     * различать для этих сочетаний нет (ни одно не занято браузером в
-     * обычном <textarea>).
+     * Cmd/Ctrl+B/I — bold/italic without Shift; Cmd/Ctrl+Shift+X/P/M/K —
+     * strikethrough/spoiler/inline code/link. metaKey — Mac (Cmd), ctrlKey —
+     * Windows/Linux (Ctrl); both are handled identically, there's no real reason to
+     * distinguish them for these combinations (none of them are claimed by the browser in a
+     * plain <textarea>).
      */
     function handleFormattingShortcut(event) {
       if (!(event.metaKey || event.ctrlKey)) return;
@@ -2847,25 +2847,25 @@ const ChatPanel = (() => {
       }
     }
 
-    // --- Тулбар форматирования (волна 11; десктоп — см. фикс ниже) ---
+    // --- Formatting toolbar (wave 11; desktop — see the fix below) ---
     //
-    // Набирать "**"/"||" руками неудобно везде, не только на телефоне — на
-    // десктопе горячие клавиши (Cmd/Ctrl+B/I/Shift+X/P/M/K, см. выше) есть,
-    // но без этого тулбара (или самой кнопки «Aa») были ПОЛНОСТЬЮ
-    // недискаверабельны: ни намёка на то, что форматирование существует,
-    // если не знать про хоткеи заранее. Тулбар теперь общий для всех
-    // layout, два триггера показа ОДНОГО и того же тулбара (переиспользует
-    // wrapSelectionWithMarkers/insertLinkMarkdown — ту же логику, что и
-    // хоткеи, никакого отдельного форматирующего кода):
-    //   1) «по выделению» — выделили текст в textarea — тулбар появляется
-    //      сам (см. document 'selectionchange' ниже);
-    //   2) «по кнопке» — кнопка «Aa» рядом с инпутом (см. formatToggleButton)
-    //      открывает тот же тулбар вручную (работает и без выделения —
-    //      тогда кнопки вставляют пустую пару маркеров с курсором между
-    //      ними, тот же фоллбэк поведения, что и у хоткеев без выделения).
-    // Оба состояния независимы и складываются через ИЛИ — см.
-    // updateFormatToolbarVisibility: тулбар виден, если открыт вручную (Aa)
-    // ИЛИ прямо сейчас есть непустое выделение.
+    // Typing "**"/"||" by hand is inconvenient everywhere, not just on a phone — on
+    // desktop, hotkeys exist (Cmd/Ctrl+B/I/Shift+X/P/M/K, see above),
+    // but without this toolbar (or the "Aa" button itself) they were COMPLETELY
+    // undiscoverable: no hint that formatting even exists,
+    // unless you already know the hotkeys. The toolbar is now shared across all
+    // layouts, with two triggers that show the SAME toolbar (reusing
+    // wrapSelectionWithMarkers/insertLinkMarkdown — the same logic as the
+    // hotkeys, no separate formatting code):
+    //   1) "by selection" — select text in the textarea and the toolbar appears
+    //      on its own (see document 'selectionchange' below);
+    //   2) "by button" — the "Aa" button next to the input (see formatToggleButton)
+    //      opens the same toolbar manually (also works without a selection —
+    //      in that case the buttons insert an empty pair of markers with the cursor between
+    //      them, the same fallback behavior as the hotkeys without a selection).
+    // Both states are independent and combined with OR — see
+    // updateFormatToolbarVisibility: the toolbar is visible if it was opened manually (Aa)
+    // OR there's currently a non-empty selection.
     function updateFormatToolbarVisibility() {
       const hasSelection =
         document.activeElement === textInput && textInput.selectionStart !== textInput.selectionEnd;
@@ -2881,25 +2881,25 @@ const ChatPanel = (() => {
       updateFormatToolbarVisibility();
     });
 
-    // 'selectionchange' — глобальное DOM-событие (не у конкретного элемента):
-    // фильтруем по activeElement внутри updateFormatToolbarVisibility. Ловит
-    // и выделение свайпом/долгим тапом на телефоне, и мышью на десктопе, и
-    // программные изменения выделения (в т.ч. textInput.setSelectionRange
-    // из самих же wrapSelectionWithMarkers/insertLinkMarkdown после
-    // применения форматирования — выделение схлопывается в курсор,
-    // hasSelection становится false, и тулбар сам скрывается, если не
-    // закреплён кнопкой «Aa»).
+    // 'selectionchange' — a global DOM event (not tied to a specific element):
+    // we filter by activeElement inside updateFormatToolbarVisibility. It catches
+    // selection made by swipe/long-press on a phone, by mouse on desktop, and
+    // programmatic selection changes (including textInput.setSelectionRange
+    // from wrapSelectionWithMarkers/insertLinkMarkdown themselves after
+    // formatting is applied — the selection collapses to a cursor,
+    // hasSelection becomes false, and the toolbar hides itself unless
+    // pinned open by the "Aa" button).
     document.addEventListener('selectionchange', updateFormatToolbarVisibility);
 
-    // Кнопки тулбара: mousedown с preventDefault — чтобы тап по кнопке НЕ
-    // забирал фокус (и вместе с ним выделение) у textarea ДО того, как
-    // click-обработчик ниже успеет прочитать textInput.selectionStart/End
-    // (по факту selectionStart/End не сбрасываются при потере фокуса — это
-    // просто свойства DOM-элемента — но preventDefault на mousedown это
-    // распространённый и более надёжный приём для тулбаров форматирования,
-    // не полагающийся на данную деталь реализации браузера). click всё равно
-    // срабатывает как обычно — preventDefault на mousedown отменяет только
-    // фокусировку/выделение самой кнопки, не последующий click.
+    // Toolbar buttons: mousedown with preventDefault — so that tapping the button does NOT
+    // steal focus (and, with it, the selection) from the textarea BEFORE the
+    // click handler below gets a chance to read textInput.selectionStart/End
+    // (in fact selectionStart/End aren't reset on losing focus — they're
+    // just properties of the DOM element — but preventDefault on mousedown is a
+    // common and more robust technique for formatting toolbars,
+    // one that doesn't rely on this particular browser implementation detail). click still
+    // fires as usual — preventDefault on mousedown only cancels
+    // the focus/selection of the button itself, not the subsequent click.
     formatToolbar.querySelectorAll('.chat-format-btn').forEach((btn) => {
       btn.addEventListener('mousedown', (event) => event.preventDefault());
       btn.addEventListener('click', () => {
@@ -2929,11 +2929,11 @@ const ChatPanel = (() => {
       });
     });
 
-    // --- UI отправки файлов: скрепка, drag&drop, paste картинки из буфера ---
+    // --- File sending UI: paperclip, drag&drop, pasting an image from the clipboard ---
     attachButton.addEventListener('click', () => fileInput.click());
     fileInput.addEventListener('change', () => {
       handleFilesSelected(fileInput.files);
-      fileInput.value = ''; // сброс — иначе повторный выбор ТОГО ЖЕ файла не даст change
+      fileInput.value = ''; // reset — otherwise re-selecting the SAME file won't fire change
     });
 
     panel.addEventListener('dragover', (event) => {
@@ -2962,11 +2962,11 @@ const ChatPanel = (() => {
     });
 
     /**
-     * Единая точка применения состояния инпута — учитывает ОБА независимых
-     * повода дизейблить отправку одновременно (обрыв соединения и запрет
-     * лидера, см. заголовок конструктора controller): connectionLost имеет
-     * приоритет над forbiddenByLeader просто по порядку проверки (оба и так
-     * дают одинаковый визуальный эффект — задизейбленный инпут с поясняющим
+     * A single point that applies the input state — accounts for BOTH independent
+     * reasons to disable sending at the same time (a lost connection and the leader's
+     * restriction, see the controller constructor's header): connectionLost takes
+     * priority over forbiddenByLeader simply by check order (both produce
+     * the same visual effect anyway — a disabled input with an explanatory
      * placeholder).
      */
     function applyInputState() {
@@ -3000,7 +3000,7 @@ const ChatPanel = (() => {
       applyInputState();
     }
 
-    /** room.js вызывает при applyGuestEnforcement()/settings-changed (см. docs/permissions-and-leader.md). */
+    /** Called by room.js on applyGuestEnforcement()/settings-changed (see docs/permissions-and-leader.md). */
     function setChatForbidden(forbidden) {
       forbiddenByLeader = forbidden;
       applyInputState();
@@ -3015,7 +3015,7 @@ const ChatPanel = (() => {
     };
 
     function handleServerError({ message }) {
-      // Серверные ошибки (напр. rate-limit) — показываем в панели тем же баннером.
+      // Server-side errors (e.g. rate limit) — shown in the panel via the same banner.
       if (message) showError(message);
     }
 
@@ -3046,10 +3046,10 @@ const ChatPanel = (() => {
       applyInputState();
       setCollapsed(true);
 
-      // Чат ходит ИСКЛЮЧИТЕЛЬНО по P2P-шине (DataChannel, E2E за счёт DTLS).
-      // Серверного fallback-релея чата больше нет (см. docs/chat.md): если
-      // шина к адресату ещё не открыта, конверт копится локально и уходит при
-      // её открытии (см. sendEnvelopeToPeer/notifyBusOpen), а не через сервер.
+      // Chat travels EXCLUSIVELY over the P2P bus (DataChannel, E2E thanks to DTLS).
+      // There is no longer a server-side fallback relay for chat (see docs/chat.md): if
+      // the bus to the recipient isn't open yet, the envelope is queued locally and goes out
+      // once it opens (see sendEnvelopeToPeer/notifyBusOpen), rather than through the server.
       bus.onMessage(dispatchEnvelope);
       signaling.on('error', handleServerError);
 
@@ -3057,7 +3057,7 @@ const ChatPanel = (() => {
       if (candidates.length > 0) {
         requestHistorySequential(candidates);
       }
-      // Пустая комната (candidates пуст) — спрашивать не у кого, история пуста.
+      // An empty room (candidates is empty) — nobody to ask, history stays empty.
     }
 
     return { attach, publicApi };

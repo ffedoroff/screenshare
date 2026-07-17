@@ -1,10 +1,10 @@
-# Права deploy-юзера (CI) в этом namespace. ServiceAccount `deployer` в ns
-# `deploy` — общий на все проекты сервера, заводится один раз в самом кластере
-# (simple-deploy/artifacts/server/rbac.yaml); здесь только Role+RoleBinding,
-# ограничивающие его правами в chat-prod. Применяет админ.
+# Permissions for the deploy user (CI) in this namespace. ServiceAccount `deployer` in ns
+# `deploy` — shared across all projects on the server, set up once at the cluster level
+# (simple-deploy/artifacts/server/rbac.yaml); here it's just the Role+RoleBinding
+# restricting it to permissions within chat-prod. Applied by an admin.
 #
-# Права: только патчить существующий Deployment, читать поды/логи. Ни
-# секретов, ни создания ресурсов, ни cluster-wide прав.
+# Permissions: only patching the existing Deployment, reading pods/logs. No
+# secrets, no creating resources, no cluster-wide permissions.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata: { name: deployer, namespace: chat-prod }

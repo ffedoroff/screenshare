@@ -1,4 +1,4 @@
-# ClusterIP-сервис перед подом приложения.
+# ClusterIP service in front of the application pod.
 apiVersion: v1
 kind: Service
 metadata: { name: chat, namespace: chat-prod }

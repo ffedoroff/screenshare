@@ -1,187 +1,201 @@
-# Маркетинговый ресёрч: 4 сегмента пользователей
+# Marketing Research: 4 User Segments
 
-> Ресёрч для продукта **chat** (P2P-видеочат, MIT, self-hosting = один Rust-бинарь +
-> статика, публичный инстанс — chat.fedorov.it). Факты о продукте взяты из
-> `README.md`, `docs/PRD.md`, `docs/DESIGN.md`, `docs/privacy.md`,
-> `docs/security.md`, `docs/self-hosting.md` — без вымышленных фич. Факты о
-> конкурентах — из веб-поиска, июль 2026, ссылки в каждом разделе и в сводном
-> списке источников в конце.
+> Research for the **chat** product (P2P video chat, MIT, self-hosting = one Rust
+> binary + static files, public instance — chat.fedorov.it). Facts about the
+> product are taken from `README.md`, `docs/PRD.md`, `docs/DESIGN.md`,
+> `docs/privacy.md`, `docs/security.md`, `docs/self-hosting.md` — no invented
+> features. Facts about competitors — from web search, July 2026, links in each
+> section and in the combined source list at the end.
 >
-> Ничего в коде/README/лендинге этим файлом не меняется — это входной
-> материал для будущей работы над лендингом/README.
+> This file does not change anything in the code/README/landing page — it is
+> input material for future work on the landing page/README.
 
 <!-- toc -->
 
-- [0. Продукт: что у нас реально есть (для сверки, не для маркетинга)](#0-продукт-что-у-нас-реально-есть-для-сверки-не-для-маркетинга)
-- [1. Сегмент 1 — Не-технари](#1-сегмент-1--не-технари)
-- [2. Сегмент 2 — Технари, уставшие от лимитов бесплатных тарифов](#2-сегмент-2--технари-уставшие-от-лимитов-бесплатных-тарифов)
-- [3. Сегмент 3 — Технари-параноики / селф-хостеры](#3-сегмент-3--технари-параноики--селф-хостеры)
-- [4. Сегмент 4 — Интеграторы](#4-сегмент-4--интеграторы)
-- [5. Сводная таблица конкурентов и лимитов (2026)](#5-сводная-таблица-конкурентов-и-лимитов-2026)
-- [6. Один лендинг / README на все сегменты: иерархия сообщений](#6-один-лендинг--readme-на-все-сегменты-иерархия-сообщений)
-- [7. Приоритизация сегментов](#7-приоритизация-сегментов)
-- [8. Общий список «чего нельзя честно обещать»](#8-общий-список-чего-нельзя-честно-обещать)
-- [9. Нагрузка на сервер ≈ 0 (аргумент для сегментов 3 и 4)](#9-нагрузка-на-сервер--0-аргумент-для-сегментов-3-и-4)
-- [Источники](#источники)
+- [0. Product: What We Actually Have (for Fact-Checking, Not Marketing)](#0-product-what-we-actually-have-for-fact-checking-not-marketing)
+- [1. Segment 1 — Non-Technical Users](#1-segment-1--non-technical-users)
+- [2. Segment 2 — Technical Users Tired of Free-Tier Limits](#2-segment-2--technical-users-tired-of-free-tier-limits)
+- [3. Segment 3 — Paranoid Technical Users / Self-Hosters](#3-segment-3--paranoid-technical-users--self-hosters)
+- [4. Segment 4 — Integrators](#4-segment-4--integrators)
+- [5. Competitor and Limits Summary Table (2026)](#5-competitor-and-limits-summary-table-2026)
+- [6. One Landing Page / README for All Segments: Message Hierarchy](#6-one-landing-page--readme-for-all-segments-message-hierarchy)
+- [7. Segment Prioritization](#7-segment-prioritization)
+- [8. Combined List of "What We Can't Honestly Promise"](#8-combined-list-of-what-we-cant-honestly-promise)
+- [9. Server Load ≈ 0 (Argument for Segments 3 and 4)](#9-server-load--0-argument-for-segments-3-and-4)
+- [Sources](#sources)
 
 <!-- /toc -->
 
-## 0. Продукт: что у нас реально есть (для сверки, не для маркетинга)
+## 0. Product: What We Actually Have (for Fact-Checking, Not Marketing)
 
-Чтобы ни один пункт ниже не превратился в выдумку, вот жёсткий факт-лист,
-которым связаны все формулировки в этом документе:
+So that not a single point below turns into fiction, here is a hard fact
+sheet that every statement in this document is bound to:
 
-- **Рекомендуемый дефолт — 6 участников** (env `MAX_PARTICIPANTS`, у продукта
-  самого нет жёсткого потолка — любое значение на self-host), полный
-  WebRTC-mesh (каждый с каждым напрямую), без SFU и без медиа-сервера —
-  `DESIGN.md` §1.1, §2.2, `src/state.rs::DEFAULT_MAX_PARTICIPANTS`,
+- **Recommended default — 6 participants** (env `MAX_PARTICIPANTS`, the
+  product itself has no hard ceiling — any value on self-host), full
+  WebRTC mesh (everyone connects directly to everyone else), no SFU and no
+  media server — `DESIGN.md` §1.1, §2.2, `src/state.rs::DEFAULT_MAX_PARTICIPANTS`,
   `self-hosting.md` §6.
-- **У продукта нет лимита длительности звонка.** Автозакрытие комнаты —
-  рекомендуемый дефолт (env `MAX_ROOM_LIFETIME_SECONDS`, любое значение на
-  self-host); на ПУБЛИЧНОМ инстансе chat.fedorov.it действует настроенный
-  оператором дефолт (3 часа) — `security.md` §8, `self-hosting.md` §6. Важно
-  различать продукт (без лимита) и конкретный инстанс (лимит есть, потому что
-  так настроил оператор).
-- **Видео/аудио/чат/файлы никогда не идут через сервер** — ни в основном
-  пути, ни как fallback, ДАЖЕ когда прямое P2P-соединение не устанавливается
-  (файлы не проксируются через сервер вообще ни при каких обстоятельствах —
-  `privacy.md` §1, `chat.md` §10); сигнальный сервер видит только
-  зашифрованные blob'ы SDP/ICE и служебные сообщения — `privacy.md` §1–2. См.
-  [§9](#9-нагрузка-на-сервер--0-аргумент-для-сегментов-3-и-4): отсюда следует,
-  что нагрузка на сервер во время самого звонка ≈ 0.
-- **E2E-шифрование сигналинга с forward secrecy**: у каждой вкладки — свежий
-  эфемерный ECDH-ключ на сессию, никогда не сохраняется; утечка ссылки
-  *после* звонка не раскрывает прошлый трафик — `privacy.md` §3.6,
-  `security.md` (таблица угроз).
-- **Нет аккаунтов, cookies, localStorage** — вообще никакого
-  кросс-сессионного идентификатора — `privacy.md` §4.
-- **SAS-верификация** — 5 эмодзи, commit-before-reveal, защита от активного
-  MITM, детектируется человеком — `security.md` §11.
-- **Собеседники видят ваш IP** (это неизбежное свойство прямого P2P: ICE
-  требует обмена реальными адресами) — сервер, наоборот, IP не логирует и не
-  хранит — `privacy.md` §2. Это ключевое честное отличие от
-  сервер-опосредованных решений (см. §8).
-- **Публикуемый build-hash** деплоя (GitHub Release, независимый канал) —
-  форензик-чекпоинт, не криптографическая гарантия — `security.md` §10.
-- **MIT-лицензия**, один Rust-бинарь + статика, `docker compose up -d`,
-  self-host также в режиме split-origin (фронт и сигналинг раздельно) —
-  `README.md`, `self-hosting.md` §1.
-- **Нет записи звонков, нет истории после закрытия комнаты, нет мобильных
-  приложений** (только браузер / PWA), **один процесс, одна реплика**
-  (in-memory state, без БД) — `PRD.md` §10, `self-hosting.md` §7.1.
-- **Нет независимого security-аудита третьей стороной** — только
-  внутренний threat-model документ (`security.md`) и открытый код (~2.3k
-  строк Rust в `src/`). Это честно нужно признавать параноикам (см. §3).
+- **The product has no call duration limit.** Room auto-close is a
+  recommended default (env `MAX_ROOM_LIFETIME_SECONDS`, any value on
+  self-host); on the PUBLIC instance chat.fedorov.it, the operator has
+  configured a default (3 hours) — `security.md` §8, `self-hosting.md` §6.
+  It's important to distinguish the product (no limit) from a specific
+  instance (a limit exists because the operator configured it that way).
+- **Video/audio/chat/files never go through the server** — not in the main
+  path, not as a fallback, EVEN when a direct P2P connection can't be
+  established (files are never proxied through the server, under any
+  circumstances whatsoever — `privacy.md` §1, `chat.md` §10); the signaling
+  server only ever sees encrypted SDP/ICE blobs and service messages —
+  `privacy.md` §1–2. See [§9](#9-server-load--0-argument-for-segments-3-and-4):
+  it follows that server load during the call itself is ≈ 0.
+- **E2E encryption of signaling with forward secrecy**: each tab has a
+  fresh ephemeral ECDH key per session, never persisted; a link leaking
+  *after* the call does not expose past traffic — `privacy.md` §3.6,
+  `security.md` (threat table).
+- **No accounts, cookies, localStorage** — no cross-session identifier of
+  any kind whatsoever — `privacy.md` §4.
+- **SAS verification** — 5 emoji, commit-before-reveal, protection against
+  active MITM, detectable by a human — `security.md` §11.
+- **Peers see each other's IP** (this is an unavoidable property of direct
+  P2P: ICE requires exchanging real addresses) — the server, on the other
+  hand, does not log or store IPs — `privacy.md` §2. This is a key, honest
+  point of difference from server-mediated solutions (see §8).
+- **A published build hash** for the deployment (GitHub Release, an
+  independent channel) — a forensic checkpoint, not a cryptographic
+  guarantee — `security.md` §10.
+- **MIT license**, one Rust binary + static files, `docker compose up -d`,
+  self-host also supports split-origin mode (front end and signaling
+  served separately) — `README.md`, `self-hosting.md` §1.
+- **No call recording, no history after the room closes, no mobile apps**
+  (browser / PWA only), **single process, single replica** (in-memory
+  state, no database) — `PRD.md` §10, `self-hosting.md` §7.1.
+- **No independent third-party security audit** — only an internal threat
+  model document (`security.md`) and open code (~2.3k lines of Rust in
+  `src/`). This needs to be honestly acknowledged to the paranoid segment
+  (see §3).
 
 ---
 
-## 1. Сегмент 1 — Не-технари
+## 1. Segment 1 — Non-Technical Users
 
-### 1.1 Портрет и сценарии
+### 1.1 Profile and Scenarios
 
-- Семья, разбросанная по городам/странам, созванивается «просто поговорить».
-- Двое друзей хотят один раз созвониться, и ни один не хочет заводить Zoom-
-  аккаунт ради 15-минутного разговора.
-- Человек, который принципиально не хочет «отдавать» ещё один email/номер
-  телефона очередному сервису — насмотрелся новостей об утечках,
-  слежке, но сам не технарь и не будет разбираться в Jitsi.
-- Пользователь, которому важно физически не оставить следов: разговор с
-  врачом, юристом, психологом, или просто личный разговор, который не хочется
-  «класть» на серверы Meta/Google.
+- A family scattered across cities/countries, calling "just to talk."
+- Two friends who want to have a one-off call, and neither wants to create
+  a Zoom account for a 15-minute conversation.
+- A person who, as a matter of principle, doesn't want to "hand over" yet
+  another email/phone number to yet another service — has seen enough news
+  about leaks and surveillance, but isn't technical themselves and won't
+  figure out Jitsi.
+- A user for whom it matters that no trace is physically left behind: a
+  conversation with a doctor, a lawyer, a therapist, or simply a personal
+  conversation they don't want "sitting" on Meta's or Google's servers.
 
-Мотив у этого сегмента не «я хочу криптографию», а «я не хочу регистрироваться
-и не хочу, чтобы это где-то лежало» — abstraction layer ниже, эмоциональный,
-не технический.
+This segment's motive isn't "I want cryptography" but "I don't want to
+register and I don't want this stored anywhere" — one abstraction layer
+down, emotional, not technical.
 
-### 1.2 Каналы обитания
+### 1.2 Where They Hang Out
 
-Этот сегмент **не сидит на HN/r/selfhosted** — их приводят рекомендации:
+This segment **doesn't live on HN/r/selfhosted** — they arrive via
+recommendations:
 
-- Посты в духе «10 приватных альтернатив Zoom» на общих техно-медиа (не
-  нишевых) — Lifehacker-типа сайтов, YouTube-обзоры.
-- Реддиты общего профиля (r/privacytoolsIO — более общий, чем r/privacy),
-  телеграм-каналы про приватность для широкой аудитории.
-- Сарафанное радио: если один технарь в компании друзей/семье прислал
-  ссылку — остальные просто по ней проходят, не читая, что это такое.
-- App Store/Play Store не работает как канал (нет приложений) — единственный
-  вход это сама ссылка на звонок, поэтому для этого сегмента канал
-  дистрибуции = сам продукт: если ссылка «просто работает», это уже
-  вирусный эффект.
+- Posts like "10 private alternatives to Zoom" on general tech media (not
+  niche ones) — Lifehacker-style sites, YouTube reviews.
+- General-audience subreddits (r/privacytoolsIO — more general than
+  r/privacy), privacy-focused Telegram channels aimed at a broad audience.
+- Word of mouth: if one technical person in a group of friends/family sends
+  a link, everyone else just clicks through without reading what it is.
+- The App Store/Play Store doesn't work as a channel (there are no apps) —
+  the only entry point is the call link itself, so for this segment the
+  distribution channel IS the product: if the link "just works," that's
+  already a viral effect.
 
-### 1.3 Чем пользуются сейчас
+### 1.3 What They Use Now
 
-WhatsApp-видео (до 32 участников), FaceTime (до 32 у Apple), Telegram
-(до 30 активных, до 1000 зрителей), обычный Zoom «по ссылке от знакомого».
-Все требуют либо номер телефона (WhatsApp, Telegram, Signal), либо
-Apple ID (FaceTime), либо аккаунт (Zoom для организатора) — то есть у всех
-есть точка идентификации, даже если сам звонок ощущается «бесплатным и
-простым» [WhatsApp][wa-32], [FaceTime][facetime-32], [Telegram][tg-1000].
+WhatsApp video (up to 32 participants), FaceTime (up to 32 on Apple),
+Telegram (up to 30 active, up to 1000 viewers), plain Zoom "via a link from
+someone I know." All of them require either a phone number (WhatsApp,
+Telegram, Signal), an Apple ID (FaceTime), or an account (Zoom for the
+organizer) — that is, all of them have a point of identification, even if
+the call itself feels "free and simple" [WhatsApp][wa-32],
+[FaceTime][facetime-32], [Telegram][tg-1000].
 
-### 1.4 Их боли в текущих решениях
+### 1.4 Their Pain Points With Current Solutions
 
-- Нужен телефон/email/аккаунт хоть у кого-то в звонке (обычно у организатора).
-- Ощущение (часто верное), что переписка/история где-то сохраняется на
-  сервере компании.
-- Установка приложения — для разового звонка это трение и лишнее разрешение
-  на телефоне.
-- Не понимают и не должны понимать термины «E2E», «forward secrecy» — им
-  нужен перевод на человеческий язык: «никто, кроме собеседника, не может
-  прочитать».
+- At least someone in the call (usually the organizer) needs a
+  phone/email/account.
+- A feeling (often correct) that the correspondence/history is stored
+  somewhere on the company's server.
+- Installing an app — for a one-off call this is friction and an extra
+  permission on the phone.
+- They don't understand and shouldn't have to understand terms like "E2E,"
+  "forward secrecy" — they need a translation into human language: "no one
+  but the person you're talking to can read this."
 
-### 1.5 Как продать именно им
+### 1.5 How to Sell to Them Specifically
 
-**Ключевое сообщение (одна фраза):**
+**Key message (one phrase):**
 
 > "Open a link, talk, nothing is left behind — not even by us."
 
-**3–5 поддерживающих пунктов:**
+**3–5 supporting points:**
 
-1. Никакой регистрации — ни телефона, ни email, ни пароля. Просто ссылка.
-2. Ничего не сохраняется — ни сообщения, ни файлы, ни то, что вы вообще
-   созванивались; после звонка ничего не остаётся ни у нас, ни где-либо ещё.
-3. Разговор идёт напрямую между вашими устройствами, а не через чей-то
-   сервер — собеседник видит только ваш IP-адрес, и больше ничего.
-4. Открытый код (можно проверить, а не просто поверить на слово).
-5. Работает в браузере на телефоне и компьютере — ничего не устанавливать.
+1. No registration whatsoever — no phone, no email, no password. Just a
+   link.
+2. Nothing is saved — no messages, no files, not even the fact that you
+   had a call at all; after the call, nothing remains, either with us or
+   anywhere else.
+3. The conversation goes directly between your devices, not through
+   anyone's server — the other person only sees your IP address, and
+   nothing else.
+4. Open source code (you can verify it, not just take our word for it).
+5. Works in the browser on phone and computer — nothing to install.
 
-**Какие фичи показывать первыми:**
+**Which features to show first:**
 
-- Одна кнопка «Создать звонок» → сразу ссылка/QR.
-- Простой join-модал: только имя (с готовой подсказкой), больше ничего.
-- Плейн-лэнгвич версия privacy-панели: «вот что сервер видит, а вот что —
-  никогда» (уже есть в UI как «Connection & Privacy»).
+- One "Create a call" button → immediately a link/QR code.
+- A simple join modal: just a name (with a suggested placeholder), nothing
+  else.
+- A plain-language version of the privacy panel: "here's what the server
+  sees, and here's what it never sees" (already present in the UI as
+  "Connection & Privacy").
 
-**Какие ограничения честно признавать:**
+**Which limitations to honestly acknowledge:**
 
-- Рекомендуемый дефолт — до 6 человек (полный mesh, каждый шлёт видео каждому
-  напрямую) — если планируется созвон большой семьи/класса, надо сказать
-  прямо, что это не для 20+ человек: mesh технически не про такие масштабы,
-  даже если формально лимит можно поднять.
-- На chat.fedorov.it комната автоматически закрывается через 3 часа (это
-  настройка оператора этого конкретного инстанса, а не лимит продукта) —
-  длинные посиделки на нём придётся пересоздавать; при self-host лимит можно
-  поставить любым.
-- Нет записи звонка — если кому-то нужна запись «на память», этого нет и не
-  будет (это философия продукта, не недоработка).
+- Recommended default is up to 6 people (full mesh, everyone sends video
+  directly to everyone else) — if a large family/class reunion call is
+  planned, it needs to be said outright that this isn't for 20+ people:
+  mesh isn't technically built for that scale, even if the limit can
+  formally be raised.
+- On chat.fedorov.it, the room automatically closes after 3 hours (this is
+  a setting configured by the operator of this specific instance, not a
+  product limit) — long hangout sessions on it will need to be recreated;
+  on self-host, the limit can be set to anything.
+- No call recording — if someone wants a recording "as a keepsake," that
+  doesn't exist and won't (this is a product philosophy, not a missing
+  feature).
 
-**Каналы дистрибуции:** сарафанное радио через технарей-друзей → сама ссылка
-как продукт; общие «привacy-friendly приложения» подборки; никаких платных
-каналов на старте, органика через простоту UX.
+**Distribution channels:** word of mouth via technical friends → the link
+itself as the product; general "privacy-friendly apps" roundups; no paid
+channels at launch, organic growth through UX simplicity.
 
-### 1.6 Что нельзя честно обещать
+### 1.6 What Can't Be Honestly Promised
 
-- Нельзя обещать «как Zoom, но лучше» по надёжности для больших созвонов —
-  Zoom/Meet держат сотни участников на SFU/медиасервере, у нас full mesh с
-  рекомендуемым дефолтом в шесть (формально можно больше, но платит за это
-  трафиком/CPU каждый участник, а не сервер).
-- Нельзя обещать анонимность собеседника: собеседник видит ваш IP (это не
-  Tor и не VPN — обычный WebRTC P2P).
-- Нельзя обещать «работает без интернета/на любой сети» — за симметричным
-  NAT нужен TURN-релей (опционально настраивается на self-host, но на
-  публичном инстансе будет включён по умолчанию только если оператор его
-  настроил).
+- Can't promise "like Zoom, but better" in terms of reliability for large
+  calls — Zoom/Meet hold hundreds of participants on an SFU/media server,
+  we have full mesh with a recommended default of six (formally more is
+  possible, but each participant pays for it in bandwidth/CPU, not the
+  server).
+- Can't promise anonymity from the other participant: the other person
+  sees your IP (this is not Tor and not a VPN — regular WebRTC P2P).
+- Can't promise "works without internet/on any network" — behind symmetric
+  NAT a TURN relay is needed (optionally configurable on self-host, but on
+  the public instance it will be enabled by default only if the operator
+  set it up).
 
-### 1.7 Черновики EN (для лендинга/README, короткая секция для этого сегмента)
+### 1.7 EN Drafts (for the landing page/README, short section for this segment)
 
 ```
 No sign-up. No app to install. Just a link.
@@ -193,121 +207,125 @@ hand over even if we wanted to.
 
 ---
 
-## 2. Сегмент 2 — Технари, уставшие от лимитов бесплатных тарифов
+## 2. Segment 2 — Technical Users Tired of Free-Tier Limits
 
-### 2.1 Портрет и сценарии
+### 2.1 Profile and Scenarios
 
-- Разработчик/тимлид маленькой команды (2–6 человек), которому регулярно
-  нужен быстрый созвон дольше 40 минут, но платить за Zoom Pro/Google
-  Workspace не хочет — обычно потому что это разовые/нерегулярные звонки, а
-  не ежедневный рабочий инструмент.
-- Фрилансер/консультант, который звонит клиентам и не хочет, чтобы звонок
-  обрывался на 40-й минуте у клиента с бесплатным Zoom.
-- Небольшой open-source проект / читальный клуб / коммьюнити, где никто не
-  платит за корпоративные тарифы, но регулярно нужны длинные обсуждения.
+- A developer/team lead of a small team (2–6 people) who regularly needs a
+  quick call longer than 40 minutes but doesn't want to pay for Zoom
+  Pro/Google Workspace — usually because these are one-off/irregular
+  calls, not a daily work tool.
+- A freelancer/consultant who calls clients and doesn't want the call to
+  cut off at minute 40 when the client is on free Zoom.
+- A small open-source project / reading club / community, where no one
+  pays for corporate tiers, but long discussions are needed regularly.
 
-### 2.2 Каналы обитания
+### 2.2 Where They Hang Out
 
-Hacker News, r/webdev, r/programming, тематические Telegram-чаты про
-инструменты разработчика, Twitter/X-инфлюенсеры про продуктивность и
-инструменты для маленьких команд, Indie Hackers.
+Hacker News, r/webdev, r/programming, developer-tools-focused Telegram
+chats, Twitter/X influencers about productivity and tools for small teams,
+Indie Hackers.
 
-### 2.3 Чем пользуются сейчас, и актуальные лимиты (2026, проверено поиском)
+### 2.3 What They Use Now, and Current Limits (2026, verified by search)
 
-| Сервис | Лимит бесплатного тарифа | Источник |
+| Service | Free tier limit | Source |
 |---|---|---|
-| **Zoom Basic** | Группа (3+) — **40 минут**, потом принудительное завершение (10-мин предупреждение); 1:1 без лимита времени | [Zoom support][zoom-40] |
-| **Google Meet (личный аккаунт)** | Группа (3+) — **60 минут**, предупреждение на 50-й минуте, звонок обрывается без grace period; 1:1 — до 24 часов | [itsconvo][meet-60] |
-| **Microsoft Teams (free)** | Группа — **60 минут**, до **100 участников**, лимит определяется лицензией организатора | [Microsoft Learn][teams-limits] |
+| **Zoom Basic** | Group (3+) — **40 minutes**, then forced termination (10-min warning); 1:1 with no time limit | [Zoom support][zoom-40] |
+| **Google Meet (personal account)** | Group (3+) — **60 minutes**, warning at minute 50, call cuts off with no grace period; 1:1 — up to 24 hours | [itsconvo][meet-60] |
+| **Microsoft Teams (free)** | Group — **60 minutes**, up to **100 participants**, limit determined by the organizer's license | [Microsoft Learn][teams-limits] |
 
-Итого: у всех трёх мейнстрим-игроков — жёсткий тайм-лимит на групповой
-звонок (40–60 минут), заточенный именно на конвертацию в платную подписку.
+Bottom line: all three mainstream players have a hard time limit on group
+calls (40–60 minutes), specifically tuned to convert users into paid
+subscriptions.
 
-### 2.4 Их боли в текущих решениях
+### 2.4 Their Pain Points With Current Solutions
 
-- Таймер-триггер апгрейда — сама механика лимита существует, чтобы продать
-  подписку, а не потому что это технически необходимо.
-- Обход лимита («пересоздать звонок каждые 40 минут») — рабочий, но
-  раздражающий и разрывающий разговор хак, которым реально пользуются
-  (весь топ поисковой выдачи про «как обойти лимит Zoom» об этом).
-- Для разовых/нерегулярных созвонов платить за годовую подписку экономически
-  не оправдано.
-- Discord — бесплатная альтернатива без лимита времени, но требует аккаунт,
-  сервер, установку (для многих) и по умолчанию не для одноразовых внешних
-  звонков с людьми не из вашего Discord-круга.
+- The upgrade-timer trigger — the limit mechanism exists specifically to
+  sell a subscription, not because it's technically necessary.
+- Working around the limit ("recreate the call every 40 minutes") — a
+  functional but annoying, conversation-breaking hack that people actually
+  use (the top of the search results for "how to get around the Zoom
+  limit" is all about this).
+- For one-off/irregular calls, paying for an annual subscription isn't
+  economically justified.
+- Discord — a free alternative with no time limit, but it requires an
+  account, a server, an install (for many), and by default isn't meant for
+  one-off external calls with people outside your Discord circle.
 
-### 2.5 Как продать именно им
+### 2.5 How to Sell to Them Specifically
 
-**Ключевое сообщение:**
+**Key message:**
 
 > "No 40-minute wall — ever. The product itself has no duration cap. Our own free public instance defaults to a generous 3-hour auto-close (a config value, not a hard limit) — still miles ahead of Zoom's 40 minutes or Meet's 60, which you can't change no matter what you do."
 
-**3–5 поддерживающих пунктов:**
+**3–5 supporting points:**
 
-1. У продукта нет лимита длительности звонка вовсе (env
-   `MAX_ROOM_LIFETIME_SECONDS`, любое значение на своём self-host); на нашем
-   публичном инстансе — щедрый дефолт **3 часа**, а не жёсткие 40/60 минут,
-   которые в Zoom/Meet нельзя поменять никак, даже если очень хочется.
-2. Никакого аккаунта — не нужно просить собеседника «зарегистрируйся,
-   чтобы я мог тебе позвонить бесплатно дольше часа».
-3. self-host бесплатно, навсегда, без «free tier» который могут срезать —
-   один `docker compose up`.
-4. E2E-шифрование сигналинга «из коробки», без переключателя и без
-   отключения фич (в отличие от многих SFU-решений, где E2EE — опциональная
-   галочка).
-5. Открытый исходный код — не «доверьтесь нам», а «проверьте сами».
+1. The product has no call duration limit at all (env
+   `MAX_ROOM_LIFETIME_SECONDS`, any value on your own self-host); on our
+   public instance — a generous **3-hour** default, not the hard 40/60
+   minutes that you can't change in Zoom/Meet no matter how much you want
+   to.
+2. No account — no need to ask the other person to "sign up so I can call
+   you for free for longer than an hour."
+3. Self-host is free, forever, with no "free tier" that can be cut — one
+   `docker compose up`.
+4. E2E encryption of signaling out of the box, with no toggle and no
+   disabled features (unlike many SFU-based solutions, where E2EE is an
+   optional checkbox).
+5. Open source code — not "trust us," but "verify it yourself."
 
-**Какие фичи показывать первыми:**
+**Which features to show first:**
 
-- Прямое сравнение таймера: «Zoom: 40 мин, нельзя поменять. Meet: 60 мин,
-  нельзя поменять. Мы: 3 часа на публичном инстансе — и это конфиг, не
-  потолок продукта.»
-- Скорость входа: ссылка → сразу в звонке, без формы регистрации.
-- Публичный chat.fedorov.it как «просто попробуй прямо сейчас», без
-  установки.
+- A direct timer comparison: "Zoom: 40 min, can't be changed. Meet: 60
+  min, can't be changed. Us: 3 hours on the public instance — and that's a
+  config value, not a product ceiling."
+- Speed of entry: link → straight into the call, no sign-up form.
+- The public chat.fedorov.it as "just try it right now," no install.
 
-**Какие ограничения честно признавать:**
+**Which limitations to honestly acknowledge:**
 
-- Рекомендуемый дефолт 6 человек (mesh-архитектура) — это не замена
-  Zoom/Teams для большого митинга/вебинара; технически можно поднять больше,
-  но линейно растёт трафик/CPU каждого участника (не сервера).
-- Нет записи — если нужен архив звонка, это не тот инструмент.
-- На нашем публичном инстансе 3 часа — это реальный практический потолок для
-  обычного пользователя (сам он там значение не меняет), так что для этого
-  инстанса «не без лимита вообще» — честно, как у MiroTalk P2P (см. §3), там
-  вообще без лимита. Но у самого продукта, в отличие от Zoom/Meet, лимита
-  структурно нет: self-host с любым `MAX_ROOM_LIFETIME_SECONDS` закрывает
-  вопрос полностью.
+- Recommended default of 6 people (mesh architecture) — this isn't a
+  replacement for Zoom/Teams for a big meeting/webinar; technically more
+  can be allowed, but each participant's traffic/CPU grows linearly (not
+  the server's).
+- No recording — if a call archive is needed, this isn't the right tool.
+- On our public instance, 3 hours is a real practical ceiling for a
+  regular user (they don't change the value there themselves), so for
+  this instance it's "not unlimited" — honestly, like MiroTalk P2P (see
+  §3), which has no limit at all. But the product itself, unlike
+  Zoom/Meet, structurally has no limit: self-hosting with any
+  `MAX_ROOM_LIFETIME_SECONDS` fully resolves the issue.
 
-**Каналы дистрибуции:** Show HN / Hacker News (аудитория этого сегмента там
-живёт и явно реагирует на «no signup, P2P, disposable» посты — ниже
-исторические примеры), Twitter-threads «инструменты для маленьких команд»,
-Indie Hackers, reddit r/webdev.
+**Distribution channels:** Show HN / Hacker News (this segment's audience
+lives there and clearly responds to "no signup, P2P, disposable" posts —
+historical examples below), Twitter threads about "tools for small teams,"
+Indie Hackers, r/webdev.
 
-Исторические примеры того, что этот питч работает на HN — похожие
-«no-signup P2P video chat» продукты регулярно попадают в топ:
+Historical examples of this pitch working on HN — similar "no-signup P2P
+video chat" products regularly hit the top:
 
-- «Free, P2P, disposable group video calling app for the web» — [HN
+- "Free, P2P, disposable group video calling app for the web" — [HN
   discussion][hn-disposable]
-- «Show HN: Group video chat with no signups or downloads» — [HN
+- "Show HN: Group video chat with no signups or downloads" — [HN
   discussion][hn-nosignup]
-- «Show HN: Briefing – Anonymous, secure, open source WebRTC group video
-  chat» — [HN discussion][hn-briefing]
+- "Show HN: Briefing – Anonymous, secure, open source WebRTC group video
+  chat" — [HN discussion][hn-briefing]
 
-### 2.6 Что нельзя честно обещать
+### 2.6 What Can't Be Honestly Promised
 
-- Нельзя говорить «безлимитно» про наш ПУБЛИЧНЫЙ инстанс — там действует
-  настроенный оператором дефолт (3 часа / рекомендуемые 6 человек), просто
-  щедрее, чем у конкурентов, и по разным осям (мы даём время, они — охват).
-  Про сам ПРОДУКТ честно говорить «лимита нет» — self-host с любым
-  `MAX_ROOM_LIFETIME_SECONDS`/`MAX_PARTICIPANTS` решает вопрос полностью; не
-  путать эти два утверждения в одном тексте.
-- Нельзя обещать интеграции с календарём/Outlook — этого нет и не будет
-  (см. `PRD.md` §10, «Out of Scope»).
-- Нельзя обещать запись для пересмотра встречи позже — сознательно
-  отсутствует.
+- Can't say "unlimited" about our PUBLIC instance — it runs on an
+  operator-configured default (3 hours / recommended 6 people), just more
+  generous than competitors, and along different axes (we give time, they
+  give reach). About the PRODUCT itself it's honest to say "there is no
+  limit" — self-hosting with any `MAX_ROOM_LIFETIME_SECONDS`/
+  `MAX_PARTICIPANTS` fully resolves the question; don't conflate these two
+  statements in the same piece of text.
+- Can't promise calendar/Outlook integrations — this doesn't exist and
+  won't (see `PRD.md` §10, "Out of Scope").
+- Can't promise recording to review the meeting later — deliberately
+  absent.
 
-### 2.7 Черновики EN
+### 2.7 EN Drafts
 
 ```
 Zoom cuts you off at 40 minutes, no matter what you do. Google Meet at 60.
@@ -319,151 +337,162 @@ card, no "upgrade to continue" banner, ever.
 
 ---
 
-## 3. Сегмент 3 — Технари-параноики / селф-хостеры
+## 3. Segment 3 — Paranoid Technical Users / Self-Hosters
 
-### 3.1 Портрет и сценарии
+### 3.1 Profile and Scenarios
 
-- Человек, который уже сам хостит Nextcloud/Immich/Vaultwarden и по
-  умолчанию не доверяет SaaS с чужими данными.
-- Небольшая NGO/юридическая/журналистская команда, которой нужно
-  контролировать инфраструктуру целиком (юрисдикция, отсутствие
-  подрядчика-посредника).
-- Участник r/selfhosted / r/privacy, который прежде чем что-то поставить,
-  читает threat model и смотрит, что видно на `strace`/в логах сервера.
+- A person who already self-hosts Nextcloud/Immich/Vaultwarden and by
+  default distrusts SaaS with other people's data.
+- A small NGO/legal/journalism team that needs to control its entire
+  infrastructure (jurisdiction, no intermediary contractor).
+- A r/selfhosted / r/privacy member who, before installing anything, reads
+  the threat model and checks what's visible on `strace`/in server logs.
 
-### 3.2 Каналы обитания
+### 3.2 Where They Hang Out
 
-r/selfhosted, r/privacy, r/degoogle, форум Awesome-Selfhosted /
-LibreSelfhosted-каталоги, HN (та же аудитория, что в §2, частично
-пересекается), Matrix/Telegram-чаты про self-hosting, Lemmy/Fediverse.
+r/selfhosted, r/privacy, r/degoogle, the Awesome-Selfhosted forum /
+LibreSelfhosted directories, HN (the same audience as in §2, partly
+overlapping), Matrix/Telegram chats about self-hosting, Lemmy/Fediverse.
 
-### 3.3 Чем пользуются сейчас
+### 3.3 What They Use Now
 
-| Инструмент | Модель | Ключевая особенность | Источник |
+| Tool | Model | Key characteristic | Source |
 |---|---|---|---|
-| **Jitsi Meet** (self-hosted) | Сервер + SFU (Jitsi Videobridge) | По умолчанию сервер **видит расшифрованный** медиапоток (снимает DTLS-SRTP на videobridge, хоть и не хранит); есть опциональный E2EE-тоггл, но только Chromium-based браузеры, и он **отключает** запись/стриминг/dial-in | [jitsi.org][jitsi-e2ee], [Jitsi self-hosting handbook][jitsi-handbook] |
-| **Element Call / Matrix** | Matrix homeserver + LiveKit SFU | Полноценный self-host требует поднять Synapse/Dendrite **и** LiveKit — заметно больше инфраструктуры, чем «один бинарь»; группа тоже идёт через SFU, не чистый mesh | [element-call GitHub][element-call], [Element blog][element-sovereignty] |
-| **Signal** | Централизованный сервис, звонки P2P/relay | До **75** участников в группе, но: закрытый сервер Signal (нельзя self-host серверную часть в полном объёме для звонков), обязателен номер телефона, отдельное приложение | [aboutsignal.com][signal-75] |
-| **Jami** | Полностью децентрализованный P2P (OpenDHT), без сервера вообще | GNU-проект, GPLv3, звонки/чат P2P без центрального сервера в принципе — но требует **установки нативного приложения**, не работает «по ссылке в браузере» | [jami.net][jami], [Wikipedia][jami-wiki] |
-| **MiroTalk P2P** | Self-hosted P2P (без SFU), браузер | Похожая архитектура на наш продукт: без лимита времени, без лимита комнат — но **AGPLv3** (копилефт: форк с изменениями обязан быть открыт), не MIT | [GitHub][mirotalk] |
-| **Galène** | Self-hosted, Go + Pion, SFU | Лёгкий, портируемый (даже OpenWRT), но для many-to-many масштабируется квадратично: ~20 участников на одном ядре — не проблема для нас при потолке 6, но иллюстрирует, что даже «лёгкие» SFU тяжелее чистого mesh | [galene.org][galene], [GitHub][galene-gh] |
+| **Jitsi Meet** (self-hosted) | Server + SFU (Jitsi Videobridge) | By default the server **sees decrypted** media (terminates DTLS-SRTP at the videobridge, though doesn't store it); there's an optional E2EE toggle, but only for Chromium-based browsers, and it **disables** recording/streaming/dial-in | [jitsi.org][jitsi-e2ee], [Jitsi self-hosting handbook][jitsi-handbook] |
+| **Element Call / Matrix** | Matrix homeserver + LiveKit SFU | A full self-host requires standing up Synapse/Dendrite **and** LiveKit — noticeably more infrastructure than "one binary"; the group call also goes through an SFU, not pure mesh | [element-call GitHub][element-call], [Element blog][element-sovereignty] |
+| **Signal** | Centralized service, P2P/relay calls | Up to **75** participants in a group, but: Signal's server is closed source (the server side can't be fully self-hosted for calls), a phone number is required, a separate app is required | [aboutsignal.com][signal-75] |
+| **Jami** | Fully decentralized P2P (OpenDHT), no server at all | GNU project, GPLv3, calls/chat are P2P with no central server in principle — but requires **installing a native app**, doesn't work "via a browser link" | [jami.net][jami], [Wikipedia][jami-wiki] |
+| **MiroTalk P2P** | Self-hosted P2P (no SFU), browser | Similar architecture to our product: no time limit, no room limit — but **AGPLv3** (copyleft: a fork with modifications must be open), not MIT | [GitHub][mirotalk] |
+| **Galène** | Self-hosted, Go + Pion, SFU | Lightweight, portable (even to OpenWRT), but scales quadratically for many-to-many: ~20 participants per core — not a problem for us at a ceiling of 6, but it illustrates that even "lightweight" SFUs are heavier than pure mesh | [galene.org][galene], [GitHub][galene-gh] |
 
-### 3.4 Их боли в текущих решениях
+### 3.4 Their Pain Points With Current Solutions
 
-- **Jitsi** — «self-hosting не тривиален» прямо по словам самой
-  документации Jitsi (нужен домен, сертификат, отдельная SFU-компонента
-  videobridge, XMPP-prosody, Jicofo — несколько сервисов, не один бинарь);
-  и даже после этого сервер по умолчанию видит расшифрованное медиа, если
-  не включить E2EE-тоггл вручную (который сам по себе отключает часть
-  фич) [jitsi-handbook], [jitsi-e2ee].
-- **Element/Matrix** — сила (децентрализация, федерация) оборачивается
-  весом: нужен homeserver + LiveKit, это инфраструктура организации, а не
-  «поднял за 2 минуты для разового звонка».
-- **Signal** — сам сервер закрыт, self-host невозможен «под ключ»; чтобы
-  просто позвонить — нужен телефон и установка приложения на все стороны.
-- **Jami** — архитектурно самый близкий по духу к «нет сервера вообще», но
-  требует установки нативного клиента у всех участников — не «click a
-  link».
-- **LiveKit/Daily/mediasoup-based self-host решения** — по умолчанию SFU
-  видит decrypted-медиа поток на сервере (нужен явный E2E слой сверху,
-  который редко включён по умолчанию) — те же оговорки, что у Jitsi.
-- Общая боль: «open source» не значит «сервер ничего не видит» — у
-  большинства self-hosted решений сервер физически проходит через
-  расшифрованный медиапоток (SFU-архитектура), и только у mesh-based
-  решений (мы, MiroTalk P2P, Jami) сервер **структурно** не может увидеть
-  медиа, а не «может, но обещает не смотреть».
+- **Jitsi** — "self-hosting is not trivial," in the words of Jitsi's own
+  documentation (needs a domain, a certificate, a separate SFU component —
+  videobridge, XMPP-prosody, Jicofo — several services, not one binary);
+  and even after that, the server sees decrypted media by default unless
+  the E2EE toggle is enabled manually (which itself disables some
+  features) [jitsi-handbook], [jitsi-e2ee].
+- **Element/Matrix** — its strength (decentralization, federation) turns
+  into weight: a homeserver + LiveKit is required, this is organizational
+  infrastructure, not "spun up in 2 minutes for a one-off call."
+- **Signal** — the server itself is closed source, self-hosting isn't
+  possible "turnkey"; just to make a call, a phone number and an app
+  install on all sides are required.
+- **Jami** — architecturally the closest in spirit to "no server at all,"
+  but requires installing a native client for all participants — not
+  "click a link."
+- **LiveKit/Daily/mediasoup-based self-host solutions** — by default the
+  SFU sees a decrypted media stream on the server (an explicit E2E layer
+  on top is needed, which is rarely enabled by default) — the same caveats
+  as Jitsi.
+- General pain point: "open source" doesn't mean "the server sees
+  nothing" — in most self-hosted solutions the server physically passes
+  through the decrypted media stream (SFU architecture), and only in
+  mesh-based solutions (us, MiroTalk P2P, Jami) is the server
+  **structurally** unable to see the media, rather than "able to, but
+  promising not to look."
 
-### 3.5 Как продать именно им
+### 3.5 How to Sell to Them Specifically
 
-**Ключевое сообщение:**
+**Key message:**
 
 > "The server can't see your call — not because we promise not to look, but because there's structurally nothing to look at: media never touches it."
 
-**3–5 поддерживающих пунктов:**
+**3–5 supporting points:**
 
-1. Полный mesh, без SFU — сервер не декодирует, не хранит и не может
-   технически прочитать ни видео, ни аудио, ни чат ни при каких условиях
-   (в отличие от Jitsi/большинства self-hosted решений, где E2EE — это
-   опциональный тоггл, а не архитектура по умолчанию).
-2. Один Rust-бинарь + статика — `docker compose up -d`, никакого XMPP-
-   сервера, отдельного SFU, homeserver и координации из нескольких
-   компонент.
-3. Ноль телеметрии, ноль cookies, ноль localStorage, IP не логируется —
-   проверьте `src/ws.rs`, это буквально 2.3 тыс. строк кода.
-4. Публикуемый build-hash деплоя через независимый канал (GitHub Release) —
-   можно сверить, что раздаётся именно тот код, который лежит в репо.
-5. SAS-верификация (5 эмодзи) — защита от активного MITM без PKI/аккаунтов.
-6. **Нагрузка на сервер во время звонка ≈ 0** (см.
-   [§9](#9-нагрузка-на-сервер--0-аргумент-для-сегментов-3-и-4)) — сервер
-   релеит только маленькие зашифрованные blob'ы при установке соединения,
-   всё остальное время звонка сервер практически ничего не делает; поэтому
-   это реально работает на самом дешёвом VPS (1 vCPU/512МБ), а не требует
-   мощного железа «на всякий случай».
+1. Full mesh, no SFU — the server doesn't decode, doesn't store, and
+   cannot technically read video, audio, or chat under any circumstances
+   (unlike Jitsi/most self-hosted solutions, where E2EE is an optional
+   toggle, not the default architecture).
+2. One Rust binary + static files — `docker compose up -d`, no XMPP
+   server, no separate SFU, no homeserver, no coordination across multiple
+   components.
+3. Zero telemetry, zero cookies, zero localStorage, IP not logged — check
+   `src/ws.rs`, that's literally 2.3k lines of code.
+4. A published build hash of the deployment via an independent channel
+   (GitHub Release) — you can verify that exactly the code that's in the
+   repo is what's being served.
+5. SAS verification (5 emoji) — protection against active MITM without
+   PKI/accounts.
+6. **Server load during a call ≈ 0** (see
+   [§9](#9-server-load--0-argument-for-segments-3-and-4)) — the server only
+   relays small encrypted blobs while a connection is being set up; the
+   rest of the call the server does practically nothing — which is why it
+   really does run on the cheapest VPS (1 vCPU/512MB), rather than needing
+   beefy hardware "just in case."
 
-**Какие фичи показывать первыми:**
+**Which features to show first:**
 
-- Ссылку на `src/` и размер кодовой базы — «маленький, можно прочитать
-  целиком за вечер».
-- `docs/security.md` и `docs/e2e-encryption.md` как есть — этот сегмент
-  реально читает threat model, а не только маркетинг.
-- Build-hash / verify-инструкцию (`security.md` §10.2).
-- SAS-верификацию как фичу, а не «мелкий шрифт».
-- Прикидку по трафику из [§9](#9-нагрузка-на-сервер--0-аргумент-для-сегментов-3-и-4)
-  — конкретные цифры (КБ на комнату, сотни-тысячи комнат на дешёвом VPS)
-  убеждают этот сегмент лучше общих слов «легковесный».
+- A link to `src/` and the size of the codebase — "small, you can read the
+  whole thing in an evening."
+- `docs/security.md` and `docs/e2e-encryption.md` as they are — this
+  segment actually reads the threat model, not just the marketing.
+- The build hash / verification instructions (`security.md` §10.2).
+- SAS verification as a feature, not "fine print."
+- The traffic estimate from
+  [§9](#9-server-load--0-argument-for-segments-3-and-4) — specific numbers
+  (KB per room, hundreds to thousands of rooms on a cheap VPS) convince
+  this segment better than generic words like "lightweight."
 
-**Какие ограничения честно признавать:**
+**Which limitations to honestly acknowledge:**
 
-- **Нет независимого security-аудита третьей стороной** — это открытый
-  проект одного разработчика, а не BigBlueButton/Jitsi с институциональной
-  поддержкой. Стоит сказать прямо: «маленький, читаемый код — это разумная
-  замена аудиту, но не то же самое, что аудит».
-- Guest-permissions (запрет чата/камеры гостям) — это кооперативная мера,
-  не серверная: модифицированный клиент может её игнорировать (см.
-  `security.md` §9). Для параноика это важная деталь, и скрывать её —
-  плохая идея, они это и так вычислят из архитектуры.
-- Single-replica, in-memory — при рестарте сервера все текущие комнаты
-  теряют signaling-состояние (хотя P2P-медиа продолжает работать) — не
-  «высокая доступность» в enterprise-смысле.
-- Рекомендуемый дефолт — до 6 участников (env `MAX_PARTICIPANTS`) — сервер
-  сам числу участников не ограничивает выше этого структурно (можно поднять
-  дефолт), но с ростом числа участников линейно растёт исходящий
-  трафик/CPU КАЖДОГО клиента (n-1 копий каждому шлёшь напрямую) — это
-  реальный технический потолок mesh на стороне устройств участников, не
-  сервера, и именно поэтому не задирать дефолт бесконечно — переход на SFU
-  противоречил бы всей архитектурной идее (сервер тогда увидел бы медиа).
+- **No independent third-party security audit** — this is an open project
+  by a single developer, not BigBlueButton/Jitsi with institutional
+  backing. It's worth saying outright: "small, readable code is a
+  reasonable substitute for an audit, but not the same thing as an audit."
+- Guest permissions (blocking chat/camera for guests) — this is a
+  cooperative measure, not a server-enforced one: a modified client can
+  ignore it (see `security.md` §9). For a paranoid user this is an
+  important detail, and hiding it is a bad idea — they'll work it out from
+  the architecture anyway.
+- Single-replica, in-memory — when the server restarts, all current rooms
+  lose their signaling state (though P2P media keeps working) — this isn't
+  "high availability" in the enterprise sense.
+- Recommended default — up to 6 participants (env `MAX_PARTICIPANTS`) —
+  the server itself doesn't structurally cap the number of participants
+  beyond this (the default can be raised), but as the number of
+  participants grows, outgoing traffic/CPU on EVERY client grows linearly
+  (you send n-1 copies directly to each) — this is a real technical
+  ceiling of mesh on the participants' devices, not the server, and that's
+  exactly why the default shouldn't be pushed up endlessly — switching to
+  an SFU would contradict the whole architectural idea (the server would
+  then see the media).
 
-**Каналы дистрибуции:**
+**Distribution channels:**
 
-- **r/selfhosted** — самый прямой канал, конкретно под self-hosting-пост
-  («I built a P2P video chat where the server literally can't see the
-  media — single Rust binary, MIT»).
-- **awesome-selfhosted** список — формальные требования простые (source
-  code, license, работающая ссылка) и мы их удовлетворяем; попадание в
-  список даёт долгоиграющий органический трафик [awesome-selfhosted].
-- **r/privacy**, r/degoogle — с акцентом на архитектурное отличие от Jitsi
-  (см. выше), а не общий privacy-питч.
-- HN Show HN — тот же пост, что и в §2.6, но с упором на архитектуру, не
-  на лимиты Zoom.
+- **r/selfhosted** — the most direct channel, specifically a self-hosting
+  post ("I built a P2P video chat where the server literally can't see the
+  media — single Rust binary, MIT").
+- The **awesome-selfhosted** list — the formal requirements are simple
+  (source code, license, a working link) and we satisfy them; getting into
+  the list provides long-running organic traffic [awesome-selfhosted].
+- **r/privacy**, r/degoogle — with an emphasis on the architectural
+  difference from Jitsi (see above), not a generic privacy pitch.
+- HN Show HN — the same post as in §2.6, but focused on architecture, not
+  Zoom's limits.
 
-### 3.6 Что нельзя честно обещать
+### 3.6 What Can't Be Honestly Promised
 
-- Нельзя говорить «более приватно, чем Jitsi с E2EE включённым» в абсолютном
-  смысле — при включённом Jitsi E2EE медиа тоже недоступно серверу; честное
-  отличие — это то, что у нас так **по умолчанию и всегда**, без тоггла и без
-  потери фич, а не что криптографический результат принципиально другой.
-- Нельзя обещать анонимность внутри звонка от **других участников** — они
-  видят ваш IP (в Jitsi через SFU IP от других участников скрыт — сервер
-  видит все IP, но участники друг друга не видят напрямую). Это реальный
-  trade-off mesh-архитектуры, а не только плюс.
-- Нельзя обещать отсутствие метаданных на сервере вообще — room id, peer id,
-  публичные ключи, тайминги join/leave — сервер их видит по конструкции
-  (`privacy.md` §2). Zero-knowledge только про контент, не про факт звонка.
-- Нельзя обещать federation/decentralization уровня Matrix/Jami — у нас
-  всё ещё нужен один сигнальный сервер (даже если он не видит контент).
-- Нельзя обещать формальный аудит — только читаемость кода и открытость.
+- Can't say "more private than Jitsi with E2EE enabled" in an absolute
+  sense — with Jitsi E2EE enabled, media is also inaccessible to the
+  server; the honest difference is that for us this is **the default,
+  always**, without a toggle and without losing features, not that the
+  cryptographic outcome is fundamentally different.
+- Can't promise anonymity within the call from **other participants** —
+  they see your IP (in Jitsi, via the SFU, participants' IPs are hidden
+  from each other — the server sees all IPs, but participants don't see
+  each other directly). This is a real trade-off of mesh architecture, not
+  only an advantage.
+- Can't promise the absence of metadata on the server altogether — room
+  id, peer id, public keys, join/leave timings — the server sees these by
+  construction (`privacy.md` §2). Zero-knowledge applies only to content,
+  not to the fact that a call took place.
+- Can't promise federation/decentralization at the level of Matrix/Jami —
+  we still need one signaling server (even though it doesn't see content).
+- Can't promise a formal audit — only readable code and openness.
 
-### 3.7 Черновики EN
+### 3.7 EN Drafts
 
 ```
 Most "private" video tools route your call through a server that
@@ -476,139 +505,145 @@ enough that you don't have to take our word for it.
 
 ---
 
-## 4. Сегмент 4 — Интеграторы
+## 4. Segment 4 — Integrators
 
-### 4.1 Портрет и сценарии
+### 4.1 Profile and Scenarios
 
-- Разработчик SaaS-продукта (телемедицина, edtech, консультации,
-  внутренний тул компании), которому нужен видеозвонок как *фича внутри
-  своего продукта*, не как отдельный сервис.
-- Стартап на раннем этапе, у которого нет бюджета на per-minute биллинг
-  LiveKit Cloud/Daily/Twilio, но нужен рабочий видеочат уже сейчас.
-- Инди-разработчик, который хочет встроить видео в свой открытый или
-  закрытый проект и не хочет писать WebRTC-стек с нуля.
+- A developer of a SaaS product (telemedicine, edtech, consulting, an
+  internal company tool) who needs a video call as a *feature inside their
+  own product*, not as a separate service.
+- An early-stage startup with no budget for per-minute billing from
+  LiveKit Cloud/Daily/Twilio, but that needs a working video chat right
+  now.
+- An indie developer who wants to embed video in their open or closed
+  project and doesn't want to write a WebRTC stack from scratch.
 
-### 4.2 Каналы обитания
+### 4.2 Where They Hang Out
 
-Hacker News (Show HN про инфраструктурные тулы), r/webdev, r/programming,
-Product Hunt (категория Developer Tools), Indie Hackers, профильные
-Discord/Slack про WebRTC (webrtcHacks, WebRTC Ventures community),
-Twitter/X-разработчики инфраструктуры.
+Hacker News (Show HN for infrastructure tools), r/webdev, r/programming,
+Product Hunt (Developer Tools category), Indie Hackers, WebRTC-focused
+Discord/Slack communities (webrtcHacks, WebRTC Ventures community),
+Twitter/X infrastructure developers.
 
-### 4.3 Чем пользуются сейчас и их условия (2026, проверено поиском)
+### 4.3 What They Use Now and Their Terms (2026, verified by search)
 
-| Решение | Модель | Условия / цена | Источник |
+| Solution | Model | Terms / pricing | Source |
 |---|---|---|---|
-| **Jitsi Meet iframe API / Jitsi as a Service (8x8)** | Iframe embed или self-host | Бесплатный self-host, но нужно поднимать несколько компонент (videobridge, prosody, jicofo); managed вариант платный | [Jitsi handbook][jitsi-handbook] |
-| **LiveKit** | Open-source SFU (Go/Pion) + managed Cloud | **Self-host полностью бесплатен** (Apache 2.0) — платите только за свою инфраструктуру; Cloud: Free/Build tier, Ship $50/мес, Scale $500/мес, дальше по использованию (agent-минуты $0.01/мин, WebRTC-минуты $0.0004–0.0005/мин, трафик $0.10–0.12/ГБ) | [livekit.com/pricing][livekit-pricing], [self-hosting docs][livekit-selfhost] |
-| **Daily.co** | Managed API/SDK | 10 000 бесплатных участник-минут/мес, затем $0.004/участник-минуту; запись отдельно оплачивается | [daily.co pricing][daily-pricing] |
-| **Twilio Video** | Managed API | В марте 2024 объявили EOL на декабрь 2024, но **в октябре 2024 решение отменили** — продукт остаётся стандалоном; статус на 2026 — жив, но с историей нервного анонса, которую интеграторы помнят | [Twilio changelog][twilio-reversal], [bloggeek.me][twilio-sunset] |
-| **Whereby Embedded** | Managed iframe/SDK | Explore — бесплатный тир, Build — $9.99/мес, Grow — кастом; usage-based биллинг сверху | [whereby.com/pricing][whereby-pricing] |
-| **mediasoup / Pion** | «Голые» библиотеки (Node.js/Go) | Бесплатны и open source, но это **низкоуровневые движки**: нет UI, нет сигналинга «из коробки» — интегратор пишет всё сам | [mediasoup/Pion сравнение][sfu-comparison] |
-| **MiroTalk P2P** | Self-hosted P2P, готовое UI | Бесплатно, но **AGPLv3** — если встраиваешь в закрытый продукт с модификациями, обязан открыть изменения | [GitHub][mirotalk] |
+| **Jitsi Meet iframe API / Jitsi as a Service (8x8)** | Iframe embed or self-host | Free to self-host, but requires standing up several components (videobridge, prosody, jicofo); the managed option is paid | [Jitsi handbook][jitsi-handbook] |
+| **LiveKit** | Open-source SFU (Go/Pion) + managed Cloud | **Fully free to self-host** (Apache 2.0) — you only pay for your own infrastructure; Cloud: Free/Build tier, Ship $50/mo, Scale $500/mo, then usage-based (agent minutes $0.01/min, WebRTC minutes $0.0004–0.0005/min, bandwidth $0.10–0.12/GB) | [livekit.com/pricing][livekit-pricing], [self-hosting docs][livekit-selfhost] |
+| **Daily.co** | Managed API/SDK | 10,000 free participant-minutes/month, then $0.004/participant-minute; recording billed separately | [daily.co pricing][daily-pricing] |
+| **Twilio Video** | Managed API | In March 2024 announced EOL for December 2024, but **reversed the decision in October 2024** — the product remains standalone; status as of 2026 — alive, but with a history of a nerve-wracking announcement that integrators remember | [Twilio changelog][twilio-reversal], [bloggeek.me][twilio-sunset] |
+| **Whereby Embedded** | Managed iframe/SDK | Explore — free tier, Build — $9.99/mo, Grow — custom; usage-based billing on top | [whereby.com/pricing][whereby-pricing] |
+| **mediasoup / Pion** | "Bare" libraries (Node.js/Go) | Free and open source, but these are **low-level engines**: no UI, no signaling out of the box — the integrator writes everything themselves | [mediasoup/Pion comparison][sfu-comparison] |
+| **MiroTalk P2P** | Self-hosted P2P, ready-made UI | Free, but **AGPLv3** — if embedded into a closed product with modifications, you must open-source the changes | [GitHub][mirotalk] |
 
-### 4.4 Их боли в текущих решениях
+### 4.4 Their Pain Points With Current Solutions
 
-- **Биллинг за минуту** непредсказуем на старте: у Daily/LiveKit Cloud/
-  Whereby модель «плати по использованию» — отлично при масштабе, но
-  тревожно для MVP без прогнозируемого трафика.
-- **Голые библиотеки** (mediasoup, Pion) дают контроль, но требуют
-  реализовать сигналинг, UI, TURN-обвязку, permission-модель — недели
-  работы прежде чем есть что показать пользователю.
-- **Лицензии-ловушки**: AGPL-решения (MiroTalk P2P и многие self-hosted
-  альтернативы) требуют раскрывать изменения при встраивании в SaaS —
-  для закрытого продукта это часто red flag на этапе due diligence
-  юристов.
-- **Нервозность вокруг судьбы продукта**: история Twilio Video (анонс EOL
-  → реверс через 7 месяцев) — живой пример того, что managed API может
-  однажды закрыться, и мигрировать с проприетарного протокола дорого.
-- **Overkill для маленьких кейсов**: если продукту нужен видеозвонок 1:1
-  или в маленькой группе (консультация, приём, small-team call), полный
-  SFU-стек (Jitsi, LiveKit self-host) — избыточная инфраструктура ради
-  функциональности, которая и так покрывается mesh.
+- **Per-minute billing** is unpredictable at launch: Daily/LiveKit
+  Cloud/Whereby's "pay for what you use" model is great at scale, but
+  worrying for an MVP with no predictable traffic.
+- **Bare libraries** (mediasoup, Pion) give control, but require
+  implementing signaling, UI, TURN plumbing, a permissions model — weeks
+  of work before there's anything to show a user.
+- **Licensing traps**: AGPL solutions (MiroTalk P2P and many self-hosted
+  alternatives) require disclosing changes when embedded into SaaS — for a
+  closed product this is often a red flag during a lawyer's due diligence.
+- **Anxiety around a product's fate**: the Twilio Video story (EOL
+  announcement → reversal 7 months later) is a live example of how a
+  managed API can one day shut down, and migrating away from a proprietary
+  protocol is expensive.
+- **Overkill for small use cases**: if a product needs a 1:1 or small-group
+  video call (a consultation, an appointment, a small-team call), a full
+  SFU stack (Jitsi, LiveKit self-host) is excess infrastructure for
+  functionality that mesh already covers.
 
-### 4.5 Как продать именно им
+### 4.5 How to Sell to Them Specifically
 
-**Ключевое сообщение:**
+**Key message:**
 
 > "MIT-licensed, single binary, no per-minute billing ever — fork it, brand it, ship it inside your product."
 
-**3–5 поддерживающих пунктов:**
+**3–5 supporting points:**
 
-1. **MIT**, не AGPL/copyleft — можно встроить в закрытый коммерческий
-   продукт без обязательства открывать свой код.
-2. Один бинарь без внешних зависимостей (без БД, без Redis, без отдельного
-   SFU-кластера) — разворачивается за минуты, а не как Jitsi/Matrix-стек
-   из нескольких сервисов.
-3. Готовый signaling-протокол + фронтенд-логика WebRTC-mesh «из коробки» —
-   не низкоуровневая библиотека вроде mediasoup/Pion, где всё это придётся
-   писать самому.
-4. Нет платы за минуту использования, потому что нет биллинг-модели вообще
-   — self-host = ваша инфраструктура, ваши расходы, предсказуемые заранее.
-5. Split-origin режим (фронт и сигналинг на разных доменах/операторах) —
-   удобно встраивать под свой домен/бренд, не привязываясь к нашему.
-6. **Сервер вообще не касается медиа** (см.
-   [§9](#9-нагрузка-на-сервер--0-аргумент-для-сегментов-3-и-4)) — поэтому
-   ваша инфраструктурная стоимость почти не растёт с числом одновременных
-   звонков, в отличие от Daily/LiveKit Cloud/Whereby, где биллинг считается
-   по участник-минутам/трафику медиа именно потому, что их сервер этот
-   медиапоток физически пропускает через себя.
+1. **MIT**, not AGPL/copyleft — can be embedded into a closed commercial
+   product with no obligation to open-source your code.
+2. A single binary with no external dependencies (no database, no Redis,
+   no separate SFU cluster) — deploys in minutes, not like a Jitsi/Matrix
+   stack made of several services.
+3. A ready-made signaling protocol + WebRTC-mesh front-end logic out of the
+   box — not a low-level library like mediasoup/Pion, where all of that
+   would have to be written yourself.
+4. No per-minute usage fee, because there's no billing model at all —
+   self-host = your infrastructure, your costs, predictable in advance.
+5. Split-origin mode (front end and signaling on different domains/
+   operators) — convenient for embedding under your own domain/brand,
+   without being tied to ours.
+6. **The server never touches the media at all** (see
+   [§9](#9-server-load--0-argument-for-segments-3-and-4)) — so your
+   infrastructure cost barely grows with the number of simultaneous calls,
+   unlike Daily/LiveKit Cloud/Whereby, whose billing is calculated by
+   participant-minutes/media traffic precisely because their server
+   physically passes that media stream through itself.
 
-**Какие фичи показывать первыми:**
+**Which features to show first:**
 
-- Лицензия MIT — крупно, в первую же секунду (это часто первый вопрос
-  юриста/CTO).
-- `docker compose up -d` → работающий инстанс за пару минут — время до
-  первого впечатления критично для этого сегмента.
-- `docs/signaling-protocol.md` и `docs/self-hosting.md` (env vars,
-  `CORS_ORIGIN`, split-origin) — интегратор хочет видеть протокол и
-  конфигурацию до того, как начнёт интегрировать.
-- Ветка «нет комиссии за минуту» с явным сравнением против Daily/
-  LiveKit Cloud/Whereby-биллинга.
+- The MIT license — prominently, in the very first second (this is often
+  the first question a lawyer/CTO asks).
+- `docker compose up -d` → a working instance in a couple of minutes —
+  time to first impression is critical for this segment.
+- `docs/signaling-protocol.md` and `docs/self-hosting.md` (env vars,
+  `CORS_ORIGIN`, split-origin) — an integrator wants to see the protocol
+  and configuration before they start integrating.
+- The "no per-minute fee" angle, with an explicit comparison against
+  Daily/LiveKit Cloud/Whereby billing.
 
-**Какие ограничения честно признавать:**
+**Which limitations to honestly acknowledge:**
 
-- Рекомендуемый дефолт — до 6 участников (env `MAX_PARTICIPANTS`,
-  mesh-архитектура); формально можно поднять, но цена — трафик/CPU у КАЖДОГО
-  клиента, а не у сервера. Для продукта, которому нужны десятки/сотни
-  участников в одной комнате (вебинары, большие тренинги), mesh всё равно
-  архитектурно не подходит — туда LiveKit/mediasoup/Jitsi всё ещё лучше
-  подходят, честно направлять таких интеграторов в их сторону.
-- Нет встроенной записи/стриминга — если продукту нужен «звонок +
-  запись для комплаенса», это не про нас (и по архитектуре сознательно не
-  будет: сервер не видит медиа, значит и не может его записать сам).
-- Single-replica, in-memory — интегратору, которому нужен horizontal
-  scaling/rolling deploy без даунтайма, придётся учитывать это в своей
-  инфраструктуре (redeploy = несколько секунд разрыва сигналинга,
-  P2P-медиа не рвётся).
-- Молодой проект без публичного трек-рекорда крупных интеграций — в
-  отличие от LiveKit/Daily с историей enterprise-клиентов, здесь пока
-  «попробуй и сделай вывод сам», а не «сотни компаний уже используют».
+- Recommended default — up to 6 participants (env `MAX_PARTICIPANTS`,
+  mesh architecture); formally it can be raised, but the price is
+  traffic/CPU on EVERY client, not the server. For a product that needs
+  dozens/hundreds of participants in one room (webinars, large trainings),
+  mesh still isn't architecturally suited — LiveKit/mediasoup/Jitsi are
+  still a better fit there, and it's honest to point such integrators in
+  that direction.
+- No built-in recording/streaming — if the product needs "call + recording
+  for compliance," that's not us (and by design this is deliberate: the
+  server doesn't see the media, so it can't record it itself).
+- Single-replica, in-memory — an integrator who needs horizontal
+  scaling/rolling deploys with no downtime will need to account for this
+  in their own infrastructure (a redeploy = a few seconds of signaling
+  disruption, P2P media doesn't drop).
+- A young project with no public track record of large integrations —
+  unlike LiveKit/Daily with a history of enterprise customers, here it's
+  currently "try it and judge for yourself," not "hundreds of companies
+  already use it."
 
-**Каналы дистрибуции:** Show HN (заголовок в духе «MIT-licensed P2P video
-chat you can embed — no per-minute billing»), Product Hunt в категории
-Developer Tools, r/webdev, публикация в подборках типа «open source
-alternatives to Daily/Twilio Video», upstream PR/mention в
-awesome-webrtc-style списках, техническая статья на dev.to/личном блоге
-с бенчмарком «время до первого работающего звонка: у нас vs mediasoup vs
-Jitsi self-host».
+**Distribution channels:** Show HN (a title along the lines of
+"MIT-licensed P2P video chat you can embed — no per-minute billing"),
+Product Hunt in the Developer Tools category, r/webdev, publication in
+roundups like "open source alternatives to Daily/Twilio Video," an
+upstream PR/mention in awesome-webrtc-style lists, a technical article on
+dev.to/a personal blog with a benchmark of "time to first working call:
+us vs. mediasoup vs. Jitsi self-host."
 
-### 4.6 Что нельзя честно обещать
+### 4.6 What Can't Be Honestly Promised
 
-- Нельзя обещать «замена LiveKit/mediasoup при масштабе» — mesh физически
-  не тянет много участников; честно — это нишевый инструмент для
-  small-group видео внутри продукта, не универсальный видео-стек.
-- Нельзя обещать SLA/поддержку уровня managed-вендора (Daily/LiveKit Cloud
-  сами держат инфраструктуру и отвечают за аптайм) — self-host = ваша
-  ответственность за деплой и мониторинг.
-- Нельзя обещать recording/streaming API «просто добавьте флаг» — этого
-  нет и архитектурно не может появиться без компромисса с приватностью
-  (сервер должен был бы получить доступ к медиа).
-- Нельзя обещать готовые SDK для iOS/Android-нативных приложений — только
-  браузер/WebView; для мобильного SaaS с нативным клиентом это
-  ограничение существенное.
+- Can't promise "a replacement for LiveKit/mediasoup at scale" — mesh
+  physically can't handle many participants; honestly, this is a niche
+  tool for small-group video inside a product, not a universal video
+  stack.
+- Can't promise SLA/support at the level of a managed vendor (Daily/
+  LiveKit Cloud maintain their own infrastructure and are responsible for
+  uptime) — self-host = your responsibility for deployment and
+  monitoring.
+- Can't promise a recording/streaming API "just add a flag" — this doesn't
+  exist and architecturally can't appear without compromising privacy (the
+  server would have to gain access to the media).
+- Can't promise ready-made SDKs for native iOS/Android apps — browser/
+  WebView only; for a mobile SaaS with a native client this is a
+  significant limitation.
 
-### 4.7 Черновики EN
+### 4.7 EN Drafts
 
 ```
 MIT-licensed. One binary. Fork it, put your logo on it, run it behind
@@ -621,235 +656,250 @@ you need dozens of participants in one room.
 
 ---
 
-## 5. Сводная таблица конкурентов и лимитов (2026)
+## 5. Competitor and Limits Summary Table (2026)
 
-| Продукт | Тип | Лимит бесплатного/базового тарифа | Сервер видит медиа? | Лицензия | Self-host? |
+| Product | Type | Free/basic tier limit | Server sees media? | License | Self-host? |
 |---|---|---|---|---|---|
-| Zoom Basic | SaaS mainstream | 40 мин (группа 3+), безлимит 1:1 [zoom-40] | Да (централизованный) | Проприетарный | Нет |
-| Google Meet (личный) | SaaS mainstream | 60 мин (группа 3+) [meet-60] | Да | Проприетарный | Нет |
-| Microsoft Teams (free) | SaaS mainstream | 60 мин, до 100 участников [teams-limits] | Да | Проприетарный | Нет |
-| WhatsApp | Мессенджер | до 32 участников видео [wa-32] | Метаданные да, контент E2E | Проприетарный | Нет |
-| Telegram | Мессенджер | 30 активных / 1000 зрителей [tg-1000] | Да (звонки не E2E по умолчанию в группах) | Проприетарный (клиент частично открыт) | Нет |
-| Signal | Мессенджер | 75 участников группового звонка [signal-75] | Нет (E2E), но сервер Signal закрыт | Открытый клиент, закрытый сервер | Нет (серверная часть) |
-| Jitsi Meet | Self-hosted SaaS-стиль | Без формального лимита; сервер = SFU | По умолчанию да (снимает DTLS-SRTP на videobridge); E2EE — опциональный тоггл, Chromium-only, отключает запись/стриминг [jitsi-e2ee] | Apache 2.0 | Да, но несколько компонент [jitsi-handbook] |
-| Element Call / Matrix | Self-hosted, федеративный | Без лимита; масштабируется через LiveKit SFU | Через LiveKit SFU — как Jitsi | Apache 2.0 (Element Call) | Да, но homeserver + LiveKit [element-call] |
-| Jami | P2P, децентрализованный | Без лимита | Нет — нет сервера вообще | GPLv3 (GNU-проект) | N/A (serverless по конструкции) [jami] |
-| MiroTalk P2P | Self-hosted P2P | Без лимита времени/комнат | Нет (mesh, как у нас) | **AGPLv3** | Да, один сервис [mirotalk] |
-| Galène | Self-hosted SFU | ~20 участников/ядро в many-to-many | Да (SFU) | MIT | Да, один бинарь (Go) [galene] |
-| **Наш chat** | Self-hosted P2P mesh + публичный инстанс | **Рекомендуемый дефолт 6 участников / на публичном инстансе автозакрытие через 3ч (оба — конфиг: `MAX_PARTICIPANTS`/`MAX_ROOM_LIFETIME_SECONDS`; у продукта самого лимита нет)** | **Нет — структурно невозможно** | **MIT** | Да, один Rust-бинарь |
-| LiveKit (self-host) | Open-source SFU | Без лимита (своя инфра) | Да (SFU), если не добавлен E2E-слой | Apache 2.0 | Да [livekit-selfhost] |
-| LiveKit Cloud | Managed | Free/Build tier → $0.01/мин агент, $0.0004–5/мин медиа [livekit-pricing] | Да | — | Нет |
-| Daily.co | Managed | 10 000 бесплатных участник-минут/мес → $0.004/мин [daily-pricing] | Да | — | Нет |
-| Whereby Embedded | Managed | Explore free → Build $9.99/мес → Grow custom [whereby-pricing] | Да | — | Нет |
-| Twilio Video | Managed | Платный с самого начала; EOL анонсирован 2024, отменён в том же году [twilio-reversal] | Да | — | Нет |
-| mediasoup / Pion | Библиотека | Нет лимита — но нет и UI/сигналинга «из коробки» | Зависит от того, что вы построите | ISC (mediasoup) / MIT (Pion) | Да, но нужно строить самому [sfu-comparison] |
+| Zoom Basic | Mainstream SaaS | 40 min (group 3+), unlimited 1:1 [zoom-40] | Yes (centralized) | Proprietary | No |
+| Google Meet (personal) | Mainstream SaaS | 60 min (group 3+) [meet-60] | Yes | Proprietary | No |
+| Microsoft Teams (free) | Mainstream SaaS | 60 min, up to 100 participants [teams-limits] | Yes | Proprietary | No |
+| WhatsApp | Messenger | up to 32 video participants [wa-32] | Metadata yes, content E2E | Proprietary | No |
+| Telegram | Messenger | 30 active / 1000 viewers [tg-1000] | Yes (calls not E2E by default in groups) | Proprietary (client partly open) | No |
+| Signal | Messenger | 75 group call participants [signal-75] | No (E2E), but Signal's server is closed source | Open client, closed server | No (server side) |
+| Jitsi Meet | Self-hosted, SaaS-style | No formal limit; server = SFU | Yes by default (terminates DTLS-SRTP at videobridge); E2EE is an optional toggle, Chromium-only, disables recording/streaming [jitsi-e2ee] | Apache 2.0 | Yes, but several components [jitsi-handbook] |
+| Element Call / Matrix | Self-hosted, federated | No limit; scales via LiveKit SFU | Via LiveKit SFU — like Jitsi | Apache 2.0 (Element Call) | Yes, but homeserver + LiveKit [element-call] |
+| Jami | P2P, decentralized | No limit | No — no server at all | GPLv3 (GNU project) | N/A (serverless by design) [jami] |
+| MiroTalk P2P | Self-hosted P2P | No time/room limit | No (mesh, like us) | **AGPLv3** | Yes, single service [mirotalk] |
+| Galène | Self-hosted SFU | ~20 participants/core in many-to-many | Yes (SFU) | MIT | Yes, single binary (Go) [galene] |
+| **Our chat** | Self-hosted P2P mesh + public instance | **Recommended default 6 participants / auto-close after 3h on the public instance (both are config: `MAX_PARTICIPANTS`/`MAX_ROOM_LIFETIME_SECONDS`; the product itself has no limit)** | **No — structurally impossible** | **MIT** | Yes, single Rust binary |
+| LiveKit (self-host) | Open-source SFU | No limit (your own infra) | Yes (SFU), unless an E2E layer is added | Apache 2.0 | Yes [livekit-selfhost] |
+| LiveKit Cloud | Managed | Free/Build tier → $0.01/min agent, $0.0004–5/min media [livekit-pricing] | Yes | — | No |
+| Daily.co | Managed | 10,000 free participant-minutes/mo → $0.004/min [daily-pricing] | Yes | — | No |
+| Whereby Embedded | Managed | Explore free → Build $9.99/mo → Grow custom [whereby-pricing] | Yes | — | No |
+| Twilio Video | Managed | Paid from the start; EOL announced 2024, reversed the same year [twilio-reversal] | Yes | — | No |
+| mediasoup / Pion | Library | No limit — but no UI/signaling out of the box either | Depends on what you build | ISC (mediasoup) / MIT (Pion) | Yes, but you have to build it yourself [sfu-comparison] |
 
 ---
 
-## 6. Один лендинг / README на все сегменты: иерархия сообщений
+## 6. One Landing Page / README for All Segments: Message Hierarchy
 
-Все четыре сегмента не противоречат друг другу — они просто читают лендинг
-на разной глубине. Правильная иерархия — **один заголовок для всех, секции
-вглубь для каждого сегмента**, а не четыре разных лендинга.
+All four segments don't contradict each other — they simply read the
+landing page at different depths. The right hierarchy is **one headline
+for everyone, sections that go deeper for each segment**, not four
+separate landing pages.
 
-### 6.1 Заголовок (для всех, 3 секунды на прочтение)
+### 6.1 Headline (for everyone, 3 seconds to read)
 
 ```
 A video call the server can't see, and remembers nothing.
 No sign-up. Six people, three hours by default — then it's gone.
 ```
 
-Это одновременно:
-- понятно не-технарю («не нужна регистрация», «сервер не видит»),
-- отвечает технарю-с-лимитами («три часа по умолчанию, не потолок продукта» —
-  контраст против жёстких 40/60 минут у Zoom/Meet, которые не поменять никак
-  и которые они уже знают на своей боли),
-- намекает параноику на архитектуру («сервер не может видеть», не «сервер
-  обещает не смотреть»),
-- намекает интегратору, что это открытый инструмент, а не только SaaS
-  (через ссылку на GitHub в хедере/футере).
+This simultaneously:
+- is understandable to a non-technical user ("no registration needed,"
+  "the server doesn't see it"),
+- answers the technical user with limits ("three hours by default, not a
+  product ceiling" — a contrast against the hard 40/60 minutes of
+  Zoom/Meet, which can't be changed no matter what, and which they already
+  know from painful experience),
+- hints to the paranoid user at the architecture ("the server can't see
+  it," not "the server promises not to look"),
+- hints to the integrator that this is an open tool, not just a SaaS
+  (via a link to GitHub in the header/footer).
 
-### 6.2 Первый экран (одна демонстрация действия)
+### 6.2 First Screen (a single demonstration of action)
 
-Кнопка **"Start a call"** → сразу ссылка + QR. Один клик — общий для всех
-сегментов якорь: это тот самый UX, который продаёт сам себя не-технарю и
-одновременно демонстрирует технарю «no signup» без единого слова.
+A **"Start a call"** button → immediately a link + QR code. One click — a
+common anchor for all segments: this is the exact UX that sells itself to
+a non-technical user and simultaneously demonstrates "no signup" to a
+technical user without a single word.
 
-### 6.3 Секции ниже, по сегментам (порядок — по приоритету, см. §7)
+### 6.3 Sections Below, by Segment (order — by priority, see §7)
 
-1. **"No account, ever."** (не-технари + параноики) — простыми словами:
-   что сервер видит / не видит, ссылка на privacy-панель в приложении.
-2. **"Free, and we mean it — 3 hours, not 40 minutes."** (уставшие от
-   лимитов технари) — прямое сравнение с Zoom/Meet/Teams таблицей.
-3. **"The server structurally can't see your call."** (параноики) —
-   архитектурная диаграмма mesh vs SFU, ссылка на `docs/security.md`,
-   build-hash, SAS-эмодзи.
-4. **"MIT. One binary. Embed it."** (интеграторы) — блок в самом низу или
-   отдельная страница `/self-hosting` и `/for-developers`, ссылка на
-   `docs/self-hosting.md` и `docs/signaling-protocol.md`.
+1. **"No account, ever."** (non-technical users + paranoid users) — in
+   simple words: what the server sees / doesn't see, a link to the privacy
+   panel in the app.
+2. **"Free, and we mean it — 3 hours, not 40 minutes."** (technical users
+   tired of limits) — a direct comparison table with Zoom/Meet/Teams.
+3. **"The server structurally can't see your call."** (paranoid users) —
+   an architecture diagram of mesh vs. SFU, a link to `docs/security.md`,
+   build hash, SAS emoji.
+4. **"MIT. One binary. Embed it."** (integrators) — a block at the very
+   bottom or a separate `/self-hosting` and `/for-developers` page, a link
+   to `docs/self-hosting.md` and `docs/signaling-protocol.md`.
 
-### 6.4 Общее правило формулировок
+### 6.4 General Rule of Wording
 
-- Никогда не врать про лимиты — везде, где называется «6 человек» или
-  «3 часа», рядом (не в другом месте страницы) — честная причина И статус
-  конфига: «mesh architecture, by design — configurable, this is our
-  recommended default / this instance's setting» — превращает ограничение в
-  сигнал осознанности, а не в скрытый минус, и не выдаёт настроенный дефолт
-  за жёсткий потолок продукта.
-- Слово "privacy" не продаёт не-технарю — продаёт "nothing is saved" /
-  "no sign-up". Слово "open source" не продаёт не-технарю — продаёт
-  параноику и интегратору. Разводить эти слова по секциям, не мешать в
-  заголовке.
-
----
-
-## 7. Приоритизация сегментов
-
-**Дешевле всего привлечь → больше всего органического роста при низких
-усилиях:**
-
-1. **Сегмент 3 (параноики/селф-хостеры)** — самый дешёвый канал: один
-   хороший пост на r/selfhosted + попадание в awesome-selfhosted даёт
-   долгосрочный органический трафик почти бесплатно, и эта аудитория сама
-   активно делится находками дальше (в r/privacy, в телеграм-чатах). Они
-   же — самые требовательные критики, так что успешный заход здесь
-   валидирует продукт перед остальными сегментами.
-2. **Сегмент 2 (уставшие от лимитов технари)** — тоже дешёвый (Show HN,
-   Twitter), и это сегмент с наибольшим бытовым мотивом «мне нужно прямо
-   сейчас» — конверсия из посещения в реальное использование выше, чем у
-   параноиков (которые сначала читают threat model, потом пробуют).
-3. **Сегмент 1 (не-технари)** — самый большой TAM, но самый дорогой канал
-   (нет своих community-каналов, только сарафанное радио через технарей из
-   сегментов 2–3) — **растёт как побочный эффект успеха у 2 и 3**, а не как
-   отдельная маркетинговая кампания на старте.
-4. **Сегмент 4 (интеграторы)** — самый долгий цикл принятия решения (нужно
-   время на evaluation, лицензионный due diligence), но самый высокий
-   потенциальный «рычаг» — один встроивший продукт может привести множество
-   конечных пользователей не через прямой маркетинг, а через дистрибуцию
-   чужого продукта. Стоит инвестировать в документацию для этого сегмента
-   рано (`self-hosting.md`, `signaling-protocol.md` уже в хорошем состоянии),
-   но не ждать быстрой конверсии.
-
-**Рекомендация по порядку запуска:** r/selfhosted + Show HN одновременно
-(сегменты 2 и 3 читают одни и те же каналы) → через 2–4 недели
-awesome-selfhosted PR → через месяц лёгкий питч в сторону интеграторов
-(Product Hunt Developer Tools, dev.to статья) → рост сегмента 1 идёт
-пассивно на всём протяжении, отдельного канала не заводить.
+- Never lie about the limits — everywhere "6 people" or "3 hours" is
+  mentioned, right next to it (not somewhere else on the page) — the
+  honest reason AND the config status: "mesh architecture, by design —
+  configurable, this is our recommended default / this instance's
+  setting" — turns the limitation into a signal of deliberate design, not
+  a hidden downside, and doesn't pass off a configured default as a hard
+  product ceiling.
+- The word "privacy" doesn't sell to a non-technical user — "nothing is
+  saved" / "no sign-up" does. The word "open source" doesn't sell to a
+  non-technical user — it sells to the paranoid user and the integrator.
+  Keep these words in separate sections, don't mix them in the headline.
 
 ---
 
-## 8. Общий список «чего нельзя честно обещать»
+## 7. Segment Prioritization
 
-Свод пунктов из секций 1–4, собранный в одно место — чтобы ни один
-маркетинговый текст не «дрейфовал» в сторону преувеличения:
+**Cheapest to acquire → most organic growth for the least effort:**
 
-| Нельзя обещать | Почему | Честная альтернатива в тексте |
+1. **Segment 3 (paranoid users/self-hosters)** — the cheapest channel: one
+   good r/selfhosted post + getting into awesome-selfhosted delivers
+   long-term organic traffic almost for free, and this audience actively
+   shares findings further on its own (on r/privacy, in Telegram chats).
+   They are also the most demanding critics, so a successful launch here
+   validates the product before the other segments.
+2. **Segment 2 (technical users tired of limits)** — also cheap (Show HN,
+   Twitter), and this is the segment with the strongest everyday motive of
+   "I need this right now" — conversion from visit to actual use is higher
+   than for paranoid users (who read the threat model first, then try it).
+3. **Segment 1 (non-technical users)** — the largest TAM, but the most
+   expensive channel (no dedicated community channels, only word of mouth
+   through technical people from segments 2–3) — **grows as a side effect
+   of success with 2 and 3**, not as a separate marketing campaign at
+   launch.
+4. **Segment 4 (integrators)** — the longest decision cycle (needs time
+   for evaluation, license due diligence), but the highest potential
+   "leverage" — one product that embeds us can bring many end users not
+   through direct marketing, but through distribution of someone else's
+   product. It's worth investing in documentation for this segment early
+   (`self-hosting.md`, `signaling-protocol.md` are already in good shape),
+   but not expecting a fast conversion.
+
+**Recommended launch order:** r/selfhosted + Show HN simultaneously
+(segments 2 and 3 read the same channels) → in 2–4 weeks an
+awesome-selfhosted PR → a month later a light pitch toward integrators
+(Product Hunt Developer Tools, a dev.to article) → segment 1 growth
+happens passively throughout, no separate channel needed.
+
+---
+
+## 8. Combined List of "What We Can't Honestly Promise"
+
+The points from sections 1–4, collected in one place — so that no
+marketing text "drifts" toward exaggeration:
+
+| Can't promise | Why | Honest alternative wording |
 |---|---|---|
-| «Безлимитно» (про наш ПУБЛИЧНЫЙ инстанс) | На chat.fedorov.it настроен дефолт 3 часа / рекомендуемые 6 человек — это конфиг оператора этого инстанса, не потолок продукта | «На нашем инстансе — 3 часа и 6 человек, щедрее, чем у Zoom/Meet; сам продукт лимита не ставит — self-host с любым `MAX_ROOM_LIFETIME_SECONDS`/`MAX_PARTICIPANTS`» |
-| «Анонимность от собеседников» | В P2P собеседники видят реальный IP друг друга | «Собеседник видит только ваш IP-адрес — и ничего больше» |
-| «Более приватно, чем Jitsi с включённым E2EE» | При включённом Jitsi E2EE результат криптографически похож | «У нас так по умолчанию, всегда, без переключателя и без потери фич» |
-| «Аудировано независимой командой» | Аудита нет, только внутренний threat model | «Маленькая, читаемая кодовая база — проверьте сами» |
-| «Замена Zoom/Teams для больших встреч» | Mesh не масштабируется за пределы малых групп | «Для маленьких, спонтанных звонков — не для вебинаров на 100+ человек» |
-| «Можно записать звонок» | Архитектурно сервер не видит медиа → не может записать | «Нет записи — это осознанный trade-off ради приватности» |
-| «Работает как нативное мобильное приложение» | Только браузер/PWA, нет App Store/Play Store присутствия | «Мобильный браузер, устанавливается как PWA — без магазина приложений» |
-| «Enforced гостевые ограничения» | Guest permissions — кооперативная мера, не серверная | «Модерация работает для честных клиентов; это не защита от модифицированного клиента» |
-| «SLA / гарантированный аптайм» (для интеграторов) | Self-host = ответственность оператора, single-replica | «Ваша инфраструктура, ваш аптайм — мы не managed-вендор» |
-| «Без метаданных вообще» | Сервер видит room id, peer id, тайминги join/leave | «Контент не виден никогда; факт звонка и его тайминг — видны, честно» |
-| «Чем больше людей в звонке, тем больше нагрузка на сервер» | Неверно: медиа mesh P2P и сервера не касается вовсе, сервер участвует только в сигналинге при установке соединения (см. [§9](#9-нагрузка-на-сервер--0-аргумент-для-сегментов-3-и-4)) | «Нагрузка на сервер во время самого звонка ≈ 0, независимо от числа участников» |
+| "Unlimited" (about our PUBLIC instance) | On chat.fedorov.it a default of 3 hours / recommended 6 people is configured — this is that instance's operator config, not a product ceiling | "On our instance — 3 hours and 6 people, more generous than Zoom/Meet; the product itself sets no limit — self-host with any `MAX_ROOM_LIFETIME_SECONDS`/`MAX_PARTICIPANTS`" |
+| "Anonymity from other participants" | In P2P, participants see each other's real IP | "The other person only sees your IP address — and nothing else" |
+| "More private than Jitsi with E2EE enabled" | With Jitsi E2EE enabled, the result is cryptographically similar | "For us this is the default, always, with no toggle and no loss of features" |
+| "Audited by an independent team" | No audit exists, only an internal threat model | "A small, readable codebase — check it yourself" |
+| "A replacement for Zoom/Teams for large meetings" | Mesh doesn't scale beyond small groups | "For small, spontaneous calls — not for webinars with 100+ people" |
+| "You can record the call" | Architecturally the server doesn't see the media → can't record it | "No recording — this is a deliberate trade-off for privacy" |
+| "Works like a native mobile app" | Browser/PWA only, no App Store/Play Store presence | "Mobile browser, installable as a PWA — no app store" |
+| "Enforced guest restrictions" | Guest permissions are a cooperative measure, not server-enforced | "Moderation works for honest clients; this is not protection against a modified client" |
+| "SLA / guaranteed uptime" (for integrators) | Self-host = the operator's responsibility, single-replica | "Your infrastructure, your uptime — we are not a managed vendor" |
+| "No metadata at all" | The server sees room id, peer id, join/leave timings | "Content is never visible; the fact of the call and its timing are visible, honestly" |
+| "The more people on the call, the higher the server load" | Incorrect: mesh media is P2P and never touches the server; the server only participates in signaling while the connection is being set up (see [§9](#9-server-load--0-argument-for-segments-3-and-4)) | "Server load during the call itself is ≈ 0, regardless of the number of participants" |
 
 ---
 
-## 9. Нагрузка на сервер ≈ 0 (аргумент для сегментов 3 и 4)
+## 9. Server Load ≈ 0 (Argument for Segments 3 and 4)
 
-Отдельный раздел, потому что это сильный, конкретный (не «легковесный», а
-цифры) аргумент именно для параноиков-селф-хостеров (§3 — «на чём это
-поднять») и интеграторов (§4 — «сколько это будет стоить в инфраструктуре»),
-и в существующих секциях он раньше не был явно проговорён.
+A separate section, because this is a strong, concrete (not "lightweight,"
+but actual numbers) argument specifically for paranoid self-hosters (§3 —
+"what can I run this on") and integrators (§4 — "how much will this cost
+in infrastructure"), and it hadn't been explicitly spelled out in the
+existing sections before.
 
-### 9.1 Что сервер РЕАЛЬНО делает по трафику
+### 9.1 What the Server ACTUALLY Does, Traffic-Wise
 
-Только сигналинг — и весь список исчерпывающий (`src/ws.rs`, `src/state.rs`):
+Only signaling — and the list below is exhaustive (`src/ws.rs`,
+`src/state.rs`):
 
-- Держит комнаты в памяти процесса (участники, лидер, настройки) — это RAM,
-  не трафик.
-- Релеит маленькие ЗАШИФРОВАННЫЕ blob'ы SDP-offer/answer и ICE-кандидатов
-  между парами участников — ТОЛЬКО при установке соединения (в момент входа
-  в комнату и при перестройке ICE), не всё время звонка. Сервер их не
-  разбирает и не хранит — просто маршрутизирует опаковые байты от одного
-  peerId к другому (`privacy.md` §1–2). Каждое такое сообщение сервер сам
-  каппит — не более 16КБ (`RELAY_MAX_BYTES`, см. `security.md` §4).
-- Служебные события: `join-room`/`peer-joined`/`peer-left`,
-  зашифрованный `name-announce` (не более 2КБ на сообщение), смена лидера,
-  смена настроек комнаты, старт/стоп шаринга экрана — все это короткие
-  JSON-сообщения, единицы байт-килобайт, не привязанные к длительности
-  звонка (в основном join/leave-события, а не постоянный поток).
-- WebSocket ping/pong-хартбит каждые 20 секунд на соединение
-  (`PING_INTERVAL`, `src/ws.rs`) — несколько байт на кадр, чтобы держать
-  соединение живым и ловить обрыв сети раньше TCP-таймаута ОС.
+- Holds rooms in the process's memory (participants, leader, settings) —
+  this is RAM, not traffic.
+- Relays small ENCRYPTED SDP offer/answer blobs and ICE candidates between
+  pairs of participants — ONLY while a connection is being established
+  (at the moment of joining a room and during ICE renegotiation), not for
+  the whole duration of the call. The server doesn't parse or store them —
+  it just routes opaque bytes from one peerId to another (`privacy.md`
+  §1–2). The server itself caps each such message — no more than 16KB
+  (`RELAY_MAX_BYTES`, see `security.md` §4).
+- Service events: `join-room`/`peer-joined`/`peer-left`, an encrypted
+  `name-announce` (no more than 2KB per message), leader changes, room
+  setting changes, screen-share start/stop — all of these are short JSON
+  messages, single-digit-to-kilobyte in size, not tied to the duration of
+  the call (mostly join/leave events, not a continuous stream).
+- A WebSocket ping/pong heartbeat every 20 seconds per connection
+  (`PING_INTERVAL`, `src/ws.rs`) — a few bytes per frame, to keep the
+  connection alive and catch a network drop earlier than the OS's TCP
+  timeout.
 
-### 9.2 Что НИКОГДА не проходит через сервер
+### 9.2 What NEVER Goes Through the Server
 
-Видео, аудио, чат — идут по прямому WebRTC mesh между браузерами, сервер в
-этом пути не участвует вообще (`privacy.md` §1). Файлы — отдельно стоит
-подчеркнуть: они тоже идут по выделенному P2P data-channel и НЕ
-проксируются через сервер НИ ПРИ КАКИХ обстоятельствах, включая случай,
-когда прямое соединение установить не удаётся (`privacy.md` §1, `chat.md`
-§10 «No Server Fallback») — то есть даже в худшем сетевом случае сервер не
-становится файловым релеем, в отличие от многих других серверных
-архитектур с fallback через сервер.
+Video, audio, chat — travel over a direct WebRTC mesh between browsers,
+the server doesn't participate in this path at all (`privacy.md` §1).
+Files deserve a special mention: they too travel over a dedicated P2P data
+channel and are NOT proxied through the server under ANY circumstances,
+including the case where a direct connection cannot be established
+(`privacy.md` §1, `chat.md` §10 "No Server Fallback") — meaning that even
+in the worst-case network scenario, the server never becomes a file
+relay, unlike many other server architectures with a server-side
+fallback.
 
-### 9.3 Следствие: во время звонка серверный трафик комнаты ≈ 0
+### 9.3 Consequence: Server Traffic for a Room ≈ 0 During the Call
 
-Единственный трафик, который сервер несёт за всю жизнь комнаты, — это
-короткий всплеск при установке mesh-соединений (когда участники входят) и
-редкие короткие события (join/leave/смена настроек/смена лидера). Сам
-разговор — сколько бы он ни длился — НЕ создаёт растущего серверного
-трафика: 3-часовой звонок и 3-минутный звонок нагружают сервер практически
-одинаково, потому что нагрузка привязана к числу СОБЫТИЙ установки
-соединения, а не к времени или объёму медиа.
+The only traffic the server carries over the entire life of a room is a
+short burst while mesh connections are being established (as participants
+join) and rare short events (join/leave/setting changes/leader changes).
+The conversation itself — no matter how long it runs — does NOT create
+growing server traffic: a 3-hour call and a 3-minute call load the server
+almost identically, because the load is tied to the number of connection-
+establishment EVENTS, not to time or media volume.
 
-**Грубая прикидка цифрами** (порядок величины, не точный бюджет):
+**A rough order-of-magnitude estimate** (not an exact budget):
 
-- Один зашифрованный SDP-blob (offer/answer, base64 + AES-GCM overhead) —
-  примерно **2–8 КБ**; ICE-кандидат — заметно меньше, около 0.5–1.5 КБ,
-  таких за установку соединения обычно несколько на пару.
-- Комната из 6 участников — это full mesh, т.е. **15 пар** (C(6,2) = 15) —
-  каждая пара обменивается одним offer, одним answer и несколькими
-  ICE-кандидатами через сервер, один раз, при установке.
-- Итого на установку ВСЕЙ комнаты из 6 человек — по грубой прикидке
-  **порядка десятков КБ до, в худшем случае, невысокой сотни КБ**
-  суммарно, ОДНОРАЗОВО, при входе всех участников — и это весь серверный
-  трафик за всю жизнь комнаты, будь она 5 минут или все настроенные 3 часа.
-  Для сравнения: одна секунда включённого видео 720p в mesh — это уже
-  сотни КБ ЗА СЕКУНДУ, но эти данные вообще не идут через сервер.
+- One encrypted SDP blob (offer/answer, base64 + AES-GCM overhead) is
+  roughly **2–8 KB**; an ICE candidate is noticeably smaller, around
+  0.5–1.5 KB, and there are usually several of these per pair during
+  connection setup.
+- A room of 6 participants is a full mesh, i.e. **15 pairs**
+  (C(6,2) = 15) — each pair exchanges one offer, one answer, and a few ICE
+  candidates through the server, once, during setup.
+- In total, setting up an ENTIRE room of 6 people comes out, by a rough
+  estimate, to **on the order of tens of KB, up to, in the worst case, a
+  modest hundred KB** total, ONE TIME, as all participants join — and
+  that's the entire server traffic for the whole life of the room,
+  whether it lasts 5 minutes or the full configured 3 hours. For
+  comparison: one second of 720p video turned on in the mesh is already
+  hundreds of KB PER SECOND, but that data never goes through the server
+  at all.
 
-### 9.4 Следствие: дёшево держать много комнат одновременно
+### 9.4 Consequence: It's Cheap to Hold Many Rooms at Once
 
-Поскольку нагрузка на сервер практически не зависит от того, сколько
-участников разговаривают и как долго, крошечный VPS (1 vCPU / 512 МБ RAM)
-без проблем держит сотни-тысячи параллельных комнат — упирается это не в
-CPU/трафик сигналинга, а в дефолтный потолок `MAX_ROOMS=500`
-(`DEFAULT_MAX_ROOMS`, `self-hosting.md` §6), который сам по себе просто
-консервативная DoS-защита (H2, см. `security.md` §4), а не отражение
-реальных ресурсных ограничений — сам оператор может поднять его выше на
-том же дешёвом VPS, если нужно больше комнат одновременно.
+Since server load barely depends on how many participants are talking or
+for how long, a tiny VPS (1 vCPU / 512 MB RAM) has no trouble holding
+hundreds to thousands of parallel rooms — the bottleneck isn't
+CPU/signaling traffic, it's the default ceiling `MAX_ROOMS=500`
+(`DEFAULT_MAX_ROOMS`, `self-hosting.md` §6), which by itself is simply a
+conservative DoS protection measure (H2, see `security.md` §4), not a
+reflection of real resource constraints — the operator can raise it higher
+on the same cheap VPS if more simultaneous rooms are needed.
 
-### 9.5 Как использовать это в питчах
+### 9.5 How to Use This in Pitches
 
-- **Сегмент 3 (параноики/селф-хостеры, §3.5):** «работает на самом дешёвом
-  VPS» — не общий слоган, а прямое следствие того, что сервер физически не
-  видит и не пропускает через себя медиапоток; можно показать эти цифры
-  прямо на лендинге как подтверждение, а не просто заявить.
-- **Сегмент 4 (интеграторы, §4.5):** «нет поминутных costs» — потому что
-  сервер физически не масштабируется по нагрузке ОТ звонков (только от
-  ЧИСЛА одновременных КОМНАТ, что не то же самое) — в отличие от
-  Daily/LiveKit Cloud/Whereby, чей биллинг именно потому и считается по
-  участник-минутам/ГБ медиатрафика, что их сервер этот трафик физически
-  через себя пропускает.
+- **Segment 3 (paranoid users/self-hosters, §3.5):** "runs on the
+  cheapest VPS" — not a generic slogan, but a direct consequence of the
+  server physically never seeing or passing the media stream through
+  itself; these numbers can be shown right on the landing page as proof,
+  rather than just asserted.
+- **Segment 4 (integrators, §4.5):** "no per-minute costs" — because the
+  server's load physically doesn't scale with call activity (only with
+  the NUMBER of simultaneous ROOMS, which is not the same thing) — unlike
+  Daily/LiveKit Cloud/Whereby, whose billing is calculated precisely by
+  participant-minutes/GB of media traffic because their server physically
+  passes that traffic through itself.
 
 ---
 
-## Источники
+## Sources
 
 - [zoom-40] Zoom: [Understanding time limits for Zoom Meetings](https://support.zoom.com/hc/en/article?id=zm_kb&sysparm_article=KB0067966); [Is Zoom Free? Free Plan Limits & Upgrade Triggers (2026)](https://costbench.com/software/communication/zoom/free-plan/)
 - [meet-60] Google Meet: [Google Meet Time Limit: Free vs Paid Plans (2026)](https://www.itsconvo.com/guides/google-meet-time-limit); [Google Meet Time Limit (2026)](https://meetgeek.ai/blog/google-meet-time-limit)
@@ -879,7 +929,7 @@ CPU/трафик сигналинга, а в дефолтный потолок `
 - [hn-nosignup] [Show HN: Group video chat with no signups or downloads | Hacker News](https://news.ycombinator.com/item?id=18447957)
 - [hn-briefing] [Show HN: Briefing – Anonymous, secure, open source WebRTC group video chat | Hacker News](https://news.ycombinator.com/item?id=23523830)
 
-Внутренние источники фактов о продукте: `README.md`, `docs/PRD.md`,
+Internal sources for product facts: `README.md`, `docs/PRD.md`,
 `docs/DESIGN.md`, `docs/privacy.md`, `docs/security.md`,
-`docs/self-hosting.md` (все — в этом репозитории, актуальны на момент
-ресёрча).
+`docs/self-hosting.md` (all — in this repository, current as of the time
+of the research).

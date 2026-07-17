@@ -1,112 +1,117 @@
-# Деплой в KubeSolo
+# Deploy to KubeSolo
 
-IaC этого проекта. Применяется **админом** (не CI) — деплой-пользователь
-из CI умеет только менять тег образа в уже созданном Deployment. Подход и
-конвенции — плейбук `simple-deploy` (`kube/backend-deploy.md`).
+IaC for this project. Applied by an **admin** (not CI) — the deploy user
+from CI can only change the image tag on an already-created Deployment. The
+approach and conventions come from the `simple-deploy` playbook
+(`kube/backend-deploy.md`).
 
-## Порядок применения (один раз, админским kubeconfig)
+## Order of application (once, with the admin kubeconfig)
 
 ```bash
 kubectl apply -f deploy/manifests/namespace.yaml
 kubectl apply -f deploy/manifests/rbac.yaml
-kubectl apply -f deploy/manifests/deployment.yaml   # image: chat:PLACEHOLDER — под не поднимется,
-                                                     # пока CI не задеплоит первый реальный тег
+kubectl apply -f deploy/manifests/deployment.yaml   # image: chat:PLACEHOLDER — the pod won't come up
+                                                     # until CI deploys the first real tag
 kubectl apply -f deploy/manifests/service.yaml
 kubectl apply -f deploy/manifests/ingress.yaml
 ```
 
-`rbac.yaml` заводит Role+RoleBinding в неймспейсе `chat-prod` для уже
-существующего `ServiceAccount deployer` (ns `deploy`, общий на все проекты
-сервера — см. `simple-deploy/artifacts/server/rbac.yaml`).
+`rbac.yaml` sets up a Role+RoleBinding in the `chat-prod` namespace for the
+already-existing `ServiceAccount deployer` (ns `deploy`, shared across all
+projects on the server — see `simple-deploy/artifacts/server/rbac.yaml`).
 
-`ingress.yaml` рассчитан на уже развёрнутый на кластере
-`cloudflare-tunnel-ingress-controller` (см. `simple-deploy/cloudflare/tunnel.md`,
-«Вариант 2») — отдельно ничего в дашборде Cloudflare заводить не нужно, DNS и
-туннель контроллер создаёт по самому `Ingress`.
+`ingress.yaml` assumes the `cloudflare-tunnel-ingress-controller` is already
+deployed on the cluster (see `simple-deploy/cloudflare/tunnel.md`,
+"Option 2") — nothing needs to be set up separately in the Cloudflare
+dashboard; the controller creates the DNS and tunnel from the `Ingress`
+itself.
 
-## Метрики (Prometheus + Grafana)
+## Metrics (Prometheus + Grafana)
 
-`deployment.yaml` (применённый по шагам выше) уже несёт всё нужное для
-скрейпа — второй порт `mgmt` (8081, `/metrics`) и аннотации
-`prometheus.io/scrape|port|path` на поде (тот же паттерн, что у
-`code-ranker-backend`, см. `src/main.rs::spawn_metrics_server`,
-`simple-deploy/standards/observability/metrics.md`). Отдельно применять
-для этого ничего не нужно — Prometheus (`kubernetes_sd_config`, роль `pod`)
-подхватывает новый под сам, без правки своего конфига.
+`deployment.yaml` (applied in the steps above) already carries everything
+needed for scraping — a second port `mgmt` (8081, `/metrics`) and
+`prometheus.io/scrape|port|path` annotations on the pod (the same pattern as
+`code-ranker-backend`, see `src/main.rs::spawn_metrics_server`,
+`simple-deploy/standards/observability/metrics.md`). Nothing extra needs to
+be applied for this — Prometheus (`kubernetes_sd_config`, role `pod`) picks
+up the new pod on its own, without editing its own config.
 
-Grafana-дашборд — отдельный ConfigMap, НЕ входит в список выше и применяется
-так же вручную, админом:
+The Grafana dashboard is a separate ConfigMap, NOT part of the list above,
+and is applied the same way, manually, by an admin:
 
 ```bash
 kubectl apply -f deploy/monitoring/grafana-dashboard-chat.yaml
 ```
 
-Этого одного `apply` НЕДОСТАТОЧНО, чтобы дашборд появился в Grafana: сам под
-`grafana` (ns `monitoring`) монтирует дашборды через `projected volume`
-(`ConfigMap` на каждый дашборд — см. `grafana-dashboard-code-ranker`,
-`grafana-dashboard-store`), список источников которого сегодня прописан ТОЛЬКО
-в самом Deployment `grafana`, не в манифесте этого репозитория (монитор в
-принципе не входит в состав `chat` — общий для всего кластера). Значит, после
-`apply` выше нужно ЕЩЁ РАЗ, руками, добавить
-`configMap.name: grafana-dashboard-chat` в
-`spec.template.spec.volumes[].projected.sources` Deployment'а `grafana` (ns
-`monitoring`), например:
+This single `apply` is NOT enough on its own for the dashboard to show up in
+Grafana: the `grafana` pod itself (ns `monitoring`) mounts dashboards via a
+`projected volume` (a `ConfigMap` per dashboard — see
+`grafana-dashboard-code-ranker`, `grafana-dashboard-store`), whose list of
+sources today is defined ONLY in the `grafana` Deployment itself, not in this
+repo's manifests (the monitoring stack isn't part of `chat` at all — it's
+shared across the whole cluster). So after the `apply` above you ALSO need
+to, by hand, add `configMap.name: grafana-dashboard-chat` to
+`spec.template.spec.volumes[].projected.sources` on the `grafana` Deployment
+(ns `monitoring`), for example:
 
 ```bash
 kubectl -n monitoring edit deployment grafana
-# в volumes: - name: dashboards -> projected.sources: добавить
+# in volumes: - name: dashboards -> projected.sources: add
 #   - configMap: { name: grafana-dashboard-chat }
 kubectl -n monitoring rollout restart deployment grafana
 ```
 
-Провижининг-сайдкар (`grafana-dashboards-provider`, `updateIntervalSeconds:
-30`) сам подхватывает файл после этого — пересоздавать под ещё раз для
-каждого будущего обновления самого JSON внутри `grafana-dashboard-chat`
-(в отличие от первого добавления источника) уже не требуется.
+The provisioning sidecar (`grafana-dashboards-provider`,
+`updateIntervalSeconds: 30`) picks up the file on its own after that —
+recreating the pod again for every future update to the JSON inside
+`grafana-dashboard-chat` (unlike adding the source the first time) is no
+longer required.
 
-## Как устроен CI-деплой
+## How the CI deploy works
 
-Push в `main` → `.github/workflows/deploy-prod.yml`:
+Push to `main` → `.github/workflows/deploy-prod.yml`:
 
-1. Job `test`: прогоняет тесты протокола сигналинга (65 проверок; сам собирает
-   `cargo build`). Красные тесты не пускают деплой.
-2. Job `deploy` (`needs: test`): собирает образ (`docker buildx build
-   --provenance=false --sbom=false --platform linux/amd64`, кэш GHA),
-   иммутабельный тег **`prod-<short-sha>`** ровно того коммита, что запушен;
-   в образ впекаются `APP_VERSION`/`GIT_COMMIT`/`BUILD_DATE` (см. `/version.json`).
-3. Доставляет его на сервер напрямую по SSH (без реестра):
+1. Job `test`: runs the signaling protocol tests (65 checks; builds
+   `cargo build` itself). Failing tests block the deploy.
+2. Job `deploy` (`needs: test`): builds the image (`docker buildx build
+   --provenance=false --sbom=false --platform linux/amd64`, GHA cache),
+   immutable tag **`prod-<short-sha>`** of exactly the commit that was
+   pushed; `APP_VERSION`/`GIT_COMMIT`/`BUILD_DATE` are baked into the image
+   (see `/version.json`).
+3. Delivers it to the server directly over SSH (no registry):
    `docker save | gzip | ssh … "prod <tag>"`.
-4. Серверный скрипт (`deployer`, forced command) импортирует образ в
-   containerd, выполняет `kubectl set image deployment/chat '*=chat:<tag>'` и
-   ждёт `rollout status`.
+4. The server-side script (`deployer`, forced command) imports the image
+   into containerd, runs `kubectl set image deployment/chat '*=chat:<tag>'`,
+   and waits for `rollout status`.
 
-CI ничего не знает про манифесты выше — они не пересоздаются при каждом
-деплое, меняется только тег образа в уже существующем Deployment.
+CI knows nothing about the manifests above — they aren't recreated on every
+deploy, only the image tag on the already-existing Deployment changes.
 
-## Особенности этого Deployment (важно)
+## Notable characteristics of this Deployment (important)
 
-- **`replicas: 1` + `strategy.type: Recreate`**, не обычный
-  zero-downtime-шаблон (`replicas: 2` + `RollingUpdate`). Причина — комнаты
-  живут в памяти одного процесса (`src/state.rs`); см. комментарий в
-  `deploy/manifests/deployment.yaml`. Практическое следствие: каждый деплой
-  на несколько секунд обрывает активные трансляции.
-- **Никакого хранилища на диске.** Приложение полностью эфемерно: история
-  чата и состояние комнат живут только в памяти процесса и умирают вместе с
-  комнатой (реапер TTL) или с рестартом пода. Поэтому в манифестах
-  сознательно нет PVC/volume — их удалили вместе с уходом SQLite из
-  приложения, писать на диск больше нечего.
-- Секретов приложению не нужно (TURN, если понадобится, — через `Secret` +
-  `envFrom`, аналогично другим проектам сервера).
+- **`replicas: 1` + `strategy.type: Recreate`**, not the usual
+  zero-downtime template (`replicas: 2` + `RollingUpdate`). Reason — rooms
+  live in the memory of a single process (`src/state.rs`); see the comment
+  in `deploy/manifests/deployment.yaml`. Practical consequence: every deploy
+  cuts off active broadcasts for a few seconds.
+- **No storage on disk whatsoever.** The application is fully ephemeral:
+  chat history and room state live only in the process's memory and die
+  along with the room (TTL reaper) or with a pod restart. That's why the
+  manifests deliberately have no PVC/volume — they were removed along with
+  SQLite leaving the application; there's nothing left to write to disk.
+- The application needs no secrets (TURN, if it's ever needed, would go
+  through a `Secret` + `envFrom`, the same as other projects on the server).
 
-## Откат
+## Rollback
 
-Основной путь (как в остальных проектах сервера) — перезапустить run
-предыдущего коммита: `gh run rerun <id>` (пересоберёт и переимпортирует тот же
-`prod-<sha>`; это же спасает после рестарта kubesolo, когда локальные образы
-пропали). Быстрый локальный откат, пока старый образ ещё в containerd:
+The main path (as with the other projects on the server) is to rerun the
+previous commit's run: `gh run rerun <id>` (rebuilds and re-imports the same
+`prod-<sha>`; this is also what saves you after a kubesolo restart, when
+local images are gone). A quick local rollback, while the old image is still
+in containerd:
 
 ```bash
 kubectl -n chat-prod rollout undo deployment/chat
-# или к конкретному тегу:
-kubectl -n chat-prod set image deployment/chat '*=chat:prod-<старый_sha>'
+# or to a specific tag:
+kubectl -n chat-prod set image deployment/chat '*=chat:prod-<old_sha>'
 ```

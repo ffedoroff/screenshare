@@ -1,38 +1,39 @@
 #!/usr/bin/env node
-// tests/e2e/resilience.spec.mjs — браузерный e2e устойчивости к обрывам,
-// переписан под протокол v2 (симметричная комната-встреча, mesh между всеми,
-// шаринг экрана — замок на одного участника, комната живёт, пока не
-// опустеет + EMPTY_ROOM_TTL_SECONDS для пустой). Тот же самодостаточный
-// стиль, что и basic.spec.mjs/старый resilience.spec.mjs: свой мини-раннер,
-// свой сервер (порт 3333, состояние целиком в памяти процесса), реальный Chrome через
-// playwright-core, синтетические медиастабы по умолчанию (см. helpers.mjs).
+// tests/e2e/resilience.spec.mjs — browser e2e resilience-to-disconnects test,
+// rewritten for protocol v2 (a symmetric meeting room, mesh between everyone,
+// screen sharing — a lock held by one participant, the room stays alive until
+// it's empty + EMPTY_ROOM_TTL_SECONDS for an empty room). The same
+// self-contained style as basic.spec.mjs/the old resilience.spec.mjs: its own
+// mini runner, its own server (port 3333, state entirely in the process's
+// memory), a real Chrome via playwright-core, synthetic media stubs by
+// default (see helpers.mjs).
 //
-// Сервер этого файла запускается с EMPTY_ROOM_TTL_SECONDS=5 (не 3 — см.
-// сценарий (е): пяти секунд достаточно, чтобы детерминированно проверить и
-// «успели зайти вовремя», и «опоздали», без гонки с реапером, который тикает
-// раз в секунду, см. src/state.rs::REAPER_INTERVAL).
+// This file's server is started with EMPTY_ROOM_TTL_SECONDS=5 (not 3 — see
+// scenario (e): five seconds is enough to deterministically check both
+// "joined in time" and "was late", without racing the reaper, which ticks
+// once a second, see src/state.rs::REAPER_INTERVAL).
 //
-// Порядок сценариев в коде — а, б, в, г, д, е, ж, как в плане (в отличие от
-// старого файла порядок дополнительно не переставлялся: ни один из сценариев
-// а..д не уничтожает комнату безвозвратно — комната живёт, пока в ней
-// остаётся хотя бы один участник, поэтому они естественно текут друг в
-// друга через общую комнату Вася/Петя/Оля. Только сценарий (е) закономерно
-// опустошает и хоронит эту комнату по TTL, поэтому сценарий (ж) — уже в
-// заведомо новой комнате).
+// Scenario order in the code — a, b, c, d, e, f, g, as in the plan (unlike
+// the old file the order was not further rearranged: none of scenarios
+// a..d permanently destroys the room — the room stays alive as long as at
+// least one participant remains, so they naturally flow into one another
+// through a shared room of Vasya/Petya/Olya. Only scenario (e) predictably
+// empties and buries that room via TTL, so scenario (f) is already in a
+// deliberately new room).
 //
-// Тайминги — поллинг с дедлайном (waitForFunction/waitUntil, всегда третьим
-// аргументом { polling: 100, timeout }), без слепых sleep — за одним
-// намеренным исключением в сценарии (е): TTL пустой комнаты — это свойство
-// реального времени на сервере, а не наблюдаемое состояние DOM, поэтому
-// «подождать меньше TTL» и «подождать больше TTL» невозможно выразить через
-// поллинг условия — там и только там используется helpers.sleep с
-// пояснением на месте.
+// Timing — deadline-based polling (waitForFunction/waitUntil, always with a
+// third argument { polling: 100, timeout }), no blind sleeps — with one
+// deliberate exception in scenario (e): the TTL of an empty room is a
+// property of real time on the server, not observable DOM state, so "wait
+// less than the TTL" and "wait more than the TTL" can't be expressed via
+// condition polling — that is the one and only place helpers.sleep is used,
+// with an explanation right there.
 //
-// Обрыв сети (сценарий г) — тот же приём, что и в старом файле: чистый
-// `context.setOffline(true)` не рвёт уже открытый WebSocket предсказуемо
-// быстро (проверено эмпирически при написании старого теста — см. историю),
-// поэтому тестовый арнесс сам принудительно закрывает сигналинг-сокет через
-// обёртку window.__e2eSockets (см. подготовку контекста Игоря).
+// Network drop (scenario d) — the same trick as in the old file: a plain
+// `context.setOffline(true)` doesn't reliably close an already-open
+// WebSocket quickly (verified empirically while writing the old test — see
+// history), so the test harness itself forcibly closes the signaling socket
+// via the window.__e2eSockets wrapper (see the setup of Igor's context).
 
 import { chromium } from 'playwright-core';
 import assert from 'node:assert/strict';
@@ -73,8 +74,8 @@ const micStubArg = { tryReal: process.env.E2E_TRY_REAL_MIC === '1', timeoutMs: R
 const camStubArg = { tryReal: process.env.E2E_TRY_REAL_CAM === '1', timeoutMs: REAL_CAM_TIMEOUT_MS };
 const captureStubArg = { tryReal: process.env.E2E_TRY_REAL_CAPTURE === '1', timeoutMs: REAL_CAPTURE_TIMEOUT_MS };
 
-// Мик + камера (в этом порядке — см. комментарий у installCamStub в
-// helpers.mjs про делегирование запросов без video).
+// Mic + camera (in this order — see the comment on installCamStub in
+// helpers.mjs about delegating requests without video).
 async function installMicAndCamStubs(context) {
   await context.addInitScript(installMicStub(), micStubArg);
   await context.addInitScript(installCamStub(), camStubArg);
@@ -84,13 +85,13 @@ async function installCaptureOnly(context) {
   await context.addInitScript(installCaptureStub(), captureStubArg);
 }
 
-// --- Хелперы для DOM протокола v2 (тайлы, счётчик участников, оверлей) ---
+// --- Helpers for the protocol v2 DOM (tiles, participant counter, overlay) ---
 
 function tileSelector(name) {
   return `.tile[data-name="${name}"]`;
 }
 
-/** Корона видна (не .hidden) на тайле `selector .tile-crown` (см. README.md «Права и лидер»). */
+/** The crown is visible (not .hidden) on the tile `selector .tile-crown` (see README.md "Permissions and the leader"). */
 async function waitCrownVisible(page, selector, visible, timeoutMs = 8000) {
   await page.waitForFunction(
     ({ sel, want }) => {
@@ -169,23 +170,24 @@ async function waitScreenStageHidden(page, hidden, timeoutMs = 8000) {
 
 async function createRoomViaApi(baseUrl) {
   const res = await fetch(`${baseUrl}/api/rooms`, { method: 'POST' });
-  assert.ok(res.ok, `POST /api/rooms ответил статусом ${res.status}`);
+  assert.ok(res.ok, `POST /api/rooms responded with status ${res.status}`);
   const data = await res.json();
-  assert.ok(data && typeof data.roomId === 'string' && data.roomId, `в ответе нет roomId: ${JSON.stringify(data)}`);
+  assert.ok(data && typeof data.roomId === 'string' && data.roomId, `no roomId in the response: ${JSON.stringify(data)}`);
   return data.roomId;
 }
 
 /**
- * Ш1 v2 (E2E-шифрование): комната создаётся напрямую через API (в обход
- * лендинга) — токен ссылки (`t`) и срок (`e`) сервер не выдаёт и не знает
- * вовсе, поэтому тест генерирует их сам (см. generateRoomToken/roomUrlWithKey
- * в helpers.mjs, `e` — валидный по умолчанию) и возвращает СРАЗУ готовую
- * ссылку для гостя (с `#t=...&e=...`, без leaderToken) — все участники ниже
- * заходят именно по ней, иначе без валидного токена упёрлись бы в оверлей
- * «Ссылка неполная» (см. static/room.js). Эта же ссылка (со своим `t`/`e`
- * прямо в адресной строке, БЕЗ `lt` — его тут никогда и не было) остаётся
- * рабочей и после `page.reload()` — это ключевое свойство v2 (ссылка
- * переживает F5), см. сценарий (в) ниже.
+ * S1 v2 (E2E encryption): the room is created directly via the API (bypassing
+ * the landing page) — the server neither issues nor knows the link token
+ * (`t`) and expiry (`e`) at all, so the test generates them itself (see
+ * generateRoomToken/roomUrlWithKey in helpers.mjs, `e` is valid by default)
+ * and immediately returns a ready-made guest link (with `#t=...&e=...`,
+ * without leaderToken) — all participants below join through it, otherwise
+ * without a valid token they'd hit the "Link is incomplete" overlay (see
+ * static/room.js). This same link (with its own `t`/`e` right in the address
+ * bar, WITHOUT `lt` — it was never there to begin with) also stays working
+ * after `page.reload()` — this is a key property of v2 (the link survives
+ * F5), see scenario (c) below.
  */
 async function createRoomViaApiWithKey(baseUrl) {
   const roomId = await createRoomViaApi(baseUrl);
@@ -199,8 +201,8 @@ async function main() {
   await server.start();
 
   let browser = null;
-  // Держим все созданные контексты, чтобы гарантированно закрыть в finally
-  // даже если какой-то шаг упал посередине.
+  // Keep all created contexts so we can guarantee closing them in finally
+  // even if some step failed partway through.
   const allContexts = [];
 
   try {
@@ -211,17 +213,18 @@ async function main() {
     });
 
     // ============================================================
-    // Подготовка: комната через POST /api/rooms, Вася/Петя/Оля заходят
-    // напрямую по ссылке (не через лендинг — это уже покрыто basic.spec.mjs).
+    // Setup: a room via POST /api/rooms, Vasya/Petya/Olya join directly
+    // via the link (not via the landing page — that's already covered by
+    // basic.spec.mjs).
     // ============================================================
     let roomId = null;
     let roomKey = null;
     let roomUrl = null;
-    const setupRoomOk = await step('подготовка: создаём комнату через POST /api/rooms', async () => {
+    const setupRoomOk = await step('setup: create a room via POST /api/rooms', async () => {
       ({ roomId, roomKey, roomUrl } = await createRoomViaApiWithKey(server.baseUrl));
     });
     if (!setupRoomOk || !roomId) {
-      console.log('FAIL - критическая ошибка: комната не создана, дальнейшие сценарии невозможны');
+      console.log('FAIL - critical error: room was not created, further scenarios are impossible');
       return;
     }
 
@@ -230,8 +233,8 @@ async function main() {
     const olyaContext = await browser.newContext();
     allContexts.push(vasyaContext, petyaContext, olyaContext);
     await installMicAndCamStubs(vasyaContext);
-    await installCaptureOnly(petyaContext); // Петя шарит экран в сценарии (б)
-    await installCaptureOnly(olyaContext); // Оля шарит экран в сценариях (б)/(в)
+    await installCaptureOnly(petyaContext); // Petya shares their screen in scenario (b)
+    await installCaptureOnly(olyaContext); // Olya shares their screen in scenarios (b)/(c)
     await installPcRegistry(vasyaContext);
     await installPcRegistry(petyaContext);
     await installPcRegistry(olyaContext);
@@ -239,40 +242,41 @@ async function main() {
     let petyaPage = await petyaContext.newPage();
     let olyaPage = await olyaContext.newPage();
 
-    const bothJoinedOk = await step('подготовка: Вася, Петя и Оля заходят в комнату (модалка входа) — у всех по 3 тайла', async () => {
+    const bothJoinedOk = await step('setup: Vasya, Petya, and Olya join the room (join modal) — everyone has 3 tiles', async () => {
       await vasyaPage.goto(roomUrl);
       await petyaPage.goto(roomUrl);
       await olyaPage.goto(roomUrl);
-      await joinRoom(vasyaPage, 'Вася');
-      await joinRoom(petyaPage, 'Петя');
-      await joinRoom(olyaPage, 'Оля');
+      await joinRoom(vasyaPage, 'Vasya');
+      await joinRoom(petyaPage, 'Petya');
+      await joinRoom(olyaPage, 'Olya');
       await waitForOverlayHidden(vasyaPage);
       await waitForOverlayHidden(petyaPage);
       await waitForOverlayHidden(olyaPage);
-      // waitForMeshSettled ждёт и тайлы, и что у всех троих обе mesh-связи
-      // реально дошли до connected (см. helpers.mjs) — сценарий (а) ниже
-      // сразу кликает по камере/микрофону.
+      // waitForMeshSettled waits for both the tiles and for all three of
+      // them to have both mesh connections actually reach connected (see
+      // helpers.mjs) — scenario (a) below immediately clicks the
+      // camera/mic.
       await waitForMeshSettled([vasyaPage, petyaPage, olyaPage], { tileCount: 3, connectionsPerPage: 2 });
     });
 
     if (!bothJoinedOk) {
-      console.log('FAIL - критическая ошибка: участники не собрались, дальнейшие сценарии невозможны');
+      console.log('FAIL - critical error: participants did not assemble, further scenarios are impossible');
       return;
     }
 
     // ============================================================
-    // (а) Вася включает камеру и микрофон, затем закрывает вкладку
+    // (a) Vasya turns on the camera and microphone, then closes the tab
     // ============================================================
-    const vasyaTileSel = tileSelector('Вася');
+    const vasyaTileSel = tileSelector('Vasya');
 
-    const scenarioACamOk = await step('(а) Вася включает камеру — у Пети и Оли живое видео в его тайле', async () => {
+    const scenarioACamOk = await step('(a) Vasya turns on the camera — Petya and Olya see live video on his tile', async () => {
       await vasyaPage.click('#camera-button');
       for (const page of [petyaPage, olyaPage]) {
         await assertVideoPlaying(page, { selector: `${vasyaTileSel} video` });
       }
     });
 
-    const scenarioAMicOk = await step('(а) Вася включает микрофон — у Пети и Оли «Говорят» на его тайле', async () => {
+    const scenarioAMicOk = await step('(a) Vasya turns on the microphone — Petya and Olya see "Speaking" on his tile', async () => {
       await vasyaPage.click('#mic-button');
       for (const page of [petyaPage, olyaPage]) {
         await waitForClassOnSelector(page, vasyaTileSel, 'tile--speaking', true, 8000);
@@ -280,10 +284,10 @@ async function main() {
     });
 
     if (scenarioACamOk || scenarioAMicOk) {
-      await step('(а) Вася закрывает вкладку — у Пети и Оли тайл исчезает, счётчик участников падает, «Говорят» гаснет', async () => {
+      await step('(a) Vasya closes the tab — Petya and Olya see his tile disappear, the participant count drops, "Speaking" goes off', async () => {
         await vasyaPage.close();
         for (const page of [petyaPage, olyaPage]) {
-          await waitForNoTile(page, 'Вася');
+          await waitForNoTile(page, 'Vasya');
           await waitForTileCount(page, 2);
           await waitParticipantCount(page, 2);
           await page.waitForFunction(
@@ -294,25 +298,25 @@ async function main() {
         }
       });
 
-      await step('(а) чат между Петей и Олей продолжает работать после ухода Васи', async () => {
+      await step('(a) chat between Petya and Olya keeps working after Vasya leaves', async () => {
         await openChatPanel(petyaPage);
         await openChatPanel(olyaPage);
-        const text = `Петя после ухода Васи — ${Date.now()}`;
+        const text = `Petya after Vasya left — ${Date.now()}`;
         await sendChatMessage(petyaPage, text);
-        assert.ok(await messageTextsInclude(petyaPage, text), 'сообщение не появилось у самой Пети');
-        assert.ok(await messageTextsInclude(olyaPage, text), 'сообщение не дошло до Оли');
+        assert.ok(await messageTextsInclude(petyaPage, text), 'the message did not appear for Petya themselves');
+        assert.ok(await messageTextsInclude(olyaPage, text), 'the message did not reach Olya');
       });
     } else {
-      skip('(а) закрытие вкладки Васи', 'не удалось включить камеру/микрофон');
-      skip('(а) чат Петя <-> Оля', 'сценарий (а) не выполнен');
+      skip('(a) closing Vasya\'s tab', 'failed to turn on the camera/microphone');
+      skip('(a) chat Petya <-> Olya', 'scenario (a) did not complete');
     }
 
     // ============================================================
-    // (б) Петя шарит экран, потом закрывает вкладку (дисконнект владельца
-    // замка) — Оля видит освобождение и захватывает шаринг сама
+    // (b) Petya shares their screen, then closes the tab (owner disconnect
+    // of the lock) — Olya sees the release and grabs the share herself
     // ============================================================
     const scenarioBShareOk = await step(
-      '(б) Петя шарит экран — у Оли главная зона живая, у самого Пети — заглушка «You are sharing» вместо превью собственного захвата, кнопка fullscreen у него скрыта',
+      '(b) Petya shares their screen — Olya sees a live main stage, Petya himself sees a "You are sharing" placeholder instead of a preview of his own capture, his fullscreen button is hidden',
       async () => {
         await petyaPage.click('#screen-button');
         await waitScreenButtonOn(petyaPage, true);
@@ -324,16 +328,16 @@ async function main() {
     );
 
     if (scenarioBShareOk) {
-      await step('(б) Петя закрывает вкладку — у Оли экран освобождён (главная зона очищена, кнопка снова активна), комната жива', async () => {
+      await step('(b) Petya closes the tab — Olya sees the screen released (main stage cleared, button active again), the room is alive', async () => {
         await petyaPage.close();
         await waitParticipantCount(olyaPage, 1);
         await waitScreenStageHidden(olyaPage, true);
         const disabled = await olyaPage.evaluate(() => document.getElementById('screen-button')?.disabled);
-        assert.equal(disabled, false, 'кнопка «Экран» у Оли должна быть снова активна');
+        assert.equal(disabled, false, 'Olya\'s "Screen" button should be active again');
       });
 
       await step(
-        '(б) Оля захватывает шаринг — share-started, у неё в главной зоне заглушка «You are sharing» (не живое видео своего же захвата — см. static/room.js: showLocalScreenPreview), кнопка fullscreen скрыта',
+        '(b) Olya grabs the share — share-started, she sees a "You are sharing" placeholder on her main stage (not a live video of her own capture — see static/room.js: showLocalScreenPreview), her fullscreen button is hidden',
         async () => {
           await olyaPage.click('#screen-button');
           await waitScreenButtonOn(olyaPage, true);
@@ -343,87 +347,87 @@ async function main() {
         }
       );
     } else {
-      skip('(б) закрытие вкладки Пети / освобождение экрана', 'шаринг Пети не заработал');
-      skip('(б) Оля захватывает шаринг', 'шаринг Пети не заработал');
+      skip('(b) closing Petya\'s tab / releasing the screen', 'Petya\'s share did not work');
+      skip('(b) Olya grabs the share', 'Petya\'s share did not work');
     }
 
     // ============================================================
-    // (в) Оля перезагружает страницу (F5) посреди своего же шаринга
+    // (c) Olya reloads the page (F5) in the middle of her own share
     // ============================================================
     if (scenarioBShareOk) {
-      await step('(в) Оля перезагружает страницу (F5) — возвращается в комнату по t/e из адресной строки БЕЗ новой ссылки, старый шаринг освобождён сервером, история чата пуста (Ф1: сервер её не хранит, а к этому моменту Оля в комнате одна — спросить не у кого)', async () => {
-        // Ш1 v2 (E2E-шифрование, см. static/room.js/docs/research-p2p-key-handoff.md
-        // §6.5–6.6): `t`/`e` НЕ вычищаются из адресной строки (вычищается
-        // только одноразовый `lt`, которого у гостевой ссылки olyaPage и не
-        // было) — это ключевое свойство v2, ссылка обязана переживать F5.
-        // Поэтому здесь можно и нужно использовать НАСТОЯЩИЙ page.reload(),
-        // а не эмулировать его (как приходилось бы в v1, где ключ комнаты жил
-        // только в памяти вкладки и вычищался из URL целиком).
+      await step('(c) Olya reloads the page (F5) — comes back into the room via t/e from the address bar WITHOUT a new link, the old share is released by the server, chat history is empty (F1: the server doesn\'t store it, and at this point Olya is alone in the room — no one to ask)', async () => {
+        // S1 v2 (E2E encryption, see static/room.js/docs/research-p2p-key-handoff.md
+        // §6.5–6.6): `t`/`e` are NOT cleared from the address bar (only the
+        // one-time `lt` is cleared, which olyaPage's guest link never had
+        // anyway) — this is a key property of v2, the link must survive F5.
+        // So a REAL page.reload() can and should be used here, rather than
+        // emulated (as would be necessary in v1, where the room key lived
+        // only in the tab's memory and was entirely cleared from the URL).
         const urlBeforeReload = olyaPage.url();
         const hashBeforeReload = await olyaPage.evaluate(() => location.hash);
         assert.ok(
           hashBeforeReload.includes('t=') && hashBeforeReload.includes('e='),
-          `перед F5 в адресной строке должны быть t=/e=, получено: "${hashBeforeReload}"`
+          `before F5 the address bar should contain t=/e=, got: "${hashBeforeReload}"`
         );
         assert.ok(
           !hashBeforeReload.includes('lt='),
-          `lt= не должно быть в адресной строке (эта гостевая ссылка его никогда не несла): "${hashBeforeReload}"`
+          `lt= should not be in the address bar (this guest link never carried it): "${hashBeforeReload}"`
         );
 
         await olyaPage.reload();
-        await joinRoom(olyaPage, 'Оля');
+        await joinRoom(olyaPage, 'Olya');
         await waitForOverlayHidden(olyaPage);
 
-        // Явная проверка ключевого свойства v2: вход после F5 состоялся БЕЗ
-        // новой ссылки — URL (включая t=/e=) не изменился ни на символ, за
-        // свежим фрагментом никуда ходить не пришлось.
+        // Explicit check of the key v2 property: rejoining after F5 happened
+        // WITHOUT a new link — the URL (including t=/e=) did not change by a
+        // single character, no need to go fetch a fresh fragment.
         assert.equal(
           olyaPage.url(),
           urlBeforeReload,
-          'после F5 URL должен остаться тем же — t/e не меняются, новая ссылка не нужна'
+          'after F5 the URL should stay the same — t/e do not change, no new link is needed'
         );
         const hashAfterReload = await olyaPage.evaluate(() => location.hash);
-        assert.equal(hashAfterReload, hashBeforeReload, 'фрагмент после F5 должен остаться ровно тем же (t=/e=)');
+        assert.equal(hashAfterReload, hashBeforeReload, 'the fragment after F5 should stay exactly the same (t=/e=)');
 
-        // Ф1: истории на сервере больше нет вообще (см. README.md/src/ws.rs) —
-        // новичок запрашивает последние сообщения у соседей по mesh
-        // DataChannel (см. static/chat.js). К этому моменту сценариев (а)/(б)
-        // и Вася, и Петя уже покинули комнату — Оля тут одна, спрашивать не у
-        // кого, поэтому у неё ЗАКОНОМЕРНО пустая лента (как и в пустой
-        // комнате при первом входе). Реальный кейс «история приходит от
-        // живого пира по DataChannel» уже покрыт отдельным сценарием в
-        // tests/e2e/basic.spec.mjs.
+        // F1: there is no history on the server at all anymore (see
+        // README.md/src/ws.rs) — a newcomer requests the latest messages from
+        // their mesh peers via DataChannel (see static/chat.js). By this
+        // point in scenarios (a)/(b) both Vasya and Petya have already left
+        // the room — Olya is alone here, no one to ask, so her feed is
+        // PREDICTABLY empty (same as in an empty room on first join). The
+        // real case of "history arrives from a live peer over DataChannel" is
+        // already covered by a separate scenario in tests/e2e/basic.spec.mjs.
         await openChatPanel(olyaPage);
         const texts = await (await getChatDom(olyaPage)).messages.allTextContents();
-        assert.equal(texts.length, 0, 'у Оли (единственной в комнате после reload) лента чата должна быть пустой');
+        assert.equal(texts.length, 0, 'Olya\'s (the only one left in the room after reload) chat feed should be empty');
 
-        // Старый шаринг реально освобождён сервером (дисконнект = share-stopped),
-        // а не просто «выглядит» освобождённым из-за свежей загрузки страницы:
-        // если бы сервер всё ещё считал Олю владельцем экрана (баг), новая
-        // заявка на шаринг получила бы share-rejected и кнопка не перешла бы
-        // в состояние «включено».
+        // The old share is actually released by the server (disconnect =
+        // share-stopped), not just "looking" released because the page was
+        // freshly loaded: if the server still considered Olya the screen
+        // owner (a bug), a new share request would get share-rejected and
+        // the button wouldn't switch to the "on" state.
         await olyaPage.click('#screen-button');
         await waitScreenButtonOn(olyaPage, true, 8000);
         await waitScreenStageHidden(olyaPage, false);
 
-        // Прибираем за собой перед следующими сценариями.
+        // Clean up before the next scenarios.
         await olyaPage.click('#screen-button');
         await waitScreenButtonOn(olyaPage, false, 8000);
         await waitScreenStageHidden(olyaPage, true);
       });
     } else {
-      skip('(в) reload Оли посреди шаринга', 'сценарий (б) не выполнен, шаринга у Оли нет');
+      skip('(c) Olya\'s reload mid-share', 'scenario (b) did not complete, Olya has no share');
     }
 
     // ============================================================
-    // (г) Обрыв сети у нового участника (Игорь)
+    // (d) Network drop for a new participant (Igor)
     // ============================================================
     const igorContext = await browser.newContext();
     allContexts.push(igorContext);
-    // Учёт WebSocket-инстансов страницы Игоря — нужен, чтобы детерминированно
-    // оборвать сигналинг после setOffline(true) (см. комментарий в шапке
-    // файла и в старом resilience.spec.mjs: сам setOffline рвёт уже
-    // открытый WS только через 46+ секунд, если вообще рвёт).
+    // Track Igor's page's WebSocket instances — needed to deterministically
+    // break signaling after setOffline(true) (see the comment in the file
+    // header and in the old resilience.spec.mjs: setOffline itself only
+    // breaks an already-open WS after 46+ seconds, if it breaks it at all).
     await igorContext.addInitScript(() => {
       window.__e2eSockets = [];
       const RealWebSocket = window.WebSocket;
@@ -436,50 +440,50 @@ async function main() {
     });
     const igorPage = await igorContext.newPage();
 
-    const igorJoinedOk = await step('(г, подготовка) новый участник Игорь подключается к комнате', async () => {
+    const igorJoinedOk = await step('(d, setup) new participant Igor joins the room', async () => {
       await igorPage.goto(roomUrl);
-      await joinRoom(igorPage, 'Игорь');
+      await joinRoom(igorPage, 'Igor');
       await waitForOverlayHidden(igorPage);
       await waitForTileCount(olyaPage, 2);
       await waitParticipantCount(olyaPage, 2);
     });
 
     if (igorJoinedOk) {
-      await step('(г) обрыв сети у Игоря (setOffline + принудительный разрыв WS) — у Оли его тайл исчезает', async () => {
+      await step('(d) network drop for Igor (setOffline + forced WS close) — Olya sees his tile disappear', async () => {
         await igorContext.setOffline(true);
         await igorPage.evaluate(() => {
           for (const ws of window.__e2eSockets || []) {
-            try { ws.close(); } catch { /* уже закрыт */ }
+            try { ws.close(); } catch { /* already closed */ }
           }
         });
-        await waitForNoTile(olyaPage, 'Игорь', 15_000);
+        await waitForNoTile(olyaPage, 'Igor', 15_000);
         await waitParticipantCount(olyaPage, 1, 15_000);
       });
-      // Роль Игоря в тесте окончена — закрываем его контекст, НЕ восстанавливая
-      // сеть (setOffline(false)). Иначе, раз страница Игоря так и осталась
-      // открытой, авто-reconnect (см. static/room.js) законно попытался бы
-      // переподключиться и заново войти в комнату, как только сеть вернётся —
-      // это корректное поведение само по себе (проверяется отдельно в
-      // сценарии (з) про рестарт сервера), но здесь только помешало бы
-      // последующим сценариям (д)/(е), которые рассчитывают, что Игорь
-      // окончательно ушёл.
-      try { await igorContext.close(); } catch { /* уже закрыт */ }
+      // Igor's role in the test is done — close his context, WITHOUT
+      // restoring the network (setOffline(false)). Otherwise, since Igor's
+      // page is still open, auto-reconnect (see static/room.js) would
+      // legitimately try to reconnect and rejoin the room as soon as the
+      // network came back — that's correct behavior in its own right
+      // (verified separately in scenario (h) about a server restart), but
+      // here it would only get in the way of the following scenarios (e)/(f),
+      // which rely on Igor having permanently left.
+      try { await igorContext.close(); } catch { /* already closed */ }
     } else {
-      skip('(г) обрыв сети у Игоря', 'Игорь не подключился к комнате');
+      skip('(d) network drop for Igor', 'Igor did not join the room');
     }
 
     // ============================================================
-    // (д) Переполнение комнаты: добиваем до 6 участников, 7-й видит
-    // «Комната заполнена»
+    // (e) Room overflow: fill the room up to 6 participants, the 7th sees
+    // "Room is full"
     // ============================================================
     const fillerContexts = [];
     const fillerPages = [];
     let roomFullOk = false;
-    await step('(д) добиваем комнату до 6 участников лёгкими вкладками, 7-й получает «Комната заполнена»', async () => {
+    await step('(e) fill the room up to 6 participants with lightweight tabs, the 7th gets "Room is full"', async () => {
       const current = await participantCount(olyaPage);
-      assert.ok(Number.isFinite(current), `не удалось прочитать participant-count у Оли: ${current}`);
+      assert.ok(Number.isFinite(current), `failed to read Olya's participant-count: ${current}`);
       const toAdd = 6 - current;
-      assert.ok(toAdd >= 0, `в комнате уже больше 6 участников (${current}) — сценарий неприменим`);
+      assert.ok(toAdd >= 0, `the room already has more than 6 participants (${current}) — the scenario doesn't apply`);
 
       for (let i = 0; i < toAdd; i++) {
         const ctx = await browser.newContext();
@@ -495,14 +499,14 @@ async function main() {
       }
       await waitParticipantCount(olyaPage, 6, 15_000);
 
-      // Фиксированная сетка тайлов (см. п.6 задания и static/room.js:
-      // computeTileGridColumns/layoutTilesGrid — десктоп: 3×2 на 6 тайлах) не
-      // должна вызывать скролл сцены: это тот самый баг (best-fit раскладка
-      // плюс max-width грида, см. комментарий у layoutTilesGrid), который
-      // чинили в этом батче. olyaContext — десктопный вьюпорт по умолчанию
-      // (без explicit viewport/isMobile, в отличие от мобильного смоука в
-      // basic.spec.mjs), поэтому проверка именно здесь бьёт по десктопной
-      // раскладке.
+      // The fixed tile grid (see item 6 of the task and static/room.js:
+      // computeTileGridColumns/layoutTilesGrid — desktop: 3×2 for 6 tiles)
+      // should not cause the stage to scroll: this is exactly the bug
+      // (best-fit layout plus grid max-width, see the comment at
+      // layoutTilesGrid) that was fixed in this batch. olyaContext is a
+      // default desktop viewport (no explicit viewport/isMobile, unlike the
+      // mobile smoke test in basic.spec.mjs), so the check here specifically
+      // exercises the desktop layout.
       const gridOverflow = await olyaPage.evaluate(() => {
         const grid = document.getElementById('tiles-grid');
         return grid
@@ -514,14 +518,14 @@ async function main() {
             }
           : null;
       });
-      assert.ok(gridOverflow, '#tiles-grid должен быть в DOM при 6 участниках');
+      assert.ok(gridOverflow, '#tiles-grid should be in the DOM with 6 participants');
       assert.ok(
         gridOverflow.scrollWidth <= gridOverflow.clientWidth + 1,
-        `#tiles-grid не должен скроллиться по ширине на 6 тайлах: ${JSON.stringify(gridOverflow)}`
+        `#tiles-grid should not scroll horizontally with 6 tiles: ${JSON.stringify(gridOverflow)}`
       );
       assert.ok(
         gridOverflow.scrollHeight <= gridOverflow.clientHeight + 1,
-        `#tiles-grid не должен скроллиться по высоте на 6 тайлах: ${JSON.stringify(gridOverflow)}`
+        `#tiles-grid should not scroll vertically with 6 tiles: ${JSON.stringify(gridOverflow)}`
       );
 
       const seventhContext = await browser.newContext();
@@ -530,69 +534,69 @@ async function main() {
       await joinRoom(seventhPage);
       await waitOverlayTitle(seventhPage, 'Room is full', 10_000);
       roomFullOk = true;
-      await seventhContext.close(); // в комнату не попал, дальше не нужен
+      await seventhContext.close(); // did not get into the room, not needed further
     });
 
     if (!roomFullOk) {
-      skip('(д) переполнение комнаты', 'не удалось довести комнату до 6 участников');
+      skip('(e) room overflow', 'failed to bring the room up to 6 participants');
     }
 
     // ============================================================
-    // (е) Опустевшая комната: все выходят («Покинуть» / закрытие) — вход в
-    // течение TTL успешен, вход после TTL — «Комната не найдена».
+    // (f) Empty room: everyone leaves ("Leave" / closing tabs) — joining
+    // within the TTL succeeds, joining after the TTL — "Room not found".
     // ============================================================
-    await step('(е) все выходят из комнаты — Оля жмёт «Покинуть», остальные закрывают вкладки', async () => {
+    await step('(f) everyone leaves the room — Olya clicks "Leave", the rest close their tabs', async () => {
       await olyaPage.click('#leave-button');
       for (const page of fillerPages) {
         if (!page.isClosed()) await page.close();
       }
       for (const ctx of fillerContexts) {
-        try { await ctx.close(); } catch { /* уже закрыт */ }
+        try { await ctx.close(); } catch { /* already closed */ }
       }
     });
 
-    // Намеренный sleep (см. комментарий в шапке файла): TTL — свойство
-    // реального времени сервера, а не наблюдаемое состояние DOM, поэтому
-    // «меньше TTL» здесь можно проверить только реальной паузой короче него.
+    // Deliberate sleep (see the comment in the file header): the TTL is a
+    // property of real server time, not observable DOM state, so "less than
+    // the TTL" can only be checked here with a real pause shorter than it.
     await sleep(1000);
 
     const test1Context = await browser.newContext();
     allContexts.push(test1Context);
     const test1Page = await test1Context.newPage();
-    const withinTtlOk = await step('(е) вход в опустевшую комнату в течение TTL (1с < 5с) — успешен', async () => {
+    const withinTtlOk = await step('(f) joining an emptied room within the TTL (1s < 5s) — succeeds', async () => {
       await test1Page.goto(roomUrl);
       await joinRoom(test1Page);
       await waitForOverlayHidden(test1Page);
     });
 
     if (withinTtlOk) {
-      // Освобождаем комнату снова — от этого момента отсчитываем TTL заново
-      // для проверки истечения.
+      // Empty the room again — from this moment we count the TTL anew for
+      // checking expiry.
       await test1Page.close();
 
-      // Намеренный sleep дольше EMPTY_ROOM_TTL_SECONDS(5с) + период
-      // реапера(1с, см. src/state.rs::REAPER_INTERVAL) + запас.
+      // Deliberate sleep longer than EMPTY_ROOM_TTL_SECONDS(5s) + the reaper's
+      // period (1s, see src/state.rs::REAPER_INTERVAL) + margin.
       await sleep((EMPTY_ROOM_TTL_SECONDS + 1) * 1000 + 1500);
 
       const test2Context = await browser.newContext();
       allContexts.push(test2Context);
       const test2Page = await test2Context.newPage();
-      await step('(е) вход в ту же комнату после истечения TTL — «Комната не найдена»', async () => {
+      await step('(f) joining the same room after the TTL has expired — "Room not found"', async () => {
         await test2Page.goto(roomUrl);
         await joinRoom(test2Page);
         await waitOverlayTitle(test2Page, 'Room not found', 10_000);
       });
     } else {
-      skip('(е) вход после истечения TTL', 'вход в течение TTL не удался, дальнейшая проверка не имеет смысла');
+      skip('(f) joining after TTL expiry', 'joining within the TTL failed, further checking is pointless');
     }
 
     // ============================================================
-    // (ж) Rate-limit чата глазами пользователя — уже в заведомо новой
-    // комнате (предыдущая похоронена сценарием (е)).
+    // (g) Chat rate limit from the user's perspective — already in a
+    // deliberately new room (the previous one was buried by scenario (f)).
     // ============================================================
     let ninaPage = null;
     let tolyaPage = null;
-    const rateLimitPrepOk = await step('(ж, подготовка) новая комната — Нина и Толя заходят', async () => {
+    const rateLimitPrepOk = await step('(g, setup) new room — Nina and Tolya join', async () => {
       const { roomUrl: newRoomUrl } = await createRoomViaApiWithKey(server.baseUrl);
 
       const ninaContext = await browser.newContext();
@@ -603,14 +607,14 @@ async function main() {
 
       await ninaPage.goto(newRoomUrl);
       await tolyaPage.goto(newRoomUrl);
-      await joinRoom(ninaPage, 'Нина');
-      await joinRoom(tolyaPage, 'Толя');
+      await joinRoom(ninaPage, 'Nina');
+      await joinRoom(tolyaPage, 'Tolya');
       await waitForOverlayHidden(ninaPage);
       await waitForOverlayHidden(tolyaPage);
     });
 
     if (rateLimitPrepOk) {
-      await step('(ж) Нина быстро шлёт 11 сообщений — 11-е отклоняется с ошибкой в панели, первые 10 доставлены Толе', async () => {
+      await step('(g) Nina quickly sends 11 messages — the 11th is rejected with an error in the panel, the first 10 are delivered to Tolya', async () => {
         await openChatPanel(ninaPage);
         await openChatPanel(tolyaPage);
         const prefix = `RL-${Date.now()}-`;
@@ -621,7 +625,7 @@ async function main() {
         const ninaChat = await getChatDom(ninaPage);
         await ninaChat.errorBanner.waitFor({ state: 'visible', timeout: 5000 });
         const errorText = await ninaChat.errorBanner.textContent();
-        assert.ok(errorText && errorText.trim().length > 0, 'баннер ошибки чата пуст');
+        assert.ok(errorText && errorText.trim().length > 0, 'the chat error banner is empty');
 
         await waitUntil(
           async () => {
@@ -629,43 +633,45 @@ async function main() {
             const texts = await tolyaChat.messages.allTextContents();
             return texts.filter((t) => t.startsWith(prefix)).length === 10;
           },
-          { timeoutMs: 8000, message: 'у Толи не набралось ровно 10 сообщений с rate-limit префиксом' }
+          { timeoutMs: 8000, message: 'Tolya did not end up with exactly 10 messages with the rate-limit prefix' }
         );
 
         const tolyaChat = await getChatDom(tolyaPage);
         const finalTexts = await tolyaChat.messages.allTextContents();
         const matched = finalTexts.filter((t) => t.startsWith(prefix));
-        assert.equal(matched.length, 10, `у Толи должно быть ровно 10 сообщений, получено ${matched.length}: ${JSON.stringify(matched)}`);
-        assert.ok(!matched.includes(`${prefix}11`), '11-е сообщение не должно было дойти до Толи');
+        assert.equal(matched.length, 10, `Tolya should have exactly 10 messages, got ${matched.length}: ${JSON.stringify(matched)}`);
+        assert.ok(!matched.includes(`${prefix}11`), 'the 11th message should not have reached Tolya');
       });
     } else {
-      skip('(ж) rate-limit чата', 'Нина/Толя не подключились к новой комнате');
+      skip('(g) chat rate limit', 'Nina/Tolya did not join the new room');
     }
 
-    // Разгружаем ресурсы перед последним (самым тяжёлым, реальный рестарт
-    // сервера) сценарием: закрываем все контексты предыдущих сценариев — они
-    // здесь больше не нужны, а простаивающие вкладки (у части из них WebRTC
-    // ещё жив) иначе конкурируют за CPU с ICE-негоциацией трёх новых
-    // участников ниже и делают waitForMeshSettled эмпирически флейковым.
+    // Free up resources before the last (heaviest, a real server restart)
+    // scenario: close all contexts from previous scenarios — they're no
+    // longer needed here, and idle tabs (some of which still have WebRTC
+    // alive) would otherwise compete for CPU with the ICE negotiation of the
+    // three new participants below and make waitForMeshSettled empirically
+    // flaky.
     for (const ctx of allContexts) {
-      try { await ctx.close(); } catch { /* уже закрыт */ }
+      try { await ctx.close(); } catch { /* already closed */ }
     }
     allContexts.length = 0;
 
     // ============================================================
-    // (з) Рестарт сервера (деплой): звонок должен пережить его почти
-    // незаметно. Свежая комната — Вася/Петя/Оля заходят, у Васи микрофон,
-    // Петя шарит экран, есть переписка — затем сервер целиком останавливается
-    // (SIGTERM/SIGKILL, см. helpers.mjs::createServerController.stop) и
-    // поднимается заново на том же порту (server.start()) — ровно то, что
-    // происходит при выкатке новой версии (см. README.md, раздел «Живучесть
-    // звонка при деплое»). Мы НЕ трогаем static/* — только сервер-процесс.
+    // (h) Server restart (deploy): the call should survive it almost
+    // unnoticed. A fresh room — Vasya/Petya/Olya join, Vasya has his
+    // microphone on, Petya shares their screen, there's some chat history —
+    // then the server is stopped entirely (SIGTERM/SIGKILL, see
+    // helpers.mjs::createServerController.stop) and comes back up on the
+    // same port (server.start()) — exactly what happens when a new version
+    // is rolled out (see README.md, section "Call resilience during
+    // deploys"). We do NOT touch static/* — only the server process.
     // ============================================================
     let vasya2Page = null;
     let petya2Page = null;
     let olya2Page = null;
     const restartPrepOk = await step(
-      '(з, подготовка) новая комната — Вася/Петя/Оля заходят, Вася включает микрофон, Петя шарит экран, есть переписка',
+      '(h, setup) new room — Vasya/Petya/Olya join, Vasya turns on his microphone, Petya shares their screen, there is chat history',
       async () => {
         const { roomUrl: restartRoomUrl } = await createRoomViaApiWithKey(server.baseUrl);
 
@@ -685,18 +691,18 @@ async function main() {
         await vasya2Page.goto(restartRoomUrl);
         await petya2Page.goto(restartRoomUrl);
         await olya2Page.goto(restartRoomUrl);
-        await joinRoom(vasya2Page, 'Вася');
-        await joinRoom(petya2Page, 'Петя');
-        await joinRoom(olya2Page, 'Оля');
+        await joinRoom(vasya2Page, 'Vasya');
+        await joinRoom(petya2Page, 'Petya');
+        await joinRoom(olya2Page, 'Olya');
         await waitForOverlayHidden(vasya2Page);
         await waitForOverlayHidden(petya2Page);
         await waitForOverlayHidden(olya2Page);
         await waitForMeshSettled([vasya2Page, petya2Page, olya2Page], { tileCount: 3, connectionsPerPage: 2 });
 
         await vasya2Page.click('#camera-button');
-        await assertVideoPlaying(petya2Page, { selector: `${tileSelector('Вася')} video` });
+        await assertVideoPlaying(petya2Page, { selector: `${tileSelector('Vasya')} video` });
         await vasya2Page.click('#mic-button');
-        await waitForClassOnSelector(petya2Page, tileSelector('Вася'), 'tile--speaking', true, 8000);
+        await waitForClassOnSelector(petya2Page, tileSelector('Vasya'), 'tile--speaking', true, 8000);
 
         await petya2Page.click('#screen-button');
         await waitScreenButtonOn(petya2Page, true);
@@ -705,54 +711,56 @@ async function main() {
         await openChatPanel(vasya2Page);
         await openChatPanel(petya2Page);
         await openChatPanel(olya2Page);
-        const msg1 = `до рестарта — раз — ${Date.now()}`;
-        const msg2 = `до рестарта — два — ${Date.now()}`;
+        const msg1 = `before the restart — one — ${Date.now()}`;
+        const msg2 = `before the restart — two — ${Date.now()}`;
         await sendChatMessage(vasya2Page, msg1);
-        assert.ok(await messageTextsInclude(petya2Page, msg1), 'сообщение 1 не дошло до Пети');
-        assert.ok(await messageTextsInclude(olya2Page, msg1), 'сообщение 1 не дошло до Оли');
+        assert.ok(await messageTextsInclude(petya2Page, msg1), 'message 1 did not reach Petya');
+        assert.ok(await messageTextsInclude(olya2Page, msg1), 'message 1 did not reach Olya');
         await sendChatMessage(petya2Page, msg2);
-        assert.ok(await messageTextsInclude(vasya2Page, msg2), 'сообщение 2 не дошло до Васи');
-        assert.ok(await messageTextsInclude(olya2Page, msg2), 'сообщение 2 не дошло до Оли');
+        assert.ok(await messageTextsInclude(vasya2Page, msg2), 'message 2 did not reach Vasya');
+        assert.ok(await messageTextsInclude(olya2Page, msg2), 'message 2 did not reach Olya');
 
-        // Комната создана через createRoomViaApi (без leaderToken) — лидером
-        // становится первый вошедший (см. README.md «Права и лидер»), здесь
-        // это Вася (join-room отправлен первым, до Пети/Оли).
-        await waitCrownVisible(petya2Page, tileSelector('Вася'), true);
+        // The room was created via createRoomViaApi (without leaderToken) —
+        // the first one to join becomes the leader (see README.md
+        // "Permissions and the leader"), here that's Vasya (join-room was
+        // sent first, before Petya/Olya).
+        await waitCrownVisible(petya2Page, tileSelector('Vasya'), true);
       }
     );
 
     if (restartPrepOk) {
       await step(
-        '(з) сервер останавливается — у всех троих баннер «Переподключение…» появляется, тайлы/медиа/чат не разрушены',
+        '(h) the server stops — all three see the "Reconnecting…" banner appear, tiles/media/chat are not destroyed',
         async () => {
           await server.stop();
           for (const page of [vasya2Page, petya2Page, olya2Page]) {
             await waitForClassOnSelector(page, '#reconnect-banner', 'hidden', false, 10_000);
           }
-          // Сигналинг мёртв, но mesh (медиа/DataChannel-чат) от него физически
-          // не зависит (см. README.md) — тайлы никуда не делись прямо сейчас.
+          // Signaling is dead, but the mesh (media/DataChannel chat)
+          // doesn't physically depend on it (see README.md) — the tiles
+          // haven't gone anywhere right now.
           await waitForTileCount(vasya2Page, 3);
           await waitForTileCount(petya2Page, 3);
           await waitForTileCount(olya2Page, 3);
         }
       );
 
-      // Намеренная контролируемая пауза (не гонка с реальным даунтаймом
-      // деплоя): гарантирует, что окно «сервер лежит» не короче интервала
-      // поллинга баннера выше, даже на быстрой машине, где процесс успевает
-      // перезапуститься почти мгновенно.
+      // A deliberate controlled pause (not a race with the real deploy
+      // downtime): guarantees the "server is down" window is not shorter
+      // than the banner's polling interval above, even on a fast machine
+      // where the process restarts almost instantly.
       await sleep(1500);
 
       await step(
-        '(з) сервер поднимается заново на том же порту — авто-reconnect восстанавливает сигналинг, баннер исчезает',
+        '(h) the server comes back up on the same port — auto-reconnect restores signaling, the banner disappears',
         async () => {
           await server.start();
-          // Параллельно (не последовательно) и с запасом по времени: первые
-          // 1-2 попытки reconnect могут напороться на сервер, который ещё не
-          // до конца поднялся (порт слушается чуть раньше, чем приложение
-          // готово ответить) — бэкофф (1с→2с→4с→8с) в редком случае может
-          // унести реальный успех за пределы десятка секунд, это всё ещё
-          // далеко от продуктового бюджета в 2 минуты.
+          // In parallel (not sequentially) and with a time margin: the first
+          // 1-2 reconnect attempts might hit a server that hasn't fully come
+          // up yet (the port is listening slightly before the app is ready
+          // to respond) — the backoff (1s→2s→4s→8s) could in a rare case
+          // push the real success beyond ten seconds, which is still far
+          // from the product budget of 2 minutes.
           await Promise.all(
             [vasya2Page, petya2Page, olya2Page].map((page) =>
               waitForClassOnSelector(page, '#reconnect-banner', 'hidden', true, 45_000)
@@ -761,47 +769,48 @@ async function main() {
         }
       );
 
-      await step('(з.б) тайлы и счётчик участников восстановились (3 участника = "3 / 6")', async () => {
+      await step('(h.b) tiles and the participant counter have recovered (3 participants = "3 / 6")', async () => {
         for (const page of [vasya2Page, petya2Page, olya2Page]) {
           await waitForTileCount(page, 3, 15_000);
           await waitParticipantCount(page, 3, 15_000);
         }
       });
 
-      // Лидерство при рестарте сервера (см. README.md «Права и лидер»):
-      // сервер теряет ВСЮ память (включая leader_id) при рестарте — комната
-      // восстанавливается пустой через PUT /api/rooms/{id} и лидером
-      // становится первый, кто успешно ре-джойнится (см.
-      // src/main.rs::restore_room и src/ws.rs::JoinRoom). Кто из троих
-      // ре-джойнится первым — гонка бэкоффов реконнекта (см.
-      // static/room.js), НЕ гарантированно снова Вася. Здесь фиксируем
-      // фактический исход и главное свойство: без дедлока и ровно один
-      // лидер, на котором сходятся ВСЕ участники.
+      // Leadership on server restart (see README.md "Permissions and the
+      // leader"): the server loses ALL its memory (including leader_id) on
+      // restart — the room is restored empty via PUT /api/rooms/{id} and the
+      // leader becomes whoever successfully rejoins first (see
+      // src/main.rs::restore_room and src/ws.rs::JoinRoom). Which of the
+      // three rejoins first is a race of reconnect backoffs (see
+      // static/room.js), NOT guaranteed to be Vasya again. Here we record the
+      // actual outcome and the main property: no deadlock and exactly one
+      // leader that all participants agree on.
       await step(
-        '(з.д) лидерство после рестарта сервера: ровно один лидер, сходятся все участники — фиксируем фактическое поведение',
+        '(h.e) leadership after the server restart: exactly one leader, all participants agree — recording the actual behavior',
         async () => {
           const leaderIds = await Promise.all(
             [vasya2Page, petya2Page, olya2Page].map((page) => page.evaluate(() => leaderId))
           );
           assert.ok(
             leaderIds.every((id) => id === leaderIds[0]),
-            `все участники должны видеть ОДНОГО И ТОГО ЖЕ лидера (без дедлока/расхождения), получено: ${JSON.stringify(leaderIds)}`
+            `all participants should see THE SAME ONE leader (no deadlock/divergence), got: ${JSON.stringify(leaderIds)}`
           );
-          assert.ok(leaderIds[0], 'leaderId не должен быть пустым после реконнекта');
+          assert.ok(leaderIds[0], 'leaderId should not be empty after reconnect');
 
           const nameByPeerId = {};
-          for (const [label, page] of [['Вася', vasya2Page], ['Петя', petya2Page], ['Оля', olya2Page]]) {
+          for (const [label, page] of [['Vasya', vasya2Page], ['Petya', petya2Page], ['Olya', olya2Page]]) {
             const myId = await page.evaluate(() => myPeerId);
             nameByPeerId[myId] = label;
           }
           console.log(
-            `# фактическое поведение (лидерство при рестарте сервера): лидером остался(лась) ${
+            `# actual behavior (leadership on server restart): the leader remained ${
               nameByPeerId[leaderIds[0]] || leaderIds[0]
             }`
           );
 
-          // Ровно один участник должен видеть корону на СВОЁМ тайле — не ноль
-          // (лидер потерян) и не больше одного (несколько «лидеров» разом).
+          // Exactly one participant should see the crown on THEIR OWN tile —
+          // not zero (leader lost) and not more than one (several "leaders"
+          // at once).
           const ownCrownFlags = await Promise.all(
             [vasya2Page, petya2Page, olya2Page].map((page) =>
               page.evaluate(() => !document.querySelector('.tile--own .tile-crown')?.classList.contains('hidden'))
@@ -810,13 +819,13 @@ async function main() {
           assert.equal(
             ownCrownFlags.filter(Boolean).length,
             1,
-            `ровно один участник должен видеть корону на своём тайле, получено: ${JSON.stringify(ownCrownFlags)}`
+            `exactly one participant should see the crown on their own tile, got: ${JSON.stringify(ownCrownFlags)}`
           );
         }
       );
 
       let screenRestoredActually = false;
-      await step('(з.в) шаринг экрана Пети после реконнекта — фиксируем фактическое поведение', async () => {
+      await step('(h.c) Petya\'s screen share after reconnect — recording the actual behavior', async () => {
         try {
           await waitScreenButtonOn(petya2Page, true, 15_000);
           await waitScreenStageHidden(olya2Page, false, 15_000);
@@ -824,37 +833,37 @@ async function main() {
           screenRestoredActually = true;
         } catch (err) {
           screenRestoredActually = false;
-          console.log(`[инфо] шаринг экрана Пети НЕ восстановился после реконнекта сервера: ${err.message}`);
+          console.log(`[info] Petya's screen share did NOT restore after the server reconnect: ${err.message}`);
         }
       });
       console.log(
-        `# фактическое поведение (в): шаринг экрана после рестарта сервера ${
-          screenRestoredActually ? 'ВОССТАНОВЛЕН (share-start успешно переигран)' : 'НЕ восстановлен (сцена честно ушла)'
+        `# actual behavior (c): screen share after server restart ${
+          screenRestoredActually ? 'RESTORED (share-start replayed successfully)' : 'NOT restored (the stage rightfully went away)'
         }`
       );
 
-      await step('(з.г) P2P-чат работает и история на месте (клиентские буферы) после реконнекта', async () => {
+      await step('(h.d) P2P chat works and history is intact (client-side buffers) after reconnect', async () => {
         for (const page of [vasya2Page, petya2Page, olya2Page]) {
           await openChatPanel(page);
           const chat = await getChatDom(page);
           const texts = await chat.messages.allTextContents();
-          assert.ok(texts.some((t) => t.includes('до рестарта')), 'история чата не сохранилась в клиентском буфере после реконнекта');
+          assert.ok(texts.some((t) => t.includes('before the restart')), 'chat history was not preserved in the client-side buffer after reconnect');
         }
-        const msg3 = `после рестарта — ${Date.now()}`;
+        const msg3 = `after the restart — ${Date.now()}`;
         await sendChatMessage(olya2Page, msg3);
-        assert.ok(await messageTextsInclude(vasya2Page, msg3), 'новое сообщение после рестарта не дошло до Васи');
-        assert.ok(await messageTextsInclude(petya2Page, msg3), 'новое сообщение после рестарта не дошло до Пети');
+        assert.ok(await messageTextsInclude(vasya2Page, msg3), 'the new message after the restart did not reach Vasya');
+        assert.ok(await messageTextsInclude(petya2Page, msg3), 'the new message after the restart did not reach Petya');
       });
 
-      await step('(з.д) медиа живо: видео Васи у Пети продолжает идти (videoWidth растёт)', async () => {
-        await assertVideoPlaying(petya2Page, { selector: `${tileSelector('Вася')} video` });
+      await step('(h.e) media is alive: Vasya\'s video keeps playing for Petya (videoWidth is growing)', async () => {
+        await assertVideoPlaying(petya2Page, { selector: `${tileSelector('Vasya')} video` });
       });
     } else {
-      skip('(з) рестарт сервера', 'подготовка не удалась');
+      skip('(h) server restart', 'setup failed');
     }
 
     for (const ctx of allContexts) {
-      try { await ctx.close(); } catch { /* уже закрыт */ }
+      try { await ctx.close(); } catch { /* already closed */ }
     }
   } finally {
     if (browser) await browser.close();
@@ -868,8 +877,8 @@ main()
     process.exit(counts.failedCount > 0 ? 1 : 0);
   })
   .catch(async (err) => {
-    console.log(`FAIL - неожиданная ошибка теста: ${err && err.stack ? err.stack : err}`);
-    try { await server.stop(); } catch { /* уже остановлен или не запускался */ }
+    console.log(`FAIL - unexpected test error: ${err && err.stack ? err.stack : err}`);
+    try { await server.stop(); } catch { /* already stopped or never started */ }
     bumpFailedForUnexpectedError();
     printSummary();
     process.exit(1);

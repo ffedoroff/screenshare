@@ -1,54 +1,55 @@
-// room.js — единая страница комнаты, протокол v2 (симметричная комната).
+// room.js — single room page, protocol v2 (symmetric room).
 //
-// Все участники равноправны и соединяются mesh: на каждого другого участника
-// заводится свой RtcPeer (см. rtc.js, perfect negotiation). Роль
-// polite/impolite не привязана к типу участника (broadcaster/viewer больше
-// нет) — она детерминированно выводится из сравнения peerId: у кого peerId
-// лексикографически БОЛЬШЕ, тот polite. Обе стороны считают одно и то же
-// сравнение над одной и той же парой id, поэтому ровно один из двух получает
-// polite=true — коллизии офферов разрешаются как обычно (см. rtc.js).
+// All participants are equal and connect in a mesh: each other participant
+// gets its own RtcPeer (see rtc.js, perfect negotiation). The polite/impolite
+// role is not tied to a participant type (there's no broadcaster/viewer
+// anymore) — it's deterministically derived from comparing peerId: whoever
+// has the lexicographically GREATER peerId is polite. Both sides compute the
+// same comparison over the same pair of ids, so exactly one of the two gets
+// polite=true — offer collisions are resolved as usual (see rtc.js).
 //
-// roomId берём из URL (последний сегмент pathname), как и раньше у viewer.js.
+// roomId is taken from the URL (last pathname segment), same as before in viewer.js.
 
 'use strict';
 
-// --- Анонимность: leaderToken из фрагмента ссылки (см. static/landing.js —
-// POST /api/rooms -> редирект на /r/<id>#lt=<token>&t=<token>&e=<expiry>&n=<имя>)
-// читается ДО ВСЕГО остального. Из адресной строки вычищается ТОЛЬКО
-// одноразовый #lt (после первого join он сожжён сервером и бесполезен,
-// светить его незачем). `#t`/`#e`/`#n` вычищать не нужно — они ЧАСТЬ
-// инвайт-ссылки (см. ниже) и остаются в адресной строке у всех участников
-// (в частности — переживают F5, см. init/initCryptoIdentity).
+// --- Anonymity: leaderToken from the link fragment (see static/landing.js —
+// POST /api/rooms -> redirects to /r/<id>#lt=<token>&t=<token>&e=<expiry>&n=<name>)
+// is read BEFORE ANYTHING ELSE. From the address bar we clean up ONLY the
+// one-time #lt (after the first join it's burned by the server and useless,
+// no point exposing it). `#t`/`#e`/`#n` don't need cleaning up — they ARE
+// PART of the invite link (see below) and stay in the address bar for all
+// participants (in particular — they survive F5, see init/initCryptoIdentity).
 //
-// E2E v2 («вариант E», см. docs/research-p2p-key-handoff.md §6.5–6.6 и
-// static/crypto.js): `t` — статический PSK-токен ссылки (16 байт,
-// base64url) — он НИКОГДА не шифрует трафик сам, только аутентифицирует.
-// `e` — момент истечения ссылки (unix-секунды, base36) — часть вывода
-// K_auth, подделать нельзя (см. static/crypto.js). Оба ОСТАЮТСЯ в адресной
-// строке СОЗНАТЕЛЬНО: ссылка = секрет по самой модели (ей и делятся), а
-// сохранение t/e в URL позволяет пережить F5 — иначе перезагрузка выбрасывала
-// бы из комнаты («ссылка неполная»), при том что хранить секрет в storage
-// запрещено (полная анонимность). Тот же паттерн у Excalidraw. Фрагмент
-// никогда не уходит на сервер сам по себе.
+// E2E v2 ("variant E", see docs/research-p2p-key-handoff.md §6.5–6.6 and
+// static/crypto.js): `t` — static PSK link token (16 bytes,
+// base64url) — it NEVER encrypts traffic itself, only authenticates.
+// `e` — link expiry moment (unix seconds, base36) — part of the K_auth
+// derivation, can't be forged (see static/crypto.js). Both are DELIBERATELY
+// KEPT in the address bar: the link itself IS the secret by design (it's
+// what gets shared), and keeping t/e in the URL allows surviving F5 —
+// otherwise a reload would kick you out of the room ("incomplete link"),
+// given that storing the secret in storage is forbidden (full anonymity).
+// Same pattern as Excalidraw. The fragment never goes to the server by
+// itself.
 //
-// Реальные ключи шифрования (K_pair_sig/K_pair_meta на каждую пару
-// участников) — ЭФЕМЕРНЫЕ: выводятся заново каждой вкладкой при входе из
-// собственной одноразовой пары ECDH P-256 + K_auth(t,e), см.
-// initCryptoIdentity ниже и static/crypto.js. `t`/`e` парсятся ЗДЕСЬ ЖЕ — до
-// того, как страница успела показать что-либо, и до какого-либо обращения к
-// сигналингу.
+// The actual encryption keys (K_pair_sig/K_pair_meta for each pair of
+// participants) are EPHEMERAL: derived anew by each tab on entry from its
+// own one-time ECDH P-256 pair + K_auth(t,e), see initCryptoIdentity below
+// and static/crypto.js. `t`/`e` are parsed RIGHT HERE — before the page has
+// had a chance to show anything, and before any contact with signaling.
 //
-// `n` — имя комнаты, которое ввёл СОЗДАТЕЛЬ на лендинге (см. static/landing.js,
-// static/namegen.js). Раньше жило только в одноразовом #lt-фрагменте и
-// пропадало у создателя после первого F5, а гости его не видели вовсе.
-// Теперь `n` — ЧАСТЬ инвайт-ссылки (buildShareLink кладёт его туда) и
-// остаётся в адресной строке (`#t=...&e=...&n=...`) у ВСЕХ, кто зашёл по
-// ссылке — имя комнаты видят все участники, оно переживает F5. Ключевой
-// инвариант не изменился: сервер фрагмент не видит (он никогда не уходит по
-// сети), так что название комнаты и для сервера остаётся неизвестным. Битый
-// percent-encoding (напр. от ручного редактирования URL) не должен ронять
-// страницу — decodeURIComponent в try/catch, при ошибке имя просто
-// отсутствует (null).
+// `n` — the room name that the CREATOR entered on the landing page (see
+// static/landing.js, static/namegen.js). It used to live only in the
+// one-time #lt fragment and would disappear for the creator after the first
+// F5, while guests never saw it at all. Now `n` is PART of the invite link
+// (buildShareLink puts it there) and stays in the address bar
+// (`#t=...&e=...&n=...`) for EVERYONE who joined via the link — all
+// participants see the room name, and it survives F5. The key invariant is
+// unchanged: the server never sees the fragment (it never travels over the
+// network), so the room name remains unknown to the server too. Malformed
+// percent-encoding (e.g. from manually editing the URL) must not crash the
+// page — decodeURIComponent is wrapped in try/catch, and on error the name
+// is simply absent (null).
 const { initialLeaderToken, linkTokenBase64url, linkExpiry, initialRoomName } = (() => {
   const hash = location.hash;
   const ltMatch = hash.match(/(?:^|[&#])lt=([^&]+)/);
@@ -56,10 +57,10 @@ const { initialLeaderToken, linkTokenBase64url, linkExpiry, initialRoomName } = 
   const eMatch = hash.match(/(?:^|[&#])e=([^&]+)/);
   const nMatch = hash.match(/(?:^|[&#])n=([^&]+)/);
   const lt = ltMatch ? decodeURIComponent(ltMatch[1]) : null;
-  // `t` (base64url) и `e` (base36) состоят только из URL-safe символов —
-  // decodeURIComponent не нужен (и вреден не был бы, но не нужен). Дальнейшая
-  // валидация формата — в initCryptoIdentity (см. ниже), не здесь: здесь
-  // только чистое извлечение из фрагмента.
+  // `t` (base64url) and `e` (base36) consist only of URL-safe characters —
+  // decodeURIComponent isn't needed (it wouldn't hurt either, but isn't
+  // needed). Further format validation happens in initCryptoIdentity (see
+  // below), not here: here it's just plain extraction from the fragment.
   const t = tMatch ? tMatch[1] : null;
   const e = eMatch ? eMatch[1] : null;
   let n = null;
@@ -67,15 +68,15 @@ const { initialLeaderToken, linkTokenBase64url, linkExpiry, initialRoomName } = 
     try {
       n = decodeURIComponent(nMatch[1]);
     } catch (err) {
-      n = null; // битый percent-encoding — просто без имени, страницу не роняем
+      n = null; // malformed percent-encoding — just go without a name, don't crash the page
     }
   }
   if (lt) {
-    // Пересобираем фрагмент без lt (одноразовый секрет — светить его в
-    // адресной строке незачем), сохраняя t/e/n. `n` берём из уже
-    // раскодированного `n` и энкодим заново (а не переносим nMatch[1] как
-    // есть) — так гарантированно нет ни двойного кодирования, ни устаревшего
-    // percent-encoding из невалидного/ручного URL.
+    // Rebuild the fragment without lt (a one-time secret — no point exposing
+    // it in the address bar), keeping t/e/n. We take `n` from the already
+    // decoded `n` and re-encode it (rather than carrying nMatch[1] over
+    // as-is) — this guarantees no double-encoding and no stale
+    // percent-encoding from an invalid/manually edited URL.
     const parts = [];
     if (t) parts.push(`t=${t}`);
     if (e) parts.push(`e=${e}`);
@@ -85,11 +86,11 @@ const { initialLeaderToken, linkTokenBase64url, linkExpiry, initialRoomName } = 
   return { initialLeaderToken: lt, linkTokenBase64url: t, linkExpiry: e, initialRoomName: n };
 })();
 
-// --- Локальный рендер имени комнаты (видно ВСЕМ участникам, зашедшим по
-// инвайт-ссылке с `n` — см. комментарий выше) — делаем это СРАЗУ, до init(),
-// чтобы заголовок вкладки и шапка не мигали дефолтным текстом. Если в
-// ссылке `n` не было (например, ссылка без имени комнаты), .room-logo/title
-// остаются дефолтными.
+// --- Local render of the room name (visible to ALL participants who joined
+// via an invite link with `n` — see comment above) — done IMMEDIATELY,
+// before init(), so the tab title and header don't flash the default text.
+// If the link had no `n` (e.g. a link without a room name), .room-logo/title
+// stay at their defaults.
 if (initialRoomName) {
   document.title = `${initialRoomName} — video call`;
   const roomLogoEl = document.querySelector('.room-logo');
@@ -142,7 +143,7 @@ const reconnectBannerEl = document.getElementById('reconnect-banner');
 const versionBannerEl = document.getElementById('version-banner');
 const versionBannerReloadButtonEl = document.getElementById('version-banner-reload-button');
 
-// --- DOM: права и лидер (см. docs/permissions-and-leader.md) ---
+// --- DOM: permissions and leader (see docs/permissions-and-leader.md) ---
 const settingsButton = document.getElementById('settings-button');
 const settingsBadgeEl = document.getElementById('settings-badge');
 const joinRequestsEl = document.getElementById('join-requests');
@@ -157,7 +158,7 @@ const settingGuestVideoInput = document.getElementById('setting-guest-video');
 const settingGuestScreenInput = document.getElementById('setting-guest-screen');
 const settingMaxParticipantsInput = document.getElementById('setting-max-participants');
 
-// --- DOM: «Соединение и приватность» (см. раздел ниже) — видно ВСЕМ участникам ---
+// --- DOM: "Connection and privacy" (see section below) — visible to ALL participants ---
 const settingsCryptoRowEl = document.getElementById('settings-crypto-row');
 const settingsCryptoTextEl = document.getElementById('settings-crypto-text');
 const settingsPeersListEl = document.getElementById('settings-peers-list');
@@ -166,19 +167,19 @@ const settingsServerTrafficEl = document.getElementById('settings-server-traffic
 const settingsBuildRowEl = document.getElementById('settings-build-row');
 const settingsBuildTextEl = document.getElementById('settings-build-text');
 
-// --- DOM: устройства (см. заголовок раздела «Выбор камеры и микрофона» ниже) — видно ВСЕМ участникам, не только лидеру ---
+// --- DOM: devices (see the "Camera and microphone selection" section header below) — visible to ALL participants, not just the leader ---
 const settingMicDeviceSelect = document.getElementById('setting-mic-device');
 const settingCameraDeviceSelect = document.getElementById('setting-camera-device');
 
-// --- DOM: fullscreen кнопки сцены шаринга экрана ---
+// --- DOM: fullscreen button for the screen-share stage ---
 const screenFullscreenButtonEl = document.getElementById('screen-fullscreen-button');
 
-// Статичная разметка (не зависит от пользовательских данных) — безопасна для innerHTML.
+// Static markup (doesn't depend on user data) — safe for innerHTML.
 const CROWN_ICON_SVG =
   '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M3 19h18l-1.6-9.6-5.2 3.6L12 5l-2.2 8-5.2-3.6L3 19z"/></svg>';
 
-// Значок перечёркнутого микрофона на тайле (см. раздел «Индикатор
-// «микрофон выключен»» ниже) — тоже статичная разметка.
+// Muted-mic icon on the tile (see the "Mic off" indicator section below) —
+// also static markup.
 const MIC_OFF_ICON_SVG =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
   '<rect x="9" y="2" width="6" height="11" rx="3"></rect>' +
@@ -188,15 +189,15 @@ const MIC_OFF_ICON_SVG =
   '<line x1="3" y1="3" x2="21" y2="21"></line>' +
   '</svg>';
 
-// roomId — последний сегмент пути, например /r/abc123 -> "abc123".
+// roomId — the last path segment, e.g. /r/abc123 -> "abc123".
 const roomId = location.pathname.split('/').filter(Boolean).pop();
 
-// Мобильные браузеры (Android Chrome, iOS Safari) не реализуют
-// getDisplayMedia — нативного захвата экрана из веба на них нет вообще (это
-// не вопрос разрешений, метода просто нет в API). Кнопку «Экран» в таком
-// случае не дизейблим (это подразумевало бы «временно недоступно»), а прячем
-// совсем — не обещаем функциональность, которой на этом устройстве не
-// существует в принципе.
+// Mobile browsers (Android Chrome, iOS Safari) don't implement
+// getDisplayMedia — there's no native screen capture from the web on them at
+// all (it's not a permissions issue, the method simply isn't in the API). In
+// that case we don't disable the "Screen" button (that would imply
+// "temporarily unavailable"), we hide it entirely — we don't promise
+// functionality that fundamentally doesn't exist on this device.
 const screenShareSupported = !!(
   navigator.mediaDevices && typeof navigator.mediaDevices.getDisplayMedia === 'function'
 );
@@ -204,163 +205,166 @@ if (!screenShareSupported) {
   screenButton.classList.add('hidden');
 }
 
-// --- E2E v2: криптографическая идентичность вкладки (см. static/crypto.js) ---
-// Выводятся ОДИН раз при старте страницы (см. init/initCryptoIdentity ниже),
-// ДО join-room — null, пока вывод не завершился (или не начинался). В отличие
-// от room-wide v1 (единый K_sig/K_meta на всю комнату), здесь это ЛИЧНЫЕ
-// материалы вкладки, из которых для КАЖДОГО пира отдельно выводится своя
-// пара ключей (см. pairKeysCache ниже) — ни один ключ шифрования сам по себе
-// общий для комнаты.
-let myEphemeralKeyPair = null; // {publicKey, privateKey} — ECDH P-256, одноразовая на вкладку (PFS)
-let myEpub = null; // base64url(raw) экспорт публичной половины — это и летит на проводе как `epub`
-let kAuthBytes = null; // K_auth (см. static/crypto.js: deriveAuthKey) — HKDF-salt для ВСЕХ попарных ключей
-// Кеш попарных ключей: peerId -> Promise<{sigKey, metaKey}> — наполняется
-// лениво, как только становится известен `epub` этого пира (joined.peers[]/
-// peer-joined/join-request/waiting.leaderEpub — см. cachePairKeys), чистится
-// при уходе пира (см. removeRemotePeer).
+// --- E2E v2: cryptographic identity of the tab (see static/crypto.js) ---
+// Derived ONCE at page startup (see init/initCryptoIdentity below), BEFORE
+// join-room — null while derivation hasn't completed (or hasn't started).
+// Unlike room-wide v1 (a single K_sig/K_meta for the whole room), these are
+// PERSONAL materials of the tab, from which a separate key pair is derived
+// for EACH peer individually (see pairKeysCache below) — no single
+// encryption key is shared across the room.
+let myEphemeralKeyPair = null; // {publicKey, privateKey} — ECDH P-256, one-time per tab (PFS)
+let myEpub = null; // base64url(raw) export of the public half — this is what goes over the wire as `epub`
+let kAuthBytes = null; // K_auth (see static/crypto.js: deriveAuthKey) — HKDF salt for ALL pairwise keys
+// Cache of pairwise keys: peerId -> Promise<{sigKey, metaKey}> — populated
+// lazily as soon as this peer's `epub` becomes known (joined.peers[]/
+// peer-joined/join-request/waiting.leaderEpub — see cachePairKeys), cleared
+// when the peer leaves (see removeRemotePeer).
 const pairKeysCache = new Map();
-// Взводится один раз на первую же неудачную расшифровку входящего
-// (SDP/ICE/stream-info/name-announce с серверного релея) — почти всегда
-// значит, что токен ссылки (`t`/`e`) неверный или несовпадающий у сторон
-// (см. handleCryptoFailureOnce). Отдельно от terminalState, чтобы не
-// показать оверлей дважды при параллельных отказах нескольких пиров сразу.
+// Set once on the first failed decryption of incoming data
+// (SDP/ICE/stream-info/name-announce from the server relay) — almost always
+// means the link token (`t`/`e`) is wrong or mismatched between sides (see
+// handleCryptoFailureOnce). Kept separate from terminalState so we don't
+// show the overlay twice when several peers fail in parallel at once.
 let cryptoFailureHandled = false;
 
-// --- Общее состояние комнаты/сигналинга ---
+// --- Shared room/signaling state ---
 let signaling = null;
 let myPeerId = null;
 let myName = null;
 let joinedOnce = false;
-// Как только показан «финальный» оверлей (ошибка/обрыв), больше не
-// перетираем его сообщениями о попутных проблемах.
+// Once the "final" overlay is shown (error/disconnect), we no longer
+// overwrite it with messages about incidental problems.
 let terminalState = false;
-// ICE-серверы, полученные один раз при первой загрузке страницы — переиспользуются
-// при создании пиров как при обычных peer-joined, так и при реконнект-сверке.
+// ICE servers obtained once on the first page load — reused when creating
+// peers both for regular peer-joined and during reconnect reconciliation.
 let iceServersCache = null;
 
-// --- SAS: человекоудобная проверка ключа (см. static/crypto.js: deriveSas,
-// docs/security.md «SAS / MITM») ---
+// --- SAS: human-friendly key verification (see static/crypto.js: deriveSas,
+// docs/security.md "SAS / MITM") ---
 //
-// ОДИН DTLS-сертификат на всю сессию, переиспользуемый во всех
-// RTCPeerConnection этого участника (передаётся в RtcPeer через certificate)
-// — чтобы у нас был единственный стабильный фингерпринт, одинаково видимый
-// всеми пирами. Иначе браузер сгенерировал бы новый сертификат на каждое
-// соединение и «отпечаток комнаты» не сошёлся бы. Генерируется один раз в
-// connectAndJoin (ensureSessionCertificate) и переживает reconnect.
+// A SINGLE DTLS certificate for the whole session, reused across all
+// RTCPeerConnections of this participant (passed into RtcPeer via
+// certificate) — so we have one stable fingerprint, seen identically by all
+// peers. Otherwise the browser would generate a new certificate for each
+// connection and the "room fingerprint" wouldn't match up. Generated once in
+// connectAndJoin (ensureSessionCertificate) and survives reconnect.
 let sessionCertificate = null;
-let ownCertFingerprint = null; // фингерпринт нашего sessionCertificate (нормализуется в crypto.js)
+let ownCertFingerprint = null; // fingerprint of our sessionCertificate (normalized in crypto.js)
 
-// --- SAS v2: commit-before-reveal раунд (см. docs/sas-verification.md) ---
+// --- SAS v2: commit-before-reveal round (see docs/sas-verification.md) ---
 //
-// Раунд идентифицируется roundId = hash(состав по peerId ‖ их фингерпринты).
-// Смена состава ИЛИ любого фингерпринта -> новый roundId -> свежий раунд с
-// новыми нонсами (это и закрывает грайнд сертификата после ревила, §7.2).
-let sasCurrentRoundId = null; // roundId текущего раунда, либо null
-let sasRoundMembers = null; // снапшот [{peerId, fingerprint}] на старте раунда (фиксированный ожидаемый состав)
-let sasMyNonce = null; // наш нонс текущего раунда (Uint8Array 32)
-let sasCommits = new Map(); // peerId -> commitHex (свой + принятые с шины)
-let sasReveals = new Map(); // peerId -> nonce (Uint8Array), свой + принятые и (позже) проверяемые
-let sasRevealed = false; // раскрыли ли мы уже свой нонс в этом раунде (гейт: только после всех коммитов)
+// A round is identified by roundId = hash(membership by peerId ‖ their
+// fingerprints). A change in membership OR any fingerprint -> new roundId ->
+// a fresh round with new nonces (this is what closes off the
+// certificate-grinding attack after reveal, §7.2).
+let sasCurrentRoundId = null; // roundId of the current round, or null
+let sasRoundMembers = null; // snapshot [{peerId, fingerprint}] at round start (fixed expected membership)
+let sasMyNonce = null; // our nonce for the current round (Uint8Array 32)
+let sasCommits = new Map(); // peerId -> commitHex (ours + received over the bus)
+let sasReveals = new Map(); // peerId -> nonce (Uint8Array), ours + received and (later) verified
+let sasRevealed = false; // whether we've already revealed our nonce this round (gate: only after all commits)
 let sasState = 'hidden'; // hidden | unavailable | verifying | ok | mismatch
-let sasResult = null; // { emoji:[...], hex } когда state==='ok'
+let sasResult = null; // { emoji:[...], hex } when state==='ok'
 let sasRefreshTimer = null;
 const SAS_REFRESH_MS = 3000;
 
-// --- Авто-reconnect сигналинга (переживает деплой/рестарт сервера) ---
+// --- Auto-reconnect for signaling (survives a server deploy/restart) ---
 //
-// Ключевая идея: обрыв WS-сигналинга сам по себе НЕ должен рушить mesh
-// (медиа/DataChannel-чат) — они физически не зависят от сигналинга и живут,
-// пока живо само P2P-соединение (см. docs/self-hosting.md, «Surviving a
-// Restart/Redeploy»). Поэтому неожиданный обрыв (не «Покинуть», не room-not-found/
-// room-full — те уже терминальны сами по себе) запускает цикл
-// переподключения с экспоненциальным бэкоффом вместо немедленного
-// «Соединение потеряно».
-const RECONNECT_BACKOFF_MS = [1000, 2000, 4000, 8000]; // 1с→2с→4с→8с, дальше повторяется 8с (cap)
-const RECONNECT_TOTAL_BUDGET_MS = 120_000; // суммарный бюджет попыток — около 2 минут
-const RECONNECT_JOIN_TIMEOUT_MS = 8000; // сколько ждём ответ на join-room одной попытки
-// Сколько ждём отставшего пира/владельца экрана после успешного реконнекта,
-// прежде чем считать его окончательно ушедшим — остальные участники тоже
-// переподключаются вразнобой, им нужно время на собственный реконнект.
+// Key idea: a WS signaling drop by itself must NOT tear down the mesh
+// (media/DataChannel chat) — they don't physically depend on signaling and
+// stay alive as long as the P2P connection itself is alive (see
+// docs/self-hosting.md, "Surviving a Restart/Redeploy"). So an unexpected
+// drop (not "Leave", not room-not-found/room-full — those are already
+// terminal by themselves) starts a reconnection cycle with exponential
+// backoff instead of an immediate "Connection lost".
+const RECONNECT_BACKOFF_MS = [1000, 2000, 4000, 8000]; // 1s→2s→4s→8s, then repeats at 8s (cap)
+const RECONNECT_TOTAL_BUDGET_MS = 120_000; // total attempt budget — about 2 minutes
+const RECONNECT_JOIN_TIMEOUT_MS = 8000; // how long we wait for a join-room response on a single attempt
+// How long we wait for a lagging peer/screen-share owner after a successful
+// reconnect, before considering them finally gone — other participants are
+// also reconnecting at their own pace and need time for their own reconnect.
 const RECONNECT_PEER_GRACE_MS = 13_000;
 
 let reconnecting = false;
 let reconnectAttempt = 0;
 let reconnectDeadline = 0;
 let reconnectTimer = null;
-// Взводится перед намеренным закрытием сокета самим пользователем (кнопка
-// «Покинуть») — такое закрытие не должно триггерить авто-reconnect.
+// Set before the socket is intentionally closed by the user themselves (the
+// "Leave" button) — such a closure must not trigger auto-reconnect.
 let intentionalDisconnect = false;
-// Резолвер текущей попытки join-room в процессе реконнекта (см.
-// waitForJoinOutcome/sendJoinAndWait) — обычные обработчики joined/
-// room-not-found/room-full дополнительно репортят сюда исход, если он
-// взведён, вместо (или в дополнение к) обычной обработки.
+// Resolver for the current join-room attempt during reconnect (see
+// waitForJoinOutcome/sendJoinAndWait) — the regular joined/room-not-found/
+// room-full handlers additionally report the outcome here if it's set,
+// instead of (or in addition to) normal handling.
 let pendingJoinResolve = null;
-// peerId -> id таймера отложенного удаления пира, который не нашёлся в
-// свежем joined.peers сразу после реконнекта (см. reconcileAfterReconnect).
+// peerId -> id of the deferred peer-removal timer for a peer not found in
+// the fresh joined.peers right after reconnect (see reconcileAfterReconnect).
 const pendingPeerRemovals = new Map();
-// Таймер грейс-периода для владельца экрана, который сам ещё не ре-джойнился
-// после реконнекта (см. reconcileScreenShareAfterReconnect).
+// Grace-period timer for a screen-share owner who hasn't re-joined yet
+// themselves after a reconnect (see reconcileScreenShareAfterReconnect).
 let screenOwnerGraceTimer = null;
-// Версия приложения (см. GET /version.json), с которой была загружена эта
-// страница — сверяется заново после каждого успешного реконнекта (стандарт
-// version-skew баннера, см. docs/signaling-protocol.md, «GET /version.json»).
+// App version (see GET /version.json) that this page was loaded with —
+// re-checked after every successful reconnect (the version-skew banner
+// standard, see docs/signaling-protocol.md, "GET /version.json").
 let lastKnownVersion = null;
 
-// --- Таймер длительности созвона (см. docs/security.md, «Meeting Duration
-// Ceiling») ---
+// --- Call-duration timer (see docs/security.md, "Meeting Duration
+// Ceiling") ---
 //
-// Раньше показывали ОСТАТОК до серверного лимита (expiresInSeconds) с
-// подсветкой жёлтым/красным по мере приближения к концу. Теперь вместо этого
-// показываем count-up: время, ПРОШЕДШЕЕ с момента входа ПЕРВОГО участника
-// комнаты. Сервер присылает это как `joined.roomAgeSeconds` (аддитивное поле,
-// целые секунды, 0 у самого первого вошедшего, см. src/ws.rs) — значение
-// ОБЩЕЕ для всех участников комнаты (не «сколько лично я тут сижу»), поэтому
-// у опоздавшего участника таймер сразу показывает актуальный возраст комнаты,
-// а не 0. `expiresInSeconds` сервер всё ещё присылает (лимит жизни комнаты
-// никуда не делся — по его истечении сервер шлёт `room-expired`, см.
-// signaling.on('room-expired') ниже), но для отображения он больше не
-// используется, поэтому и жёлтой/красной «критичности» тут больше нет — она
-// была привязана именно к остатку до лимита, а не к прошедшему времени.
-let roomAgeBaseSeconds = null; // roomAgeSeconds из последнего joined, null до первого joined
-let roomAgeBaseAtMs = null; // Date.now() в момент получения этого joined — от него считаем "+ прошло с тех пор"
+// We used to show the REMAINDER until the server limit (expiresInSeconds)
+// with yellow/red highlighting as it approached the end. Now instead we show
+// a count-up: time ELAPSED since the FIRST participant joined the room. The
+// server sends this as `joined.roomAgeSeconds` (an additive field, whole
+// seconds, 0 for the very first joiner, see src/ws.rs) — the value is SHARED
+// across all room participants (not "how long have I personally been here"),
+// so a latecomer's timer immediately shows the room's actual age instead of
+// 0. The server still sends `expiresInSeconds` (the room lifetime limit
+// hasn't gone anywhere — when it expires the server sends `room-expired`,
+// see signaling.on('room-expired') below), but it's no longer used for
+// display, so the yellow/red "criticality" is also gone — it was tied
+// specifically to the remainder until the limit, not to elapsed time.
+let roomAgeBaseSeconds = null; // roomAgeSeconds from the last joined, null until the first joined
+let roomAgeBaseAtMs = null; // Date.now() at the moment this joined was received — the base we count "+ elapsed since" from
 let roomTimerInterval = null;
 
-// Лимит числа участников комнаты — сервер присылает ЭФФЕКТИВНЫЙ лимит в
-// `joined.maxParticipants` (см. src/protocol.rs::ServerMessage::Joined) на
-// КАЖДОМ joined; в `settings-changed` отдельного числа нет — пересчитываем
-// сами из `settings.maxParticipants` (см. обработчик settings-changed ниже).
-// Эффективный лимит — это либо серверный потолок из env `MAX_PARTICIPANTS`
-// (рекомендуемый дефолт 6, см. docs/self-hosting.md §6), либо СВОЙ, более
-// низкий лимит, который лидер комнаты выставил через панель настроек
-// (`RoomSettings.maxParticipants`, `null` = «без своего лимита», следует за
-// серверным потолком автоматически — см. populateMaxParticipantsOptions
-// ниже). 6 здесь — фолбэк ТОЛЬКО на случай совсем старого сервера без этого
-// поля вовсе. Снижение лимита НЕ выгоняет уже вошедших — сервер просто
-// перестаёт пропускать новых, пока состав не поредеет сам естественным
-// образом (см. docs/research-room-limit.md §2.2) — клиент здесь только
-// отображает текущее значение и блокирует выбор чисел выше уже известного
-// максимума, сам никого не выгоняет и не может.
+// Room participant limit — the server sends the EFFECTIVE limit in
+// `joined.maxParticipants` (see src/protocol.rs::ServerMessage::Joined) on
+// EVERY joined; `settings-changed` doesn't carry a separate number — we
+// recompute it ourselves from `settings.maxParticipants` (see the
+// settings-changed handler below). The effective limit is either the
+// server-side ceiling from the `MAX_PARTICIPANTS` env var (recommended
+// default 6, see docs/self-hosting.md §6), or the room leader's OWN, lower
+// limit set via the settings panel (`RoomSettings.maxParticipants`, `null` =
+// "no custom limit", automatically follows the server ceiling — see
+// populateMaxParticipantsOptions below). The 6 here is a fallback ONLY for
+// the case of a very old server that doesn't send this field at all.
+// Lowering the limit does NOT kick out people who already joined — the
+// server simply stops admitting new ones until the membership thins out
+// naturally on its own (see docs/research-room-limit.md §2.2) — the client
+// here only displays the current value and blocks selecting numbers above
+// the already-known maximum, it never kicks anyone out itself and can't.
 let maxParticipants = 6;
 
-// Лучшее известное значение НАСТОЯЩЕГО серверного потолка (без учёта
-// собственного лимита лидера, если он есть) — нужно для двух вещей: (а)
-// верхняя граница списка опций в селекте «Max participants» (см.
-// populateMaxParticipantsOptions), чтобы после сужения лимита лидер мог
-// вернуть его обратно к реальному потолку, а не только к текущему суженному
-// числу; (б) фолбэк при пересчёте эффективного лимита из settings-changed,
-// которое (в отличие от joined) не присылает эффективное число отдельно —
-// см. обработчик settings-changed ниже. Обновляется ТОЛЬКО когда есть
-// железное доказательство: сразу после joined/реконнекта, у которого
-// `roomSettings.maxParticipants === null` (лидер не сузил лимит) — в этот
-// момент `joined.maxParticipants` совпадает с настоящим потолком по
-// построению (см. `Room::effective_max_participants` на сервере). Если мы
-// попали в уже суженную кем-то комнату и ни разу не видели её несуженной —
-// остаётся на дефолтном фолбэке 6 до первого joined без своего лимита.
+// Best known value of the ACTUAL server ceiling (disregarding the leader's
+// own limit, if any) — needed for two things: (a) the upper bound of the
+// option list in the "Max participants" select (see
+// populateMaxParticipantsOptions), so that after narrowing the limit the
+// leader can raise it back to the real ceiling, not just to the currently
+// narrowed number; (b) a fallback when recomputing the effective limit from
+// settings-changed, which (unlike joined) doesn't send the effective number
+// separately — see the settings-changed handler below. Updated ONLY when we
+// have solid proof: right after a joined/reconnect where
+// `roomSettings.maxParticipants === null` (the leader hasn't narrowed the
+// limit) — at that moment `joined.maxParticipants` matches the real ceiling
+// by construction (see `Room::effective_max_participants` on the server). If
+// we joined a room already narrowed by someone else and never saw it
+// un-narrowed, it stays at the default fallback of 6 until the first joined
+// without a custom limit.
 let knownServerMaxParticipants = 6;
 
 /**
- * M:SS из миллисекунд, а после часа — H:MM:SS (не может быть отрицательным —
- * вызывающая сторона зажимает снизу в 0).
+ * M:SS from milliseconds, and H:MM:SS past the one-hour mark (can't be
+ * negative — the caller clamps it to 0 from below).
  */
 function formatRoomTimer(elapsedMs) {
   const totalSeconds = Math.max(0, Math.floor(elapsedMs / 1000));
@@ -373,7 +377,7 @@ function formatRoomTimer(elapsedMs) {
   return `${minutes}:${String(seconds).padStart(2, '0')}`;
 }
 
-/** Раз в секунду — пересчитать прошедшее время комнаты и обновить пилюлю таймера. */
+/** Once a second — recompute the room's elapsed time and update the timer pill. */
 function updateRoomTimerDisplay() {
   if (roomAgeBaseSeconds === null) return;
   const elapsedMs = roomAgeBaseSeconds * 1000 + (Date.now() - roomAgeBaseAtMs);
@@ -382,11 +386,11 @@ function updateRoomTimerDisplay() {
 }
 
 /**
- * Вызывается на КАЖДОМ joined (первый вход и реконнект) — пересинхронизирует
- * базу отсчёта из свежего roomAgeSeconds. Значение монотонно растёт на
- * сервере, поэтому здесь просто берём его как новую базу (а не пытаемся
- * «продолжить» старую) — после долгого реконнекта это подтянет таймер вперёд
- * на реальный прошедший срок, а не оставит его отставшим.
+ * Called on EVERY joined (initial entry and reconnect) — resynchronizes the
+ * counting base from the fresh roomAgeSeconds. The value grows monotonically
+ * on the server, so here we simply take it as the new base (rather than
+ * trying to "continue" the old one) — after a long reconnect this pulls the
+ * timer forward to the real elapsed time instead of leaving it lagging.
  */
 function startRoomTimer(roomAgeSeconds) {
   if (typeof roomAgeSeconds !== 'number' || !Number.isFinite(roomAgeSeconds)) return;
@@ -398,7 +402,7 @@ function startRoomTimer(roomAgeSeconds) {
   }
 }
 
-/** Комната истекла (room-expired) — таймер больше не идёт, дальше показывать нечего. */
+/** The room has expired (room-expired) — the timer stops running, there's nothing further to show. */
 function stopRoomTimer() {
   if (roomTimerInterval) {
     clearInterval(roomTimerInterval);
@@ -411,51 +415,54 @@ function stopRoomTimer() {
 
 // peerId -> { rtc: RtcPeer, name, tile: {root, videoEl, placeholderEl, labelEl, crownEl} }
 const peers = new Map();
-// peerId -> имя (включая себя не храним — своё имя в myName).
+// peerId -> name (we don't store our own here — our own name is in myName).
 const peerNames = new Map();
-// peerId -> { bytesSent, bytesReceived, ts } — снимок счётчиков transport-статы
-// с ПРЕДЫДУЩЕГО тика единого поллера скоростей (PEER_STATS_REFRESH_MS, см.
-// pollPeerStats/computePeerConnectionStats дальше в файле) — точка отсчёта
-// для расчёта скорости in/out между тиками. Чистим запись при уходе пира
-// (removeRemotePeer) — иначе, если тот же peerId переиспользуется в новом
-// соединении, скорость на первом тике посчиталась бы от чужих старых байт.
+// peerId -> { bytesSent, bytesReceived, ts } — snapshot of transport-stats
+// counters from the PREVIOUS tick of the shared speed poller
+// (PEER_STATS_REFRESH_MS, see pollPeerStats/computePeerConnectionStats
+// further in the file) — the baseline for computing in/out speed between
+// ticks. Cleared when a peer leaves (removeRemotePeer) — otherwise, if the
+// same peerId gets reused on a new connection, the speed on the first tick
+// would be computed against someone else's stale byte counts.
 const peerStatsHistory = new Map();
-// { bytesSent, bytesReceived, ts } с ПРЕДЫДУЩЕГО вызова renderServerCounters —
-// точка отсчёта для скорости строки «Server relay traffic» в секции
-// «Соединение и приватность». Тот же приём, что peerStatsHistory выше, только
-// для агрегированного счётчика серверного WS (static/common.js: ConnStats),
-// а не per-peer WebRTC-транспорта — и, в отличие от peerStatsHistory, здесь
-// нет getStats(), поэтому обновляется прямо в рендере (см. formatPeerStatsLine
-// ниже), а не в едином поллере. null до первого вызова.
+// { bytesSent, bytesReceived, ts } from the PREVIOUS call to
+// renderServerCounters — the baseline for the "Server relay traffic" line's
+// speed in the "Connection and privacy" section. Same trick as
+// peerStatsHistory above, but for the aggregated server WS counter
+// (static/common.js: ConnStats), not per-peer WebRTC transport — and unlike
+// peerStatsHistory, there's no getStats() here, so it's updated right in the
+// render (see formatPeerStatsLine below) rather than in the shared poller.
+// null until the first call.
 let serverBytesHistory = null;
-// Свой тайл (создаётся сразу после joined).
+// Our own tile (created right after joined).
 let ownTile = null;
-// Объект тайла (как из createTile), сейчас развёрнутый на всю страницу
-// кликом (см. maximizeTile/unmaximizeTile), либо null. Одновременно
-// максимизирован только один тайл — свой или чужой.
+// The tile object (as returned by createTile) currently maximized to full
+// page via a click (see maximizeTile/unmaximizeTile), or null. Only one
+// tile can be maximized at a time — ours or someone else's.
 let maximizedTile = null;
 
-// --- Права и лидер (см. docs/permissions-and-leader.md) ---
+// --- Permissions and leader (see docs/permissions-and-leader.md) ---
 let leaderId = null;
 let isLeader = false;
-// RoomSettings с сервера (см. src/protocol.rs::RoomSettings) — null до первого joined.
+// RoomSettings from the server (see src/protocol.rs::RoomSettings) — null until the first joined.
 let roomSettings = null;
-// Заявки лобби, видимые ТОЛЬКО лидеру: [{ peerId, name }].
+// Lobby requests, visible ONLY to the leader: [{ peerId, name }].
 let pendingRequests = [];
 let toastTimer = null;
 // peerId -> { mic: {stream, track} | null, camera: {stream, track, enabled} | null } —
-// храним ссылки на входящие треки гостей НЕЗАВИСИМО от того, разрешено ли их
-// сейчас рендерить, чтобы можно было ретроактивно показать/скрыть при смене
-// guestAudio/guestVideo на лету (см. refreshMediaRenderingForPeer).
+// stores references to guests' incoming tracks REGARDLESS of whether
+// they're currently allowed to be rendered, so we can retroactively show/hide
+// them when guestAudio/guestVideo changes on the fly (see
+// refreshMediaRenderingForPeer).
 const peerMediaRefs = new Map();
 
-// Ф0: шина комнаты поверх mesh RTCDataChannel (см. bus.js/rtc.js) — общая
-// для чата (chat.js) и будущих фич, живёт на протяжении всей сессии в
-// комнате (пира регистрируем/снимаем синхронно с peers, см.
+// Phase 0: room bus on top of the mesh RTCDataChannel (see bus.js/rtc.js) —
+// shared by chat (chat.js) and future features, lives for the whole session
+// in the room (a peer is registered/deregistered in sync with peers, see
 // createRemotePeer/removeRemotePeer).
 const bus = new Bus();
 
-// --- Локальные медиа ---
+// --- Local media ---
 let micStream = null;
 let micTrack = null;
 let micRequestInProgress = false;
@@ -464,16 +471,16 @@ let camStream = null;
 let camTrack = null;
 let camRequestInProgress = false;
 
-// --- Выбор устройств (см. раздел «Камера и микрофон» ниже) ---
+// --- Device selection (see the "Camera and microphone" section below) ---
 //
-// Выбор пользователя живёт ТОЛЬКО в памяти вкладки (никакого localStorage —
-// анонимность, см. docs/privacy.md, «Anonymity») и переживает выключение/включение мика или
-// камеры кнопкой, но не reload/переход в другую комнату.
-// selected*DeviceId — то, что выбрано в селекте прямо сейчас (желаемое);
-// current*DeviceId — deviceId, реально стоящий за активным треком (что
-// сейчас физически захвачено). Они расходятся, когда пользователь выбрал
-// устройство, ПОКА мик/камера выключены кнопкой — реальное переключение
-// тогда откладывается до следующего включения (см. micButton/cameraButton
+// The user's choice lives ONLY in the tab's memory (no localStorage —
+// anonymity, see docs/privacy.md, "Anonymity") and survives turning the mic
+// or camera off/on via the button, but not a reload/switching to another room.
+// selected*DeviceId — what's currently selected in the dropdown (desired);
+// current*DeviceId — the deviceId actually behind the active track (what's
+// physically captured right now). They diverge when the user picked a
+// device WHILE the mic/camera is off via the button — the actual switch is
+// then deferred until the next time it's turned on (see micButton/cameraButton
 // click).
 let selectedMicDeviceId = null;
 let selectedCamDeviceId = null;
@@ -481,38 +488,39 @@ let currentMicDeviceId = null;
 let currentCamDeviceId = null;
 
 let screenStream = null;
-// peerId текущего владельца экрана (может быть myPeerId) или null.
+// peerId of the current screen-share owner (can be myPeerId) or null.
 let currentScreenOwnerPeerId = null;
-// Резолвер ожидания решения сервера на share-start (see screenButton click).
+// Resolver for awaiting the server's decision on share-start (see screenButton click).
 let pendingShareDecision = null;
 
-// --- Маршрутизация входящих треков по stream-info ---
+// --- Routing incoming tracks via stream-info ---
 // streamId -> { kind: 'mic'|'camera'|'screen', name }
 const streamInfoMap = new Map();
-// streamId -> [{ peerId, stream, track }] — треки, для которых ontrack уже
-// случился, а соответствующий stream-info ещё не пришёл (гонка реальна).
+// streamId -> [{ peerId, stream, track }] — tracks for which ontrack has
+// already fired, but the corresponding stream-info hasn't arrived yet (the
+// race is real).
 const pendingTracks = new Map();
 
-// peerId -> <audio> со скрытым входящим микрофоном.
+// peerId -> hidden <audio> element with the incoming microphone.
 const micAudioEls = new Map();
-// peerId -> функция stop() монитора уровня звука (см. common.js: SpeakingDetection).
+// peerId -> stop() function of the audio-level monitor (see common.js: SpeakingDetection).
 const micMonitors = new Map();
-// streamId -> peerId, чей это входящий поток камеры — нужно, чтобы применить
-// обновление `enabled` из повторного stream-info (см. broadcastStreamEnabled).
+// streamId -> peerId whose incoming camera stream this is — needed to apply
+// an `enabled` update from a repeated stream-info (see broadcastStreamEnabled).
 const cameraStreamOwner = new Map();
-// То же самое для потоков микрофона — нужно применять обновление `enabled`
-// к индикатору «микрофон выключен» на тайле (см. applyMicEnabledUpdate).
+// Same thing for microphone streams — needed to apply an `enabled` update to
+// the "mic off" indicator on the tile (see applyMicEnabledUpdate).
 const micStreamOwner = new Map();
 
 let chat = null;
 
-// ---------- Оверлей ----------
+// ---------- Overlay ----------
 
-// `onAction` — необязательный колбэк для кнопки оверлея; по умолчанию (не
-// передан) кнопка ведёт на главную (см. overlayActionButtonEl ниже) — так
-// работали «Комната не найдена»/«Комната заполнена» и раньше. Лобби
-// («Ожидание одобрения…») переопределяет его на «Отменить» = leave + на
-// главную (см. registerSignalingHandlers: signaling.on('waiting', ...)).
+// `onAction` — an optional callback for the overlay button; by default (not
+// passed) the button goes to the home page (see overlayActionButtonEl
+// below) — that's how "Room not found"/"Room full" used to work. The lobby
+// ("Waiting for approval…") overrides it to "Cancel" = leave + go home (see
+// registerSignalingHandlers: signaling.on('waiting', ...)).
 let overlayActionHandler = null;
 
 function showOverlay({ title, text = '', spinner = false, actionLabel = null, onAction = null }) {
@@ -541,22 +549,22 @@ overlayActionButtonEl.addEventListener('click', () => {
   }
 });
 
-// ---------- E2E v2: криптографическая идентичность вкладки ----------
+// ---------- E2E v2: cryptographic identity of the tab ----------
 
-const LINK_TOKEN_BYTES = 16; // должно совпадать с RoomCrypto TOKEN_BYTES
-const LINK_EXPIRY_GRACE_SECONDS = 120; // толеранс к рассинхрону часов клиента/сервера (см. static/landing.js: +300 сверх lifetimeSeconds на сервере)
+const LINK_TOKEN_BYTES = 16; // must match RoomCrypto TOKEN_BYTES
+const LINK_EXPIRY_GRACE_SECONDS = 120; // tolerance for client/server clock skew (see static/landing.js: +300 on top of lifetimeSeconds on the server)
 
 /**
- * Разобрать и провалидировать `t`/`e` из фрагмента ссылки (см. верх файла),
- * вывести K_auth и сгенерировать одноразовую эфемерную пару вкладки — ВСЁ
- * ДО join-room (см. init ниже). Возвращает:
- *   - 'invalid' — `t`/`e` отсутствуют или битые (не декодируются, `t` не
- *     ровно 16 байт, `e` не base36), либо сам WebCrypto отказался
- *     (недоступен и т.п.) — трактуется как «ссылка неполная»;
- *   - 'expired' — формат валиден, но `now > e + LINK_EXPIRY_GRACE_SECONDS` —
- *     терминальный оверлей «Link expired» (см. showLinkExpiredOverlay);
- *   - 'ok' — можно идти в join-room.
- * Заодно генерирует myPeerId (см. ниже, «Почему peerId выбирает клиент»).
+ * Parse and validate `t`/`e` from the link fragment (see top of file),
+ * derive K_auth and generate a one-time ephemeral tab key pair — ALL OF
+ * THIS BEFORE join-room (see init below). Returns:
+ *   - 'invalid' — `t`/`e` are missing or malformed (don't decode, `t` isn't
+ *     exactly 16 bytes, `e` isn't base36), or WebCrypto itself failed
+ *     (unavailable, etc.) — treated as "incomplete link";
+ *   - 'expired' — the format is valid, but `now > e + LINK_EXPIRY_GRACE_SECONDS` —
+ *     the terminal "Link expired" overlay (see showLinkExpiredOverlay);
+ *   - 'ok' — can proceed to join-room.
+ * Also generates myPeerId (see below, "Why the client chooses peerId").
  */
 async function initCryptoIdentity() {
   if (!linkTokenBase64url || !linkExpiry) return 'invalid';
@@ -565,17 +573,18 @@ async function initCryptoIdentity() {
   try {
     tokenBytes = RoomCrypto.base64urlToBytes(linkTokenBase64url);
   } catch (err) {
-    console.error('Не удалось декодировать токен ссылки:', err);
+    console.error('Failed to decode link token:', err);
     return 'invalid';
   }
   if (tokenBytes.length !== LINK_TOKEN_BYTES) return 'invalid';
 
-  if (!/^[0-9a-z]+$/.test(linkExpiry)) return 'invalid'; // base36 lowercase, см. static/landing.js
+  if (!/^[0-9a-z]+$/.test(linkExpiry)) return 'invalid'; // base36 lowercase, see static/landing.js
   const expirySeconds = parseInt(linkExpiry, 36);
   if (!Number.isFinite(expirySeconds) || expirySeconds <= 0) return 'invalid';
-  // Проверка ТОЛЬКО здесь, при входе — не в рантайме (см. верх файла и
-  // docs/security.md): рассинхрон часов посреди живого звонка не должен его
-  // рвать, жизнь комнаты и так ограничена сервером (room-expired).
+  // Checked ONLY here, at entry — not at runtime (see top of file and
+  // docs/security.md): a clock skew in the middle of a live call shouldn't
+  // tear it down, the room's lifetime is already bounded by the server
+  // (room-expired).
   if (Math.floor(Date.now() / 1000) > expirySeconds + LINK_EXPIRY_GRACE_SECONDS) return 'expired';
 
   try {
@@ -583,38 +592,38 @@ async function initCryptoIdentity() {
     myEphemeralKeyPair = await RoomCrypto.generateEphemeralKeyPair();
     myEpub = await RoomCrypto.exportEpub(myEphemeralKeyPair.publicKey);
   } catch (err) {
-    console.error('Не удалось инициализировать криптографическую идентичность вкладки:', err);
+    console.error('Failed to initialize the tab\'s cryptographic identity:', err);
     return 'invalid';
   }
 
-  // Почему peerId выбирает КЛИЕНТ (а не только сервер, как раньше): пока
-  // участник ждёт в лобби (см. signaling.on('waiting') ниже), он должен
-  // прислать лидеру name-announce, зашифрованный под попарным ключом,
-  // транскрипт которого включает peerId ОБЕИХ сторон (см.
-  // static/crypto.js: derivePairKeys) — а lobby-путь сервера (см.
-  // src/ws.rs) не сообщает ожидающему его собственный peerId до одобрения
-  // (Waiting несёт только leaderPeerId/leaderEpub). Решение: генерируем
-  // peerId САМИ (UUID v4 — тот же алфавит, что и generate_peer_id() на
-  // сервере) и посылаем его в join-room ЯВНО с самого первого входа (не
-  // только при реконнекте, как было раньше) — сервер принимает
-  // предъявленный peerId, если это валидный UUID и он свободен в комнате
-  // (см. src/ws.rs::handle_join_room), что на практике всегда так для
-  // свежесгенерированного UUID. Один и тот же myPeerId живёt всю сессию
-  // вкладки (включая все реконнекты), как и myEphemeralKeyPair.
+  // Why the CLIENT chooses peerId (rather than only the server, as before):
+  // while a participant is waiting in the lobby (see signaling.on('waiting')
+  // below), they must send the leader a name-announce encrypted under a
+  // pairwise key whose transcript includes the peerId of BOTH sides (see
+  // static/crypto.js: derivePairKeys) — and the server's lobby path (see
+  // src/ws.rs) doesn't tell the waiting participant their own peerId before
+  // approval (Waiting only carries leaderPeerId/leaderEpub). The solution:
+  // we generate peerId OURSELVES (UUID v4 — the same alphabet as generate_peer_id() on
+  // the server) and send it in join-room EXPLICITLY from the very first
+  // entry (not only on reconnect, as it used to be) — the server accepts
+  // the presented peerId if it's a valid UUID and is free in the room (see
+  // src/ws.rs::handle_join_room), which in practice is always true for a
+  // freshly generated UUID. The same myPeerId lives for the whole tab
+  // session (including all reconnects), just like myEphemeralKeyPair.
   myPeerId = crypto.randomUUID();
 
   return 'ok';
 }
 
-/** Оверлей «ссылка неполная» — вход без валидных `t`/`e` ИЛИ первая же неудачная расшифровка входящего (см. handleCryptoFailureOnce) трактуются одинаково: с этим токеном (или без него) в комнате всё равно ничего не заработает. */
+/** "Incomplete link" overlay — entering without valid `t`/`e` OR the first failed decryption of incoming data (see handleCryptoFailureOnce) are treated the same way: with this token (or without one), nothing in the room will work anyway. */
 function showInvalidLinkOverlay() {
   terminalState = true;
-  // join-modal видна ПО УМОЛЧАНИЮ (в разметке room.html у неё нет класса
-  // .hidden — её прячет/показывает только JS, см. showJoinModal/hideJoinModal
-  // ниже) и её z-index ВЫШЕ, чем у #overlay (см. static/style.css) — если её
-  // явно не спрятать здесь, она осталась бы поверх этого оверлея (и
-  // технически кликабельной) в сценарии «токен невалиден ещё до входа»,
-  // когда showJoinModal() вообще не успел выполниться.
+  // join-modal is visible BY DEFAULT (in room.html markup it has no
+  // .hidden class — only JS hides/shows it, see showJoinModal/hideJoinModal
+  // below) and its z-index is HIGHER than #overlay's (see static/style.css)
+  // — if it isn't explicitly hidden here, it would stay on top of this
+  // overlay (and technically clickable) in the "token is invalid even
+  // before entry" scenario, when showJoinModal() never had a chance to run.
   hideJoinModal();
   showOverlay({
     title: 'Link is invalid',
@@ -623,7 +632,7 @@ function showInvalidLinkOverlay() {
   });
 }
 
-/** Терминальный оверлей «ссылка истекла» — `e` из фрагмента в прошлом (с запасом LINK_EXPIRY_GRACE_SECONDS), см. initCryptoIdentity. Отдельно от showInvalidLinkOverlay: сообщение честнее («эта ссылка БЫЛА рабочей, но срок вышел», а не «ссылка сломана»). */
+/** Terminal "link expired" overlay — `e` from the fragment is in the past (with the LINK_EXPIRY_GRACE_SECONDS margin), see initCryptoIdentity. Kept separate from showInvalidLinkOverlay: the message is more honest ("this link WAS working, but has expired", rather than "the link is broken"). */
 function showLinkExpiredOverlay() {
   terminalState = true;
   hideJoinModal();
@@ -635,38 +644,39 @@ function showLinkExpiredOverlay() {
 }
 
 /**
- * Первая неудачная расшифровка входящего с серверного релея (SDP/ICE/
- * stream-info/name-announce — см. static/rtc.js: onCryptoFailure, и
- * signaling.on('stream-info'/'name-announce') ниже) — почти наверняка
- * означает, что токен ссылки (`t`/`e`) у нас не совпадает с тем, что у
- * собеседника (испорчен при копировании, разные ссылки после MITM-подмены и
- * т.п.): с совпадающим токеном GCM-тег почти никогда не собьётся сам по
- * себе (см. static/crypto.js, «Почему PSK-в-salt даёт аутентификацию»).
- * Показываем тот же оверлей, что и при отсутствующем/битом `t`/`e` — с точки
- * зрения пользователя разница не важна, результат один и тот же («эта ссылка
- * не работает, нужна новая»).
+ * The first failed decryption of an incoming message from the server relay
+ * (SDP/ICE/stream-info/name-announce — see static/rtc.js: onCryptoFailure,
+ * and signaling.on('stream-info'/'name-announce') below) — almost
+ * certainly means our link token (`t`/`e`) doesn't match the other side's
+ * (corrupted while copying, different links after a MITM swap, etc.): with a
+ * matching token the GCM tag will almost never fail on its own (see
+ * static/crypto.js, "Why PSK-in-salt provides authentication").
+ * We show the same overlay as for a missing/malformed `t`/`e` — from the
+ * user's point of view the distinction doesn't matter, the outcome is the
+ * same ("this link doesn't work, need a new one").
  */
 function handleCryptoFailureOnce(err) {
   if (cryptoFailureHandled || terminalState) return;
   cryptoFailureHandled = true;
-  console.error('Похоже, токен ссылки неверен (не удалось расшифровать входящее сообщение):', err);
+  console.error('Looks like the link token is wrong (failed to decrypt an incoming message):', err);
   showInvalidLinkOverlay();
   if (signaling) signaling.close();
 }
 
 /**
- * Получить (лениво вывести, если ещё не выводили) попарные ключи для
- * `peerId` — см. static/crypto.js: derivePairKeys. `epubStr` обязателен
- * ПЕРВЫЙ раз, когда мы узнаём об этом пире (joined.peers[]/peer-joined/
- * join-request/waiting.leaderEpub) — дальше кеш переиспользуется без него.
- * ВАЖНО: сам `pairKeysCache.set(promise)` — СИНХРОННЫЙ (деривация ключей
- * асинхронна, но промис ложится в кеш сразу): к моменту, когда сервер на
- * том же WS доставит первый релей от этого пира, запись в кеше уже есть —
- * guard'ы по pairKeysCache.has() (см. signaling.on('stream-info'/
- * 'name-announce')) никогда не глотают сообщения от честного пира.
- * Промис-отказ у УЖЕ закешированной пары (невалидный epub, WebCrypto
- * отказалась) — дальше по коду трактуется как криптографический отказ (см.
- * encryptSigFor/decryptSigFrom) — «не тихо игнорить».
+ * Get (lazily derive, if not already derived) pairwise keys for `peerId` —
+ * see static/crypto.js: derivePairKeys. `epubStr` is required the FIRST
+ * time we learn about this peer (joined.peers[]/peer-joined/join-request/
+ * waiting.leaderEpub) — after that the cache is reused without it.
+ * IMPORTANT: `pairKeysCache.set(promise)` itself is SYNCHRONOUS (key
+ * derivation is async, but the promise lands in the cache immediately): by
+ * the time the server delivers the first relay from this peer over the same
+ * WS, the cache entry already exists — the pairKeysCache.has() guards (see
+ * signaling.on('stream-info'/'name-announce')) never swallow a message
+ * from a legitimate peer. A promise rejection for an ALREADY cached pair
+ * (invalid epub, WebCrypto failed) is treated further down the code as a
+ * cryptographic failure (see encryptSigFor/decryptSigFrom) — "don't
+ * silently ignore it".
  */
 function cachePairKeys(peerId, epubStr) {
   if (!pairKeysCache.has(peerId)) {
@@ -687,57 +697,57 @@ function cachePairKeys(peerId, epubStr) {
   return pairKeysCache.get(peerId);
 }
 
-/** Тот же кеш, но без epub — для мест, где пара ДОЛЖНА уже быть закеширована заранее (см. createRemotePeer/sendStreamInfoTo/signaling.on('stream-info')). Неизвестный peerId — отказ (см. cachePairKeys). */
+/** The same cache, but without epub — for places where the pair MUST already be cached in advance (see createRemotePeer/sendStreamInfoTo/signaling.on('stream-info')). An unknown peerId — rejection (see cachePairKeys). */
 function getPairKeys(peerId) {
   return pairKeysCache.get(peerId) || Promise.reject(new Error(`getPairKeys: no pair keys cached for peer ${peerId}`));
 }
 
-/** Зашифровать SDP/ICE/stream-info под попарным K_pair_sig для конкретного `peerId` — см. static/rtc.js: sigCrypto, и sendStreamInfoTo ниже. */
+/** Encrypt SDP/ICE/stream-info under the pairwise K_pair_sig for a specific `peerId` — see static/rtc.js: sigCrypto, and sendStreamInfoTo below. */
 async function encryptSigFor(peerId, obj) {
   const { sigKey } = await getPairKeys(peerId);
   return RoomCrypto.encryptJson(sigKey, obj);
 }
 
-/** Расшифровать SDP/ICE/stream-info от конкретного `peerId` под попарным K_pair_sig — любая ошибка (неизвестный epub, неверный ключ, битый конверт) прокидывается вызывающей стороне как есть (см. static/rtc.js: onCryptoFailure, и signaling.on('stream-info') ниже). */
+/** Decrypt SDP/ICE/stream-info from a specific `peerId` under the pairwise K_pair_sig — any error (unknown epub, wrong key, malformed envelope) is propagated to the caller as-is (see static/rtc.js: onCryptoFailure, and signaling.on('stream-info') below). */
 async function decryptSigFrom(peerId, blob) {
   const { sigKey } = await getPairKeys(peerId);
   return RoomCrypto.decryptJson(sigKey, blob);
 }
 
-/** Зашифровать собственное имя под попарным K_pair_meta конкретного `peerId` — payload для `name-announce` (см. src/protocol.rs::ClientMessage::NameAnnounce). */
+/** Encrypt our own name under a specific `peerId`'s pairwise K_pair_meta — the payload for `name-announce` (see src/protocol.rs::ClientMessage::NameAnnounce). */
 async function encryptNameAnnouncePayload(peerId) {
   const { metaKey } = await getPairKeys(peerId);
   return RoomCrypto.encryptToBase64(metaKey, { name: myName || null });
 }
 
-/** Отправить `name-announce` пиру/лидеру `peerId` — ничего не шлём, если своё имя пусто (аноним и так показан как «Guest» у всех, дополнительное сообщение не добавляет информации). Отказ (напр. пара ещё не закеширована) — не роняем комнату, только логируем: это НАШЕ исходящее действие, а не подозрительное входящее. */
+/** Send `name-announce` to peer/leader `peerId` — send nothing if our own name is empty (an anonymous user is already shown as "Guest" to everyone, an extra message adds no information). A failure (e.g. the pair isn't cached yet) doesn't bring down the room, we just log it: this is OUR OWN outgoing action, not a suspicious incoming one. */
 async function sendNameAnnounceTo(peerId) {
   if (!myName) return;
   try {
     const payload = await encryptNameAnnouncePayload(peerId);
     signaling.send('name-announce', { to: peerId, payload });
   } catch (err) {
-    console.error(`Не удалось отправить name-announce пиру ${peerId}:`, err);
+    console.error(`Failed to send name-announce to peer ${peerId}:`, err);
   }
 }
 
-/** sendNameAnnounceTo для целого списка peerId — см. signaling.on('joined')/reconnect ниже («переотправить всем идемпотентно»). */
+/** sendNameAnnounceTo for a whole list of peerIds — see signaling.on('joined')/reconnect below ("idempotently resend to everyone"). */
 function broadcastNameAnnounceTo(peerIds) {
   if (!myName) return;
   for (const peerId of peerIds) sendNameAnnounceTo(peerId);
 }
 
 /**
- * Расшифровать payload входящего `name-announce` от `fromPeerId` под его
- * попарным K_pair_meta. Любая ошибка (невалидный epub отправителя, неверный
- * ключ, битый конверт) прокидывается как есть — вызывающая сторона
- * (signaling.on('name-announce') ниже; отправители без установленной пары
- * отфильтрованы там ЕЩЁ ДО вызова — см. guard по pairKeysCache.has())
- * трактует ЛЮБУЮ ошибку здесь как криптографический отказ (см.
- * handleCryptoFailureOnce): в отличие от v1, где нерасшифровавшееся имя тихо
- * превращалось в «Гость», здесь честный отправитель с правильным `t`/`e`
- * ВСЕГДА расшифровывается успешно — отказ означает подмену/рассинхрон
- * токена, а не безобидную порчу одного поля.
+ * Decrypt the payload of an incoming `name-announce` from `fromPeerId`
+ * under its pairwise K_pair_meta. Any error (sender's invalid epub, wrong
+ * key, malformed envelope) is propagated as-is — the caller
+ * (signaling.on('name-announce') below; senders without an established pair
+ * are already filtered out there BEFORE the call — see the
+ * pairKeysCache.has() guard) treats ANY error here as a cryptographic
+ * failure (see handleCryptoFailureOnce): unlike v1, where a name that
+ * failed to decrypt silently turned into "Guest", here a legitimate sender
+ * with the correct `t`/`e` ALWAYS decrypts successfully — a failure means a
+ * spoof/token mismatch, not the harmless corruption of a single field.
  */
 async function decryptNameAnnouncePayload(fromPeerId, payload) {
   const { metaKey } = await getPairKeys(fromPeerId);
@@ -745,15 +755,15 @@ async function decryptNameAnnouncePayload(fromPeerId, payload) {
   return obj && typeof obj.name === 'string' && obj.name ? obj.name : null;
 }
 
-// SAS v2 (см. docs/sas-verification.md, стейт-машина ниже). fromPeerId —
-// АУТЕНТИФИЦИРОВАННЫЙ транспортный отправитель (bus зовёт обработчики с ним,
-// см. H3 в docs/security.md): сообщения не несут self-declared id, подмена
-// автора невозможна. Сообщения не своего раунда игнорируются.
+// SAS v2 (see docs/sas-verification.md, state machine below). fromPeerId is
+// the AUTHENTICATED transport sender (the bus calls handlers with it, see
+// H3 in docs/security.md): messages don't carry a self-declared id, the
+// author can't be spoofed. Messages from a different round are ignored.
 bus.onMessage((fromPeerId, obj) => {
   if (!obj || obj.kind !== 'sas-commit') return;
   if (obj.round !== sasCurrentRoundId || typeof obj.commit !== 'string') return;
   if (!sasCommits.has(fromPeerId)) sasCommits.set(fromPeerId, obj.commit);
-  sasTryComplete().catch((err) => console.warn('SAS: обработка sas-commit не удалась:', err));
+  sasTryComplete().catch((err) => console.warn('SAS: failed to process sas-commit:', err));
 });
 bus.onMessage((fromPeerId, obj) => {
   if (!obj || obj.kind !== 'sas-reveal') return;
@@ -763,10 +773,10 @@ bus.onMessage((fromPeerId, obj) => {
   } catch {
     return;
   }
-  sasTryComplete().catch((err) => console.warn('SAS: обработка sas-reveal не удалась:', err));
+  sasTryComplete().catch((err) => console.warn('SAS: failed to process sas-reveal:', err));
 });
 
-// ---------- Ненавязчивые сообщения ----------
+// ---------- Unobtrusive messages ----------
 
 let roomMessageTimer = null;
 function showRoomMessage(text) {
@@ -778,7 +788,7 @@ function showRoomMessage(text) {
   }, 4000);
 }
 
-/** Ненавязчивый тост (смена лидера и т.п., см. docs/permissions-and-leader.md) — отдельно от showRoomMessage (та зарезервирована под предупреждения/ошибки). */
+/** Unobtrusive toast (leader change, etc., see docs/permissions-and-leader.md) — kept separate from showRoomMessage (that one is reserved for warnings/errors). */
 function showToast(text, ms = 3000) {
   toastEl.textContent = text;
   toastEl.classList.remove('hidden');
@@ -788,7 +798,7 @@ function showToast(text, ms = 3000) {
   }, ms);
 }
 
-// ---------- Баннер переподключения сигналинга ----------
+// ---------- Signaling reconnect banner ----------
 
 function showReconnectBanner() {
   reconnectBannerEl.classList.remove('hidden');
@@ -798,12 +808,12 @@ function hideReconnectBanner() {
   reconnectBannerEl.classList.add('hidden');
 }
 
-// ---------- Баннер version-skew ----------
+// ---------- Version-skew banner ----------
 
 async function fetchVersion() {
   try {
-    // Ш2: через window.API_BASE (см. static/config.js) — /version.json живёт
-    // на API-хосте, не обязательно совпадающем с origin этой страницы.
+    // Step 2: via window.API_BASE (see static/config.js) — /version.json
+    // lives on the API host, which doesn't necessarily match this page's origin.
     const res = await fetch(`${window.API_BASE}/version.json`);
     if (!res.ok) return null;
     const data = await res.json();
@@ -813,7 +823,7 @@ async function fetchVersion() {
   }
 }
 
-/** Сравнить текущую серверную версию с той, с которой была загружена страница. Никогда не «забывает» уже показанное расхождение. */
+/** Compare the current server version with the one this page was loaded with. Never "forgets" a mismatch it has already shown. */
 async function checkVersionSkew() {
   const current = await fetchVersion();
   if (current && lastKnownVersion && current !== lastKnownVersion) {
@@ -825,23 +835,24 @@ versionBannerReloadButtonEl.addEventListener('click', () => {
   location.reload();
 });
 
-// ---------- Build-хэш опубликованной статики (форензический якорь, см.
-// docs/security.md, «Published Build Hash») ----------
+// ---------- Build hash of the published static bundle (a forensic anchor,
+// see docs/security.md, "Published Build Hash") ----------
 //
-// /build-hash.json лежит РЯДОМ со страницей — корень бандла на Cloudflare
-// Pages (см. .github/workflows/deploy-prod.yml, job deploy-pages), same-origin
-// fetch, НЕ через window.API_BASE (в отличие от /version.json выше — тот
-// живёт на сигналинг-хосте, этот — на хосте статики, см. Ш2 в
-// docs/self-hosting.md §1.2). В dev/self-hosted сборке файла нет вообще
-// (нет такого маршрута на сервере, см. src/main.rs) — тогда все три места
-// показа (лендинг, попап «Поделиться», настройки) остаются скрытыми,
-// ничего не падает. Кэш — только в памяти вкладки (fetch ровно один раз),
-// без localStorage — анонимность страницы не нарушается.
+// /build-hash.json lives NEXT TO the page — the bundle root on Cloudflare
+// Pages (see .github/workflows/deploy-prod.yml, job deploy-pages), a
+// same-origin fetch, NOT via window.API_BASE (unlike /version.json above —
+// that lives on the signaling host, this one on the static-assets host, see
+// Step 2 in docs/self-hosting.md §1.2). In a dev/self-hosted build the file
+// doesn't exist at all (no such route on the server, see src/main.rs) —
+// then all three display spots (landing page, "Share" popup, settings) stay
+// hidden, nothing breaks. The cache lives only in the tab's memory (fetched
+// exactly once), no localStorage — the page's anonymity isn't broken.
 //
-// ВАЖНО: это НЕ криптогарантия (см. docs/security.md §10.4) — хостер
-// статики теоретически может подменить и сам build-hash.json заодно с
-// остальным бандлом. Настоящая сверка — с GitHub Release, независимым
-// каналом, а не с тем, что показывает эта же страница.
+// IMPORTANT: this is NOT a cryptographic guarantee (see docs/security.md
+// §10.4) — the static-assets host could in theory tamper with
+// build-hash.json itself along with the rest of the bundle. The real check
+// is against the GitHub Release, an independent channel, not against what
+// this very page displays.
 let buildHashInfo = null;
 let buildHashPromise = null;
 
@@ -850,7 +861,7 @@ function fetchBuildHashOnce() {
     buildHashPromise = (async () => {
       try {
         const res = await fetch('/build-hash.json');
-        if (!res.ok) return null; // dev/self-hosted без build-hash.json — штатно
+        if (!res.ok) return null; // dev/self-hosted without build-hash.json — expected
         const data = await res.json();
         if (!data || typeof data.hash !== 'string' || !data.hash) return null;
         return data;
@@ -866,11 +877,12 @@ function fetchBuildHashOnce() {
 }
 
 /**
- * Строка «build: <короткий хэш>… + verify» в попапе «Поделиться» — рядом со
- * ссылкой/QR, НЕ внутри них (см. static/room.html). Формат — как в подвале
- * лендинга (static/index.html/landing.js: loadBuildHash): 10 символов хэша +
- * многоточие в summary, полный хэш — по раскрытию (details) и в title,
- * ссылка «verify» ведёт на тот же GitHub Releases.
+ * The "build: <short hash>… + verify" line in the "Share" popup — next to
+ * the link/QR, NOT inside them (see static/room.html). Format matches the
+ * landing page footer (static/index.html/landing.js: loadBuildHash): 10
+ * hash characters + ellipsis in the summary, the full hash shown on
+ * expanding (details) and in the title, the "verify" link points to the
+ * same GitHub Releases.
  */
 function renderShareBuildLine() {
   if (!buildHashInfo) {
@@ -886,7 +898,7 @@ function renderShareBuildLine() {
   sharePopupBuildEl.classList.remove('hidden');
 }
 
-/** Необязательная строка в «Соединение и приватность» — тот же хэш, для тех, кто туда заглядывает вместо попапа «Поделиться». */
+/** An optional line in "Connection and privacy" — the same hash, for those who look there instead of the "Share" popup. */
 function renderSettingsBuildRow() {
   if (!buildHashInfo) {
     settingsBuildRowEl.classList.add('hidden');
@@ -902,7 +914,7 @@ fetchBuildHashOnce().then(() => {
   renderSettingsBuildRow();
 });
 
-// ---------- Воспроизведение с фоллбэком на mute при блокировке автовоспроизведения ----------
+// ---------- Playback with a fallback to mute when autoplay is blocked ----------
 
 function safePlay(el) {
   const p = el.play();
@@ -916,13 +928,13 @@ function safePlay(el) {
   }
 }
 
-// ---------- Тайлы участников ----------
+// ---------- Participant tiles ----------
 
 /**
- * Детерминированный оттенок из peerId — чтобы заглушки без камеры отличались
- * друг от друга живым цветом, а не были одинаковыми синими кругами. Тот же
- * peerId всегда даёт тот же градиент (в т.ч. между перезаходами), т.к. хэш
- * чисто строковый, без случайности.
+ * Deterministic hue derived from peerId — so camera-off placeholders differ
+ * from each other with a live color instead of being identical blue
+ * circles. The same peerId always yields the same gradient (including
+ * across re-joins), since the hash is purely string-based, no randomness.
  */
 function hueFromPeerId(peerId) {
   let hash = 0;
@@ -934,13 +946,14 @@ function hueFromPeerId(peerId) {
 }
 
 /**
- * Первый графемный кластер строки — буква аватара берёт именно кластер, а не
- * charAt(0)/[0]: на имени, начинающемся с эмодзи (см. static/namegen.js:
- * userName()), charAt(0) вернул бы половину суррогатной пары. Intl.Segmenter
- * — точный способ; фолбэк [...str][0] берёт первую код-точку целиком
- * (корректно для однокодпойнтных эмодзи ANIMALS, см. namegen.js).
- * Используется и в createTile, и в updatePeerTileName/updateOwnTileLabel —
- * три места, где раньше этот код был продублирован дословно.
+ * First grapheme cluster of a string — the avatar letter takes the cluster
+ * specifically, not charAt(0)/[0]: for a name starting with an emoji (see
+ * static/namegen.js: userName()), charAt(0) would return half of a
+ * surrogate pair. Intl.Segmenter is the precise way; the [...str][0]
+ * fallback takes the first code point whole (correct for single-code-point
+ * ANIMALS emoji, see namegen.js). Used in both createTile and
+ * updatePeerTileName/updateOwnTileLabel — three places where this code used
+ * to be duplicated verbatim.
  */
 function firstGraphemeOf(str) {
   if (!str) return null;
@@ -950,14 +963,16 @@ function firstGraphemeOf(str) {
 }
 
 /**
- * Подпись тайла показывает просто имя (см. п.5 задания), но круг-аватар уже
- * несёт первый графемный кластер имени как отдельную крупную картинку — если
- * этот кластер оказывается эмодзи (см. namegen.js: userName() почти всегда
- * начинается с эмодзи), подпись дублировала бы его же текстом рядом с
- * кругом. \p{Extended_Pictographic} — надёжная проверка «это эмодзи», а не
- * первая буква обычного имени (иначе, например, имя "Alice" лишилось бы "A").
- * Если после вычитания кластера ничего не остаётся (имя — один эмодзи без
- * слова) — возвращаем исходную строку, чтобы подпись не была пустой.
+ * The tile caption shows just the name (see task item 5), but the avatar
+ * circle already carries the name's first grapheme cluster as a separate,
+ * large image — if that cluster turns out to be an emoji (see
+ * static/namegen.js: userName() almost always starts with an emoji), the
+ * caption would duplicate it as text next to the circle.
+ * \p{Extended_Pictographic} is a reliable check for "this is an emoji", as
+ * opposed to the first letter of a regular name (otherwise, e.g., the name
+ * "Alice" would lose its "A"). If nothing remains after removing the
+ * cluster (the name is a single emoji with no word), we return the original
+ * string so the caption isn't empty.
  */
 function stripLeadingAvatarEmoji(trimmedName, grapheme) {
   if (!trimmedName || !grapheme) return trimmedName;
@@ -966,46 +981,47 @@ function stripLeadingAvatarEmoji(trimmedName, grapheme) {
   return rest || trimmedName;
 }
 
-/** Имя для показа под аватаром/в углу тайла — просто имя, без "Guest"-плейсхолдера, если и так есть. */
+/** Name to display under the avatar/in the tile corner — just the name, without the "Guest" placeholder if there already is one. */
 function tileDisplayName(trimmedName, grapheme) {
   return trimmedName ? stripLeadingAvatarEmoji(trimmedName, grapheme) : 'Guest';
 }
 
-// ---------- Раскладка грида тайлов: фиксированная сетка под лимит 6 ----------
+// ---------- Tile grid layout: fixed grid for the 6-participant limit ----------
 //
-// Комната по умолчанию ограничена 6 участниками (см. knownServerMaxParticipants
-// выше) — по заданию (п.6) раскладка для 1..6 тайлов ФИКСИРОВАННАЯ и
-// предсказуемая (не «лучшее из перебора N вариантов колонок», как было
-// раньше в computeBestFitTileLayout — тот перебор давал переменное число
-// колонок в зависимости от формы сцены, из-за чего результат было сложно
-// уместить одновременно и по ширине, и по высоте без скролла): десктоп —
-// 1→1, 2→2, 3→3, 4→2×2, 5-6→3×2; мобильный портрет (см. @media (max-width:
-// 640px) в static/style.css) — всегда 2 колонки (кроме одиночного тайла).
+// The room is limited to 6 participants by default (see
+// knownServerMaxParticipants above) — per the spec (item 6), the layout for
+// 1..6 tiles is FIXED and predictable (not "best of an N-way search over
+// column counts" as computeBestFitTileLayout used to do — that search
+// produced a variable number of columns depending on the stage shape, which
+// made it hard to fit both width and height at once without scrolling):
+// desktop — 1→1, 2→2, 3→3, 4→2×2, 5-6→3×2; mobile portrait (see @media
+// (max-width: 640px) in static/style.css) — always 2 columns (except for a
+// single tile).
 //
-// Сам тайл всё равно масштабируется под аспект 16:9 и вписывается МАКСИМУМ
-// возможного размера — но теперь по ЯВНО зафиксированному числу колонок/строк,
-// а не подбором. Оба грид-трека (и grid-template-columns, И
-// grid-template-rows) проставляются инлайн в px — раньше высота строк
-// отдавалась на откуп CSS-фоллбэку `grid-auto-rows: minmax(0, 1fr)`, что при
-// недетерминированной (auto) высоте самого #tiles-grid могло не совпасть с
-// реально проверенным по высоте расчётом. Явные grid-template-rows убирают
-// эту неоднозначность: итоговая высота грида гарантированно равна
-// rows*tileHeight + gaps, т.е. ровно тому, что было проверено на fit по
-// высоте сцены (см. также фикс .room-page: height вместо min-height в
-// static/style.css — вторая половина того же бага со скроллом).
+// The tile itself still scales to a 16:9 aspect ratio and fits the MAXIMUM
+// possible size — but now with an EXPLICITLY fixed number of columns/rows,
+// rather than by search. Both grid tracks (grid-template-columns AND
+// grid-template-rows) are set inline in px — previously row height was left
+// to the CSS fallback `grid-auto-rows: minmax(0, 1fr)`, which, given the
+// non-deterministic (auto) height of #tiles-grid itself, could mismatch the
+// height actually verified by the fit computation. Explicit
+// grid-template-rows removes this ambiguity: the resulting grid height is
+// guaranteed to equal rows*tileHeight + gaps, i.e. exactly what was checked
+// to fit the stage height (see also the .room-page fix: height instead of
+// min-height in static/style.css — the other half of the same scrolling bug).
 const TILE_ASPECT_RATIO = 16 / 9;
 
-// Тот же брейкпоинт, что и мобильный @media в static/style.css — раскладка
-// колонок должна совпадать с тем, что реально видит пользователь.
+// The same breakpoint as the mobile @media in static/style.css — the column
+// layout must match what the user actually sees.
 const MOBILE_TILES_MEDIA_QUERY = '(max-width: 640px)';
 
 /**
- * Число колонок для фиксированной раскладки под tileCount (см. комментарий
- * выше). Больше 6 тайлов — нестандартная серверная конфигурация с
- * увеличенным лимитом участников — не описана заданием отдельно; берём
- * общий разумный fallback ceil(sqrt(n)), чтобы сетка не расползалась в одну
- * строку/колонку, а не потому, что это «правильная» раскладка для такого
- * случая.
+ * Number of columns for the fixed layout given tileCount (see comment
+ * above). More than 6 tiles — a non-standard server configuration with an
+ * increased participant limit — isn't described separately by the spec; we
+ * use a generic reasonable fallback of ceil(sqrt(n)) so the grid doesn't
+ * sprawl into a single row/column, not because it's the "correct" layout
+ * for that case.
  */
 function computeTileGridColumns(tileCount, isMobile) {
   if (tileCount <= 1) return 1;
@@ -1018,10 +1034,10 @@ function computeTileGridColumns(tileCount, isMobile) {
 }
 
 /**
- * Максимальный размер тайла 16:9, вписанный ОДНОВРЕМЕННО и по ширине
- * (containerWidth, поделённой на cols с учётом зазоров), и по высоте
- * (containerHeight, поделённой на rows) — возвращает { cols, rows,
- * tileWidth, tileHeight } либо null, если контейнер/список тайлов пуст.
+ * Maximum 16:9 tile size that fits SIMULTANEOUSLY both by width
+ * (containerWidth, divided by cols accounting for gaps) and by height
+ * (containerHeight, divided by rows) — returns { cols, rows, tileWidth,
+ * tileHeight } or null if the container/tile list is empty.
  */
 function computeFixedTileLayout(containerWidth, containerHeight, tileCount, gapPx, isMobile) {
   if (tileCount <= 0 || containerWidth <= 0 || containerHeight <= 0) return null;
@@ -1033,9 +1049,10 @@ function computeFixedTileLayout(containerWidth, containerHeight, tileCount, gapP
   let tileWidth = cellWidth;
   let tileHeight = tileWidth / TILE_ASPECT_RATIO;
   if (tileHeight > cellHeight) {
-    // Ширина колонки позволила бы тайл выше строки — масштабируем по высоте
-    // вместо этого (аспект 16:9 сохраняется в любом случае, лишнее место по
-    // ширине просто остаётся пустым по краю за счёт justify-content: center).
+    // The column width would allow a tile taller than the row — scale by
+    // height instead (the 16:9 aspect ratio is preserved either way, the
+    // leftover width space is simply left empty on the edge thanks to
+    // justify-content: center).
     tileHeight = cellHeight;
     tileWidth = tileHeight * TILE_ASPECT_RATIO;
   }
@@ -1043,12 +1060,13 @@ function computeFixedTileLayout(containerWidth, containerHeight, tileCount, gapP
 }
 
 /**
- * Доступное место для #tiles-grid внутри .room-stage — сцена делится с
- * другими видимыми детьми (главным образом #screen-stage, когда кто-то
- * шарит экран, и #invite-cta в одиночной комнате), поэтому из полного
- * content-box .room-stage вычитаем высоту+gap каждого другого ВИДИМОГО
- * прямого ребёнка (общий подход, не привязанный к тому, что это именно
- * screen-stage — если появится ещё один сосед, учтётся автоматически).
+ * Available space for #tiles-grid inside .room-stage — the stage is shared
+ * with other visible children (mainly #screen-stage, when someone is
+ * sharing their screen, and #invite-cta in a solo room), so from the full
+ * content-box of .room-stage we subtract the height+gap of every other
+ * VISIBLE direct child (a general approach, not tied specifically to
+ * screen-stage — if another sibling appears, it will be accounted for
+ * automatically).
  */
 function computeAvailableGridBox() {
   const stage = tilesGridEl.parentElement;
@@ -1074,17 +1092,17 @@ function computeAvailableGridBox() {
 }
 
 /**
- * Пересчитать и применить фиксированную раскладку — вызывается при изменении
- * числа тайлов (см. updateSoloState, вызывается из updateParticipantCount),
- * при тоггле --compact (showScreenStageContainer/hideScreenStage — через тот
- * же updateSoloState) и на resize окна (см. слушатель ниже; ресайз — в т.ч.
- * поворот телефона, что меняет isMobile здесь ни при чём — брейкпоинт по
- * ширине, а не ориентации, но пересчитать всё равно нужно, ширина меняется
- * тоже). Не трогает --compact (лента при шаринге экрана — своя flex-раскладка
- * с фиксированной шириной тайла, см. static/style.css) и --spotlight (лента
- * максимизации — тоже своя CSS-раскладка, см. updateSpotlightMode) — там
- * фиксированная сетка была бы не к месту и конфликтовала бы с их собственной
- * геометрией.
+ * Recompute and apply the fixed layout — called when the tile count
+ * changes (see updateSoloState, called from updateParticipantCount), when
+ * --compact is toggled (showScreenStageContainer/hideScreenStage — via the
+ * same updateSoloState), and on window resize (see the listener below;
+ * resize includes phone rotation, which is unrelated to isMobile here — the
+ * breakpoint is by width, not orientation, but a recompute is still needed
+ * since width changes too). Doesn't touch --compact (the filmstrip during
+ * screen sharing has its own flex layout with a fixed tile width, see
+ * static/style.css) or --spotlight (the maximized-tile filmstrip also has
+ * its own CSS layout, see updateSpotlightMode) — a fixed grid would be out
+ * of place there and would conflict with their own geometry.
  */
 function layoutTilesGrid() {
   if (tilesGridEl.classList.contains('tiles-grid--compact')) return;
@@ -1092,13 +1110,14 @@ function layoutTilesGrid() {
   const tileCount = tilesGridEl.children.length;
   if (tileCount === 0) return;
   const { width: stageWidth, height } = computeAvailableGridBox();
-  // #tiles-grid сама ограничена `max-width: 1200px` в CSS (см. static/style.css)
-  // — на широких десктопных экранах сцена (.room-stage) шире этого предела,
-  // и без учёта этого предела здесь JS насчитал бы колонки под ПОЛНУЮ ширину
-  // сцены, а сам грид отрисовался бы уже (max-width подрезал бы его box), из-за
-  // чего явно проставленные grid-template-columns не влезли бы в
-  // фактический clientWidth грида — горизонтальный скролл ИМЕННО этого рода
-  // и был найден смоук-тестом (см. п.6 задания: 1280×800, 6 тайлов).
+  // #tiles-grid itself is capped at `max-width: 1200px` in CSS (see
+  // static/style.css) — on wide desktop screens the stage (.room-stage) is
+  // wider than this limit, and without accounting for it the JS here would
+  // compute columns for the FULL stage width, while the grid itself would
+  // render narrower (max-width would clip its box), causing the explicitly
+  // set grid-template-columns to not fit within the grid's actual
+  // clientWidth — a horizontal scroll of EXACTLY this kind was found by
+  // smoke testing (see spec item 6: 1280×800, 6 tiles).
   const cssMaxWidth = parseFloat(getComputedStyle(tilesGridEl).maxWidth);
   const width = Number.isFinite(cssMaxWidth) ? Math.min(stageWidth, cssMaxWidth) : stageWidth;
   const gapPx = parseFloat(getComputedStyle(tilesGridEl).columnGap) || 0;
@@ -1108,17 +1127,18 @@ function layoutTilesGrid() {
   const tileWidthPx = Math.floor(layout.tileWidth);
   const tileHeightPx = Math.floor(layout.tileHeight);
   tilesGridEl.style.gridTemplateColumns = `repeat(${layout.cols}, ${tileWidthPx}px)`;
-  // grid-template-rows (не auto-rows: minmax(0, 1fr) из CSS-фоллбэка) —
-  // именно этого не хватало раньше: без явной высоты строк итоговая высота
-  // грида не была гарантированно ограничена проверенным по высоте расчётом
-  // (см. комментарий над computeFixedTileLayout и фикс .room-page в
-  // static/style.css — вторая половина того же бага со скроллом на десктопе).
+  // grid-template-rows (not auto-rows: minmax(0, 1fr) from the CSS
+  // fallback) — this specifically was missing before: without an explicit
+  // row height, the resulting grid height wasn't guaranteed to be bounded
+  // by the height-checked computation (see the comment above
+  // computeFixedTileLayout and the .room-page fix in static/style.css —
+  // the other half of the same desktop scrolling bug).
   tilesGridEl.style.gridTemplateRows = `repeat(${layout.rows}, ${tileHeightPx}px)`;
 }
 
-// Ресайз окна (поворот телефона, изменение размера окна десктоп-браузера,
-// DevTools) — единственный из трёх триггеров пересчёта (см. комментарий
-// layoutTilesGrid), который не проходит уже через updateSoloState.
+// Window resize (phone rotation, resizing the desktop browser window,
+// DevTools) — the only one of the three recompute triggers (see the
+// layoutTilesGrid comment) that doesn't already go through updateSoloState.
 window.addEventListener('resize', layoutTilesGrid);
 
 function createTile(peerId, name, isOwn) {
@@ -1136,10 +1156,11 @@ function createTile(peerId, name, isOwn) {
     video.classList.add('tile-video--mirror');
   }
 
-  // Заглушка без видео: аватар-круг (буква/эмодзи, теперь заметно крупнее и
-  // строго круглый — см. .tile-placeholder-avatar в static/style.css) + имя
-  // КРУПНО под ним. .tile-placeholder — просто flex-контейнер на весь тайл,
-  // круг с градиентом — отдельный .tile-placeholder-avatar.
+  // No-video placeholder: avatar circle (letter/emoji, now noticeably
+  // larger and strictly round — see .tile-placeholder-avatar in
+  // static/style.css) + the name shown LARGE below it. .tile-placeholder is
+  // just a flex container covering the whole tile, the gradient circle is
+  // a separate .tile-placeholder-avatar.
   const placeholder = document.createElement('div');
   placeholder.className = 'tile-placeholder';
 
@@ -1148,19 +1169,19 @@ function createTile(peerId, name, isOwn) {
   const hue = hueFromPeerId(peerId);
   avatar.style.background = `linear-gradient(135deg, hsl(${hue}, 70%, 45%), hsl(${(hue + 45) % 360}, 70%, 32%))`;
 
-  // Корона лидера НАД кругом-аватаром (см. п.4 задания) — абсолютно
-  // позиционирована относительно самого круга (avatar: position: relative,
-  // см. static/style.css), а не относительно всего тайла: так она остаётся
-  // прямо по центру над кругом при любом размере тайла (best-fit/сетка) без
-  // отдельного пересчёта в JS. Это ОТДЕЛЬНЫЙ элемент от .tile-crown в
-  // .tile-name ниже — та корона видна только во время видео (угол плашки с
-  // именем), эта — только на заглушке без видео; обе переключаются вместе в
-  // setLeaderIndicator, т.к. видео/заглушка никогда не показываются
-  // одновременно.
+  // Leader crown ABOVE the avatar circle (see spec item 4) — absolutely
+  // positioned relative to the circle itself (avatar: position: relative,
+  // see static/style.css), not relative to the whole tile: this keeps it
+  // exactly centered above the circle at any tile size (best-fit/grid)
+  // without a separate recompute in JS. This is a SEPARATE element from
+  // .tile-crown in .tile-name below — that crown is visible only during
+  // video (the corner name badge), this one only on the no-video
+  // placeholder; both are toggled together in setLeaderIndicator, since
+  // video/placeholder are never shown at the same time.
   const placeholderCrown = document.createElement('span');
   placeholderCrown.className = 'tile-crown tile-crown--placeholder hidden';
   placeholderCrown.setAttribute('aria-hidden', 'true');
-  placeholderCrown.innerHTML = CROWN_ICON_SVG; // статичная разметка, не пользовательские данные
+  placeholderCrown.innerHTML = CROWN_ICON_SVG; // static markup, not user data
   avatar.appendChild(placeholderCrown);
 
   const letter = document.createElement('span');
@@ -1175,46 +1196,48 @@ function createTile(peerId, name, isOwn) {
   placeholderName.className = 'tile-placeholder-name';
   placeholder.appendChild(placeholderName);
 
-  // Угловая подпись (видна только когда идёт видео — см. setTileVideoVisible
-  // ниже: на заглушке имя уже крупно показано по центру, дублировать его в
-  // углу незачем). Корона лидера — инлайн перед именем в этой же плашке
-  // (видео-режим, см. комментарий у placeholderCrown выше про решение для
-  // заглушки).
+  // Corner caption (visible only while video is on — see
+  // setTileVideoVisible below: on the placeholder the name is already
+  // shown large and centered, no point duplicating it in the corner).
+  // Leader crown — inline before the name in this same badge (video mode,
+  // see the placeholderCrown comment above about the placeholder solution).
   const label = document.createElement('div');
   label.className = 'tile-name hidden';
 
   const crown = document.createElement('span');
   crown.className = 'tile-crown hidden';
   crown.setAttribute('aria-hidden', 'true');
-  crown.innerHTML = CROWN_ICON_SVG; // статичная разметка, не пользовательские данные
+  crown.innerHTML = CROWN_ICON_SVG; // static markup, not user data
   label.appendChild(crown);
 
   const labelText = document.createElement('span');
   labelText.className = 'tile-name-text';
   label.appendChild(labelText);
 
-  // Просто имя, КРУПНЕЕ (см. п.5 задания) — без обёртки «You (...)» и без
-  // слова-роли «leader» (лидерство и так видно по короне); своё имя не
-  // отличается от чужого текстом. Ведущий эмодзи, дублирующий круг-аватар,
-  // вычищается (см. tileDisplayName/stripLeadingAvatarEmoji выше).
+  // Just the name, BIGGER (see spec item 5) — without a "You (...)" wrapper
+  // and without a "leader" role word (leadership is already visible via the
+  // crown); our own name isn't distinguished from others' by text. A
+  // leading emoji that duplicates the avatar circle is stripped (see
+  // tileDisplayName/stripLeadingAvatarEmoji above).
   const labelValue = tileDisplayName(trimmedName, firstGrapheme);
   labelText.textContent = labelValue;
   placeholderName.textContent = labelValue;
 
-  // Индикатор «микрофон выключен/отсутствует» (см. static/style.css:
-  // .tile-mic-off) — виден ПО УМОЛЧАНИЮ (не .hidden): до первого
-  // включения/stream-info трека у этого участника действительно ещё нет,
-  // что по заданию тоже показывает значок (см. setTileMicOff/applyMicEnabledUpdate).
+  // "Mic off/absent" indicator (see static/style.css: .tile-mic-off) —
+  // visible BY DEFAULT (not .hidden): before the first enable/stream-info,
+  // this participant genuinely doesn't have a track yet, which per spec
+  // also shows the icon (see setTileMicOff/applyMicEnabledUpdate).
   const micOff = document.createElement('span');
   micOff.className = 'tile-mic-off';
   micOff.setAttribute('aria-hidden', 'true');
-  micOff.innerHTML = MIC_OFF_ICON_SVG; // статичная разметка, не пользовательские данные
+  micOff.innerHTML = MIC_OFF_ICON_SVG; // static markup, not user data
 
-  // Бейдж скорости (см. static/style.css: .tile-speed, static/room.js:
-  // updateTileSpeedBadges) — скрыт по умолчанию: скорость известна не раньше
-  // первого тика поллера скоростей, где для этого пира уже набралось два
-  // снимка трафика (см. pollPeerStats). Свободный угол — правый нижний
-  // (верхние заняты именем/короной и микрофоном, см. static/style.css).
+  // Speed badge (see static/style.css: .tile-speed, static/room.js:
+  // updateTileSpeedBadges) — hidden by default: speed isn't known before
+  // the first tick of the speed poller where two traffic snapshots have
+  // already accumulated for this peer (see pollPeerStats). The free corner
+  // is bottom-right (the top ones are taken by the name/crown and mic, see
+  // static/style.css).
   const speed = document.createElement('span');
   speed.className = 'tile-speed hidden';
   speed.setAttribute('aria-hidden', 'true');
@@ -1238,30 +1261,31 @@ function createTile(peerId, name, isOwn) {
     labelEl: label,
     labelTextEl: labelText,
     placeholderNameEl: placeholderName,
-    letterEl: letter, // E2E v2: буква аватара обновляется отдельно от создания тайла, см. updatePeerTileName (имя приходит позже, отдельным name-announce)
+    letterEl: letter, // E2E v2: the avatar letter is updated separately from tile creation, see updatePeerTileName (the name arrives later, via a separate name-announce)
     crownEl: crown,
-    placeholderCrownEl: placeholderCrown, // корона над кругом-аватаром заглушки (см. п.4 задания) — переключается синхронно с crownEl в setLeaderIndicator
+    placeholderCrownEl: placeholderCrown, // crown above the placeholder avatar circle (see spec item 4) — toggled in sync with crownEl in setLeaderIndicator
     micOffEl: micOff,
     speedEl: speed,
   };
 
-  // Клик по тайлу — тоггл «на всю страницу» (см. maximizeTile/unmaximizeTile
-  // и .tile--maximized/.tiles-grid--spotlight в style.css). Вешаем один раз
-  // тут, а не глобальным делегированием на #tiles-grid, — у тайла и так уже
-  // есть замыкание на свои videoEl/tileObj, лишний обход DOM не нужен.
-  // closest('button') — на будущее: если внутри тайла появятся кнопки, клик
-  // по ним не должен тоглить максимизацию. Клик по УЖЕ максимизированному
-  // (в т.ч. по спотлайту) тайлу снимает режим; клик по ЛЮБОМУ ДРУГОМУ тайлу с
-  // живым видео (в т.ч. по мелкому в ленте спотлайта) — maximizeTile сама
-  // снимает предыдущий и ставит новый максимизированный («последний клик
-  // побеждает»).
+  // Clicking a tile — toggles "full page" mode (see
+  // maximizeTile/unmaximizeTile and .tile--maximized/.tiles-grid--spotlight
+  // in style.css). Attached once here rather than via global delegation on
+  // #tiles-grid — the tile already has a closure over its own
+  // videoEl/tileObj, no need for extra DOM traversal. closest('button') —
+  // for the future: if buttons appear inside the tile, clicking them
+  // shouldn't toggle maximization. Clicking an ALREADY maximized tile
+  // (including in spotlight) exits the mode; clicking ANY OTHER tile with
+  // live video (including a small one in the spotlight filmstrip) —
+  // maximizeTile itself un-maximizes the previous one and maximizes the new
+  // one ("last click wins").
   tile.addEventListener('click', (event) => {
     if (event.target.closest('button')) return;
     if (maximizedTile === tileObj) {
       unmaximizeTile();
     } else if (!video.classList.contains('hidden')) {
-      // Максимизировать есть смысл только когда видео реально показывается —
-      // на голой заглушке (аватар-плейсхолдер) разворачивать нечего.
+      // Maximizing only makes sense when video is actually showing — there's
+      // nothing to expand on a bare placeholder (avatar placeholder).
       maximizeTile(tileObj);
     }
   });
@@ -1270,17 +1294,18 @@ function createTile(peerId, name, isOwn) {
 }
 
 /**
- * E2E v2: обновить УЖЕ созданный тайл удалённого пира новым именем, пришедшим
- * через `name-announce` (см. signaling.on('name-announce')) — тайл создаётся
- * РАНЬШЕ (с плейсхолдером «Guest», см. createTile выше), потому что epub/имя
- * теперь приходят отдельно (имя даже отдельным сообщением от epub/peerId).
- * Обновляет и угловую подпись, и подпись под аватаром-заглушкой, и первую
- * букву аватара — то есть все три места, где createTile изначально
- * проставляет `labelValue`/первую графему.
+ * E2E v2: update an ALREADY created tile for a remote peer with a new name
+ * that arrived via `name-announce` (see signaling.on('name-announce')) —
+ * the tile is created EARLIER (with a "Guest" placeholder, see createTile
+ * above), because epub/name now arrive separately (the name even comes as
+ * a separate message from epub/peerId). Updates the corner caption, the
+ * caption under the placeholder avatar, and the avatar's first letter —
+ * i.e. all three places where createTile initially sets
+ * `labelValue`/the first grapheme.
  */
 function updatePeerTileName(peerId, name) {
   const entry = peers.get(peerId);
-  if (!entry) return; // пир уже ушёл, пока летело сообщение — не редкость при живом релее
+  if (!entry) return; // the peer already left while the message was in flight — not rare on a live relay
   entry.name = name || null;
   const tile = entry.tile;
   const trimmedName = (name || '').trim();
@@ -1293,35 +1318,37 @@ function updatePeerTileName(peerId, name) {
 }
 
 /**
- * Развернуть тайл на всю страницу поверх всего интерфейса. Сознательно
- * простой fixed-оверлей (см. .tile--maximized), а НЕ Fullscreen API:
- * во-первых, по заданию это тоггл «на всю страницу» (в пределах вкладки), а
- * не «на весь экран» — F11-подобный режим не нужен и был бы неожиданным для
- * пользователя; во-вторых, полноэкранный показ шаринга экрана
- * (#screen-fullscreen-button/requestFullscreenCompat) — это ДРУГАЯ сцена и
- * другой механизм (настоящий Fullscreen API), им незачем пересекаться:
- * fixed-оверлей просто рисуется поверх (z-index выше всего остального) и не
- * лезет в top-layer браузера.
+ * Expand a tile to full page over the whole UI. Deliberately a simple
+ * fixed overlay (see .tile--maximized), NOT the Fullscreen API: first,
+ * per spec this is a "full page" toggle (within the tab), not "full
+ * screen" — an F11-like mode isn't needed and would be unexpected for the
+ * user; second, the fullscreen screen-share display
+ * (#screen-fullscreen-button/requestFullscreenCompat) is a DIFFERENT stage
+ * and a different mechanism (the real Fullscreen API), there's no need for
+ * them to overlap: the fixed overlay simply draws on top (z-index above
+ * everything else) and doesn't touch the browser's top-layer.
  *
- * «Спотлайт»: если помимо максимизируемого тайла в комнате есть другие
- * (см. updateSpotlightMode) — они не пропадают, а становятся мелкой лентой
- * рядом (справа на десктопе, снизу на мобильном — см. .tiles-grid--spotlight
- * в static/style.css). Это ЧИСТО CSS-эффект: ноды тайлов не перемещаются
- * (иначе видео в них перезапустилось бы), максимизированный тайл — та же
- * .tile--maximized, просто её position:fixed-геометрия сокращена под ленту,
- * а остальные тайлы — обычные дети грида, который на время спотлайта сам
- * превращается в flex-контейнер ленты (см. updateSpotlightMode).
+ * "Spotlight": if there are other tiles in the room besides the one being
+ * maximized (see updateSpotlightMode) — they don't disappear, they become
+ * a small filmstrip alongside (on the right on desktop, at the bottom on
+ * mobile — see .tiles-grid--spotlight in static/style.css). This is a
+ * PURELY CSS effect: tile nodes aren't moved (otherwise their video would
+ * restart), the maximized tile is still the same .tile--maximized, just
+ * its position:fixed geometry is shrunk to make room for the filmstrip,
+ * and the other tiles are regular grid children, with the grid itself
+ * turning into a flex filmstrip container for the duration of spotlight
+ * (see updateSpotlightMode).
  */
 function maximizeTile(tile) {
   if (maximizedTile === tile) return;
-  if (maximizedTile) unmaximizeTile(); // защита: максимизированным может быть только один тайл одновременно
+  if (maximizedTile) unmaximizeTile(); // guard: only one tile can be maximized at a time
   maximizedTile = tile;
   tile.root.classList.add('tile--maximized');
   updateSpotlightMode();
   document.addEventListener('keydown', onMaximizedTileKeydown);
 }
 
-/** Свернуть текущий максимизированный тайл обратно в грид. */
+/** Collapse the currently maximized tile back into the grid. */
 function unmaximizeTile() {
   if (!maximizedTile) return;
   maximizedTile.root.classList.remove('tile--maximized');
@@ -1335,14 +1362,15 @@ function onMaximizedTileKeydown(event) {
 }
 
 /**
- * Включить/выключить класс ленты спотлайта на гриде (см. .tiles-grid--spotlight
- * в static/style.css) — вызывается из maximizeTile/unmaximizeTile И из
- * updateParticipantCount (состав может меняться, пока кто-то максимизирован:
- * подключился новый участник — должен появиться в ленте; последний другой
- * участник ушёл — лента больше не нужна, максимизированный тайл занимает весь
- * экран как раньше). Лента включается только если, кроме максимизированного,
- * есть хоть один другой тайл — иначе (максимизировали единственный тайл в
- * пустой комнате) показывать пустую полосу ленты незачем.
+ * Toggle the spotlight filmstrip class on the grid (see
+ * .tiles-grid--spotlight in static/style.css) — called from
+ * maximizeTile/unmaximizeTile AND from updateParticipantCount (membership
+ * can change while someone is maximized: a new participant joins — they
+ * should appear in the filmstrip; the last other participant leaves — the
+ * filmstrip is no longer needed, the maximized tile takes up the whole
+ * screen as before). The filmstrip is only enabled if there's at least one
+ * other tile besides the maximized one — otherwise (maximizing the only
+ * tile in an empty room) there's no point showing an empty filmstrip.
  */
 function updateSpotlightMode() {
   const hasOthers = maximizedTile !== null && 1 + peers.size > 1;
@@ -1350,18 +1378,19 @@ function updateSpotlightMode() {
 }
 
 /**
- * Авто-выход из максимизации, если у ЭТОГО тайла видео только что скрылось
- * (выключили камеру/трек пропал), пока тайл был развёрнут — иначе останется
- * чёрный полноэкранный оверлей без картинки, из которого обычный пользователь
- * без Esc не выйдет. Вызывается из всех мест, где скрывается video конкретного
- * тайла — showTileVideo(peerId, false) для чужих тайлов и ручные тоглы
- * ownTile.videoEl (кнопка камеры, guest enforcement) для своего.
+ * Auto-exit maximization if THIS tile's video has just been hidden (camera
+ * turned off/track disappeared) while the tile was expanded — otherwise a
+ * black fullscreen overlay with no picture would remain, which a regular
+ * user without Esc couldn't get out of. Called from every place that hides
+ * a specific tile's video — showTileVideo(peerId, false) for others' tiles
+ * and manual toggles of ownTile.videoEl (camera button, guest enforcement)
+ * for our own.
  */
 function exitMaximizeIfHidden(tile, show) {
   if (!show && maximizedTile === tile) unmaximizeTile();
 }
 
-/** Показать/скрыть значок «микрофон выключен» на конкретном объекте тайла (свой ownTile или peers.get(id).tile). */
+/** Show/hide the "mic off" icon on a specific tile object (our own ownTile or peers.get(id).tile). */
 function setTileMicOffIndicator(tile, micOff) {
   if (!tile) return;
   tile.micOffEl.classList.toggle('hidden', !micOff);
@@ -1371,40 +1400,40 @@ function updateParticipantCount() {
   const total = 1 + peers.size;
   participantCountEl.textContent = `Participants: ${total} / ${maxParticipants}`;
   updateSoloState();
-  // Состав мог измениться, пока кто-то максимизирован — лента спотлайта
-  // должна появиться/пропасть синхронно (см. updateSpotlightMode).
+  // Membership might have changed while someone is maximized — the
+  // spotlight filmstrip must appear/disappear in sync (see updateSpotlightMode).
   updateSpotlightMode();
 }
 
 /**
- * Комната из одного человека (только свой тайл, экран никто не шарит) —
- * собственный тайл крупнее и по центру, под ним — ненавязчивый призыв
- * позвать кого-то (см. .tiles-grid--solo/.invite-cta в style.css).
+ * A room with just one person (only our own tile, no one sharing a screen)
+ * — our own tile is bigger and centered, with an unobtrusive invite prompt
+ * below it (see .tiles-grid--solo/.invite-cta in style.css).
  */
 function updateSoloState() {
   const solo = peers.size === 0 && screenStageEl.classList.contains('hidden');
   tilesGridEl.classList.toggle('tiles-grid--solo', solo);
   inviteCtaEl.classList.toggle('hidden', !solo);
-  // Число тайлов и/или режим --compact могли измениться — пересчитать
-  // раскладку грида (см. layoutTilesGrid ниже; она сама не делает ничего
-  // в --compact/--spotlight, у них своя CSS-логика).
+  // The tile count and/or --compact mode may have changed — recompute the
+  // grid layout (see layoutTilesGrid below; it does nothing itself in
+  // --compact/--spotlight, they have their own CSS logic).
   layoutTilesGrid();
 }
 
-// ---------- Лидер: корона на тайле, подпись своего тайла, видимость шестерёнки ----------
+// ---------- Leader: crown on the tile, own tile caption, gear icon visibility ----------
 
 function isPeerLeader(peerId) {
   return leaderId !== null && peerId === leaderId;
 }
 
 /**
- * Обновить корону на тайлах (своём и всех текущих peers) под новый leaderId +
- * подпись своего тайла. Каждый тайл несёт ДВЕ короны (см. createTile) —
- * crownEl (угол плашки с именем, видна во время видео) и placeholderCrownEl
- * (над кругом-аватаром заглушки, видна без видео) — переключаются вместе,
- * т.к. видео/заглушка взаимоисключающи (см. setTileVideoVisible), но чтобы
- * не завязываться на то, какая из них сейчас видна, просто держим обе в
- * актуальном состоянии всегда.
+ * Update the crown on the tiles (our own and all current peers) for the new
+ * leaderId + our own tile's caption. Each tile carries TWO crowns (see
+ * createTile) — crownEl (corner of the name badge, visible during video)
+ * and placeholderCrownEl (above the placeholder avatar circle, visible
+ * without video) — toggled together, since video/placeholder are mutually
+ * exclusive (see setTileVideoVisible), but rather than depending on which
+ * one is currently visible, we simply keep both up to date at all times.
  */
 function setLeaderIndicator(newLeaderId) {
   leaderId = newLeaderId || null;
@@ -1423,11 +1452,11 @@ function setLeaderIndicator(newLeaderId) {
 }
 
 /**
- * Просто имя (см. п.5 задания) — без обёртки «Вы (...)» и без слова-роли
- * «лидер» (лидерство показывает корона, см. setLeaderIndicator, а не текст).
- * Пересчитывается при любой смене имени/leaderId. Пишем и в угловую подпись,
- * и в подпись под аватаром заглушки — обе несут один и тот же текст (см.
- * createTile).
+ * Just the name (see spec item 5) — without a "You (...)" wrapper and
+ * without a "leader" role word (leadership is shown by the crown, see
+ * setLeaderIndicator, not by text). Recomputed on any name/leaderId
+ * change. Written both into the corner caption and into the caption under
+ * the placeholder avatar — both carry the same text (see createTile).
  */
 function updateOwnTileLabel() {
   if (!ownTile) return;
@@ -1439,11 +1468,12 @@ function updateOwnTileLabel() {
 }
 
 /**
- * Шестерёнка настроек видна ВСЕМ (секция «Устройства» — выбор микрофона/
- * камеры — общая возможность). Секция «Комната» (лобби + права гостей)
- * внутри панели видна только лидеру — потеряв лидерство, прячем её и
- * список заявок (они больше не наши), но саму панель НЕ закрываем: гость
- * вполне мог в этот момент выбирать устройство.
+ * The settings gear is visible to EVERYONE (the "Devices" section —
+ * microphone/camera selection — is a shared capability). The "Room"
+ * section (lobby + guest permissions) within the panel is visible only to
+ * the leader — after losing leadership, we hide it and the request list
+ * (they're no longer ours), but we do NOT close the panel itself: a guest
+ * could well be in the middle of picking a device at that moment.
  */
 function updateSettingsButtonVisibility() {
   settingsRoomSectionEl.classList.toggle('hidden', !isLeader);
@@ -1460,11 +1490,12 @@ function setTileSpeaking(peerId, speaking) {
 }
 
 /**
- * Единая точка переключения видео/заглушки/угловой подписи тайла — держит
- * все три синхронными (свой тайл ownTile или чужой peers.get(id).tile) и
- * сама вызывает авто-выход из максимизации. Угловая подпись .tile-name видна
- * ТОЛЬКО когда идёт видео — на заглушке имя уже крупно показано по центру
- * (см. createTile/.tile-placeholder-name), дублировать его в углу незачем.
+ * A single point that toggles a tile's video/placeholder/corner caption —
+ * keeps all three in sync (our own ownTile or someone else's
+ * peers.get(id).tile) and itself triggers auto-exit from maximization. The
+ * corner caption .tile-name is visible ONLY while video is on — on the
+ * placeholder the name is already shown large and centered (see
+ * createTile/.tile-placeholder-name), no point duplicating it in the corner.
  */
 function setTileVideoVisible(tile, show) {
   tile.videoEl.classList.toggle('hidden', !show);
@@ -1479,13 +1510,14 @@ function showTileVideo(peerId, show) {
   setTileVideoVisible(entry.tile, show);
 }
 
-// ---------- Экран (главная зона) ----------
+// ---------- Screen (main area) ----------
 
 function updateScreenButtonState() {
-  // Права гостей (см. docs/permissions-and-leader.md, «Screen Sharing —
-  // Server-Enforced»): guestScreen=false запрещает
-  // гостю (не лидеру) даже пробовать — кнопка задизейблена независимо от
-  // текущего состояния владения экраном. Лидера это ограничение не касается.
+  // Guest permissions (see docs/permissions-and-leader.md, "Screen Sharing —
+  // Server-Enforced"): guestScreen=false forbids
+  // a guest (not the leader) from even trying — the button is disabled
+  // regardless of the current screen-ownership state. This restriction
+  // doesn't apply to the leader.
   if (!isLeader && roomSettings && !roomSettings.guestScreen) {
     screenButton.disabled = true;
     screenButton.title = 'Disabled by the leader';
@@ -1504,11 +1536,12 @@ function updateScreenButtonState() {
     screenButton.classList.add('control-button--on');
     screenButton.setAttribute('aria-pressed', 'true');
   } else {
-    // Кто-то другой уже шарит — кнопка ОСТАЁТСЯ активной (см.
-    // docs/permissions-and-leader.md, «перехват шаринга»): клик не заблокирован,
-    // а перехватывает экран у текущего владельца («последний победил», см.
-    // src/ws.rs::handle_share_start) — сама отправка share-start ниже уже это
-    // умеет, здесь только отражаем состояние в подсказке кнопки.
+    // Someone else is already sharing — the button STAYS active (see
+    // docs/permissions-and-leader.md, "screen-share takeover"): the click
+    // isn't blocked, it takes the screen over from the current owner ("last
+    // one wins", see src/ws.rs::handle_share_start) — sending share-start
+    // below already handles this, here we just reflect the state in the
+    // button's tooltip.
     const name = peerNames.get(currentScreenOwnerPeerId) || 'another participant';
     screenButton.disabled = false;
     screenButton.title = `${name} is sharing their screen — click to take over`;
@@ -1527,24 +1560,25 @@ function hideScreenStage() {
   screenStageEl.classList.add('hidden');
   tilesGridEl.classList.remove('tiles-grid--compact');
   screenVideoEl.srcObject = null;
-  screenVideoEl.classList.remove('hidden'); // сброс на случай, если сцену прятали во время своего же показа (см. showLocalScreenPreview)
+  screenVideoEl.classList.remove('hidden'); // reset in case the stage was hidden during our own share (see showLocalScreenPreview)
   screenSelfPlaceholderEl.classList.add('hidden');
   screenCaptionEl.textContent = '';
-  updateFullscreenButtonState(); // сцена скрыта целиком, но состояние кнопки не должно остаться от предыдущего показа
+  updateFullscreenButtonState(); // the stage is fully hidden, but the button state shouldn't linger from the previous share
   updateSoloState();
 }
 
 /**
- * Заглушка вместо живого превью СОБСТВЕННОГО захвата — НЕ подключаем
- * screenStream к <video> на своей же сцене. Причина: при захвате «всего
- * экрана» это превью само попадает в кадр захвата — рекурсивный self-capture
- * («зеркальный коридор»/hall of mirrors, тот же эффект, из-за которого
- * Meet/Zoom никогда не показывают шарящему живое превью его же экрана),
- * который на macOS усугубляется до видимой заморозки буфера и шлейфа из
- * курсоров, особенно в fullscreen (см. requestFullscreenCompat ниже). Вместо
- * видео — статичная заглушка (см. #screen-self-placeholder в room.html).
- * У зрителей (attachScreenVideo) ничего не меняется — они всегда видят чужой
- * поток, для которого этой проблемы не существует.
+ * A placeholder instead of a live preview of OUR OWN capture — we do NOT
+ * attach screenStream to a <video> on our own stage. Reason: when capturing
+ * "the whole screen," this preview would itself land inside the captured
+ * frame — recursive self-capture (a "hall of mirrors" effect, the same
+ * reason Meet/Zoom never show the sharer a live preview of their own
+ * screen), which on macOS is aggravated into a visibly frozen buffer and a
+ * trail of cursors, especially in fullscreen (see requestFullscreenCompat
+ * below). Instead of video — a static placeholder (see
+ * #screen-self-placeholder in room.html). Nothing changes for viewers
+ * (attachScreenVideo) — they always see someone else's stream, for which
+ * this problem doesn't exist.
  */
 function showLocalScreenPreview() {
   showScreenStageContainer();
@@ -1552,29 +1586,31 @@ function showLocalScreenPreview() {
   screenVideoEl.classList.add('hidden');
   screenSelfPlaceholderEl.classList.remove('hidden');
   screenCaptionEl.textContent = `Screen: You${myName ? ` (${myName})` : ''}`;
-  updateFullscreenButtonState(); // фулскринить собственную заглушку смысла нет — кнопка прячется
+  updateFullscreenButtonState(); // no point fullscreening our own placeholder — the button is hidden
 }
 
 function showRemoteScreenCaption(peerId) {
   showScreenStageContainer();
-  // Перехват экрана (см. iAmPreempted в registerSignalingHandlers:
-  // share-started) может застать сцену в состоянии «показываю заглушку
-  // своего показа» — теперь владелец другой, возвращаем обычный вид с видео.
+  // A screen-share takeover (see iAmPreempted in registerSignalingHandlers:
+  // share-started) can catch the stage in "showing our own share's
+  // placeholder" state — the owner is different now, restore the normal
+  // view with video.
   screenSelfPlaceholderEl.classList.add('hidden');
   screenVideoEl.classList.remove('hidden');
   screenCaptionEl.textContent = `Screen: ${peerNames.get(peerId) || 'Guest'}`;
   updateFullscreenButtonState();
 }
 
-// ---------- Права гостей: применение на своей стороне (отправитель) ----------
+// ---------- Guest permissions: enforcement on our own side (sender) ----------
 //
-// Кооперативная защита (см. docs/permissions-and-leader.md, §7): применяется на
-// СВОЕЙ стороне (кнопки мик/камера/экран, инпут чата) при получении
-// settings-changed/joined. Обходится модифицированным клиентом — сервер это
-// и не пытается предотвратить технически (медиа/чат — P2P), только не
-// показывает лишних возможностей честному клиенту. Симметричная защита на
-// стороне ПОЛУЧАТЕЛЯ — см. refreshMediaRenderingForPeer ниже и
-// ChatPanel.isIncomingEnvelopeAllowed в chat.js.
+// Cooperative enforcement (see docs/permissions-and-leader.md, §7): applied
+// on OUR OWN side (mic/camera/screen buttons, chat input) upon receiving
+// settings-changed/joined. Can be bypassed by a modified client — the
+// server doesn't even try to prevent this technically (media/chat are
+// P2P), it just doesn't show extra capabilities to an honest client.
+// Symmetric enforcement on the RECEIVER side — see
+// refreshMediaRenderingForPeer below and
+// ChatPanel.isIncomingEnvelopeAllowed in chat.js.
 function applyGuestEnforcement() {
   if (!roomSettings) return;
   const restrictAudio = !isLeader && !roomSettings.guestAudio;
@@ -1599,18 +1635,19 @@ function applyGuestEnforcement() {
     broadcastStreamEnabled(camStream, 'camera', false);
   }
 
-  updateScreenButtonState(); // сам проверяет guestScreen/isLeader
+  updateScreenButtonState(); // checks guestScreen/isLeader itself
 
   if (chat) chat.setChatForbidden(restrictChat);
 }
 
-// ---------- Права гостей: применение на стороне ПОЛУЧАТЕЛЯ (рендер чужих треков) ----------
+// ---------- Guest permissions: enforcement on the RECEIVER side (rendering others' tracks) ----------
 //
-// guestAudio/guestVideo=false — получатели не рендерят соответствующий трек
-// ГОСТЕЙ (не лидера), независимо от того, отключил ли сам гость трек кнопкой
-// (см. applyGuestEnforcement выше — защита именно кооперативная: сервер
-// медиапотоки не видит и не может их запретить технически, см.
-// docs/permissions-and-leader.md, «Audio & Video — Receiver-Enforced Only»).
+// guestAudio/guestVideo=false — receivers don't render the corresponding
+// track of GUESTS (not the leader), regardless of whether the guest
+// themselves disabled the track via the button (see applyGuestEnforcement
+// above — the enforcement is specifically cooperative: the server doesn't
+// see media streams and can't forbid them technically, see
+// docs/permissions-and-leader.md, "Audio & Video — Receiver-Enforced Only").
 
 function getOrCreateMediaRefs(peerId) {
   let refs = peerMediaRefs.get(peerId);
@@ -1621,11 +1658,11 @@ function getOrCreateMediaRefs(peerId) {
   return refs;
 }
 
-/** Пересчитать рендер входящих мик/камера треков одного пира под текущие roomSettings/leaderId. */
+/** Recompute rendering of one peer's incoming mic/camera tracks under the current roomSettings/leaderId. */
 function refreshMediaRenderingForPeer(peerId) {
   const refs = peerMediaRefs.get(peerId);
   if (!refs || !roomSettings) return;
-  const exempt = isPeerLeader(peerId); // лидера ограничения не касаются
+  const exempt = isPeerLeader(peerId); // restrictions don't apply to the leader
 
   if (refs.mic) {
     if (exempt || roomSettings.guestAudio) {
@@ -1650,7 +1687,7 @@ function refreshMediaRenderingForAllPeers() {
   for (const peerId of peers.keys()) refreshMediaRenderingForPeer(peerId);
 }
 
-// ---------- Лобби: заявки на вход (только у лидера) ----------
+// ---------- Lobby: join requests (leader only) ----------
 
 function renderJoinRequests() {
   joinRequestsEl.textContent = '';
@@ -1693,7 +1730,7 @@ function buildJoinRequestCardEl(req) {
   rejectButton.addEventListener('click', () => {
     signaling.send('reject', { peerId: req.peerId });
     removePendingRequest(req.peerId);
-    pairKeysCache.delete(req.peerId); // отклонён окончательно — пара больше не нужна (см. removeRemotePeer)
+    pairKeysCache.delete(req.peerId); // rejected for good — the pair is no longer needed (see removeRemotePeer)
   });
 
   actions.appendChild(acceptButton);
@@ -1719,7 +1756,7 @@ function removePendingRequest(peerId) {
   renderJoinRequests();
 }
 
-/** E2E v2: обновить имя уже показанной заявки на вход по пришедшему name-announce (см. signaling.on('name-announce')) — до этого карточка показывает «Guest» (см. buildJoinRequestCardEl). Не найден среди pendingRequests (это не ожидающий, а обычный участник) — тихий no-op. */
+/** E2E v2: update the name on an already-shown join request from an incoming name-announce (see signaling.on('name-announce')) — before that the card shows "Guest" (see buildJoinRequestCardEl). Not found among pendingRequests (it's not a waiting peer but a regular participant) — a silent no-op. */
 function setPendingRequestName(peerId, name) {
   const req = pendingRequests.find((r) => r.peerId === peerId);
   if (!req) return;
@@ -1727,7 +1764,7 @@ function setPendingRequestName(peerId, name) {
   renderJoinRequests();
 }
 
-// ---------- Настройки комнаты (только лидер): попап/bottom-sheet ----------
+// ---------- Room settings (leader only): popup/bottom-sheet ----------
 
 function syncSettingsPanelInputs() {
   if (!roomSettings) return;
@@ -1740,27 +1777,28 @@ function syncSettingsPanelInputs() {
 }
 
 /**
- * Пересобрать опции селекта «Max participants»: «No limit (default)» (= null
- * на проводе) + числа 2..knownServerMaxParticipants.
+ * Rebuild the "Max participants" select's options: "No limit (default)"
+ * (= null on the wire) + numbers 2..knownServerMaxParticipants.
  *
- * Почему верхняя граница списка — knownServerMaxParticipants (см. её
- * объявление выше), а не сама maxParticipants: сервер присылает нам ТОЛЬКО
- * эффективное значение (settings.maxParticipants ?? серверный env), никогда —
- * отдельно настоящий потолок. Если строить список прямо из текущего
- * эффективного значения, то после того как лидер сузит лимит (скажем, до 2),
- * список схлопнется до одной опции «2» и без явного шага «сначала верни No
- * limit» поднять лимит выше будет нельзя. knownServerMaxParticipants
- * запоминает настоящий потолок отдельно (см. её объявление) именно чтобы
- * избежать этого — список всегда полон, пока мы хоть раз видели комнату без
- * собственного лимита лидера.
+ * Why the list's upper bound is knownServerMaxParticipants (see its
+ * declaration above), rather than maxParticipants itself: the server sends
+ * us ONLY the effective value (settings.maxParticipants ?? the server env),
+ * never the real ceiling separately. If we built the list directly from
+ * the current effective value, then after the leader narrows the limit
+ * (say, to 2), the list would collapse to a single "2" option, and without
+ * an explicit "first restore No limit" step it would be impossible to
+ * raise the limit back up. knownServerMaxParticipants remembers the real
+ * ceiling separately (see its declaration) precisely to avoid this — the
+ * list is always complete as long as we've seen the room without the
+ * leader's own limit at least once.
  */
 function populateMaxParticipantsOptions() {
   if (!roomSettings) return;
-  const current = roomSettings.maxParticipants; // null = «без своего лимита» (дефолт)
-  // Подстраховка: если мы попали в уже суженную кем-то комнату и ни разу не
-  // видели её несуженной, knownServerMaxParticipants может быть занижен
-  // (остался на фолбэке) относительно текущего значения — не даём списку
-  // «потерять» текущий выбор лидера, всегда включаем его в диапазон.
+  const current = roomSettings.maxParticipants; // null = "no custom limit" (default)
+  // A safety net: if we joined a room already narrowed by someone else and
+  // never saw it un-narrowed, knownServerMaxParticipants may be lower
+  // (stuck at the fallback) than the current value — don't let the list
+  // "lose" the leader's current choice, always include it in the range.
   const ceiling = Math.max(2, knownServerMaxParticipants, typeof current === 'number' ? current : 0);
   settingMaxParticipantsInput.innerHTML = '';
   const noLimitOption = document.createElement('option');
@@ -1780,13 +1818,15 @@ function openSettingsPanel() {
   syncSettingsPanelInputs();
   refreshDeviceLists();
   refreshConnectionSection();
-  // Список пиров — сразу из кеша поллера скоростей (см. PEER_STATS_REFRESH_MS/
-  // pollPeerStats), не дожидаясь его следующего тика: поллер тикает постоянно
-  // и независимо от панели, но между появлением пира и первым тиком кеш мог
-  // быть ещё пуст (renderPeerConnectionsList сама учитывает это, показывая
-  // «устанавливается»). Пока панель открыта, дальше всё обновляет тик поллера
-  // (и refreshConnectionSection, и список пиров) — отдельного таймера у
-  // панели нет, весь ритм страницы — единый, раз в 3 секунды.
+  // Peer list — right away from the speed poller's cache (see
+  // PEER_STATS_REFRESH_MS/pollPeerStats), without waiting for its next
+  // tick: the poller ticks continuously and independently of the panel, but
+  // between a peer appearing and the first tick the cache could still be
+  // empty (renderPeerConnectionsList itself accounts for this, showing
+  // "connecting…"). While the panel is open, everything further is updated
+  // by the poller's tick (both refreshConnectionSection and the peer list)
+  // — the panel has no timer of its own, the page's whole rhythm is
+  // unified, once every 3 seconds.
   renderPeerConnectionsList();
   settingsPanelEl.classList.remove('hidden');
 }
@@ -1795,30 +1835,31 @@ function closeSettingsPanel() {
   settingsPanelEl.classList.add('hidden');
 }
 
-// ---------- «Соединение и приватность»: режим по каждому пиру + что видит сервер ----------
+// ---------- "Connection and privacy": per-peer mode + what the server sees ----------
 //
-// Видна ВСЕМ участникам (в отличие от #settings-room-section выше, только
-// лидер) — задел задачи «показать, в каком режиме работаем и что уходит на
-// сервер». Три части:
-//   1) статичная строка шифрования — из RoomCrypto.getCryptoInfo(), НЕ
-//      хардкодим текст алгоритма (см. static/crypto.js);
-//   2) режим соединения с каждым пиром — P2P/TURN-релей/серверный fallback/
-//      устанавливается — см. computePeerConnectionStats ниже (там же —
-//      трафик in/out и RTT из того же statsReport);
-//   3) статичный список того, что видит сервер, плюс счётчики за сессию
-//      (см. static/common.js: ConnStats — инкрементируется в местах реальной
-//      отправки через signaling.send в rtc.js/room.js/chat.js).
+// Visible to ALL participants (unlike #settings-room-section above, leader
+// only) — implements the goal of "show what mode we're operating in and
+// what goes to the server." Three parts:
+//   1) a static encryption line — from RoomCrypto.getCryptoInfo(), we do
+//      NOT hardcode the algorithm text (see static/crypto.js);
+//   2) the connection mode with each peer — P2P/TURN relay/server
+//      fallback/connecting — see computePeerConnectionStats below (also
+//      in/out traffic and RTT from the same statsReport);
+//   3) a static list of what the server sees, plus per-session counters
+//      (see static/common.js: ConnStats — incremented at the actual
+//      sending points via signaling.send in rtc.js/room.js/chat.js).
 //
-// Обновляется вся секция ЕДИНЫМ поллером скоростей (PEER_STATS_REFRESH_MS,
-// см. ниже, у renderPeerConnectionsList) — раз в 3 секунды, других
-// периодических таймеров у панели настроек нет. Поллер тикает ВСЕГДА, а не
-// только пока открыта эта панель: те же цифры нужны бейджам скорости на
-// тайлах (см. updateTileSpeedBadges), которые видны независимо от настроек.
-// При открытой панели тик дополнительно перерисовывает и дешёвые части (1 и 3
-// — refreshConnectionSection, без getStats), и список пиров (2).
-// renderPeerConnectionsList() при этом не дёргает getStats() сама — только
-// читает готовый кеш поллера (peerLastStats), так что на одного пира за тик
-// существует ровно один вызов getStats(), даже если панель настроек открыта.
+// The whole section is updated by the SINGLE shared speed poller (see
+// PEER_STATS_REFRESH_MS below, next to renderPeerConnectionsList) — every 3
+// seconds, the settings panel has no other periodic timers. The poller
+// ticks ALWAYS, not only while this panel is open: the same numbers are
+// needed by the speed badges on tiles (see updateTileSpeedBadges), which
+// are visible regardless of settings. While the panel is open, a tick
+// additionally redraws both the cheap parts (1 and 3 —
+// refreshConnectionSection, no getStats) and the peer list (2).
+// renderPeerConnectionsList() itself doesn't call getStats() at all — it
+// only reads the poller's ready cache (peerLastStats), so there's exactly
+// one getStats() call per peer per tick, even with the settings panel open.
 
 const PEER_MODE_LABELS = {
   p2p: 'direct (P2P)',
@@ -1827,7 +1868,7 @@ const PEER_MODE_LABELS = {
   connecting: 'connecting…',
 };
 
-/** Отрисовать строку шифрования из getCryptoInfo() — текст алгоритма НЕ хардкодится, кроме шаблона фразы. */
+/** Render the encryption line from getCryptoInfo() — the algorithm text is NOT hardcoded, only the phrase template is. */
 function renderCryptoInfo() {
   const info = RoomCrypto.getCryptoInfo();
   if (!info.active) {
@@ -1841,11 +1882,11 @@ function renderCryptoInfo() {
 }
 
 /**
- * Selected candidate-pair из отчёта pc.getStats() — спек-путь через
- * `transport.selectedCandidatePairId` (см. https://www.w3.org/TR/webrtc-stats/),
- * с фоллбэком на легаси-признаки (`selected`/`nominated`+`succeeded`
- * непосредственно на candidate-pair) для браузеров, где transport-статы
- * этого поля не несут.
+ * Selected candidate pair from the pc.getStats() report — the spec path
+ * via `transport.selectedCandidatePairId` (see
+ * https://www.w3.org/TR/webrtc-stats/), with a fallback to legacy markers
+ * (`selected`/`nominated`+`succeeded` directly on the candidate-pair) for
+ * browsers whose transport stats don't carry this field.
  */
 function findSelectedCandidatePair(statsReport) {
   for (const stat of statsReport.values()) {
@@ -1862,7 +1903,7 @@ function findSelectedCandidatePair(statsReport) {
   return null;
 }
 
-/** 'p2p' или 'turn' по типам локального/удалённого кандидата уже выбранной пары. */
+/** 'p2p' or 'turn' based on the local/remote candidate types of the already selected pair. */
 function candidatePairMode(pair, statsReport) {
   const local = statsReport.get(pair.localCandidateId);
   const remote = statsReport.get(pair.remoteCandidateId);
@@ -1872,12 +1913,13 @@ function candidatePairMode(pair, statsReport) {
 }
 
 /**
- * Байтовый счётчик транспорта пары (peerConnection, а не одного кандидата) —
- * запись type==='transport' покрывает ВЕСЬ DTLS-трафик соединения: медиа
- * (audio/video RTP) И датаканалы (файлы, чат, бас-протокол), поэтому это
- * честный in/out для пира. Если браузер такую запись не отдал (старый
- * Firefox), фоллбэк — сумма outbound-rtp/inbound-rtp записей, это только
- * медиа без датаканалов, но лучше, чем ничего.
+ * Byte counter for the connection's transport (the peerConnection, not a
+ * single candidate) — the type==='transport' record covers ALL of the
+ * connection's DTLS traffic: media (audio/video RTP) AND data channels
+ * (files, chat, the bus protocol), so this is an honest in/out for the
+ * peer. If the browser didn't provide such a record (old Firefox), the
+ * fallback is the sum of outbound-rtp/inbound-rtp records — that's only
+ * media without data channels, but better than nothing.
  */
 function findTransportBytes(statsReport) {
   for (const stat of statsReport.values()) {
@@ -1898,19 +1940,19 @@ function findTransportBytes(statsReport) {
 }
 
 /**
- * Режим + трафик + RTT соединения с одним пиром — единый обход ОДНОГО
- * statsReport (второй getStats() на пира не делаем, дорогая операция).
- * Режим — приоритет ровно как в задании:
- *  1) есть selected candidate-pair -> 'p2p' (host/srflx/prflx с обеих
- *     сторон) или 'turn' (кто-то из пары — relay); тут же берём RTT —
- *     currentRoundTripTime у candidate-pair, секунды -> мс;
- *  2) пары ещё нет и DataChannel-шина к пиру не открыта -> 'fallback'
- *     (весь трафик до пира — через серверный релей: signaling.send для
- *     ещё не устаканившегося mesh);
- *  3) иначе (пары нет, но шина каким-то образом уже открыта — гоночный
- *     край, в норме недостижимо) -> 'connecting'.
- * bytesSent/bytesReceived — null, если статы получить не удалось вовсе
- * (см. catch) или транспорт/rtp-записей не нашлось.
+ * Mode + traffic + RTT for the connection with one peer — a single pass
+ * over ONE statsReport (we don't do a second getStats() per peer, it's an
+ * expensive operation). Mode priority is exactly as in the spec:
+ *  1) a selected candidate pair exists -> 'p2p' (host/srflx/prflx on both
+ *     sides) or 'turn' (one side of the pair is relay); RTT is taken right
+ *     here — the candidate-pair's currentRoundTripTime, seconds -> ms;
+ *  2) no pair yet and the DataChannel bus to the peer isn't open ->
+ *     'fallback' (all traffic to the peer goes through the server relay:
+ *     signaling.send for a mesh that hasn't settled yet);
+ *  3) otherwise (no pair, but the bus is somehow already open — a race
+ *     edge case, normally unreachable) -> 'connecting'.
+ * bytesSent/bytesReceived are null if stats couldn't be obtained at all
+ * (see catch) or no transport/rtp records were found.
  */
 async function computePeerConnectionStats(peerId, entry) {
   const pc = entry.rtc && entry.rtc.pc;
@@ -1923,18 +1965,19 @@ async function computePeerConnectionStats(peerId, entry) {
     const mode = pair ? candidatePairMode(pair, statsReport) : (bus.isOpen(peerId) ? 'connecting' : 'fallback');
     return { mode, rtt, bytesSent, bytesReceived };
   } catch (err) {
-    console.warn(`[peer ${peerId}] getStats() для секции настроек не удался:`, err);
+    console.warn(`[peer ${peerId}] getStats() for the settings section failed:`, err);
   }
   return { mode: bus.isOpen(peerId) ? 'connecting' : 'fallback', rtt: null, bytesSent: null, bytesReceived: null };
 }
 
 /**
- * Адаптивный формат размера: B / KB / MB (база 1024). Целые байты и целые
- * КБ — без дробной части (округление до 1 KB: дробные килобайты избыточная
- * точность что для бейджей на тайлах, что для строк в настройках), МБ — с
- * одним знаком после запятой (там дробная часть — не шум, а разница в разы).
- * Используется и для накопленного объёма (`formatBytesCompact(4404019)` ->
- * «4.2 MB»), и — с дописанным «/s» — для скорости (см. formatPeerStatsLine).
+ * Adaptive size format: B / KB / MB (base 1024). Whole bytes and whole KB
+ * have no fractional part (rounded to 1 KB: fractional kilobytes are
+ * excessive precision both for tile badges and for settings lines), MB has
+ * one decimal digit (there the fractional part isn't noise, it's a
+ * multi-fold difference). Used both for accumulated volume
+ * (`formatBytesCompact(4404019)` -> "4.2 MB") and — with "/s" appended —
+ * for speed (see formatPeerStatsLine).
  */
 function formatBytesCompact(bytes) {
   const abs = Math.abs(bytes);
@@ -1944,11 +1987,11 @@ function formatBytesCompact(bytes) {
 }
 
 /**
- * Скорость для БЕЙДЖА НА ТАЙЛЕ (см. updateTileSpeedBadges) — в отличие от
- * formatBytesCompact выше (тот честно печатает и мелкие «3 B», это годится
- * для настроек, где рядом есть контекст), на тайле поверх видео нужен
- * компактный порядок величины, а не точные байты в секунду — до 1 KB/s
- * печатаем фиксированную «<1 KB/s».
+ * Speed for the TILE BADGE (see updateTileSpeedBadges) — unlike
+ * formatBytesCompact above (which honestly prints even tiny "3 B" values,
+ * fine for settings where there's surrounding context), on a tile
+ * overlaying video we need a compact order of magnitude rather than exact
+ * bytes per second — below 1 KB/s we print a fixed "<1 KB/s".
  */
 function formatSpeedBadge(bytesPerSec) {
   if (bytesPerSec < 1024) return '<1 KB/s';
@@ -1956,41 +1999,43 @@ function formatSpeedBadge(bytesPerSec) {
 }
 
 /**
- * Строка статы под именем пира: «↓ 320 KB/s ↑ 12 KB/s · 45 ms».
+ * The stats line under a peer's name: "↓ 320 KB/s ↑ 12 KB/s · 45 ms".
  *
- * Скорость — это ВСЕГДА дельта байт между двумя тиками секции (WebRTC не
- * отдаёт мгновенный throughput, только монотонно растущие счётчики с начала
- * соединения), поэтому нужна точка отсчёта — prevSnapshot из
- * peerStatsHistory. На первом тике после открытия панели (или после
- * появления transport-статы у только что подключившегося пира) точки
- * отсчёта ещё нет: показываем накопленный с начала соединения итог
- * (префикс «∑») — это честнее прочерков (данные реальные, просто не
- * скорость) и не требует у пользователя ждать «пустой» тик.
+ * Speed is ALWAYS a byte delta between two ticks of the section (WebRTC
+ * doesn't provide instantaneous throughput, only monotonically growing
+ * counters since the connection started), so a baseline is needed —
+ * prevSnapshot from peerStatsHistory. On the first tick after opening the
+ * panel (or after transport stats appear for a peer that just connected)
+ * there's no baseline yet: we show the total accumulated since the
+ * connection started (with a "∑" prefix) — this is more honest than dashes
+ * (the data is real, it's just not a rate) and doesn't make the user wait
+ * for an "empty" tick.
  */
 function formatPeerStatsLine(prevSnapshot, stats, nowMs) {
-  if (stats.bytesSent == null || stats.bytesReceived == null) return null; // ни transport-, ни rtp-статы не нашлось — нечего показывать
+  if (stats.bytesSent == null || stats.bytesReceived == null) return null; // neither transport nor rtp stats were found — nothing to show
   const rttPart = typeof stats.rtt === 'number' ? ` · ${Math.round(stats.rtt)} ms` : '';
 
   if (!prevSnapshot) {
     return `∑ ↓ ${formatBytesCompact(stats.bytesReceived)} ↑ ${formatBytesCompact(stats.bytesSent)}${rttPart}`;
   }
   const dtSec = Math.max(0.001, (nowMs - prevSnapshot.ts) / 1000);
-  // Math.max(0, …) — счётчики могут «просесть», если пара пересобралась
-  // (ICE restart / смена transport'а с p2p на turn) и статистика начала
-  // отсчёт заново; отрицательную дельту в такой момент лучше показать как 0,
-  // чем как «минус трафик».
+  // Math.max(0, …) — counters can "dip" if the pair was rebuilt (ICE
+  // restart / switching transport from p2p to turn) and the stats restarted
+  // counting from zero; a negative delta at such a moment is better shown
+  // as 0 than as "negative traffic".
   const downRate = Math.max(0, (stats.bytesReceived - prevSnapshot.bytesReceived) / dtSec);
   const upRate = Math.max(0, (stats.bytesSent - prevSnapshot.bytesSent) / dtSec);
   return `↓ ${formatBytesCompact(downRate)}/s ↑ ${formatBytesCompact(upRate)}/s${rttPart}`;
 }
 
 /**
- * Перерисовать список «Соединения с участниками» — ЧИТАЕТ кеш peerLastStats,
- * НИКАКИХ собственных getStats(): цифры считает единый поллер скоростей (см.
- * pollPeerStats ниже), который тикает независимо от того, открыта ли эта
- * панель. Синхронна (раньше была async из-за собственного Promise.all по
- * getStats) — рендер мгновенный, мигания частично готового списка не было и
- * не стало.
+ * Redraw the "Connections with participants" list — READS the
+ * peerLastStats cache, NO getStats() calls of its own: the numbers are
+ * computed by the single shared speed poller (see pollPeerStats below),
+ * which ticks independently of whether this panel is open. Synchronous
+ * (used to be async because of its own Promise.all over getStats) — the
+ * render is instant, there was no flicker of a partially-ready list and
+ * there still isn't.
  */
 function renderPeerConnectionsList() {
   const entries = Array.from(peers.entries());
@@ -2005,9 +2050,9 @@ function renderPeerConnectionsList() {
 
   settingsPeersListEl.textContent = '';
   for (const [peerId] of entries) {
-    // До первого тика поллера после появления пира кеша ещё нет — тот же
-    // фоллбэк-режим, что раньше отдавал сам computePeerConnectionStats на
-    // пире без готового pc.
+    // Before the poller's first tick after a peer appears, there's no cache
+    // yet — the same fallback mode that computePeerConnectionStats itself
+    // used to return for a peer without a ready pc.
     const cached = peerLastStats.get(peerId);
     const mode = cached ? cached.mode : 'connecting';
     const li = document.createElement('li');
@@ -2038,25 +2083,26 @@ function renderPeerConnectionsList() {
   }
 }
 
-// ---------- Единый поллер скоростей (см. верхний комментарий раздела «Соединение и приватность») ----------
+// ---------- Single shared speed poller (see the top comment of the "Connection and privacy" section) ----------
 //
-// Раз в PEER_STATS_REFRESH_MS, ВСЕГДА (не только при открытых настройках) —
-// по одному getStats() на каждого пира считает режим/RTT/трафик, обновляет
-// peerStatsHistory (точка отсчёта для следующего тика, см. formatPeerStatsLine
-// выше) и кеширует готовый результат в peerLastStats. Этим кешем пользуются и
-// renderPeerConnectionsList (если открыта панель настроек), и бейджи скорости
-// на тайлах (updateTileSpeedBadges) — второго обхода getStats() ни для панели,
-// ни для бейджей нет.
+// Once every PEER_STATS_REFRESH_MS, ALWAYS (not only while settings are
+// open) — one getStats() call per peer computes mode/RTT/traffic, updates
+// peerStatsHistory (the baseline for the next tick, see formatPeerStatsLine
+// above), and caches the ready result in peerLastStats. This cache is used
+// both by renderPeerConnectionsList (if the settings panel is open) and by
+// the speed badges on tiles (updateTileSpeedBadges) — there's no second
+// getStats() pass for either the panel or the badges.
 const PEER_STATS_REFRESH_MS = 3000;
 let peerStatsTimer = null;
-// peerId -> { mode, rtt, statsLine, downRate, upRate } — готовый результат
-// последнего тика поллера. downRate/upRate — null, пока для этого пира не
-// набралось хотя бы двух снимков (первый тик после подключения/после
-// пересборки пары) — тот же гейт, что у formatPeerStatsLine («∑ …» вместо
-// «…/s»), но отдельно от готовой строки: бейджам нужны сами числа.
+// peerId -> { mode, rtt, statsLine, downRate, upRate } — the ready result of
+// the poller's last tick. downRate/upRate are null until at least two
+// snapshots have accumulated for this peer (the first tick after
+// connecting/after the pair is rebuilt) — the same gate as
+// formatPeerStatsLine's ("∑ …" instead of "…/s"), but kept separate from the
+// ready-made string: the badges need the raw numbers.
 const peerLastStats = new Map();
 
-/** Один тик поллера — см. комментарий раздела выше. */
+/** A single poller tick — see the section comment above. */
 async function pollPeerStats() {
   const nowMs = Date.now();
   for (const [peerId, entry] of peers) {
@@ -2068,16 +2114,17 @@ async function pollPeerStats() {
     let upRate = null;
     if (prev && stats.bytesSent != null && stats.bytesReceived != null) {
       const dtSec = Math.max(0.001, (nowMs - prev.ts) / 1000);
-      // Math.max(0, …) — та же защита от «просевших» счётчиков после
-      // пересборки пары (ICE restart/смена transport'а), что и в
+      // Math.max(0, …) — the same protection against "dipped" counters
+      // after the pair is rebuilt (ICE restart/transport switch) as in
       // formatPeerStatsLine.
       downRate = Math.max(0, (stats.bytesReceived - prev.bytesReceived) / dtSec);
       upRate = Math.max(0, (stats.bytesSent - prev.bytesSent) / dtSec);
     }
 
-    // Точка отсчёта для скорости на СЛЕДУЮЩЕМ тике. Если статы недоступны в
-    // этот раз (bytes === null) — запись не обновляем/удаляем, чтобы
-    // временный сбой getStats() не сбросил уже накопленную точку отсчёта.
+    // The baseline for speed on the NEXT tick. If stats are unavailable
+    // this time (bytes === null), the record isn't updated/removed, so a
+    // temporary getStats() failure doesn't reset an already accumulated
+    // baseline.
     if (stats.bytesSent != null && stats.bytesReceived != null) {
       peerStatsHistory.set(peerId, { bytesSent: stats.bytesSent, bytesReceived: stats.bytesReceived, ts: nowMs });
     }
@@ -2086,11 +2133,11 @@ async function pollPeerStats() {
   }
 
   updateTileSpeedBadges();
-  // Панель настроек может быть открыта прямо сейчас — перерисовываем всю
-  // секцию «Соединение и приватность» тут же: список пиров из уже готового
-  // кеша (без лишнего getStats(), см. renderPeerConnectionsList) и дешёвые
-  // части (refreshConnectionSection). Отдельного таймера у панели нет —
-  // это единственный периодический механизм её обновления.
+  // The settings panel might be open right now — redraw the whole
+  // "Connection and privacy" section immediately: the peer list from the
+  // already-ready cache (no extra getStats(), see renderPeerConnectionsList)
+  // and the cheap parts (refreshConnectionSection). The panel has no
+  // separate timer — this is its only periodic update mechanism.
   if (!settingsPanelEl.classList.contains('hidden')) {
     refreshConnectionSection();
     renderPeerConnectionsList();
@@ -2098,21 +2145,22 @@ async function pollPeerStats() {
 }
 
 /**
- * Запустить поллер (идемпотентно) — вызывается при входе в комнату (первый
- * joined, см. registerSignalingHandlers, рядом со startSasUpdates) и тикает
- * дальше всю сессию: тик без пиров — почти no-op (for…of по пустой Map), а
- * refreshConnectionSection с тика нужен и одинокому участнику с открытой
- * панелью. Поэтому не останавливаем/не перезапускаем его на каждый
- * join/leave — только на терминальном teardown (см. stopPeerStatsPolling).
+ * Start the poller (idempotently) — called when entering the room (the
+ * first joined, see registerSignalingHandlers, next to startSasUpdates)
+ * and keeps ticking for the whole session: a tick with no peers is almost
+ * a no-op (for…of over an empty Map), while refreshConnectionSection from a
+ * tick is still needed even for a solo participant with the panel open. So
+ * we don't stop/restart it on every join/leave — only on terminal teardown
+ * (see stopPeerStatsPolling).
  */
 function startPeerStatsPolling() {
   if (peerStatsTimer) return;
   peerStatsTimer = setInterval(() => {
-    pollPeerStats().catch((err) => console.warn('Поллер скоростей пиров не удался:', err));
+    pollPeerStats().catch((err) => console.warn('Peer speed poller failed:', err));
   }, PEER_STATS_REFRESH_MS);
 }
 
-/** Остановить поллер — терминальный teardown (см. teardownMeshMediaChat). */
+/** Stop the poller — terminal teardown (see teardownMeshMediaChat). */
 function stopPeerStatsPolling() {
   if (peerStatsTimer) {
     clearInterval(peerStatsTimer);
@@ -2121,16 +2169,17 @@ function stopPeerStatsPolling() {
 }
 
 /**
- * Бейджи скорости на тайлах (.tile-speed, см. createTile/static/style.css) —
- * вызывается из pollPeerStats на каждом тике. На тайле ЧУЖОГО пира — его
- * ВХОДЯЩАЯ скорость (его медиа К НАМ): это честная «скорость его видео у
- * меня», которую и хочет видеть смотрящий на конкретный тайл (а не то, с
- * какой скоростью МЫ ему отдаём). На СВОЁМ тайле — суммарная ИСХОДЯЩАЯ
- * скорость по всем пирам (с «↑»): в mesh мы шлём n отдельных копий своего
- * медиа, ровно по копии на каждого участника, и честная «моя отдача» — это
- * сумма по всем, а не скорость к одному произвольному пиру. Пока скорость не
- * посчитана (первый тик после подключения пира — downRate/upRate ещё null)
- * — бейдж остаётся/становится скрытым.
+ * Speed badges on tiles (.tile-speed, see createTile/static/style.css) —
+ * called from pollPeerStats on every tick. On a peer's tile — their
+ * INCOMING speed (their media TO US): this is an honest "speed of their
+ * video for me," which is what someone looking at a specific tile wants to
+ * see (not the speed at which WE send to them). On OUR OWN tile — the
+ * combined OUTGOING speed across all peers (with "↑"): in a mesh we send n
+ * separate copies of our media, one copy per participant, and an honest
+ * "my upload" is the sum across all of them, not the speed to one
+ * arbitrary peer. Until speed has been computed (the first tick after a
+ * peer connects — downRate/upRate still null) — the badge stays/becomes
+ * hidden.
  */
 function updateTileSpeedBadges() {
   let totalUpRate = null;
@@ -2158,12 +2207,13 @@ function updateTileSpeedBadges() {
 }
 
 /**
- * Динамические счётчики «что видит сервер» — см. static/common.js: ConnStats.
- * Строка трафика — тот же формат, что per-peer статы (formatPeerStatsLine
- * выше): накопленный итог с «∑» на первый вызов (нет точки отсчёта), скорость
- * между вызовами дальше. Вызывается и при открытии панели (openSettingsPanel),
- * и с каждого тика единого поллера, пока панель открыта (refreshConnectionSection)
- * — тот же ритм, что у остальной секции.
+ * Dynamic "what the server sees" counters — see static/common.js: ConnStats.
+ * The traffic line uses the same format as per-peer stats
+ * (formatPeerStatsLine above): an accumulated total with "∑" on the first
+ * call (no baseline yet), a rate between subsequent calls. Called both when
+ * opening the panel (openSettingsPanel) and on every tick of the shared
+ * poller while the panel is open (refreshConnectionSection) — the same
+ * rhythm as the rest of the section.
  */
 function renderServerCounters() {
   settingsSignalingCountEl.textContent = String(ConnStats.signalingRelayCount);
@@ -2175,11 +2225,11 @@ function renderServerCounters() {
 }
 
 /**
- * Один раз за сессию сгенерировать сессионный DTLS-сертификат для SAS (см.
- * блок объявления sessionCertificate выше). Идемпотентна и не бросает: при
- * отказе просто оставляет sessionCertificate=null (звонок работает, SAS не
- * показывается). ECDSA P-256 — тот же дефолт, что браузер выбирает сам, так
- * что на совместимость соединений влияния нет.
+ * Generate the session DTLS certificate for SAS once per session (see the
+ * sessionCertificate declaration block above). Idempotent and doesn't
+ * throw: on failure it simply leaves sessionCertificate=null (the call
+ * still works, SAS just isn't shown). ECDSA P-256 is the same default the
+ * browser picks on its own, so there's no impact on connection compatibility.
  */
 async function ensureSessionCertificate() {
   if (sessionCertificate) return;
@@ -2192,33 +2242,33 @@ async function ensureSessionCertificate() {
     const sha256 = fps.find((f) => f.algorithm === 'sha-256') || fps[0];
     ownCertFingerprint = sha256 ? sha256.value : null;
   } catch (err) {
-    console.warn('Не удалось сгенерировать сессионный сертификат для SAS:', err);
+    console.warn('Failed to generate the session certificate for SAS:', err);
     sessionCertificate = null;
     ownCertFingerprint = null;
   }
 }
 
-// ---------- SAS v2: стейт-машина commit-before-reveal ----------
+// ---------- SAS v2: commit-before-reveal state machine ----------
 //
-// Полная спецификация — docs/sas-verification.md. Управляется таймером
-// (sasRefresh) плюс входящими sas-commit/sas-reveal (обработчики выше).
-// Инвариант: раунд определяется снапшотом sasRoundMembers, зафиксированным на
-// старте; сообщения не своего roundId игнорируются; showing 'ok' только когда
-// от ВСЕХ ожидаемых участников пришли и проверены reveal'ы.
+// Full spec — docs/sas-verification.md. Driven by a timer (sasRefresh) plus
+// incoming sas-commit/sas-reveal messages (handlers above). Invariant: a
+// round is defined by the sasRoundMembers snapshot fixed at its start;
+// messages with a different roundId are ignored; 'ok' is shown only once
+// reveals from ALL expected participants have arrived and been verified.
 
-/** Отрисовать текущее состояние SAS в топ-баре главного окна — единственное место в UI (см. docs/sas-verification.md §9). Идемпотентна. */
+/** Render the current SAS state in the main window's top bar — the only place it appears in the UI (see docs/sas-verification.md §9). Idempotent. */
 function renderRoomSas() {
   renderTopbarSas(sasState, sasResult);
 }
 
 /**
- * SAS «отпечаток комнаты» в топ-баре: компактный бейдж, видимый без
- * открытия чата (когда-то дублировался в шапке чат-панели — убрано, теперь
- * единственный источник, см. docs/sas-verification.md §9). Клик по бейджу
- * открывает #topbar-sas-popup с подробностями (openTopbarSasPopup /
- * renderTopbarSasPopupContent); если попап уже открыт в момент смены
- * состояния (напр. verifying -> ok), тоже обновляем его содержимое, чтобы не
- * показывать устаревший текст.
+ * The SAS "room fingerprint" in the top bar: a compact badge, visible
+ * without opening chat (used to be duplicated in the chat panel header —
+ * removed, this is now the single source, see docs/sas-verification.md
+ * §9). Clicking the badge opens #topbar-sas-popup with details
+ * (openTopbarSasPopup / renderTopbarSasPopupContent); if the popup is
+ * already open at the moment the state changes (e.g. verifying -> ok), we
+ * also update its content so it doesn't show stale text.
  */
 function renderTopbarSas(state, result) {
   if (!topbarSasEl) return;
@@ -2231,9 +2281,10 @@ function renderTopbarSas(state, result) {
   topbarSasEl.title = '';
 
   if (!state || state === 'hidden') {
-    // Одиноки в комнате — нечего и не с кем сверять (см. docs/sas-verification.md
-    // §9). Единственное состояние, где бейджа вовсе нет — значит и попапу
-    // открытым оставаться не с чем, закрываем его, если был открыт.
+    // We're alone in the room — nothing and no one to verify against (see
+    // docs/sas-verification.md §9). The only state where there's no badge
+    // at all — meaning the popup has nothing left to stay open for either,
+    // close it if it was open.
     topbarSasEl.classList.add('hidden');
     topbarSasEl.textContent = '';
     closeTopbarSasPopup();
@@ -2260,16 +2311,17 @@ function renderTopbarSas(state, result) {
     topbarSasEl.title = 'Verifying room…';
   }
 
-  // Попап уже открыт (напр. verifying -> ok сменился, пока пользователь его
-  // читает) — обновляем содержимое, иначе он показал бы устаревший текст.
+  // The popup is already open (e.g. it changed verifying -> ok while the
+  // user is reading it) — update its content, otherwise it would show stale
+  // text.
   if (!topbarSasPopupEl.classList.contains('hidden')) renderTopbarSasPopupContent(state, result);
 }
 
 /**
- * Заполнить содержимое попапа подробностей SAS под текущее состояние — те же
- * формулировки, что раньше жили в static/chat.js: setRoomSas/.chat-sas-note
- * (перенесены сюда при удалении SAS из шапки чат-панели). Не трогает
- * hidden-класс самого попапа — только его контент.
+ * Fill in the SAS details popup's content for the current state — the same
+ * wording that used to live in static/chat.js: setRoomSas/.chat-sas-note
+ * (moved here when SAS was removed from the chat panel header). Doesn't
+ * touch the popup's own hidden class — only its content.
  */
 function renderTopbarSasPopupContent(state, result) {
   if (state === 'ok' && result && Array.isArray(result.emoji)) {
@@ -2302,7 +2354,7 @@ function onTopbarSasPopupKeydown(event) {
   if (event.key === 'Escape') closeTopbarSasPopup();
 }
 
-/** Открыть попап подробностей SAS (по образцу openSharePopup). Ничего не делает, если бейдж скрыт (state hidden — нечего показывать). */
+/** Open the SAS details popup (modeled on openSharePopup). Does nothing if the badge is hidden (state hidden — nothing to show). */
 function openTopbarSasPopup() {
   if (topbarSasEl.classList.contains('hidden')) return;
   renderTopbarSasPopupContent(sasState, sasResult);
@@ -2315,15 +2367,15 @@ function closeTopbarSasPopup() {
   document.removeEventListener('keydown', onTopbarSasPopupKeydown);
 }
 
-/** Клик по бейджу переключает попап (см. static/style.css: .topbar-sas — z-index явно выше backdrop-а попапа, так что бейдж остаётся кликабельным напрямую и повторный клик закрывает попап тем же путём, каким открыл). */
+/** Clicking the badge toggles the popup (see static/style.css: .topbar-sas — its z-index is explicitly above the popup's backdrop, so the badge stays directly clickable and a repeat click closes the popup the same way it opened it). */
 function toggleTopbarSasPopup() {
   if (topbarSasPopupEl.classList.contains('hidden')) openTopbarSasPopup();
   else closeTopbarSasPopup();
 }
 
 topbarSasEl.addEventListener('click', toggleTopbarSasPopup);
-// Клик мимо (по прозрачному полноэкранному backdrop-у) — закрывает (тот же
-// приём, что у .share-popup-backdrop/openSharePopup).
+// Clicking outside (on the transparent fullscreen backdrop) — closes it
+// (the same trick as .share-popup-backdrop/openSharePopup).
 topbarSasPopupBackdropEl.addEventListener('click', closeTopbarSasPopup);
 
 function sasSetState(state) {
@@ -2332,7 +2384,7 @@ function sasSetState(state) {
   renderRoomSas();
 }
 
-/** Сбросить состояние раунда (уходим в hidden/unavailable — сверять не с кем). */
+/** Reset round state (going to hidden/unavailable — no one to verify against). */
 function sasResetRound(state) {
   sasCurrentRoundId = null;
   sasRoundMembers = null;
@@ -2343,26 +2395,26 @@ function sasResetRound(state) {
   sasSetState(state);
 }
 
-/** Начать новый раунд над снапшотом состава `members` ([{peerId, fingerprint}]) с идентификатором `rid`. */
+/** Start a new round over the membership snapshot `members` ([{peerId, fingerprint}]) with identifier `rid`. */
 function sasStartRound(rid, members) {
   sasCurrentRoundId = rid;
   sasRoundMembers = members;
   sasMyNonce = RoomCrypto.generateSasNonce();
   sasCommits = new Map();
-  sasReveals = new Map([[myPeerId, sasMyNonce]]); // свой нонс сразу известен
+  sasReveals = new Map([[myPeerId, sasMyNonce]]); // our own nonce is known right away
   sasRevealed = false;
   sasSetState('verifying');
   RoomCrypto.sasCommit(rid, myPeerId, sasMyNonce)
     .then((commit) => {
-      if (rid !== sasCurrentRoundId) return; // раунд успел смениться
+      if (rid !== sasCurrentRoundId) return; // the round has already changed
       sasCommits.set(myPeerId, commit);
       bus.broadcast({ kind: 'sas-commit', round: rid, commit });
       return sasTryComplete();
     })
-    .catch((err) => console.warn('SAS: старт раунда не удался:', err));
+    .catch((err) => console.warn('SAS: failed to start round:', err));
 }
 
-/** Повторно разослать свой commit (и reveal, если уже раскрылись) — покрывает пиров, чья шина открылась после первой рассылки. */
+/** Re-broadcast our own commit (and reveal, if already revealed) — covers peers whose bus opened after the first broadcast. */
 function sasRebroadcast() {
   const commit = sasCommits.get(myPeerId);
   if (commit) bus.broadcast({ kind: 'sas-commit', round: sasCurrentRoundId, commit });
@@ -2376,41 +2428,42 @@ function sasRebroadcast() {
 }
 
 /**
- * Продвинуть текущий раунд: гейт ревила (раскрываемся только собрав ВСЕ
- * коммиты), проверка reveal'ов против коммитов, вывод SAS. Идемпотентна;
- * безопасна при параллельных вызовах (проверяет, не сменился ли раунд).
+ * Advance the current round: the reveal gate (we only reveal after
+ * collecting ALL commits), verifying reveals against commits, deriving
+ * SAS. Idempotent; safe under concurrent calls (checks whether the round
+ * has changed).
  */
 async function sasTryComplete() {
   const rid = sasCurrentRoundId;
   if (!rid || !sasRoundMembers) return;
   const expected = sasRoundMembers.map((m) => m.peerId);
 
-  // 1. Ждём коммиты от всех ожидаемых участников.
+  // 1. Wait for commits from all expected participants.
   if (!expected.every((p) => sasCommits.has(p))) {
     sasSetState('verifying');
     return;
   }
-  // 2. Гейт: все коммиты собраны — можно раскрыть свой нонс.
+  // 2. Gate: all commits are collected — we can reveal our own nonce.
   if (!sasRevealed) {
     sasRevealed = true;
     bus.broadcast({ kind: 'sas-reveal', round: rid, nonce: RoomCrypto.bytesToBase64url(sasMyNonce) });
   }
-  // 3. Ждём reveal'ы от всех.
+  // 3. Wait for reveals from everyone.
   if (!expected.every((p) => sasReveals.has(p))) {
     sasSetState('verifying');
     return;
   }
-  // 4. Проверяем каждый чужой reveal против его коммита.
+  // 4. Verify each other reveal against its commit.
   for (const m of sasRoundMembers) {
-    if (m.peerId === myPeerId) continue; // свой нонс доверяем
+    if (m.peerId === myPeerId) continue; // we trust our own nonce
     const commit = await RoomCrypto.sasCommit(rid, m.peerId, sasReveals.get(m.peerId));
-    if (rid !== sasCurrentRoundId) return; // раунд сменился во время await
+    if (rid !== sasCurrentRoundId) return; // the round changed during the await
     if (commit !== sasCommits.get(m.peerId)) {
       sasSetState('mismatch');
       return;
     }
   }
-  // 5. Всё сошлось — выводим SAS.
+  // 5. Everything matched — derive the SAS.
   const entries = sasRoundMembers.map((m) => ({
     peerId: m.peerId,
     fingerprint: m.fingerprint,
@@ -2423,15 +2476,17 @@ async function sasTryComplete() {
 }
 
 /**
- * Периодический тик: собрать актуальный состав (свой + пиры с ОТКРЫТОЙ шиной и
- * известным DTLS-фингерпринтом), вычислить roundId (включает фингерпринты) и
- * при его смене — начать свежий раунд. Иначе — добить текущий. Состояния:
- *  - один в комнате -> hidden (сверять не с кем);
- *  - есть пиры, но ни к кому нет верифицируемого P2P-пути -> unavailable
- *    (медиа-пути тоже нет — см. docs/sas-verification.md §8/§9).
+ * Periodic tick: gather the current membership (ourselves + peers with an
+ * OPEN bus and a known DTLS fingerprint), compute roundId (includes
+ * fingerprints), and start a fresh round if it changed. Otherwise, drive
+ * the current one forward. States:
+ *  - alone in the room -> hidden (no one to verify against);
+ *  - there are peers, but no verifiable P2P path to any of them ->
+ *    unavailable (there's no media path either — see
+ *    docs/sas-verification.md §8/§9).
  */
 async function sasRefresh() {
-  if (!ownCertFingerprint || !myPeerId) return; // сертификат не готов — SAS недоступен молча
+  if (!ownCertFingerprint || !myPeerId) return; // certificate isn't ready — SAS is silently unavailable
   const peerEntries = Array.from(peers.entries());
   if (peerEntries.length === 0) {
     if (sasState !== 'hidden') sasResetRound('hidden');
@@ -2456,20 +2511,20 @@ async function sasRefresh() {
   }
 }
 
-/** Запустить периодический SAS-тик (идемпотентно, переживает reconnect). */
+/** Start the periodic SAS tick (idempotently, survives reconnect). */
 function startSasUpdates() {
-  const tick = () => sasRefresh().catch((err) => console.warn('SAS-тик не удался:', err));
+  const tick = () => sasRefresh().catch((err) => console.warn('SAS tick failed:', err));
   tick();
   if (!sasRefreshTimer) sasRefreshTimer = setInterval(tick, SAS_REFRESH_MS);
 }
 
 /**
- * Крипто-строка/счётчики сигналинга/build-хэш — дешёвые части секции
- * «Соединение и приватность» (без getStats). Вызывается при открытии панели
- * (openSettingsPanel) и с каждого тика единого 3-секундного поллера скоростей,
- * пока панель открыта (см. PEER_STATS_REFRESH_MS/pollPeerStats выше) — своего
- * таймера у секции нет. Список пиров сюда не входит — его рисует
- * renderPeerConnectionsList, из тех же мест.
+ * The crypto line/signaling counters/build hash — the cheap parts of the
+ * "Connection and privacy" section (no getStats). Called when opening the
+ * panel (openSettingsPanel) and on every tick of the shared 3-second speed
+ * poller while the panel is open (see PEER_STATS_REFRESH_MS/pollPeerStats
+ * above) — the section has no timer of its own. The peer list isn't part
+ * of this — it's drawn by renderPeerConnectionsList, from the same call sites.
  */
 function refreshConnectionSection() {
   renderCryptoInfo();
@@ -2477,23 +2532,23 @@ function refreshConnectionSection() {
   renderSettingsBuildRow();
 }
 
-// ---------- Устройства: селекты микрофона/камеры (видно всем участникам) ----------
+// ---------- Devices: microphone/camera selects (visible to all participants) ----------
 //
-// enumerateDevices() отдаёт человекочитаемые label ТОЛЬКО после того, как
-// пользователь хоть раз выдал разрешение на mic/camera в этой вкладке (до
-// этого — пустая строка у всех устройств, спецификация намеренно не палит
-// железо без разрешения) — поэтому до первого разрешения показываем
-// пронумерованный фоллбэк «Микрофон 1», «Камера 2» и т.п. Список
-// перестраивается при каждом открытии панели и по событию devicechange
-// (см. ниже) — воткнули/вынули устройство, список должен обновиться, даже
-// если панель уже открыта.
+// enumerateDevices() only returns human-readable labels ONCE the user has
+// granted mic/camera permission at least once in this tab (before that —
+// an empty string for every device, the spec deliberately doesn't reveal
+// hardware without permission) — so before the first permission grant we
+// show a numbered fallback like "Microphone 1", "Camera 2", etc. The list
+// is rebuilt on every panel open and on the devicechange event (see below)
+// — plugging in/unplugging a device should refresh the list even while the
+// panel is already open.
 async function refreshDeviceLists() {
   if (!navigator.mediaDevices || typeof navigator.mediaDevices.enumerateDevices !== 'function') return;
   let devices;
   try {
     devices = await navigator.mediaDevices.enumerateDevices();
   } catch (err) {
-    console.warn('enumerateDevices не удался:', err);
+    console.warn('enumerateDevices failed:', err);
     return;
   }
   fillDeviceSelect(
@@ -2509,9 +2564,10 @@ async function refreshDeviceLists() {
 }
 
 function fillDeviceSelect(selectEl, list, labelPrefix) {
-  // Сохраняем текущий выбор селекта (пользователь мог уже выбрать устройство
-  // в этой же сессии до перестройки списка, см. selected*DeviceId) — приоритет
-  // у него, иначе оставляем то, что уже стояло в самом селекте.
+  // Preserve the select's current choice (the user may have already picked
+  // a device this same session before the list was rebuilt, see
+  // selected*DeviceId) — it takes priority, otherwise we keep whatever was
+  // already set in the select itself.
   const wantId = selectEl.dataset.selectedDeviceId || selectEl.value || '';
   selectEl.textContent = '';
   list.forEach((d, i) => {
@@ -2539,7 +2595,7 @@ settingCameraDeviceSelect.addEventListener('change', () => {
   applyCameraDeviceChange(settingCameraDeviceSelect.value || null);
 });
 
-/** Шлёт update-settings ЦЕЛИКОМ (не патч, см. src/protocol.rs) — сервер рассылает settings-changed всем, включая нас (см. registerSignalingHandlers). */
+/** Sends update-settings as a WHOLE object (not a patch, see src/protocol.rs) — the server broadcasts settings-changed to everyone, including us (see registerSignalingHandlers). */
 function sendSettingsUpdate(partial) {
   if (!roomSettings) return;
   const next = { ...roomSettings, ...partial };
@@ -2561,26 +2617,27 @@ wireSettingToggle(settingGuestAudioInput, 'guestAudio');
 wireSettingToggle(settingGuestVideoInput, 'guestVideo');
 wireSettingToggle(settingGuestScreenInput, 'guestScreen');
 
-// Пустое значение селекта ("No limit") кодируется как null на проводе, а не
-// как число — см. populateMaxParticipantsOptions выше про то, почему это
-// важно (null «следует» за серверным потолком, зафиксированное число — нет).
+// The select's empty value ("No limit") is encoded as null on the wire,
+// not as a number — see populateMaxParticipantsOptions above for why this
+// matters (null "follows" the server ceiling, a fixed number doesn't).
 settingMaxParticipantsInput.addEventListener('change', () => {
   const raw = settingMaxParticipantsInput.value;
   sendSettingsUpdate({ maxParticipants: raw === '' ? null : parseInt(raw, 10) });
 });
 
-// ---------- Локальные потоки: рассылка новым и уже существующим пирам ----------
+// ---------- Local streams: broadcasting to new and existing peers ----------
 
 /**
- * Отправить stream-info одному пиру: если DataChannel-шина до него уже
- * открыта — через неё (см. bus.js/rtc.js, Ф2), иначе — серверный релей как
- * раньше (fallback: пока mesh только устанавливается, шины ещё нет).
- * Формат сообщения на приёме единый для обоих путей — см. handleStreamInfo.
+ * Send stream-info to a single peer: if the DataChannel bus to them is
+ * already open — through it (see bus.js/rtc.js, Phase 2), otherwise —
+ * through the server relay as before (fallback: while the mesh is still
+ * being established, there's no bus yet). The message format on receipt is
+ * the same for both paths — see handleStreamInfo.
  *
- * E2E v2: по шине `info` уходит КАК ЕСТЬ (P2P DataChannel уже E2E за счёт
- * DTLS, см. static/crypto.js/rtc.js) — а вот серверный fallback шифрует
- * `info` целиком под попарный K_pair_sig ЭТОГО `peerId`, сервер видит только
- * {v,iv,ct}.
+ * E2E v2: over the bus `info` goes AS-IS (P2P DataChannel is already E2E
+ * thanks to DTLS, see static/crypto.js/rtc.js) — whereas the server
+ * fallback encrypts `info` as a whole under THIS `peerId`'s pairwise
+ * K_pair_sig, the server sees only {v,iv,ct}.
  */
 function sendStreamInfoTo(peerId, info) {
   if (bus.isOpen(peerId)) {
@@ -2591,11 +2648,11 @@ function sendStreamInfoTo(peerId, info) {
         signaling.send('stream-info', { targetPeerId: peerId, info: encInfo });
         ConnStats.incSignalingRelay();
       })
-      .catch((err) => console.error(`Не удалось зашифровать stream-info для ${peerId}:`, err));
+      .catch((err) => console.error(`Failed to encrypt stream-info for ${peerId}:`, err));
   }
 }
 
-/** Добавить трек(и) `stream` во все существующие PeerConnection и разослать stream-info. */
+/** Add `stream`'s track(s) to all existing PeerConnections and broadcast stream-info. */
 function broadcastLocalStream(stream, kind) {
   const info = { [stream.id]: { kind, name: myName || null, enabled: true } };
   for (const [peerId, entry] of peers) {
@@ -2607,21 +2664,21 @@ function broadcastLocalStream(stream, kind) {
 }
 
 /**
- * Сообщить всем пирам, что локальный поток переключил enabled (камера
- * toggle кнопкой). `stream-info` — опаковый для сервера JSON, поэтому это
- * чисто клиентское расширение протокола, а не отдельное сообщение.
+ * Tell all peers that a local stream toggled `enabled` (camera toggled via
+ * the button). `stream-info` is opaque JSON to the server, so this is a
+ * purely client-side protocol extension, not a separate message type.
  *
- * Зачем это вообще нужно (грабли, обнаружены эмпирически): по спецификации
- * WebRTC можно было бы понадеяться, что `track.enabled = false` на
- * отправителе приведёт к событию `mute` у соответствующего трека на
- * приёмнике — так ведёт себя MediaStreamTrack при локальном рендере. На
- * практике же в Chrome сендер при `enabled = false` продолжает слать чёрные
- * кадры (аналогично тишине у аудио — см. комментарий в истории проекта про
- * счётчик микрофонов), поэтому `mute`/`unmute` на приёмнике НЕ происходит:
- * трек остаётся live и «немьютнутым», просто с чёрным содержимым. Поэтому
- * `track.onmute`/`onunmute` в attachCameraVideo оставлены только страховкой
- * (вдруг другой браузер поведёт себя иначе), а основной путь — этот явный
- * сигнал через stream-info.
+ * Why this is even needed (a gotcha found empirically): per the WebRTC
+ * spec one might hope that `track.enabled = false` on the sender would
+ * trigger a `mute` event on the corresponding track at the receiver — that's
+ * how MediaStreamTrack behaves for local rendering. In practice, however,
+ * in Chrome the sender keeps sending black frames when `enabled = false`
+ * (similar to silence for audio — see the project history comment about the
+ * microphone counter), so `mute`/`unmute` does NOT fire on the receiver: the
+ * track stays live and "unmuted," just with black content. That's why
+ * `track.onmute`/`onunmute` in attachCameraVideo are kept only as a safety
+ * net (in case another browser behaves differently), while the main path is
+ * this explicit signal via stream-info.
  */
 function broadcastStreamEnabled(stream, kind, enabled) {
   const info = { [stream.id]: { kind, name: myName || null, enabled } };
@@ -2630,7 +2687,7 @@ function broadcastStreamEnabled(stream, kind, enabled) {
   }
 }
 
-/** Убрать все треки `stream` из всех PeerConnection (используется при остановке шаринга экрана). */
+/** Remove all of `stream`'s tracks from every PeerConnection (used when stopping screen sharing). */
 function removeLocalStreamFromAllPeers(stream) {
   const tracks = stream.getTracks();
   for (const entry of peers.values()) {
@@ -2639,7 +2696,7 @@ function removeLocalStreamFromAllPeers(stream) {
         try {
           entry.rtc.pc.removeTrack(sender);
         } catch (err) {
-          console.warn('Не удалось убрать локальный трек у пира:', err);
+          console.warn('Failed to remove local track from peer:', err);
         }
       }
     }
@@ -2647,17 +2704,18 @@ function removeLocalStreamFromAllPeers(stream) {
 }
 
 /**
- * Сообщить конкретному пиру обо всех своих активных потоках (снапшот) —
- * вызывается ДВАЖДЫ за жизнь пары (см. createRemotePeer):
- *   1) сразу при создании пира — шина ещё не открыта, уйдёт через серверный
- *      релей (обычный bootstrap-путь, пока mesh только устанавливается);
- *   2) повторно в момент открытия шины к этому пиру (onBusOpen) — на этот
- *      раз уйдёт уже по шине (sendStreamInfoTo видит bus.isOpen() === true).
- * Повтор №2 закрывает гонку «оффер с треками ушёл раньше, чем открылась
- * шина»: даже если сервер потерял/задержал первую посылку, актуальное
- * состояние гарантированно долетит по P2P-каналу сразу же, как только он
- * готов — после этого точечные обновления (broadcastLocalStream/
- * broadcastStreamEnabled) уже почти всегда идут по шине.
+ * Tell a specific peer about all our active streams (a snapshot) — called
+ * TWICE over a pair's lifetime (see createRemotePeer):
+ *   1) right when the peer is created — the bus isn't open yet, it will go
+ *      through the server relay (the usual bootstrap path while the mesh
+ *      is still being established);
+ *   2) again the moment the bus to this peer opens (onBusOpen) — this time
+ *      it will go over the bus (sendStreamInfoTo sees bus.isOpen() === true).
+ * Repeat #2 closes the race of "the offer with tracks went out before the
+ * bus opened": even if the server lost/delayed the first send, the current
+ * state is guaranteed to arrive over the P2P channel as soon as it's ready
+ * — after that, point updates (broadcastLocalStream/broadcastStreamEnabled)
+ * almost always go over the bus.
  */
 function sendAllActiveStreamInfoTo(peerId) {
   const info = {};
@@ -2669,14 +2727,15 @@ function sendAllActiveStreamInfoTo(peerId) {
   }
 }
 
-// ---------- Входящие треки: маршрутизация по stream-info ----------
+// ---------- Incoming tracks: routing via stream-info ----------
 
 /**
- * Единая точка приёма stream-info — не важно, пришёл ли он по DataChannel-
- * шине (см. bus.onMessage ниже) или по серверному релею-фоллбэку (см.
- * signaling.on('stream-info', ...) в registerSignalingHandlers): формат
- * `info` в обоих случаях один и тот же (см. sendStreamInfoTo), поэтому вся
- * логика маршрутизации/дедупликации живёт здесь один раз.
+ * The single entry point for receiving stream-info — regardless of whether
+ * it arrived over the DataChannel bus (see bus.onMessage below) or over the
+ * server relay fallback (see signaling.on('stream-info', ...) in
+ * registerSignalingHandlers): the `info` format is the same in both cases
+ * (see sendStreamInfoTo), so all routing/deduplication logic lives here in
+ * one place.
  */
 function handleStreamInfo(info) {
   if (!info || typeof info !== 'object') return;
@@ -2690,33 +2749,35 @@ function handleStreamInfo(info) {
         routeRemoteTrack(item.peerId, streamId, item.stream, item.track, meta);
       }
     } else if (hadMetaBefore && meta.kind === 'camera' && typeof meta.enabled === 'boolean') {
-      // Повторный stream-info для уже подключённого потока камеры — это
-      // toggle enabled (см. broadcastStreamEnabled), а не новый трек.
+      // A repeated stream-info for an already-attached camera stream is an
+      // enabled toggle (see broadcastStreamEnabled), not a new track.
       applyCameraEnabledUpdate(streamId, meta.enabled);
     } else if (hadMetaBefore && meta.kind === 'mic' && typeof meta.enabled === 'boolean') {
-      // Тот же toggle enabled, но для микрофона — двигает индикатор
-      // «микрофон выключен» на тайле (см. applyMicEnabledUpdate).
+      // The same enabled toggle, but for the microphone — moves the "mic
+      // off" indicator on the tile (see applyMicEnabledUpdate).
       applyMicEnabledUpdate(streamId, meta.enabled);
     }
   }
 }
 
-// Приём stream-info с шины (Ф2) — обычный путь, как только mesh-пара
-// установлена; обработчик общий с сервером-фоллбэком (handleStreamInfo
-// выше). Сообщения чата и прочих фич шины (см. chat.js: dispatchEnvelope,
-// envelope.kind) сюда не попадают — фильтруем по kind: 'stream-info'.
+// Receiving stream-info over the bus (Phase 2) — the normal path once a
+// mesh pair is established; the handler is shared with the server fallback
+// (handleStreamInfo above). Chat messages and other bus features (see
+// chat.js: dispatchEnvelope, envelope.kind) don't land here — filtered by
+// kind: 'stream-info'.
 bus.onMessage((_fromPeerId, obj) => {
   if (obj && obj.kind === 'stream-info') handleStreamInfo(obj.info);
 });
 
-// Ф3: приём повторных offer/answer/ice ПО ШИНЕ (см. static/rtc.js —
-// RtcPeer._trySendBusSignal на стороне отправителя, sigCrypto там уже не
-// участвует, payload приходит в чистом виде). Маршрутизируется в ТОТ ЖЕ
-// RtcPeer, что и прислал сообщение (bus._dispatch зовёт обработчики с
-// fromPeerId — см. bus.js/rtc.js: onBusMessage), поэтому здесь просто нужен
-// сам RtcPeer конкретного пира — bus.getPeer(fromPeerId), а не полноценный
-// bus-транспорт (rtc-signal — не сообщение чата/фичи, ему нужен доступ к
-// handleBusSignal, которого у Bus API нет и не должно быть).
+// Phase 3: receiving repeated offer/answer/ice OVER THE BUS (see
+// static/rtc.js — RtcPeer._trySendBusSignal on the sender side, sigCrypto
+// isn't involved there anymore, the payload arrives in the clear).
+// Routed to the SAME RtcPeer that sent the message (bus._dispatch calls
+// handlers with fromPeerId — see bus.js/rtc.js: onBusMessage), so here we
+// just need the specific peer's own RtcPeer — bus.getPeer(fromPeerId),
+// not the full bus transport (rtc-signal isn't a chat message/feature, it
+// needs access to handleBusSignal, which the Bus API doesn't have and
+// shouldn't have).
 bus.onMessage((fromPeerId, obj) => {
   if (!obj || obj.kind !== 'rtc-signal') return;
   const rtc = bus.getPeer(fromPeerId);
@@ -2742,11 +2803,12 @@ function handleRemoteTrack(peerId, event) {
 }
 
 function routeRemoteTrack(peerId, streamId, stream, track, meta) {
-  if (!peers.has(peerId)) return; // пир уже ушёл, пока летела информация
+  if (!peers.has(peerId)) return; // the peer already left while the info was in flight
   if (meta.kind === 'mic') {
     micStreamOwner.set(streamId, peerId);
-    // Ссылку храним всегда (см. заголовок раздела «Права гостей: применение
-    // на стороне получателя») — рендерим только если разрешено прямо сейчас.
+    // We always store the reference (see the header of the "Guest
+    // permissions: enforcement on the receiver side" section) — we only
+    // render it if currently allowed.
     const enabled = meta.enabled !== false;
     getOrCreateMediaRefs(peerId).mic = { stream, track, enabled };
     refreshMediaRenderingForPeer(peerId);
@@ -2780,9 +2842,9 @@ function attachMicAudio(peerId, stream, track) {
     micMonitors.set(peerId, stop);
   }
 
-  // Грабли из старого viewer.js: removeTrack у отправителя на этой стороне
-  // даёт mute, а НЕ ended — надёжный сигнал ухода трека это removetrack на
-  // самой MediaStream (см. комментарий там же).
+  // A gotcha from the old viewer.js: removeTrack on the sender side gives
+  // us mute, NOT ended — the reliable signal that a track is gone is
+  // removetrack on the MediaStream itself (see the comment there).
   stream.onremovetrack = () => {
     if (stream.getAudioTracks().length === 0) {
       cleanupMicAudio(peerId);
@@ -2816,18 +2878,19 @@ function attachCameraVideo(peerId, stream, track, initiallyEnabled = true) {
   }
   showTileVideo(peerId, initiallyEnabled);
 
-  // Выключение камеры кнопкой — это track.enabled=false на стороне
-  // отправителя, трек не удаляется. Основной сигнал об этом — явное
-  // обновление stream-info с полем enabled (см. broadcastStreamEnabled и
-  // applyCameraEnabledUpdate) — мьют/анмьют трека здесь оставлены только
-  // страховкой на случай другого браузера/поведения: эмпирически в Chrome
-  // при enabled=false сендер продолжает слать чёрные кадры, mute не наступает.
+  // Turning the camera off via the button is track.enabled=false on the
+  // sender side, the track isn't removed. The primary signal for this is an
+  // explicit stream-info update with the enabled field (see
+  // broadcastStreamEnabled and applyCameraEnabledUpdate) — track
+  // mute/unmute here is kept only as a safety net for a different
+  // browser/behavior: empirically in Chrome, with enabled=false the sender
+  // keeps sending black frames, mute never fires.
   track.onmute = () => showTileVideo(peerId, false);
   track.onunmute = () => showTileVideo(peerId, true);
 
-  // Страховка на случай реального удаления трека (сейчас камера никогда не
-  // removeTrack'ается явно, но если браузер всё же пришлёт это — не залипаем
-  // на последнем кадре).
+  // A safety net in case the track is actually removed (right now the
+  // camera is never explicitly removeTrack'd, but if the browser does send
+  // this, we don't get stuck on the last frame).
   stream.onremovetrack = () => {
     if (stream.getVideoTracks().length === 0) {
       showTileVideo(peerId, false);
@@ -2841,9 +2904,10 @@ function attachCameraVideo(peerId, stream, track, initiallyEnabled = true) {
 }
 
 function attachScreenVideo(peerId, stream) {
-  // Владелец и подпись уже выставлены обработчиком `share-started` — здесь
-  // только подключаем сам видеопоток, как только он реально прибыл (может
-  // случиться чуть позже самого share-started — WebRTC-негоциация не мгновенна).
+  // The owner and caption are already set by the `share-started` handler —
+  // here we just attach the video stream itself, as soon as it actually
+  // arrives (which can happen a bit later than share-started itself —
+  // WebRTC negotiation isn't instant).
   showScreenStageContainer();
   if (screenVideoEl.srcObject !== stream) {
     screenVideoEl.srcObject = stream;
@@ -2855,20 +2919,20 @@ function attachScreenVideo(peerId, stream) {
   }
 }
 
-/** Применить обновление `enabled` для уже подключённого потока камеры (toggle). */
+/** Apply an `enabled` update for an already-attached camera stream (toggle). */
 function applyCameraEnabledUpdate(streamId, enabled) {
   const peerId = cameraStreamOwner.get(streamId);
   if (!peerId) return;
   const refs = peerMediaRefs.get(peerId);
   if (refs && refs.camera) refs.camera.enabled = enabled;
-  // Если рендер сейчас запрещён правами гостя (см. refreshMediaRenderingForPeer)
-  // — видео и так не подключено, трогать элемент не нужно (иначе показали бы
-  // пустой/протухший кадр).
+  // If rendering is currently forbidden by guest permissions (see
+  // refreshMediaRenderingForPeer), the video isn't attached anyway, no need
+  // to touch the element (otherwise it would show an empty/stale frame).
   const allowed = isPeerLeader(peerId) || (roomSettings && roomSettings.guestVideo);
   if (allowed) showTileVideo(peerId, enabled);
 }
 
-/** Применить обновление `enabled` для уже подключённого потока микрофона (toggle) — двигает индикатор «микрофон выключен» на тайле (см. static/style.css: .tile-mic-off), независимо от прав гостя на рендер аудио. */
+/** Apply an `enabled` update for an already-attached microphone stream (toggle) — moves the "mic off" indicator on the tile (see static/style.css: .tile-mic-off), regardless of the guest's audio-rendering permissions. */
 function applyMicEnabledUpdate(streamId, enabled) {
   const peerId = micStreamOwner.get(streamId);
   if (!peerId) return;
@@ -2878,7 +2942,7 @@ function applyMicEnabledUpdate(streamId, enabled) {
   if (entry) setTileMicOffIndicator(entry.tile, !enabled);
 }
 
-// ---------- Пиры: создание/удаление ----------
+// ---------- Peers: creation/removal ----------
 
 function createRemotePeer(peerId, name, iceServers) {
   const rtc = new RtcPeer({
@@ -2886,16 +2950,17 @@ function createRemotePeer(peerId, name, iceServers) {
     polite: myPeerId > peerId,
     signaling,
     targetPeerId: peerId,
-    // SAS: один сессионный сертификат на все соединения (см.
-    // ensureSessionCertificate, static/crypto.js: deriveSas). Может быть null,
-    // если генерация не удалась — тогда браузер сам выпустит сертификат, а SAS
-    // просто не покажется.
+    // SAS: a single session certificate for all connections (see
+    // ensureSessionCertificate, static/crypto.js: deriveSas). Can be null
+    // if generation failed — then the browser issues its own certificate,
+    // and SAS simply won't be shown.
     certificate: sessionCertificate,
-    // E2E v2: offer/answer/ice-candidate к ЭТОМУ пиру всегда идут через
-    // серверный сигналинг-релей — RtcPeer шифрует/расшифровывает их сам под
-    // ПОПАРНЫЙ K_pair_sig этого peerId (см. static/rtc.js, static/crypto.js),
-    // room.js только выдаёт функции. Пара уже должна быть в кеше к этому
-    // моменту (см. cachePairKeys — вызывается ДО createRemotePeer везде).
+    // E2E v2: offer/answer/ice-candidate to THIS peer always go through the
+    // server signaling relay — RtcPeer encrypts/decrypts them itself under
+    // this peerId's PAIRWISE K_pair_sig (see static/rtc.js, static/crypto.js),
+    // room.js just supplies the functions. The pair must already be cached
+    // by this point (see cachePairKeys — called BEFORE createRemotePeer
+    // everywhere).
     sigCrypto: {
       encrypt: (obj) => encryptSigFor(peerId, obj),
       decrypt: (blob) => decryptSigFrom(peerId, blob),
@@ -2904,23 +2969,25 @@ function createRemotePeer(peerId, name, iceServers) {
     onTrack: (event) => handleRemoteTrack(peerId, event),
     onStateChange: () => {},
     onBusMessage: (obj) => bus._dispatch(peerId, obj),
-    // Ф2: как только шина к этому пиру открылась — сразу переслать ему по
-    // ней снапшот всех наших актуальных stream-info (см.
-    // sendAllActiveStreamInfoTo, там же почему это нужно ВТОРЫМ разом).
+    // Phase 2: as soon as the bus to this peer opens — immediately forward
+    // it a snapshot of all our current stream-info over it (see
+    // sendAllActiveStreamInfoTo, and there for why this second time is needed).
     onBusOpen: () => {
       sendAllActiveStreamInfoTo(peerId);
-      // SAS: шина к пиру открылась — состав/фингерпринты могли измениться,
-      // пересобираем раунд не дожидаясь таймера (см. sasRefresh).
+      // SAS: the bus to the peer opened — membership/fingerprints may have
+      // changed, rebuild the round without waiting for the timer (see sasRefresh).
       if (sasRefreshTimer) sasRefresh().catch(() => {});
-      // Чат: слить локальную очередь исходящего, ждавшего открытия шины (пришло
-      // на смену серверному fallback-релею, см. static/chat.js: notifyBusOpen).
+      // Chat: flush the local outgoing queue that was waiting for the bus
+      // to open (arrived in place of the server fallback relay, see
+      // static/chat.js: notifyBusOpen).
       if (chat && typeof chat.notifyBusOpen === 'function') chat.notifyBusOpen(peerId);
     },
-    // Ф3: входящий файловый DataChannel — маршрутизируем в ChatPanel (там
-    // живёт протокол передачи файлов, см. static/chat.js). `chat` в момент
-    // регистрации этого колбэка может быть ещё не создан (для первых пиров
-    // ChatPanel.create() вызывается позже, см. joined ниже) — читаем
-    // переменную в момент самого вызова колбэка, а не при регистрации.
+    // Phase 3: an incoming file DataChannel — routed to ChatPanel (that's
+    // where the file-transfer protocol lives, see static/chat.js). `chat`
+    // may not yet be created at the moment this callback is registered (for
+    // the first peers, ChatPanel.create() is called later, see joined
+    // below) — we read the variable at the moment the callback actually
+    // fires, not at registration time.
     onFileChannel: (channel) => {
       if (chat) chat.handleIncomingFileChannel(peerId, channel);
     },
@@ -2928,10 +2995,10 @@ function createRemotePeer(peerId, name, iceServers) {
   bus.addPeer(peerId, rtc);
 
   const tile = createTile(peerId, name, false);
-  tile.crownEl.classList.toggle('hidden', leaderId !== peerId); // leaderId уже мог быть известен (peer-joined/реконнект)
+  tile.crownEl.classList.toggle('hidden', leaderId !== peerId); // leaderId may already be known (peer-joined/reconnect)
   peers.set(peerId, { rtc, name, tile });
 
-  // Локальные активные треки — сразу в новый pc (коалесцируются в один offer).
+  // Local active tracks — added to the new pc right away (coalesced into a single offer).
   if (micStream) rtc.pc.addTrack(micTrack, micStream);
   if (camStream) rtc.pc.addTrack(camTrack, camStream);
   if (screenStream) {
@@ -2943,15 +3010,15 @@ function createRemotePeer(peerId, name, iceServers) {
 function removeRemotePeer(peerId) {
   const entry = peers.get(peerId);
   if (!entry) return;
-  if (maximizedTile === entry.tile) unmaximizeTile(); // пир ушёл — показывать крупно больше нечего
+  if (maximizedTile === entry.tile) unmaximizeTile(); // the peer left — nothing left to show large
   entry.rtc.close();
   entry.tile.root.remove();
   peers.delete(peerId);
   peerNames.delete(peerId);
-  pairKeysCache.delete(peerId); // E2E v2: пир ушёл — попарный ключ больше не нужен (см. static/crypto.js, PFS)
+  pairKeysCache.delete(peerId); // E2E v2: the peer left — the pairwise key is no longer needed (see static/crypto.js, PFS)
   peerMediaRefs.delete(peerId);
-  peerStatsHistory.delete(peerId); // иначе новое соединение с тем же peerId унаследует чужую точку отсчёта скорости
-  peerLastStats.delete(peerId); // тот же принцип — кеш скорости не должен пережить peerId
+  peerStatsHistory.delete(peerId); // otherwise a new connection reusing the same peerId would inherit someone else's speed baseline
+  peerLastStats.delete(peerId); // same principle — the speed cache mustn't outlive the peerId
   bus.removePeer(peerId);
   cleanupMicAudio(peerId);
   for (const [streamId, ownerPeerId] of cameraStreamOwner) {
@@ -2967,31 +3034,34 @@ function removeRemotePeer(peerId) {
     updateScreenButtonState();
   }
 
-  // SAS: состав изменился — пересобрать раунд (иначе останется старый roundId).
+  // SAS: membership changed — rebuild the round (otherwise the old roundId would linger).
   if (sasRefreshTimer) sasRefresh().catch(() => {});
 }
 
 /**
- * Полный локальный teardown mesh/медиа/чата — используется терминальными
- * состояниями, после которых восстанавливать соединение бессмысленно (см.
- * signaling.on('room-expired') в registerSignalingHandlers: комната на
- * сервере уже удалена). В отличие от giveUpReconnect (там сокет сигналинга
- * умер, но mesh/DataChannel-чат физически могут пережить это и оставлены как
- * есть — см. docs/self-hosting.md, «Surviving a Restart/Redeploy»), здесь причина
- * терминальна ПО СУТИ (не «сервер моргнул», а «время вышло») — оставлять
- * висеть P2P-соединения и захваченные mic/camera/screen треки браузера
- * незачем, останавливаем их сразу.
+ * Full local teardown of the mesh/media/chat — used by terminal states
+ * after which restoring the connection is pointless (see
+ * signaling.on('room-expired') in registerSignalingHandlers: the room is
+ * already deleted on the server). Unlike giveUpReconnect (there the
+ * signaling socket died, but the mesh/DataChannel chat can physically
+ * survive that and are left as-is — see docs/self-hosting.md, "Surviving a
+ * Restart/Redeploy"), here the reason is terminal IN SUBSTANCE (not "the
+ * server blinked" but "time is up") — there's no point leaving P2P
+ * connections and captured mic/camera/screen browser tracks hanging, we
+ * stop them right away.
  */
 function teardownMeshMediaChat(reason) {
-  // Свой камера-трек ниже останавливается напрямую (не через showTileVideo/
-  // кнопку камеры) — если в этот момент был максимизирован именно свой
-  // тайл, exitMaximizeIfHidden тут не сработает сама, поэтому сворачиваем
-  // явно (иначе останется зависший чёрный оверлей после terminal-teardown).
+  // Our own camera track below is stopped directly (not via
+  // showTileVideo/the camera button) — if our own tile happened to be
+  // maximized at this moment, exitMaximizeIfHidden won't fire on its own
+  // here, so we un-maximize explicitly (otherwise a stuck black overlay
+  // would remain after the terminal teardown).
   unmaximizeTile();
-  // Единый поллер скоростей (см. startPeerStatsPolling) переживал бы этот
-  // teardown сам — тикать на пустых peers дёшево, но комната больше не
-  // восстановится (см. комментарий функции выше), поэтому останавливаем явно,
-  // как и roomTimerInterval (см. stopRoomTimer в signaling.on('room-expired')).
+  // The single shared speed poller (see startPeerStatsPolling) would
+  // survive this teardown on its own — ticking on empty peers is cheap,
+  // but the room won't be restored anymore (see the function comment
+  // above), so we stop it explicitly, same as roomTimerInterval (see
+  // stopRoomTimer in signaling.on('room-expired')).
   stopPeerStatsPolling();
   for (const peerId of Array.from(peers.keys())) {
     removeRemotePeer(peerId);
@@ -3006,15 +3076,16 @@ function teardownMeshMediaChat(reason) {
   if (chat) chat.disableInput(reason);
 }
 
-// ---------- Реконнект: грейс-период для отставших пиров/владельца экрана ----------
+// ---------- Reconnect: grace period for lagging peers/screen-share owner ----------
 
 /**
- * После успешного реконнекта пир может на время выпасть из свежего
- * joined.peers (сервер после рестарта ничего не помнит, пока участник сам не
- * переподключится) — вместо немедленного удаления даём ему
- * RECONNECT_PEER_GRACE_MS на переподключение. Если за это время придёт
- * peer-joined с тем же peerId — таймер снимается (см. cancelPendingPeerRemoval
- * в обработчике peer-joined), mesh-пир и не удалялся.
+ * After a successful reconnect, a peer may temporarily drop out of the
+ * fresh joined.peers (after a restart the server remembers nothing until
+ * the participant reconnects themselves) — instead of removing it
+ * immediately, we give it RECONNECT_PEER_GRACE_MS to reconnect. If a
+ * peer-joined with the same peerId arrives within that time, the timer is
+ * cancelled (see cancelPendingPeerRemoval in the peer-joined handler), the
+ * mesh peer was never removed at all.
  */
 function schedulePeerRemoval(peerId) {
   if (pendingPeerRemovals.has(peerId)) return;
@@ -3034,13 +3105,13 @@ function cancelPendingPeerRemoval(peerId) {
   }
 }
 
-/** Симметричный грейс для владельца экрана, который сам ещё не ре-джойнился (см. reconcileScreenShareAfterReconnect). */
+/** A symmetric grace period for a screen-share owner who hasn't re-joined yet themselves (see reconcileScreenShareAfterReconnect). */
 function scheduleScreenOwnerGrace(ownerPeerId) {
   if (screenOwnerGraceTimer) return;
   screenOwnerGraceTimer = setTimeout(() => {
     screenOwnerGraceTimer = null;
     if (currentScreenOwnerPeerId === ownerPeerId) {
-      // Владелец так и не ре-джойнился в отведённый срок — сцена честно уходит.
+      // The owner never re-joined within the allotted time — the stage is fairly torn down.
       currentScreenOwnerPeerId = null;
       hideScreenStage();
       updateScreenButtonState();
@@ -3055,17 +3126,17 @@ function cancelScreenOwnerGrace() {
   }
 }
 
-// ---------- Сигналинг ----------
+// ---------- Signaling ----------
 
-// ---------- Модалка входа: показывается ПЕРВОЙ, join-room уходит только после клика ----------
+// ---------- Join modal: shown FIRST, join-room is only sent after the click ----------
 
 function showJoinModal() {
   joinModalEl.classList.remove('hidden');
-  // Предзаполняем сгенерированным именем (см. static/namegen.js: userName())
-  // — жмёшь «Войти» и всё, спрашивать не обязательно. Пользователь может
-  // стереть поле → как и раньше, останется анонимом (onJoinModalSubmit:
-  // trim() + `|| null`). !value — на случай, если поле уже что-то содержит
-  // (не должно к этому моменту, но не перетираем на всякий случай).
+  // Pre-filled with a generated name (see static/namegen.js: userName()) —
+  // click "Join" and that's it, no need to ask. The user can clear the
+  // field → as before, they stay anonymous (onJoinModalSubmit: trim() + `||
+  // null`). !value — in case the field already contains something (it
+  // shouldn't at this point, but we don't overwrite it just in case).
   if (!joinNameInputEl.value) joinNameInputEl.value = NameGen.userName();
   joinNameInputEl.focus();
   joinNameInputEl.select();
@@ -3080,9 +3151,9 @@ let joinSubmitInProgress = false;
 async function onJoinModalSubmit() {
   if (joinSubmitInProgress) return;
   joinSubmitInProgress = true;
-  // Клик — user-gesture, полезный заодно и для AudioContext (см.
-  // static/common.js: SpeakingDetection пытается резюмировать AudioContext
-  // по click/keydown).
+  // A click is a user gesture, also useful for AudioContext (see
+  // static/common.js: SpeakingDetection tries to resume the AudioContext
+  // on click/keydown).
   const raw = joinNameInputEl.value.trim();
   myName = raw || null;
   hideJoinModal();
@@ -3097,10 +3168,10 @@ joinNameInputEl.addEventListener('keydown', (event) => {
   }
 });
 
-// Кнопка «сгенерировать заново» рядом с полем имени (см. showJoinModal) —
-// перекатывает новое NameGen.userName() и возвращает фокус в поле с
-// выделением текста, как при первом открытии модалки, чтобы можно было
-// сразу начать печатать поверх, если сгенерированное имя не понравилось.
+// The "regenerate" button next to the name field (see showJoinModal) —
+// rolls a new NameGen.userName() and returns focus to the field with the
+// text selected, just like when the modal first opens, so you can start
+// typing over it right away if you don't like the generated name.
 joinNameRegenButtonEl.addEventListener('click', () => {
   joinNameInputEl.value = NameGen.userName();
   joinNameInputEl.focus();
@@ -3108,12 +3179,12 @@ joinNameRegenButtonEl.addEventListener('click', () => {
 });
 
 async function init() {
-  // E2E v2: токен ссылки (`t`/`e`) обязателен ДО показа чего-либо связанного
-  // с реальным входом — без него нет смысла даже спрашивать имя, всё равно
-  // ничего не заработает (см. docs/e2e-encryption.md, initCryptoIdentity
-  // выше). Та же семантика (для 'invalid'), что и при отказе расшифровки
-  // первого входящего сообщения (см. showInvalidLinkOverlay); 'expired' —
-  // отдельный терминальный оверлей (см. showLinkExpiredOverlay).
+  // E2E v2: the link token (`t`/`e`) is required BEFORE showing anything
+  // related to actually joining — without it there's no point even asking
+  // for a name, nothing will work anyway (see docs/e2e-encryption.md,
+  // initCryptoIdentity above). Same semantics (for 'invalid') as a failed
+  // decryption of the first incoming message (see showInvalidLinkOverlay);
+  // 'expired' is a separate terminal overlay (see showLinkExpiredOverlay).
   const status = await initCryptoIdentity();
   if (status === 'invalid') {
     showInvalidLinkOverlay();
@@ -3124,14 +3195,14 @@ async function init() {
     return;
   }
 
-  // Анонимность (см. docs/privacy.md, «Anonymity»): имя спрашивается заново при КАЖДОМ заходе
-  // этой модалкой — никакого localStorage. Поле предзаполнено сгенерированным
-  // именем (см. showJoinModal: NameGen.userName()), чтобы можно было просто
-  // нажать «Войти» без ввода, но пользователь может стереть его — тогда
-  // останется анонимом, как и раньше. join-room уходит только после
-  // клика «Войти» (см. onJoinModalSubmit). При авто-reconnect модалка не
-  // показывается повторно — имя уже в памяти вкладки (myName), см.
-  // attemptReconnectOnce/sendJoinAndWait ниже.
+  // Anonymity (see docs/privacy.md, "Anonymity"): the name is asked again
+  // on EVERY visit via this modal — no localStorage at all. The field is
+  // pre-filled with a generated name (see showJoinModal: NameGen.userName())
+  // so you can simply click "Join" without typing, but the user can clear
+  // it — then they stay anonymous, as before. join-room is only sent after
+  // clicking "Join" (see onJoinModalSubmit). On auto-reconnect the modal
+  // isn't shown again — the name is already in the tab's memory (myName),
+  // see attemptReconnectOnce/sendJoinAndWait below.
   showJoinModal();
 }
 
@@ -3144,22 +3215,23 @@ async function connectAndJoin() {
 
   signaling = new Signaling();
   signaling.onError = (event) => {
-    console.error('Ошибка сигналинга:', event);
+    console.error('Signaling error:', event);
   };
   signaling.onClose = () => {
-    // Уже переподключаемся (этот close — от неудавшейся попытки внутри
-    // самого цикла реконнекта) — цикл сам разберётся, повторно не запускаем.
+    // Already reconnecting (this close is from a failed attempt inside the
+    // reconnect loop itself) — the loop will handle it, don't start it again.
     if (reconnecting) return;
-    // Пользователь сам вышел, или уже показан терминальный оверлей
-    // (room-not-found/room-full до первого joined, либо разрыв ещё до
-    // первого joined) — реконнект тут неуместен.
+    // The user left on their own, or a terminal overlay is already shown
+    // (room-not-found/room-full before the first joined, or a drop before
+    // the first joined) — reconnecting here would be inappropriate.
     if (intentionalDisconnect || terminalState || !joinedOnce) return;
 
-    // Неожиданный обрыв сигналинга после успешного входа — mesh (медиа,
-    // DataChannel-чат) при этом жив (см. docs/self-hosting.md, «Surviving a
-    // Restart/Redeploy»), поэтому НЕ рушим
-    // интерфейс сразу: тонкий баннер + авто-reconnect с бэкоффом, и только
-    // если он исчерпает бюджет — терминальный оверлей «Соединение потеряно».
+    // An unexpected signaling drop after a successful join — the mesh
+    // (media, DataChannel chat) stays alive through this (see
+    // docs/self-hosting.md, "Surviving a Restart/Redeploy"), so we do NOT
+    // tear down the UI right away: a thin banner + auto-reconnect with
+    // backoff, and only if it exhausts its budget — the terminal
+    // "Connection lost" overlay.
     startReconnectLoop();
   };
 
@@ -3175,12 +3247,12 @@ async function connectAndJoin() {
   }
 
   registerSignalingHandlers(iceServersCache);
-  // E2E v2: `name` теперь ВСЕГДА null на проводе (имя ходит отдельным
-  // зашифрованным `name-announce`, см. src/protocol.rs и sendNameAnnounceTo/
-  // broadcastNameAnnounceTo выше) — `peerId`/`epub` — наша собственная
-  // идентичность вкладки (см. initCryptoIdentity), шлём её явно с самого
-  // первого входа (не только при реконнекте, см. комментарий там же «Почему
-  // peerId выбирает клиент»).
+  // E2E v2: `name` is now ALWAYS null on the wire (the name travels as a
+  // separate encrypted `name-announce`, see src/protocol.rs and
+  // sendNameAnnounceTo/broadcastNameAnnounceTo above) — `peerId`/`epub` are
+  // our own tab identity (see initCryptoIdentity), sent explicitly from the
+  // very first entry (not only on reconnect, see the comment there "Why the
+  // client chooses peerId").
   signaling.send('join-room', {
     roomId,
     name: null,
@@ -3192,53 +3264,54 @@ async function connectAndJoin() {
 
 function registerSignalingHandlers(iceServers) {
   signaling.on('joined', ({ peerId, peers: otherPeers, screenOwner, leaderId: joinedLeaderId, settings, pending, roomAgeSeconds, maxParticipants: joinedMaxParticipants }) => {
-    // Реконнект ждёт именно этот ответ (см. sendJoinAndWait) — репортуем ему
-    // исход в дополнение к обычной обработке ниже (при первом входе
-    // pendingJoinResolve никогда не взведён).
+    // Reconnect is specifically waiting for this response (see
+    // waitForJoinOutcome) — report it the outcome in addition to the
+    // regular handling below (on the initial join, pendingJoinResolve is
+    // never set).
     if (pendingJoinResolve) pendingJoinResolve('joined');
 
-    // Таймер длительности созвона (count-up): пересинхронизируем базу отсчёта
-    // из свежего roomAgeSeconds на КАЖДОМ joined — и при первом входе, и при
-    // реконнекте (см. startRoomTimer выше и docs/security.md, «Meeting
-    // Duration Ceiling»).
+    // The call-duration timer (count-up): resync the counting base from
+    // the fresh roomAgeSeconds on EVERY joined — both on initial entry and
+    // on reconnect (see startRoomTimer above and docs/security.md,
+    // "Meeting Duration Ceiling").
     startRoomTimer(roomAgeSeconds);
 
-    // Потолок участников — берём с сервера на КАЖДОМ joined (аддитивное
-    // поле, см. maxParticipants выше); если его нет (старый сервер), не
-    // трогаем текущий фолбэк. total пересчитается ниже через
-    // updateParticipantCount на своём обычном пути.
+    // The participant ceiling — taken from the server on EVERY joined (an
+    // additive field, see maxParticipants above); if it's absent (an old
+    // server), we don't touch the current fallback. The total is
+    // recomputed below via updateParticipantCount along its usual path.
     if (typeof joinedMaxParticipants === 'number' && Number.isFinite(joinedMaxParticipants)) {
       maxParticipants = joinedMaxParticipants;
-      // Если у комнаты в этот момент нет своего лимита (лидер не сужал его) —
-      // эффективное значение выше и есть настоящий серверный потолок,
-      // запоминаем его отдельно (см. knownServerMaxParticipants выше) — это
-      // единственный момент, когда мы можем быть в этом уверены.
+      // If the room currently has no custom limit (the leader hasn't
+      // narrowed it), the effective value above IS the real server
+      // ceiling, remember it separately (see knownServerMaxParticipants
+      // above) — this is the only moment we can be sure of that.
       if (settings && settings.maxParticipants == null) {
         knownServerMaxParticipants = joinedMaxParticipants;
       }
     }
 
     if (!joinedOnce) {
-      // --- Первый вход в комнату (не реконнект) ---
+      // --- Initial entry into the room (not a reconnect) ---
       joinedOnce = true;
-      myPeerId = peerId; // почти всегда то же, что мы сами сгенерировали (см. initCryptoIdentity) — переприсваиваем на случай крайне редкой коллизии UUID
+      myPeerId = peerId; // almost always the same as what we generated ourselves (see initCryptoIdentity) — reassigned in case of an extremely rare UUID collision
       hideOverlay();
 
       ownTile = createTile(peerId, myName, true);
 
-      // E2E v2: имена остальных участников больше НЕ приходят в этом
-      // сообщении (PeerInfo.name всегда null у v2-клиентов, см.
-      // src/protocol.rs) — тайлы создаём с плейсхолдером «Guest» (см.
-      // createTile), настоящие имена приедут отдельными name-announce (см.
-      // ниже). Пары ключей кешируем СРАЗУ из epub — до createRemotePeer,
-      // чтобы sigCrypto (SDP/ICE/stream-info, см. createRemotePeer) сразу
-      // нашёл готовый ключ в кеше.
+      // E2E v2: other participants' names no longer arrive in this message
+      // (PeerInfo.name is always null for v2 clients, see src/protocol.rs)
+      // — tiles are created with a "Guest" placeholder (see createTile),
+      // real names will arrive as separate name-announce messages (see
+      // below). We cache key pairs RIGHT AWAY from epub — before
+      // createRemotePeer, so sigCrypto (SDP/ICE/stream-info, see
+      // createRemotePeer) immediately finds the ready key in the cache.
       for (const p of otherPeers) {
         cachePairKeys(p.peerId, p.epub);
         createRemotePeer(p.peerId, null, iceServers);
       }
-      // Анонсируем своё имя всем, кого уже видим (если оно не пусто) —
-      // «идемпотентно» переотправится и на реконнекте (см. ветку ниже).
+      // Announce our own name to everyone we already see (if it's not
+      // empty) — resent "idempotently" on reconnect too (see the branch below).
       broadcastNameAnnounceTo(otherPeers.map((p) => p.peerId));
 
       currentScreenOwnerPeerId = screenOwner || null;
@@ -3249,7 +3322,7 @@ function registerSignalingHandlers(iceServers) {
       roomSettings = settings;
       pendingRequests = (pending || []).map((p) => {
         cachePairKeys(p.peerId, p.epub);
-        return { peerId: p.peerId, name: null }; // «Guest», пока не придёт name-announce от этого pending
+        return { peerId: p.peerId, name: null }; // "Guest" until a name-announce arrives from this pending request
       });
       setLeaderIndicator(joinedLeaderId);
       updateSettingsButtonVisibility();
@@ -3272,26 +3345,27 @@ function registerSignalingHandlers(iceServers) {
         getGuestChatAllowed: () => (roomSettings ? roomSettings.guestChat : true),
       });
       startSasUpdates();
-      // Единый поллер скоростей (см. PEER_STATS_REFRESH_MS/pollPeerStats) —
-      // стартует при входе в комнату и тикает всю сессию, независимо от
-      // числа пиров и открытости панели настроек.
+      // The shared speed poller (see PEER_STATS_REFRESH_MS/pollPeerStats) —
+      // starts on entering the room and keeps ticking for the whole
+      // session, regardless of peer count and whether the settings panel is open.
       startPeerStatsPolling();
       return;
     }
 
-    // --- Реконнект: сверяем состояние комнаты с тем, что у нас уже есть ---
-    // (mesh/медиа/чат уже жили всё это время, ничего из этого не пересоздаём
-    // — см. reconcileAfterReconnect). peerId сервер обычно возвращает тот же
-    // (см. src/ws.rs::JoinRoom { peer_id }), но подстрахуемся и на случай,
-    // если он всё же сменился.
+    // --- Reconnect: reconcile the room state against what we already have ---
+    // (the mesh/media/chat have been alive this whole time, none of it is
+    // recreated here — see reconcileAfterReconnect). The server usually
+    // returns the same peerId (see src/ws.rs::JoinRoom { peer_id }), but we
+    // guard against the rare case where it changed anyway.
     myPeerId = peerId;
     roomSettings = settings;
     setLeaderIndicator(joinedLeaderId);
     updateSettingsButtonVisibility();
-    // Лидерство при реконнекте может смениться (см.
-    // docs/permissions-and-leader.md, «Reconnecting With the Same Peer Id»:
-    // сервер мог уже удалить нас и назначить нового лидера) — pending
-    // видим заново, только если после реконнекта лидер снова мы.
+    // Leadership can change across a reconnect (see
+    // docs/permissions-and-leader.md, "Reconnecting With the Same Peer Id":
+    // the server may have already removed us and assigned a new leader) —
+    // we only see pending requests again if we're the leader once more
+    // after the reconnect.
     pendingRequests = isLeader
       ? (pending || []).map((p) => {
           cachePairKeys(p.peerId, p.epub);
@@ -3302,22 +3376,24 @@ function registerSignalingHandlers(iceServers) {
     applyGuestEnforcement();
     reconcileAfterReconnect(otherPeers, screenOwner);
     refreshMediaRenderingForAllPeers();
-    updateParticipantCount(); // на случай, если maxParticipants выше сменился (сервер перезапустили с другим env)
-    // Реджойн (см. static/crypto.js, «PFS»): пара keys та же (myEphemeralKeyPair
-    // не менялся), но переотправляем name-announce всем — идемпотентно, на
-    // случай что кто-то из пиров тоже реконнектнулся и потерял состояние.
+    updateParticipantCount(); // in case maxParticipants changed above (the server was restarted with a different env)
+    // Re-joining (see static/crypto.js, "PFS"): the key pair is the same
+    // (myEphemeralKeyPair didn't change), but we resend name-announce to
+    // everyone — idempotently, in case one of the peers also reconnected
+    // and lost state.
     broadcastNameAnnounceTo(otherPeers.map((p) => p.peerId));
   });
 
   signaling.on('waiting', ({ leaderPeerId, leaderEpub }) => {
-    // Лобби (см. docs/permissions-and-leader.md, «The Waiting Room
-    // (Lobby)»): вместо joined сначала приходит
-    // это — ждём решения лидера. «Отменить» = leave + на главную (тот же
-    // приём, что и у leaveButton ниже — intentionalDisconnect до leave).
-    // E2E v2: как только известен epub лидера — анонсируем ему своё имя (если
-    // оно не пусто), см. sendNameAnnounceTo. Сервер шлёт СВЕЖИЙ `waiting` при
-    // смене лидера, пока мы ждём (см. src/ws.rs) — этот обработчик срабатывает
-    // повторно и переотправляет анонс уже новому лидеру.
+    // Lobby (see docs/permissions-and-leader.md, "The Waiting Room
+    // (Lobby)"): instead of joined, this arrives first — we wait for the
+    // leader's decision. "Cancel" = leave + go home (the same trick as
+    // leaveButton below — intentionalDisconnect before leave). E2E v2: as
+    // soon as the leader's epub is known, we announce our own name to them
+    // (if it's not empty), see sendNameAnnounceTo. The server sends a FRESH
+    // `waiting` when the leader changes while we're waiting (see
+    // src/ws.rs) — this handler fires again and resends the announcement
+    // to the new leader.
     cachePairKeys(leaderPeerId, leaderEpub);
     sendNameAnnounceTo(leaderPeerId);
     showOverlay({
@@ -3335,32 +3411,34 @@ function registerSignalingHandlers(iceServers) {
 
   signaling.on('join-request', ({ peerId, epub }) => {
     cachePairKeys(peerId, epub);
-    addPendingRequest(peerId, null); // «Guest», пока не придёт name-announce от этого pending (см. signaling.on('name-announce'))
+    addPendingRequest(peerId, null); // "Guest" until a name-announce arrives from this pending request (see signaling.on('name-announce'))
   });
 
   signaling.on('join-request-cancelled', ({ peerId }) => {
     removePendingRequest(peerId);
-    pairKeysCache.delete(peerId); // ожидающий ушёл окончательно, не дожидаясь решения — пара больше не нужна
+    pairKeysCache.delete(peerId); // the waiting peer left for good without waiting for a decision — the pair is no longer needed
   });
 
-  // E2E v2: анонс имени (см. src/protocol.rs::ServerMessage::NameAnnounce) —
-  // от обычного участника ЛЮБОМУ другому, или от pending ТОЛЬКО текущему
-  // лидеру (сервер сам это разграничивает, см. src/ws.rs::handle_name_announce).
+  // E2E v2: name announcement (see src/protocol.rs::ServerMessage::NameAnnounce)
+  // — from a regular participant to ANY other one, or from a pending
+  // participant ONLY to the current leader (the server itself enforces
+  // this distinction, see src/ws.rs::handle_name_announce).
   //
-  // Сообщение от отправителя, с которым НЕТ установленной пары
-  // (pairKeysCache), тихо игнорируется с warn — это НЕ криптопровал: либо
-  // легальный in-flight от только что ушедшего пира (его пара уже почищена
-  // в removeRemotePeer/reject/join-request-cancelled — гонка «сообщение уже
-  // летело, когда пир ушёл» штатна для живого релея), либо мусорный peerId
-  // от сервера. Ни то ни другое не сигнал MITM — атакующему нечего выиграть
-  // сообщением, которое мы игнорируем, а настоящий MITM, портящий трафик
-  // ИЗВЕСТНОЙ пары, по-прежнему бьётся о GCM-провал ниже. Семантика
-  // «известный отправитель + не расшифровалось = терминальный оверлей»
-  // (handleCryptoFailureOnce) сохраняется без изменений — тот же принцип,
-  // что и у offer/answer/ice-candidate (там guard'ом служит peers.get).
+  // A message from a sender with NO established pair (pairKeysCache) is
+  // silently ignored with a warning — this is NOT a crypto failure: either
+  // a legitimate in-flight message from a peer that just left (its pair is
+  // already cleaned up in removeRemotePeer/reject/join-request-cancelled —
+  // the "message was already in flight when the peer left" race is normal
+  // for a live relay), or a garbage peerId from the server. Neither is a
+  // sign of MITM — an attacker gains nothing from a message we ignore,
+  // while a real MITM tampering with traffic for a KNOWN pair still runs
+  // into the GCM failure below. The semantics of "known sender + failed to
+  // decrypt = terminal overlay" (handleCryptoFailureOnce) is unchanged —
+  // the same principle as for offer/answer/ice-candidate (there peers.get
+  // serves as the guard).
   signaling.on('name-announce', ({ from, payload }) => {
     if (!pairKeysCache.has(from)) {
-      console.warn('name-announce от отправителя без установленной пары (ушёл/неизвестен) — игнорируем:', from);
+      console.warn('name-announce from a sender with no established pair (left/unknown) — ignoring:', from);
       return;
     }
     decryptNameAnnouncePayload(from, payload)
@@ -3383,16 +3461,16 @@ function registerSignalingHandlers(iceServers) {
 
   signaling.on('settings-changed', ({ settings }) => {
     roomSettings = settings;
-    // ВАЖНО (легко забываемая точка, см. docs/research-room-limit.md §2.3):
-    // в отличие от joined, settings-changed не присылает эффективный лимит
-    // отдельным числом — только сами настройки. Пересчитываем его сами:
-    // settings.maxParticipants, если лидер выставил свой (не null), иначе —
-    // лучшее известное значение настоящего серверного потолка (см.
-    // knownServerMaxParticipants выше). Без этого пересчёта счётчик
-    // «Participants: N / M» и текст оверлея «Room is full» не обновились бы
-    // у уже подключённых участников в реальном времени при смене лимита
-    // лидером посреди звонка — они читают именно maxParticipants, а не
-    // roomSettings напрямую.
+    // IMPORTANT (an easily-forgotten detail, see
+    // docs/research-room-limit.md §2.3): unlike joined, settings-changed
+    // doesn't send the effective limit as a separate number — only the
+    // settings themselves. We recompute it ourselves: settings.maxParticipants
+    // if the leader set a custom one (not null), otherwise the best known
+    // value of the real server ceiling (see knownServerMaxParticipants
+    // above). Without this recompute, the "Participants: N / M" counter and
+    // the "Room is full" overlay text wouldn't update in real time for
+    // already-connected participants when the leader changes the limit
+    // mid-call — they read maxParticipants specifically, not roomSettings directly.
     maxParticipants = typeof settings.maxParticipants === 'number' ? settings.maxParticipants : knownServerMaxParticipants;
     updateParticipantCount();
     if (!settingsPanelEl.classList.contains('hidden')) syncSettingsPanelInputs();
@@ -3433,32 +3511,34 @@ function registerSignalingHandlers(iceServers) {
     terminalState = true;
     showOverlay({
       title: 'Room is full',
-      // room-full приходит ДО joined (заявка отклонена, joined никогда не
-      // придёт этому сокету) — свежего joined.maxParticipants для ЭТОГО
-      // отказа нет и не будет, поэтому текст использует ту же переменную
-      // maxParticipants, что и остальной UI: значение с сервера, если мы
-      // сами когда-то успешно входили в эту сессию браузера, иначе фолбэк 6.
+      // room-full arrives BEFORE joined (the request was rejected, joined
+      // will never arrive for this socket) — there is and will be no fresh
+      // joined.maxParticipants for THIS rejection, so the text uses the
+      // same maxParticipants variable as the rest of the UI: the
+      // server-provided value if we ourselves ever successfully joined
+      // during this browser session, otherwise the fallback of 6.
       text: `This room already has the maximum of ${maxParticipants} participants. Please try again later.`,
     });
   });
 
-  // Лимит длительности созвона (3 часа, см. docs/security.md, «Meeting
-  // Duration Ceiling», и startRoomTimer выше):
-  // сервер сам решает, что время вышло — рассылает это всем участникам И
-  // ожидающим в лобби, и сам закрывает сокет сразу следом (см. src/ws.rs::
-  // reap_rooms, src/state.rs). terminalState=true ставим СИНХРОННО здесь же
-  // (до того, как придёт сам close) — это тот же приём, что и у
-  // room-not-found/room-full/join-rejected выше: signaling.onClose проверяет
-  // terminalState и не запускает авто-reconnect, не перетирает этот оверлей
-  // «Соединением потеряно» (см. connectAndJoin: signaling.onClose). Терминально
-  // и безвозвратно — комната на сервере уже удалена, реконнект в неё
-  // технически ничего не восстановит (в отличие от рестарта сервера, см.
-  // restoreRoomViaPut — здесь восстанавливать нечего, лимит истёк осознанно).
+  // The meeting-duration limit (3 hours, see docs/security.md, "Meeting
+  // Duration Ceiling", and startRoomTimer above): the server itself decides
+  // when time's up — broadcasts this to all participants AND those waiting
+  // in the lobby, and closes the socket itself right after (see
+  // src/ws.rs::reap_rooms, src/state.rs). We set terminalState=true
+  // SYNCHRONOUSLY right here (before the close itself arrives) — the same
+  // trick as room-not-found/room-full/join-rejected above:
+  // signaling.onClose checks terminalState and doesn't start
+  // auto-reconnect, doesn't overwrite this overlay with "Connection lost"
+  // (see connectAndJoin: signaling.onClose). Terminal and irreversible —
+  // the room is already deleted on the server, reconnecting to it won't
+  // technically restore anything (unlike a server restart, see
+  // restoreRoomViaPut — here there's nothing to restore, the limit expired deliberately).
   signaling.on('room-expired', () => {
     if (pendingJoinResolve) {
       pendingJoinResolve('room-expired');
     }
-    if (terminalState) return; // оверлей уже показан (двойная доставка/гонка) — не перетираем
+    if (terminalState) return; // the overlay is already shown (double delivery/race) — don't overwrite it
     terminalState = true;
     stopRoomTimer();
     showOverlay({
@@ -3472,17 +3552,17 @@ function registerSignalingHandlers(iceServers) {
   signaling.on('peer-joined', ({ peerId, epub }) => {
     cachePairKeys(peerId, epub);
     if (peers.has(peerId)) {
-      // Уже знаем этого пира — mesh пережил обрыв сигналинга (наш или его),
-      // это просто повторный peer-joined от его собственного реконнекта.
-      // Идемпотентно: существующий RtcPeer НЕ пересоздаём.
+      // We already know this peer — the mesh survived a signaling drop
+      // (ours or theirs), this is just a repeated peer-joined from their
+      // own reconnect. Idempotent: we do NOT recreate the existing RtcPeer.
       cancelPendingPeerRemoval(peerId);
       return;
     }
-    // E2E v2: имя приедет отдельным name-announce (см. выше) — до этого
-    // тайл с плейсхолдером «Guest» (см. createTile).
+    // E2E v2: the name will arrive as a separate name-announce (see above)
+    // — until then, a tile with a "Guest" placeholder (see createTile).
     createRemotePeer(peerId, null, iceServers);
     updateParticipantCount();
-    sendNameAnnounceTo(peerId); // «на peer-joined нового пира — name-announce ему»
+    sendNameAnnounceTo(peerId); // "on a new peer's peer-joined — send them a name-announce"
   });
 
   signaling.on('peer-left', ({ peerId }) => {
@@ -3493,7 +3573,7 @@ function registerSignalingHandlers(iceServers) {
   signaling.on('offer', async ({ fromPeerId, sdp }) => {
     const entry = peers.get(fromPeerId);
     if (!entry) {
-      console.warn('offer от неизвестного пира:', fromPeerId);
+      console.warn('offer from an unknown peer:', fromPeerId);
       return;
     }
     await entry.rtc.handleDescription(sdp);
@@ -3511,20 +3591,21 @@ function registerSignalingHandlers(iceServers) {
     await entry.rtc.handleCandidate(candidate);
   });
 
-  // Серверный релей-фоллбэк (см. sendStreamInfoTo) — актуален, пока шина к
-  // конкретному пиру ещё не открыта (в основном bootstrap-окно сразу после
-  // входа в комнату); дальше основной путь — bus.onMessage выше, этот
-  // обработчик становится редким (см. handleStreamInfo — общая точка входа).
-  // E2E v2: `info` с этого пути приходит зашифрованным под попарный
-  // K_pair_sig ИМЕННО отправителя `fromPeerId` (см. sendStreamInfoTo) — по
-  // шине (bus.onMessage выше) info остаётся как есть, не завёрнутым.
-  // Отправитель без установленной пары — тихий warn-скип, НЕ криптопровал:
-  // in-flight сообщение от только что ушедшего пира (пара уже почищена в
-  // removeRemotePeer) — штатная гонка живого релея, см. подробное
-  // обоснование у signaling.on('name-announce') выше.
+  // The server relay fallback (see sendStreamInfoTo) — relevant while the
+  // bus to a specific peer isn't open yet (mainly the bootstrap window
+  // right after joining the room); after that the main path is
+  // bus.onMessage above, and this handler becomes rare (see
+  // handleStreamInfo — the shared entry point). E2E v2: `info` on this path
+  // arrives encrypted under the pairwise K_pair_sig of the sender
+  // `fromPeerId` specifically (see sendStreamInfoTo) — over the bus
+  // (bus.onMessage above) info stays as-is, unwrapped. A sender with no
+  // established pair — a silent warn-skip, NOT a crypto failure: an
+  // in-flight message from a peer that just left (its pair is already cleaned up in
+  // removeRemotePeer) — a normal race for a live relay, see the detailed
+  // reasoning at signaling.on('name-announce') above.
   signaling.on('stream-info', ({ fromPeerId, info }) => {
     if (!pairKeysCache.has(fromPeerId)) {
-      console.warn('stream-info от отправителя без установленной пары (ушёл/неизвестен) — игнорируем:', fromPeerId);
+      console.warn('stream-info from a sender with no established pair (left/unknown) — ignoring:', fromPeerId);
       return;
     }
     decryptSigFrom(fromPeerId, info)
@@ -3533,14 +3614,15 @@ function registerSignalingHandlers(iceServers) {
   });
 
   signaling.on('share-started', ({ peerId }) => {
-    cancelScreenOwnerGrace(); // владелец подтверждён сервером — грейс больше не нужен
-    // Перехват экрана (см. docs/permissions-and-leader.md, «last wins»): если
-    // до этого сообщения ВЛАДЕЛЬЦЕМ был я (currentScreenOwnerPeerId===myPeerId)
-    // и мой локальный захват (getDisplayMedia) ещё жив, а peerId в этом
-    // broadcast — уже не мой, значит меня только что перехватили. Сервер не
-    // шлёт для этого отдельное сообщение — он рассылает share-started всем,
-    // включая прежнего владельца, и это же сообщение служит ему сигналом
-    // остановить свой захват.
+    cancelScreenOwnerGrace(); // the owner is confirmed by the server — the grace period is no longer needed
+    // Screen-share takeover (see docs/permissions-and-leader.md, "last
+    // wins"): if before this message I was the OWNER
+    // (currentScreenOwnerPeerId===myPeerId) and my local capture
+    // (getDisplayMedia) is still alive, but the peerId in this broadcast
+    // isn't mine anymore, it means I've just been taken over. The server
+    // doesn't send a separate message for this — it broadcasts
+    // share-started to everyone, including the previous owner, and this
+    // same message serves as their signal to stop their own capture.
     const iAmPreempted = currentScreenOwnerPeerId === myPeerId && screenStream && peerId !== myPeerId;
     currentScreenOwnerPeerId = peerId;
     if (peerId === myPeerId) {
@@ -3570,26 +3652,28 @@ function registerSignalingHandlers(iceServers) {
   signaling.on('share-rejected', ({ busyPeerId, reason }) => {
     cancelScreenOwnerGrace();
     if (screenStream && currentScreenOwnerPeerId === myPeerId) {
-      // Мы шарили экран до обрыва сигналинга и после реконнекта попытались
-      // переиграть share-start (см. reconcileScreenShareAfterReconnect). Занятость
-      // экрана больше не отклоняется (перехват при конфликте владения — см.
-      // handle_share_start), так что единственная причина реального отказа
-      // здесь — потеря прав (лидер выключил guestScreen, пока мы были офлайн,
-      // см. ветку reason==='forbidden' ниже) — корректно останавливаем свой
-      // локальный захват.
+      // We were sharing our screen before the signaling drop, and after
+      // reconnecting we tried to replay share-start (see
+      // reconcileScreenShareAfterReconnect). Screen busyness is no longer
+      // rejected (takeover on ownership conflict instead — see
+      // handle_share_start), so the only real reason for a rejection here
+      // is losing permission (the leader disabled guestScreen while we
+      // were offline, see the reason==='forbidden' branch below) — we
+      // correctly stop our own local capture.
       forceStopLocalScreenCapture();
     }
     if (reason === 'forbidden') {
-      // Отказ по правам (guestScreen=false, см. docs/permissions-and-leader.md,
-      // «Screen Sharing — Server-Enforced»),
-      // а не потому что экран занят — busyPeerId в этом случае не приходит.
+      // Rejected due to permissions (guestScreen=false, see
+      // docs/permissions-and-leader.md, "Screen Sharing —
+      // Server-Enforced"), not because the screen is busy — busyPeerId
+      // doesn't arrive in this case.
       currentScreenOwnerPeerId = null;
       updateScreenButtonState();
       showRoomMessage('The leader has disabled screen sharing.');
     } else {
-      // Сервер больше никогда не шлёт "занято" (см. src/protocol.rs::ShareRejected) —
-      // эта ветка на практике мёртвая, оставлена только как защитная
-      // синхронизация состояния на случай непредвиденной причины отказа.
+      // The server no longer ever sends "busy" (see
+      // src/protocol.rs::ShareRejected) — this branch is dead in practice,
+      // kept only as a defensive state sync in case of an unforeseen rejection reason.
       currentScreenOwnerPeerId = busyPeerId || null;
       updateScreenButtonState();
       if (busyPeerId) {
@@ -3603,13 +3687,13 @@ function registerSignalingHandlers(iceServers) {
   });
 
   signaling.on('error', ({ message }) => {
-    console.error('Сервер сигналинга сообщил об ошибке:', message);
+    console.error('Signaling server reported an error:', message);
   });
 }
 
-// ---------- Реконнект: цикл переподключения ----------
+// ---------- Reconnect: reconnection loop ----------
 
-/** Дождаться исхода ОДНОЙ попытки join-room: 'joined' | 'room-not-found' | 'room-full' | 'timeout'. */
+/** Wait for the outcome of ONE join-room attempt: 'joined' | 'room-not-found' | 'room-full' | 'timeout'. */
 function waitForJoinOutcome(timeoutMs) {
   return new Promise((resolve) => {
     let done = false;
@@ -3624,11 +3708,11 @@ function waitForJoinOutcome(timeoutMs) {
   });
 }
 
-/** Отправить join-room со своим прежним peerId/epub (см. src/protocol.rs) и дождаться исхода. */
+/** Send join-room with our previous peerId/epub (see src/protocol.rs) and wait for the outcome. */
 function sendJoinAndWait() {
   const promise = waitForJoinOutcome(RECONNECT_JOIN_TIMEOUT_MS);
-  // E2E v2: `name` всегда null (см. connectAndJoin) — peerId/epub те же, что
-  // и при первом входе (не менялись, см. initCryptoIdentity).
+  // E2E v2: `name` is always null (see connectAndJoin) — peerId/epub are the
+  // same as on the initial entry (unchanged, see initCryptoIdentity).
   signaling.send('join-room', {
     roomId,
     name: null,
@@ -3638,18 +3722,18 @@ function sendJoinAndWait() {
   return promise;
 }
 
-/** PUT /api/rooms/<roomId> — восстановить комнату, если реапер/рестарт её убрали (см. src/main.rs::restore_room). */
+/** PUT /api/rooms/<roomId> — restore the room if the reaper/a restart removed it (see src/main.rs::restore_room). */
 async function restoreRoomViaPut() {
   try {
-    // Ш2: через window.API_BASE — см. fetchVersion выше и static/config.js.
+    // Step 2: via window.API_BASE — see fetchVersion above and static/config.js.
     const res = await fetch(`${window.API_BASE}/api/rooms/${encodeURIComponent(roomId)}`, { method: 'PUT' });
-    return res.ok; // 200 (уже была) или 201 (создана) — оба ок
+    return res.ok; // 200 (already existed) or 201 (created) — both are fine
   } catch (err) {
     return false;
   }
 }
 
-/** Одна попытка реконнекта целиком: открыть WS -> join-room -> (если room-not-found) PUT restore -> join-room ещё раз. */
+/** One full reconnect attempt: open the WS -> join-room -> (if room-not-found) PUT restore -> join-room again. */
 async function attemptReconnectOnce() {
   try {
     await signaling.connect();
@@ -3663,11 +3747,11 @@ async function attemptReconnectOnce() {
   if (outcome === 'room-not-found') {
     const restored = await restoreRoomViaPut();
     if (!restored) return false;
-    // Сервер сам закрывает сокет сразу после отказа room-not-found (см.
-    // src/ws.rs: «после отказа сервер сам закрывает сокет») — повторный
-    // join-room на ТОМ ЖЕ сокете уйдёт в никуда (см. Signaling.send: тихо
-    // не отправит на неоткрытом сокете), поэтому перед повторной попыткой
-    // открываем НОВОЕ соединение.
+    // The server itself closes the socket right after a room-not-found
+    // rejection (see src/ws.rs: "after a rejection the server closes the
+    // socket itself") — a repeated join-room on the SAME socket would go
+    // nowhere (see Signaling.send: silently won't send on a closed socket),
+    // so before retrying we open a NEW connection.
     try {
       await signaling.connect();
     } catch (err) {
@@ -3677,8 +3761,8 @@ async function attemptReconnectOnce() {
     return outcome2 === 'joined';
   }
 
-  // 'room-full' (маловероятно — наше место освобождается почти сразу после
-  // обрыва) или 'timeout' — считаем попытку неудачной, цикл повторит с бэкоффом.
+  // 'room-full' (unlikely — our spot frees up almost right after the drop)
+  // or 'timeout' — the attempt is treated as failed, the loop will retry with backoff.
   return false;
 }
 
@@ -3712,8 +3796,8 @@ function scheduleNextReconnectAttempt(delayMs) {
 function finishReconnectSuccess() {
   reconnecting = false;
   hideReconnectBanner();
-  // Стандарт version-skew баннера: перечитать /version.json после каждого
-  // успешного реконнекта (см. docs/signaling-protocol.md, «GET /version.json»).
+  // The version-skew banner standard: re-fetch /version.json after every
+  // successful reconnect (see docs/signaling-protocol.md, "GET /version.json").
   checkVersionSkew();
 }
 
@@ -3728,28 +3812,29 @@ function giveUpReconnect() {
   if (chat) chat.disableInput('Connection lost.');
 }
 
-// ---------- Реконнект: сверка состояния комнаты после успешного join ----------
+// ---------- Reconnect: reconciling room state after a successful join ----------
 
 /**
- * После реконнекта сервер может знать о комнате МЕНЬШЕ, чем знаем мы сами
- * (если он рестартовал — комната воссоздана пустой через PUT restore и
- * заново наполняется по мере того, как остальные участники тоже
- * переподключаются). НЕ пересоздаём то, что уже есть (mesh, тайлы, чат) —
- * только сверяем: новые для нас peers — создаём, тех, кого больше нет в
- * свежем списке — не удаляем сразу, а даём грейс-период (см.
- * schedulePeerRemoval) на случай, что они просто ещё не успели ре-джойниться.
+ * After a reconnect, the server may know LESS about the room than we do
+ * ourselves (if it restarted — the room was recreated empty via PUT
+ * restore and is refilled as other participants also reconnect). We do
+ * NOT recreate what already exists (mesh, tiles, chat) — we only
+ * reconcile: peers new to us are created, those no longer in the fresh
+ * list aren't removed immediately, but given a grace period (see
+ * schedulePeerRemoval) in case they just haven't re-joined yet.
  */
 function reconcileAfterReconnect(otherPeers, screenOwner) {
   const freshIds = new Set(otherPeers.map((p) => p.peerId));
 
   for (const p of otherPeers) {
-    cachePairKeys(p.peerId, p.epub); // тот же K_pair_meta/K_pair_sig, что и в joined/peer-joined (epub пира не меняется в течение его сессии)
+    cachePairKeys(p.peerId, p.epub); // the same K_pair_meta/K_pair_sig as in joined/peer-joined (the peer's epub doesn't change during its session)
     if (peers.has(p.peerId)) {
       cancelPendingPeerRemoval(p.peerId);
     } else {
-      // Имя (если уже известно с ДО обрыва) сохранилось в peerNames — тайл
-      // создаём с ним, а не с плейсхолдером (иначе реконнект без грейс-
-      // периода истёкшего пира выглядел бы как «забыли» уже показанное имя).
+      // The name (if already known from BEFORE the drop) was preserved in
+      // peerNames — the tile is created with it, not a placeholder
+      // (otherwise a reconnect without the grace period for an expired
+      // peer would look like it "forgot" an already-shown name).
       createRemotePeer(p.peerId, peerNames.get(p.peerId) || null, iceServersCache);
     }
   }
@@ -3765,25 +3850,27 @@ function reconcileAfterReconnect(otherPeers, screenOwner) {
 }
 
 /**
- * Сверка состояния шаринга экрана после реконнекта:
- *   - если ДО обрыва шарили мы сами (и захват всё ещё жив локально —
- *     mesh/getDisplayMedia не зависят от сигналинга) — переигрываем
- *     share-start; занятость экрана сервер больше не отклоняет (перехват
- *     вместо отказа — см. handle_share_start), так что это либо подтвердится
- *     (share-started, при необходимости само же и перехватит того, кто занял
- *     экран пока мы были офлайн), либо, если лидер успел отобрать guestScreen
- *     — придёт share-rejected {reason: forbidden}, тогда свой захват
- *     корректно останавливаем (см. обработчик share-rejected выше);
- *   - если шарил кто-то другой и сервер после рестарта его уже знает
- *     (screenOwner пришёл) — просто синхронизируем метку;
- *   - если шарил кто-то другой, но сервер о нём пока не знает (owner ещё не
- *     ре-джойнился, screenOwner=null) — сцена и так жива по mesh, НЕ рушим
- *     её немедленно, даём тот же грейс-период, что и пирам;
- *   - если никто не шарил — просто снимаем метку.
+ * Reconcile screen-sharing state after a reconnect:
+ *   - if WE ourselves were sharing before the drop (and the capture is
+ *     still alive locally — mesh/getDisplayMedia don't depend on
+ *     signaling) — replay share-start; the server no longer rejects for
+ *     screen busyness (takeover instead of rejection — see
+ *     handle_share_start), so this either gets confirmed (share-started,
+ *     taking over from whoever grabbed the screen while we were offline,
+ *     if needed), or, if the leader managed to revoke guestScreen — a
+ *     share-rejected {reason: forbidden} arrives, in which case we
+ *     correctly stop our own capture (see the share-rejected handler above);
+ *   - if someone else was sharing and the server already knows about it
+ *     after restarting (screenOwner arrived) — just sync the label;
+ *   - if someone else was sharing, but the server doesn't know about it yet
+ *     (the owner hasn't re-joined, screenOwner=null) — the stage is
+ *     already alive via the mesh, we do NOT tear it down immediately, we
+ *     give it the same grace period as peers;
+ *   - if no one was sharing — just clear the label.
  */
 function reconcileScreenShareAfterReconnect(screenOwner) {
   if (currentScreenOwnerPeerId === myPeerId && screenStream) {
-    pendingShareDecision = null; // на случай зависшего резолвера от старой попытки
+    pendingShareDecision = null; // in case of a stuck resolver from a stale attempt
     signaling.send('share-start');
     return;
   }
@@ -3802,28 +3889,28 @@ function reconcileScreenShareAfterReconnect(screenOwner) {
   }
 }
 
-// ---------- Микрофон ----------
+// ---------- Microphone ----------
 
 function setMicButtonOn(on) {
   micButton.classList.toggle('control-button--on', on);
   micButton.setAttribute('aria-pressed', String(on));
 }
 
-/** Индикатор «микрофон выключен» на своём тайле — по факту наличия и enabled текущего micTrack. */
+/** "Mic off" indicator on our own tile — based on whether the current micTrack exists and is enabled. */
 function updateOwnMicIndicator() {
   setTileMicOffIndicator(ownTile, !(micTrack && micTrack.enabled));
 }
 
 /**
- * Живая замена устройства микрофона БЕЗ ренегоциации: новый getUserMedia ->
- * RTCRtpSender.replaceTrack на всех уже существующих соединениях (спецификация
- * гарантирует, что replaceTrack не триггерит onnegotiationneeded — приёмники
- * не видят нового ontrack, тот же remote-трек просто начинает нести другое
- * содержимое) -> старый трек останавливаем. `enabledValue` — состояние
- * (включён/выключен), которое должен получить новый трек: вызывающая сторона
- * решает (при обычном переключении «на лету» сохраняем текущее, при
- * отложенном включении после смены устройства, пока мик молчал — то, что
- * получилось бы обычным кликом «включить»).
+ * Live microphone device switch WITHOUT renegotiation: a new getUserMedia
+ * -> RTCRtpSender.replaceTrack on all existing connections (the spec
+ * guarantees replaceTrack doesn't trigger onnegotiationneeded — receivers
+ * don't see a new ontrack, the same remote track simply starts carrying
+ * different content) -> stop the old track. `enabledValue` — the state
+ * (enabled/disabled) the new track should get: the caller decides (for a
+ * regular on-the-fly switch we keep the current state; for a deferred
+ * enable after a device change while the mic was silent — whatever a
+ * regular "turn on" click would have produced).
  */
 async function liveSwitchMicTrack(deviceId, enabledValue) {
   let newStream;
@@ -3832,7 +3919,7 @@ async function liveSwitchMicTrack(deviceId, enabledValue) {
       audio: deviceId ? { deviceId: { exact: deviceId } } : true,
     });
   } catch (err) {
-    console.warn('Не удалось переключить микрофон:', err);
+    console.warn('Failed to switch microphone:', err);
     showRoomMessage('Could not switch microphone.');
     return;
   }
@@ -3844,7 +3931,7 @@ async function liveSwitchMicTrack(deviceId, enabledValue) {
       try {
         await sender.replaceTrack(newTrack);
       } catch (err) {
-        console.warn('replaceTrack(mic) не удался:', err);
+        console.warn('replaceTrack(mic) failed:', err);
       }
     }
   }
@@ -3856,13 +3943,13 @@ async function liveSwitchMicTrack(deviceId, enabledValue) {
   currentMicDeviceId = deviceId || null;
 }
 
-/** Выбор устройства в селекте (см. static/room.html: #setting-mic-device). */
+/** Device selection in the dropdown (see static/room.html: #setting-mic-device). */
 async function applyMicDeviceChange(deviceId) {
   selectedMicDeviceId = deviceId || null;
-  // Мик сейчас реально включён — переключаем немедленно (см. задание, п.1).
-  // Иначе (выключен кнопкой или ещё ни разу не запрошен) — только запомнили
-  // выбор, реальное переключение случится при следующем включении (см.
-  // micButton click ниже).
+  // The mic is currently actually on — switch immediately (see spec item
+  // 1). Otherwise (turned off via the button or never requested yet) —
+  // we've only remembered the choice, the actual switch happens on the
+  // next enable (see micButton click below).
   if (!micTrack || !micTrack.enabled) return;
   await liveSwitchMicTrack(selectedMicDeviceId, true);
   updateOwnMicIndicator();
@@ -3879,7 +3966,7 @@ micButton.addEventListener('click', async () => {
         audio: selectedMicDeviceId ? { deviceId: { exact: selectedMicDeviceId } } : true,
       });
     } catch (err) {
-      console.warn('Доступ к микрофону отклонён:', err);
+      console.warn('Microphone access denied:', err);
       showRoomMessage('Could not access the microphone.');
       micRequestInProgress = false;
       return;
@@ -3892,13 +3979,13 @@ micButton.addEventListener('click', async () => {
     broadcastLocalStream(stream, 'mic');
     setMicButtonOn(true);
     updateOwnMicIndicator();
-    refreshDeviceLists(); // разрешение получено — у enumerateDevices теперь есть labels
+    refreshDeviceLists(); // permission granted — enumerateDevices now has labels
   } else {
     const turningOn = !micTrack.enabled;
     if (turningOn && selectedMicDeviceId && selectedMicDeviceId !== currentMicDeviceId) {
-      // Пока молчали, выбрали другое устройство в настройках — подхватываем
-      // его именно сейчас, при включении (см. задание, «при выключенном —
-      // запомнить и использовать при следующем включении»).
+      // While muted, a different device was selected in settings — pick it
+      // up right now, on enable (see the spec, "while disabled — remember
+      // and use on next enable").
       await liveSwitchMicTrack(selectedMicDeviceId, true);
     } else {
       micTrack.enabled = turningOn;
@@ -3909,7 +3996,7 @@ micButton.addEventListener('click', async () => {
   }
 });
 
-// ---------- Камера ----------
+// ---------- Camera ----------
 
 function setCameraButtonOn(on) {
   cameraButton.classList.toggle('control-button--on', on);
@@ -3921,20 +4008,20 @@ function cameraConstraintsFor(deviceId) {
     width: { ideal: 640 },
     height: { ideal: 360 },
     frameRate: { ideal: 15 },
-    // deviceId и facingMode вместе не нужны — конкретное устройство уже
-    // однозначно выбрано; facingMode (фронтальная по умолчанию на телефоне)
-    // остаётся только фоллбэком, пока пользователь ничего не выбрал сам.
+    // deviceId and facingMode aren't needed together — a specific device is
+    // already unambiguously selected; facingMode (front camera by default
+    // on a phone) remains just a fallback until the user picks something themselves.
     ...(deviceId ? { deviceId: { exact: deviceId } } : { facingMode: 'user' }),
   };
 }
 
-/** Живая замена устройства камеры БЕЗ ренегоциации — см. liveSwitchMicTrack, тот же приём для video. */
+/** Live camera device switch WITHOUT renegotiation — see liveSwitchMicTrack, the same trick for video. */
 async function liveSwitchCamTrack(deviceId, enabledValue) {
   let newStream;
   try {
     newStream = await navigator.mediaDevices.getUserMedia({ video: cameraConstraintsFor(deviceId) });
   } catch (err) {
-    console.warn('Не удалось переключить камеру:', err);
+    console.warn('Failed to switch camera:', err);
     showRoomMessage('Could not switch camera.');
     return;
   }
@@ -3946,7 +4033,7 @@ async function liveSwitchCamTrack(deviceId, enabledValue) {
       try {
         await sender.replaceTrack(newTrack);
       } catch (err) {
-        console.warn('replaceTrack(camera) не удался:', err);
+        console.warn('replaceTrack(camera) failed:', err);
       }
     }
   }
@@ -3962,7 +4049,7 @@ async function liveSwitchCamTrack(deviceId, enabledValue) {
   }
 }
 
-/** Выбор устройства в селекте (см. static/room.html: #setting-camera-device). */
+/** Device selection in the dropdown (see static/room.html: #setting-camera-device). */
 async function applyCameraDeviceChange(deviceId) {
   selectedCamDeviceId = deviceId || null;
   if (!camTrack || !camTrack.enabled) return;
@@ -3978,7 +4065,7 @@ cameraButton.addEventListener('click', async () => {
     try {
       stream = await navigator.mediaDevices.getUserMedia({ video: cameraConstraintsFor(selectedCamDeviceId) });
     } catch (err) {
-      console.warn('Доступ к камере отклонён:', err);
+      console.warn('Camera access denied:', err);
       showRoomMessage('Could not access the camera.');
       camRequestInProgress = false;
       return;
@@ -3996,7 +4083,7 @@ cameraButton.addEventListener('click', async () => {
       setTileVideoVisible(ownTile, true);
     }
     setCameraButtonOn(true);
-    refreshDeviceLists(); // разрешение получено — у enumerateDevices теперь есть labels
+    refreshDeviceLists(); // permission granted — enumerateDevices now has labels
   } else {
     const turningOn = !camTrack.enabled;
     if (turningOn && selectedCamDeviceId && selectedCamDeviceId !== currentCamDeviceId) {
@@ -4010,7 +4097,7 @@ cameraButton.addEventListener('click', async () => {
   }
 });
 
-// ---------- Экран (кнопка) ----------
+// ---------- Screen (button) ----------
 
 screenButton.addEventListener('click', async () => {
   if (screenButton.disabled) return;
@@ -4020,7 +4107,7 @@ screenButton.addEventListener('click', async () => {
     return;
   }
 
-  screenButton.disabled = true; // не даём кликнуть повторно, пока ждём решение сервера
+  screenButton.disabled = true; // prevent another click while we wait for the server's decision
   const granted = await new Promise((resolve) => {
     pendingShareDecision = { resolve };
     signaling.send('share-start');
@@ -4036,30 +4123,32 @@ screenButton.addEventListener('click', async () => {
     stream = await navigator.mediaDevices.getDisplayMedia({
       video: true,
       audio: true,
-      // Defense-in-depth к заглушке в showLocalScreenPreview (основной фикс
-      // «зеркального коридора» — см. её комментарий): selfBrowserSurface
-      // убирает СВОЮ же вкладку из пикера захвата (для варианта «весь экран»
-      // не спасает — это поля первого уровня опций getDisplayMedia, не
-      // video-constraints; браузеры без их поддержки безопасно игнорируют).
+      // Defense-in-depth alongside the placeholder in showLocalScreenPreview
+      // (the main fix for the "hall of mirrors" — see its comment):
+      // selfBrowserSurface removes OUR OWN tab from the capture picker
+      // (doesn't help for the "whole screen" option — these are top-level
+      // getDisplayMedia option fields, not video constraints; browsers
+      // without support for them safely ignore them).
       selfBrowserSurface: 'exclude',
       surfaceSwitching: 'include',
     });
   } catch (err) {
-    console.warn('getDisplayMedia отменён/отклонён:', err);
-    signaling.send('share-stop'); // отпускаем захваченный замок
+    console.warn('getDisplayMedia cancelled/denied:', err);
+    signaling.send('share-stop'); // release the lock we grabbed
     showRoomMessage('Screen sharing was cancelled.');
     updateScreenButtonState();
     return;
   }
 
   if (currentScreenOwnerPeerId !== myPeerId) {
-    // Гонка (см. docs/permissions-and-leader.md, «перехват шаринга»): пока мы
-    // ждали решение ОС/браузера в getDisplayMedia (реальная асинхронная пауза
-    // — единственное окно, где это возможно), кто-то другой успел прислать
-    // свой share-start и перехватить экран раньше нас (обработчик
-    // share-started выше уже обновил currentScreenOwnerPeerId и сцену).
-    // Наш захват уже никому не нужен — сразу останавливаем, не показывая
-    // свою сцену и не трогая чужую.
+    // A race (see docs/permissions-and-leader.md, "screen-share takeover"):
+    // while we were waiting for the OS/browser's decision in
+    // getDisplayMedia (a real async pause — the only window where this is
+    // possible), someone else managed to send their own share-start and
+    // take over the screen before us (the share-started handler above has
+    // already updated currentScreenOwnerPeerId and the stage). Our capture
+    // is now useless to anyone — we stop it right away, without showing
+    // our own stage or touching anyone else's.
     for (const track of stream.getTracks()) track.stop();
     updateScreenButtonState();
     return;
@@ -4069,7 +4158,7 @@ screenButton.addEventListener('click', async () => {
   const videoTrack = stream.getVideoTracks()[0];
   if (videoTrack) {
     videoTrack.onended = () => {
-      console.log('Видеотрек экрана завершён браузером (нативная плашка «Прекратить показ») — останавливаем шаринг');
+      console.log('Screen video track ended by the browser (the native "Stop sharing" bar) — stopping the share');
       stopScreenShare();
     };
   }
@@ -4079,7 +4168,7 @@ screenButton.addEventListener('click', async () => {
   updateScreenButtonState();
 });
 
-/** Остановить локальный захват экрана (треки + отправку пирам), без share-stop серверу и без трогать UI сцены — используется обычной остановкой (stopScreenShare), реконнектом (см. обработчик share-rejected в registerSignalingHandlers) и перехватом экрана другим участником (см. обработчик share-started там же). */
+/** Stop the local screen capture (tracks + sending to peers), without sending share-stop to the server and without touching the stage UI — used by a regular stop (stopScreenShare), by reconnect (see the share-rejected handler in registerSignalingHandlers), and by a screen-share takeover from another participant (see the share-started handler there too). */
 function forceStopLocalScreenCapture() {
   if (!screenStream) return;
   removeLocalStreamFromAllPeers(screenStream);
@@ -4099,14 +4188,14 @@ function stopScreenShare() {
   updateScreenButtonState();
 }
 
-// ---------- Fullscreen сцены шаринга экрана ----------
+// ---------- Fullscreen for the screen-share stage ----------
 //
-// Fullscreen API у современных Chrome/Safari не требует webkit-префикса на
-// десктопе, но iOS Safari (даже актуальные версии на момент написания —
-// см. caniyouse.com/fullscreen) поддерживает requestFullscreen() на
-// произвольном элементе не везде так же надёжно, как webkitRequestFullscreen
-// — поэтому пробуем стандартный метод первым и откатываемся на webkit-версию
-// как на iOS-фоллбэк. Тот же приём для exitFullscreen/fullscreenElement.
+// The Fullscreen API in modern Chrome/Safari doesn't require a webkit
+// prefix on desktop, but iOS Safari (even current versions as of writing —
+// see caniyouse.com/fullscreen) doesn't support requestFullscreen() on an
+// arbitrary element as reliably everywhere as webkitRequestFullscreen —
+// so we try the standard method first and fall back to the webkit version
+// as an iOS fallback. The same trick for exitFullscreen/fullscreenElement.
 function requestFullscreenCompat(el) {
   const fn = el.requestFullscreen || el.webkitRequestFullscreen;
   if (!fn) return Promise.reject(new Error('Fullscreen API is not available'));
@@ -4124,12 +4213,13 @@ function isFullscreenActive() {
 }
 
 /**
- * Помимо обычного aria-pressed/title по фактическому состоянию Fullscreen
- * API, прячет и дизейблит кнопку, когда экран сейчас шарю я сам —
- * фулскринить свою же статичную заглушку «You are sharing your screen» (см.
- * showLocalScreenPreview) смысла нет, там нет живого видео. Пересчитывается
- * из showLocalScreenPreview/showRemoteScreenCaption/hideScreenStage (владение
- * сценой могло смениться, в т.ч. перехватом) и штатно на fullscreenchange.
+ * Besides the usual aria-pressed/title reflecting the actual Fullscreen
+ * API state, hides and disables the button when I'm currently sharing my
+ * own screen — there's no point fullscreening our own static "You are
+ * sharing your screen" placeholder (see showLocalScreenPreview), there's no
+ * live video there. Recomputed from
+ * showLocalScreenPreview/showRemoteScreenCaption/hideScreenStage (stage
+ * ownership may have changed, including via a takeover) and normally on fullscreenchange.
  */
 function updateFullscreenButtonState() {
   const selfSharing = currentScreenOwnerPeerId === myPeerId;
@@ -4154,18 +4244,18 @@ screenFullscreenButtonEl.addEventListener('click', async () => {
       await requestFullscreenCompat(screenStageEl);
     }
   } catch (err) {
-    // Fullscreen может быть недоступен (headless-браузер, запрет окружения и
-    // т.п.) — не ломаем остальной UI, просто логируем.
-    console.warn('Fullscreen недоступен:', err);
+    // Fullscreen may be unavailable (headless browser, environment
+    // restriction, etc.) — don't break the rest of the UI, just log it.
+    console.warn('Fullscreen unavailable:', err);
   }
 });
 
 document.addEventListener('fullscreenchange', updateFullscreenButtonState);
 document.addEventListener('webkitfullscreenchange', updateFullscreenButtonState);
 
-// ---------- Поделиться (попап с QR + ссылка) ----------
+// ---------- Share (popup with QR + link) ----------
 
-/** Скопировать текст в буфер обмена с фоллбэком для окружений без Clipboard API. */
+/** Copy text to the clipboard, with a fallback for environments without the Clipboard API. */
 async function copyTextToClipboard(text) {
   try {
     await navigator.clipboard.writeText(text);
@@ -4184,7 +4274,7 @@ async function copyTextToClipboard(text) {
       tmpInput.remove();
       return success;
     } catch (execErr) {
-      console.error('Не удалось скопировать ссылку:', execErr);
+      console.error('Failed to copy the link:', execErr);
       return false;
     }
   }
@@ -4195,17 +4285,18 @@ function onSharePopupKeydown(event) {
 }
 
 /**
- * Ссылка «Поделиться» (E2E v2): собирается ЗАНОВО из location.pathname +
- * токена/срока действия, запомненных при старте страницы (linkTokenBase64url/
- * linkExpiry, см. верх файла) — НЕ из location.href, потому что leaderToken
- * там в любом случае никогда не было бы (он одноразовый и только для
- * создателя). Вид: `<origin>/r/<id>#t=<token>&e=<expiry>&n=<имя>` — БЕЗ lt.
- * `n` добавляется только если имя комнаты известно (initialRoomName) — так
- * название комнаты едет в инвайт-ссылке и становится видно всем, кто по ней
- * перешёл (см. рендер initialRoomName и парсинг фрагмента выше); сервер это
- * имя всё равно не увидит — фрагмент на сервер не уходит. Все, кто зашёл по
- * этой ссылке, аутентифицируются ОДНИМ и тем же `t`/`e` (как и раньше с `k`),
- * но выводят СВОИ собственные попарные ключи (см. static/crypto.js).
+ * The "Share" link (E2E v2): rebuilt FROM SCRATCH from location.pathname +
+ * the token/expiry remembered when the page started (linkTokenBase64url/
+ * linkExpiry, see top of file) — NOT from location.href, because
+ * leaderToken would never be there anyway (it's one-time and only for the
+ * creator). Shape: `<origin>/r/<id>#t=<token>&e=<expiry>&n=<name>` — WITHOUT
+ * lt. `n` is added only if the room name is known (initialRoomName) — this
+ * way the room name travels in the invite link and becomes visible to
+ * everyone who follows it (see the initialRoomName render and the fragment
+ * parsing above); the server still won't see this name — the fragment
+ * never goes to the server. Everyone who joins via this link authenticates
+ * with the SAME `t`/`e` (as before with `k`), but each derives THEIR OWN
+ * pairwise keys (see static/crypto.js).
  */
 function buildShareLink() {
   const namePart = initialRoomName ? `&n=${encodeURIComponent(initialRoomName)}` : '';
@@ -4213,13 +4304,13 @@ function buildShareLink() {
 }
 
 /**
- * Отрисовать QR ЛОКАЛЬНО в браузере (см. static/vendor/qrcode.js —
- * kazuhikoarase/qrcode-generator, MIT) вместо похода на сервер: ссылка
- * комнаты несёт секретные `#t`/`#e` и не должна покидать вкладку ради
- * картинки. `qrcode(0, 'M')` — typeNumber=0 значит авто-подбор версии QR под
- * длину текста, 'M' — стандартный уровень коррекции ошибок. createSvgTag
- * строит SVG из чистых числовых координат (сам текст ссылки в разметку не
- * попадает как HTML) — безопасно вставлять через innerHTML.
+ * Render the QR code LOCALLY in the browser (see static/vendor/qrcode.js —
+ * kazuhikoarase/qrcode-generator, MIT) instead of going to the server: the
+ * room link carries secret `#t`/`#e` and shouldn't leave the tab just for
+ * an image. `qrcode(0, 'M')` — typeNumber=0 means auto-selecting the QR
+ * version based on text length, 'M' is the standard error-correction
+ * level. createSvgTag builds SVG from plain numeric coordinates (the link
+ * text itself doesn't end up in the markup as HTML) — safe to insert via innerHTML.
  */
 function renderShareQr(text) {
   sharePopupQrEl.textContent = '';
@@ -4229,7 +4320,7 @@ function renderShareQr(text) {
     qr.make();
     sharePopupQrEl.innerHTML = qr.createSvgTag(4, 12);
   } catch (err) {
-    console.error('Не удалось построить QR-код комнаты:', err);
+    console.error('Failed to build the room QR code:', err);
   }
 }
 
@@ -4237,7 +4328,7 @@ function openSharePopup() {
   const link = buildShareLink();
   renderShareQr(link);
   sharePopupLinkEl.textContent = link;
-  renderShareBuildLine(); // не блокирует открытие — если хэш ещё не подтянулся, fetchBuildHashOnce().then() выше обновит строку сам, когда придёт
+  renderShareBuildLine(); // doesn't block opening — if the hash hasn't arrived yet, fetchBuildHashOnce().then() above will update the line itself once it does
   sharePopupEl.classList.remove('hidden');
   document.addEventListener('keydown', onSharePopupKeydown);
 }
@@ -4263,22 +4354,23 @@ sharePopupCopyButtonEl.addEventListener('click', async () => {
   }
 });
 
-// ---------- Покинуть комнату ----------
+// ---------- Leave room ----------
 
-// Вкладка закрывается/уходит со страницы (крестик, навигация, reload) — WS
-// оборвётся сам собой через мгновение, но это НЕ обрыв сигналинга, который
-// нужно чинить: страница всё равно исчезает, реконнект-цикл (даже одна его
-// успевшая стартовать попытка) в этот момент только продлил бы жизнь
-// комнаты на сервере лишним повторным join-room от умирающей вкладки.
-// `pagehide` срабатывает раньше фактического разрыва соединения при
-// закрытии/навигации/reload — успеваем взвести флаг до onClose.
+// The tab is closing/navigating away (the X button, navigation, reload) —
+// the WS will drop on its own in a moment, but this is NOT a signaling
+// drop that needs fixing: the page is disappearing anyway, a reconnect
+// cycle (even a single attempt that manages to start) at this point would
+// only extend the room's lifetime on the server with a redundant
+// join-room from a dying tab. `pagehide` fires earlier than the actual
+// connection drop on close/navigation/reload — we manage to set the flag
+// before onClose.
 window.addEventListener('pagehide', () => {
   intentionalDisconnect = true;
 });
 
 leaveButton.addEventListener('click', () => {
-  // Намеренный выход — закрытие сокета, которое за этим последует, НЕ должно
-  // триггерить авто-reconnect (см. signaling.onClose в init()).
+  // An intentional exit — the socket closure that follows must NOT
+  // trigger auto-reconnect (see signaling.onClose in init()).
   intentionalDisconnect = true;
   if (signaling) {
     signaling.send('leave');

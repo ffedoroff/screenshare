@@ -2,32 +2,32 @@
 name = "screenshare"
 version = "0.1.0"
 edition = "2021"
-description = "Браузерный шеринг экрана: mesh P2P WebRTC + Rust signaling-сервер"
+description = "Browser screen sharing: mesh P2P WebRTC + Rust signaling server"
 
 [dependencies]
-# Веб-фреймворк с встроенной поддержкой WebSocket
+# Web framework with built-in WebSocket support
 axum = { version = "0.8", features = ["ws"] }
-# Асинхронный рантайм
+# Async runtime
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "fs", "sync", "signal"] }
-# Сериализация сообщений сигналинга
+# Serialization of signaling messages
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Генерация peerId (и как источник энтропии для короткого roomId)
+# peerId generation (also used as an entropy source for the short roomId)
 uuid = { version = "1", features = ["v4"] }
-# Логирование
+# Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# H1 (эфемерные TURN-креды, см. src/main.rs::ice_config): HMAC-SHA1 по
-# TURN_STATIC_SECRET в стиле TURN REST API (draft-uberti-behave-turn-rest-00,
-# совместимо с turn-rs `auth.static-auth-secret`) — минимальные фичи, без
-# std-рандома/OID/zeroize, они нам не нужны.
+# H1 (ephemeral TURN credentials, see src/main.rs::ice_config): HMAC-SHA1 over
+# TURN_STATIC_SECRET in the TURN REST API style (draft-uberti-behave-turn-rest-00,
+# compatible with turn-rs `auth.static-auth-secret`) — minimal features, no
+# std-rand/OID/zeroize, we don't need those.
 hmac = { version = "0.13.0", default-features = false }
 sha1 = { version = "0.11.0", default-features = false }
-# credential в iceServers — base64(HMAC-SHA1(...)), как ждёт turn-rs.
+# credential in iceServers — base64(HMAC-SHA1(...)), as expected by turn-rs.
 base64 = "0.22.1"
-# Prometheus-метрики (см. src/metrics.rs, src/main.rs::management_router) — тот
-# же крейт/паттерн, что у code-ranker-backend (отдельный management-порт,
-# PrometheusBuilder::install_recorder() + PrometheusHandle::render() на
-# /metrics), см. simple-deploy/standards/observability/metrics.md.
+# Prometheus metrics (see src/metrics.rs, src/main.rs::management_router) — the
+# same crate/pattern as code-ranker-backend (separate management port,
+# PrometheusBuilder::install_recorder() + PrometheusHandle::render() on
+# /metrics), see simple-deploy/standards/observability/metrics.md.
 metrics = "0.23"
 metrics-exporter-prometheus = { version = "0.15", default-features = false }

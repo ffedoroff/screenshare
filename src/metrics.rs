@@ -1,78 +1,81 @@
-//! Имена Prometheus-метрик + их пре-регистрация.
+//! Prometheus metric names + their pre-registration.
 //!
-//! Тот же паттерн, что у `code-ranker-backend` (см.
-//! `code-ranker-private/backend/src/metrics.rs`): каждое имя объявлено здесь
-//! ОДИН раз как `pub const`, чтобы опечатка в строковом литерале не заводила
-//! молча новую, никем не запрашиваемую серию вместо ошибки компиляции.
-//! [`describe`] пре-регистрирует каждую метрику (имя + HELP-текст) при
-//! старте через `describe_gauge!`/`describe_counter!`, чтобы `/metrics` нёс
-//! `# HELP`/`# TYPE` уже до первого события — иначе панели Grafana показывают
-//! "No data", пока не случится первое совпадающее событие (актуально в
-//! основном для гейджей, которые заполняются только периодическим семплером
-//! ниже, см. `crate::state::reap_rooms`).
+//! Same pattern as `code-ranker-backend` (see
+//! `code-ranker-private/backend/src/metrics.rs`): each name is declared here
+//! ONCE as a `pub const`, so a typo in the string literal doesn't silently
+//! start a new, unrequested series instead of causing a compile error.
+//! [`describe`] pre-registers each metric (name + HELP text) at startup
+//! via `describe_gauge!`/`describe_counter!`, so `/metrics` carries
+//! `# HELP`/`# TYPE` already before the first event — otherwise Grafana
+//! panels show "No data" until the first matching event happens (relevant
+//! mainly for gauges, which are only populated by the periodic sampler
+//! below, see `crate::state::reap_rooms`).
 //!
-//! Единицы измерения и кардинальность — по
-//! `simple-deploy/standards/observability/metrics.md`: имя вида
-//! `chat_<что>_<единица>[_total]`, никаких лейблов с unbounded-значениями
-//! (roomId/peerId сюда никогда не попадают — комнат и так у сервера единицы,
-//! а не тысячи, отдельная разбивка по комнате не нужна и не нужна для DoS-
-//! защиты, только суммарные по процессу гейджи).
+//! Units and cardinality follow
+//! `simple-deploy/standards/observability/metrics.md`: name of the form
+//! `chat_<what>_<unit>[_total]`, no labels with unbounded values
+//! (roomId/peerId never end up here — the server has units of rooms anyway,
+//! not thousands, a per-room breakdown isn't needed and isn't needed for
+//! DoS protection either, only process-wide summary gauges).
 
 use metrics::{describe_counter, describe_gauge, Unit};
 
-/// Гейдж. Текущее число комнат в памяти процесса (и живых, и опустевших, но
-/// ещё не удалённых реапером). Обновляется семплером в `state::reap_rooms`
-/// после каждого прохода по комнатам (см. её комментарий) — не на каждый
-/// HTTP/WS-запрос, чтобы не добавлять лишний contention на горячий путь
-/// `create_room`/`join-room`.
+/// Gauge. Current number of rooms in process memory (both alive and emptied
+/// but not yet removed by the reaper). Updated by the sampler in
+/// `state::reap_rooms` after each pass over the rooms (see its comment) —
+/// not on every HTTP/WS request, so as not to add extra contention on the
+/// hot path of `create_room`/`join-room`.
 pub const ROOMS: &str = "chat_rooms";
 
-/// Гейдж. Суммарное число ПОЛНОЦЕННЫХ участников по всем комнатам разом (не
-/// ожидающих в лобби — см. `PENDING` ниже). Тот же семплер, что у `ROOMS`.
+/// Gauge. Total number of FULL participants across all rooms combined (not
+/// counting those waiting in the lobby — see `PENDING` below). Same sampler
+/// as `ROOMS`.
 pub const PARTICIPANTS: &str = "chat_participants";
 
-/// Гейдж. Суммарное число ожидающих одобрения в лобби по всем комнатам разом
-/// (`Room::pending`). Тот же семплер, что у `ROOMS`/`PARTICIPANTS`.
+/// Gauge. Total number of participants waiting for approval in the lobby
+/// across all rooms combined (`Room::pending`). Same sampler as
+/// `ROOMS`/`PARTICIPANTS`.
 pub const PENDING: &str = "chat_pending";
 
-/// Счётчик. Сколько комнат было создано за жизнь процесса — и через `POST
-/// /api/rooms`, и через `PUT /api/rooms/{id}`, когда комнаты с таким id ещё
-/// не было (реальное создание записи, а не идемпотентное подтверждение уже
-/// существующей — см. `main.rs::create_room`/`restore_room`).
+/// Counter. How many rooms were created over the process lifetime — both via
+/// `POST /api/rooms` and via `PUT /api/rooms/{id}` when a room with that id
+/// didn't exist yet (an actual record creation, not an idempotent
+/// confirmation of one that already exists — see
+/// `main.rs::create_room`/`restore_room`).
 pub const ROOMS_CREATED_TOTAL: &str = "chat_rooms_created_total";
 
-/// Гейдж. Текущее число открытых WS-соединений (см. `ws::handle_socket`) —
-/// считается ДО входа в комнату и после выхода из неё тоже (соединение может
-/// быть открыто, но ещё не прислать `join-room`, либо уже покинуть комнату,
-/// но ещё не закрыть сокет) — то есть это не то же самое, что
-/// `PARTICIPANTS`: WS-соединений в моменте может быть немного больше, чем
-/// участников комнат (лобби, ещё не отправленный `join-room`, разрыв после
-/// `leave`).
+/// Gauge. Current number of open WS connections (see `ws::handle_socket`) —
+/// counted BEFORE entering a room and after leaving it too (a connection may
+/// be open but not yet have sent `join-room`, or may have already left the
+/// room but not yet closed the socket) — that is, this is not the same as
+/// `PARTICIPANTS`: the number of WS connections at any moment can be
+/// somewhat higher than the number of room participants (lobby, `join-room`
+/// not yet sent, disconnect after `leave`).
 pub const WEBSOCKET_CONNECTIONS: &str = "chat_websocket_connections";
 
-/// Пре-регистрирует все метрики выше (имя + HELP-текст) в глобальном
-/// recorder'е. Вызывается один раз при старте, ДО первого
-/// `gauge!`/`counter!` — см. комментарий модуля.
+/// Pre-registers all the metrics above (name + HELP text) in the global
+/// recorder. Called once at startup, BEFORE the first
+/// `gauge!`/`counter!` — see the module comment.
 pub fn describe() {
-    describe_gauge!(ROOMS, Unit::Count, "Текущее число комнат в памяти процесса.");
+    describe_gauge!(ROOMS, Unit::Count, "Current number of rooms in process memory.");
     describe_gauge!(
         PARTICIPANTS,
         Unit::Count,
-        "Суммарное число участников по всем комнатам разом."
+        "Total number of participants across all rooms combined."
     );
     describe_gauge!(
         PENDING,
         Unit::Count,
-        "Суммарное число ожидающих одобрения в лобби по всем комнатам разом."
+        "Total number of participants waiting for lobby approval across all rooms combined."
     );
     describe_counter!(
         ROOMS_CREATED_TOTAL,
         Unit::Count,
-        "Сколько комнат было реально создано (POST /api/rooms + PUT-восстановление несуществующей) за жизнь процесса."
+        "How many rooms were actually created (POST /api/rooms + PUT-restoration of a nonexistent one) over the process lifetime."
     );
     describe_gauge!(
         WEBSOCKET_CONNECTIONS,
         Unit::Count,
-        "Текущее число открытых WS-соединений (не то же самое, что участники комнат)."
+        "Current number of open WS connections (not the same as room participants)."
     );
 }

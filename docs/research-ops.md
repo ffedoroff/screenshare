@@ -1,658 +1,707 @@
-# Ресёрч: деплой без разрывов и ёмкость одного инстанса
+# Research: Zero-Downtime Deploy and Single-Instance Capacity
 
-> Только анализ — ничего в коде/манифестах/CI этим файлом не меняется. Факты
-> о том, как проект устроен сейчас, взяты из `docs/self-hosting.md`,
-> `docs/webrtc-mesh.md`, `docs/signaling-protocol.md`, `src/main.rs`,
-> `src/ws.rs`, `src/state.rs`, `static/room.js`, `.github/workflows/deploy-prod.yml`,
-> `deploy/manifests/*.yaml`, `deploy/README.md`. Внешние цифры (память на
-> WS-соединение, FD-лимиты и т.п.) — из веб-поиска, июль 2026, источники в
-> конце каждой части. Где цифра не подтверждена независимо (например,
-> реальная память процесса на живом сервере) — это явно помечено как оценка,
-> а не факт.
+> Analysis only — this file doesn't change anything in the code/manifests/CI.
+> The facts about how the project is currently structured come from
+> `docs/self-hosting.md`, `docs/webrtc-mesh.md`, `docs/signaling-protocol.md`,
+> `src/main.rs`, `src/ws.rs`, `src/state.rs`, `static/room.js`,
+> `.github/workflows/deploy-prod.yml`, `deploy/manifests/*.yaml`,
+> `deploy/README.md`. External figures (memory per WS connection, FD limits,
+> etc.) come from web search, July 2026, sources at the end of each part.
+> Where a figure isn't independently confirmed (e.g., the real process memory
+> on a live server) it's explicitly marked as an estimate, not a fact.
 
 <!-- toc -->
 
-- [Часть 1. Полностью бесшовный деплой новой версии](#часть-1-полностью-бесшовный-деплой-новой-версии)
-  - [1.0 Что происходит сейчас](#10-что-происходит-сейчас)
-  - [1.1 Вариант — Graceful drain с параллельным новым контейнером](#11-вариант--graceful-drain-с-параллельным-новым-контейнером)
-  - [1.2 Вариант — Blue-green с липкостью по roomId](#12-вариант--blue-green-с-липкостью-по-roomid)
-  - [1.3 Вариант — SO_REUSEPORT / передача слушающего сокета](#13-вариант--so_reuseport--передача-слушающего-сокета)
-  - [1.4 Вариант — State handoff (сериализация комнат)](#14-вариант--state-handoff-сериализация-комнат)
-  - [1.5 Вариант — Ничего не делать сверх текущего](#15-вариант--ничего-не-делать-сверх-текущего)
-  - [1.6 Рекомендация](#16-рекомендация)
-- [Часть 2. Ёмкость одного инстанса](#часть-2-ёмкость-одного-инстанса)
-  - [2.1 Что тратится на комнату/участника (по коду)](#21-что-тратится-на-комнатуучастника-по-коду)
+- [Part 1. A Fully Seamless Deploy of a New Version](#part-1-a-fully-seamless-deploy-of-a-new-version)
+  - [1.0 What Happens Now](#10-what-happens-now)
+  - [1.1 Option — Graceful Drain with a Parallel New Container](#11-option--graceful-drain-with-a-parallel-new-container)
+  - [1.2 Option — Blue-Green with roomId Stickiness](#12-option--blue-green-with-roomid-stickiness)
+  - [1.3 Option — SO_REUSEPORT / Passing the Listening Socket](#13-option--so_reuseport--passing-the-listening-socket)
+  - [1.4 Option — State Handoff (Serializing Rooms into a New Process)](#14-option--state-handoff-serializing-rooms-into-a-new-process)
+  - [1.5 Option — Do Nothing Beyond the Current Setup](#15-option--do-nothing-beyond-the-current-setup)
+  - [1.6 Recommendation](#16-recommendation)
+- [Part 2. Single-Instance Capacity](#part-2-single-instance-capacity)
+  - [2.1 What a Room/Participant Costs (From the Code)](#21-what-a-roomparticipant-costs-from-the-code)
   - [2.2 CPU](#22-cpu)
-  - [2.3 Порты и файловые дескрипторы](#23-порты-и-файловые-дескрипторы)
-  - [2.4 Сеть](#24-сеть)
-  - [2.5 Итоговая таблица по размерам инстанса](#25-итоговая-таблица-по-размерам-инстанса)
-  - [2.6 Рекомендация по MAX_ROOMS](#26-рекомендация-по-max_rooms)
-  - [2.7 Точный расчёт памяти: 10 / 100 / 1 000 / 1 000 000 комнат × 3 участника](#27-точный-расчёт-памяти-10--100--1-000--1-000-000-комнат--3-участника)
-- [Источники](#источники)
+  - [2.3 Ports and File Descriptors](#23-ports-and-file-descriptors)
+  - [2.4 Network](#24-network)
+  - [2.5 Summary Table by Instance Size](#25-summary-table-by-instance-size)
+  - [2.6 Recommendation for MAX_ROOMS](#26-recommendation-for-max_rooms)
+  - [2.7 Precise Memory Calculation: 10 / 100 / 1 000 / 1 000 000 Rooms × 3 Participants](#27-precise-memory-calculation-10--100--1-000--1-000-000-rooms--3-participants)
+- [Sources](#sources)
 
 <!-- /toc -->
 
 ---
 
-## Часть 1. Полностью бесшовный деплой новой версии
+## Part 1. A Fully Seamless Deploy of a New Version
 
-### 1.0 Что происходит сейчас
+### 1.0 What Happens Now
 
-> Реализовано 2026-07-16: активная рассылка `Close` (код 1012) всем открытым
-> WS-соединениям по `SIGTERM` + пауза ~500мс на flush перед завершением
-> процесса (см. §1.6) — описание ниже про «WS-соединения переживают SIGTERM
-> до SIGKILL» относится к состоянию ДО этой правки.
+> Implemented 2026-07-16: an active broadcast of `Close` (code 1012) to all
+> open WS connections on `SIGTERM` + a ~500ms pause to flush before the
+> process terminates (see §1.6) — the description below of "WS connections
+> survive SIGTERM until SIGKILL" refers to the state BEFORE this change.
 
-**Пайплайн.** Push в `main` → `.github/workflows/deploy-prod.yml`: job `test`
-(протокол сигналинга) и `e2e` (браузерные тесты) гейтят всё остальное → job
-`deploy` собирает образ (`docker buildx`, тег `prod-<short-sha>`) и **доставляет
-его по SSH напрямую на сервер, без реестра** (`docker save | gzip | ssh …`) →
-серверный `deployer` (forced command) импортирует образ в containerd и
-выполняет `kubectl set image deployment/chat '*=chat:<tag>'`, затем ждёт
-`rollout status` (`deploy/README.md`). Значит, вопрос «что физически происходит
-при обновлении» — это вопрос не про Docker-рестарт напрямую, а про то, как
-Kubernetes (конкретно — однонодовый KubeSolo) катит `Deployment` с уже
-заданной стратегией.
+**Pipeline.** A push to `main` → `.github/workflows/deploy-prod.yml`: the
+`test` job (signaling protocol) and `e2e` job (browser tests) gate everything
+else → the `deploy` job builds the image (`docker buildx`, tag
+`prod-<short-sha>`) and **delivers it over SSH directly to the server, with
+no registry** (`docker save | gzip | ssh …`) → the server-side `deployer`
+(forced command) imports the image into containerd and runs
+`kubectl set image deployment/chat '*=chat:<tag>'`, then waits for
+`rollout status` (`deploy/README.md`). So the question "what physically
+happens on an update" isn't really about a Docker restart directly, but about
+how Kubernetes (specifically, single-node KubeSolo) rolls out a `Deployment`
+with its already-configured strategy.
 
-**Стратегия — `Recreate`, не `RollingUpdate`, и это осознанно.**
+**The strategy is `Recreate`, not `RollingUpdate`, and it's deliberate.**
 `deploy/manifests/deployment.yaml`: `replicas: 1`, `strategy.type: Recreate`,
-`terminationGracePeriodSeconds: 30`. Комментарий в манифесте прямо называет
-причину: состояние комнат — `HashMap` за `std::sync::Mutex` в памяти ровно
-одного процесса (`src/state.rs`); два одновременно живых под'а видели бы
-разные половины участников и никогда не увидели бы друг друга — это тот же
-инвариант «single replica», что описан в `docs/self-hosting.md` §7.1. Поэтому
-`Recreate` — не недосмотр, а прямое следствие модели состояния: старый под
-полностью останавливается **прежде**, чем начинает подниматься новый (в
-отличие от `RollingUpdate`, где они какое-то время работают параллельно).
+`terminationGracePeriodSeconds: 30`. The comment in the manifest states the
+reason directly: room state is a `HashMap` behind a `std::sync::Mutex` in the
+memory of exactly one process (`src/state.rs`); two simultaneously-alive pods
+would each see a different half of the participants and would never see each
+other — this is the same "single replica" invariant described in
+`docs/self-hosting.md` §7.1. So `Recreate` isn't an oversight but a direct
+consequence of the state model: the old pod fully stops **before** the new
+one starts coming up (unlike `RollingUpdate`, where they run in parallel for
+a while).
 
-**Что реально происходит по секундам (по коду, не измерено живьём).**
+**What actually happens, second by second (from the code, not measured live).**
 
-1. Kubernetes посылает `SIGTERM` старому под'у. `src/main.rs::shutdown_signal`
-   ловит его (или `SIGINT` локально) и передаёт в
+1. Kubernetes sends `SIGTERM` to the old pod. `src/main.rs::shutdown_signal`
+   catches it (or `SIGINT` locally) and passes it into
    `axum::serve(...).with_graceful_shutdown(...)`.
-2. Graceful shutdown у axum/hyper останавливает **приём новых** соединений на
-   слушающем сокете и ждёт завершения уже принятых HTTP-запросов — но
-   WebSocket-соединение к этому моменту уже давно «апгрейднуто» в отдельную
-   `tokio`-задачу (`ws::handle_socket`, свой собственный `tokio::select!`-цикл
-   с хартбитом), которой graceful-shutdown-механизм hyper не управляет: она
-   продолжает читать/писать в свой сокет как ни в чём не бывало. Иными
-   словами — **уже открытые WS-соединения старого под'а переживают SIGTERM и
-   продолжают релеить сигналинг**, пока их не закроет либо клиент, либо
-   собственный хартбит-таймаут (`PING_INTERVAL=20с`, `MAX_MISSED_PONGS=2` —
-   `src/ws.rs`), либо `SIGKILL`.
-3. Поскольку у активного созвона есть постоянный хартбит и участники не
-   закрывают сокет сами, естественного завершения не происходит — процесс
-   продолжает жить и обслуживать открытые сокеты до истечения
-   `terminationGracePeriodSeconds` (30с), после чего Kubernetes шлёт
-   `SIGKILL` и рвёт всё разом.
-4. Только **после** того, как старый под окончательно завершился (естественно
-   или по `SIGKILL`), `Recreate`-стратегия начинает поднимать новый под —
-   это последовательный, не параллельный процесс. Образ уже импортирован в
-   containerd на этапе доставки (шаг 3 в `deploy/README.md`), так что задержки
-   на pull нет; `readinessProbe` бьёт `/healthz` каждые 3с
-   (`periodSeconds: 3`), так что новый под обычно становится `Ready`
-   в течение нескольких секунд после старта самого бинарника.
-5. Как только под удалён из `Service` (это происходит почти сразу за
-   `SIGTERM`, независимо от readiness-пробы), новые подключения к
-   `chat-api.fedorov.it` просто не находят backend — Cloudflare Tunnel
-   Ingress (`deploy/manifests/ingress.yaml`) видит пустой список endpoints,
-   пока новый под не станет `Ready`.
+2. Graceful shutdown in axum/hyper stops **accepting new** connections on the
+   listening socket and waits for already-accepted HTTP requests to finish —
+   but by this point a WebSocket connection has long since been "upgraded"
+   into a separate `tokio` task (`ws::handle_socket`, its own
+   `tokio::select!` loop with a heartbeat), which hyper's graceful-shutdown
+   mechanism does not manage: it keeps reading/writing its socket as if
+   nothing happened. In other words — **the old pod's already-open WS
+   connections survive SIGTERM and keep relaying signaling** until they're
+   closed by either the client, or by their own heartbeat timeout
+   (`PING_INTERVAL=20s`, `MAX_MISSED_PONGS=2` — `src/ws.rs`), or by
+   `SIGKILL`.
+3. Since an active call has a constant heartbeat and participants don't
+   close the socket themselves, no natural termination occurs — the process
+   keeps living and serving open sockets until
+   `terminationGracePeriodSeconds` (30s) expires, after which Kubernetes
+   sends `SIGKILL` and tears everything down at once.
+4. Only **after** the old pod has fully terminated (naturally or via
+   `SIGKILL`) does the `Recreate` strategy start bringing up the new pod —
+   this is a sequential, not a parallel, process. The image was already
+   imported into containerd during the delivery step (step 3 in
+   `deploy/README.md`), so there's no pull delay; the `readinessProbe` hits
+   `/healthz` every 3s (`periodSeconds: 3`), so the new pod typically
+   becomes `Ready` within a few seconds of the binary itself starting.
+5. As soon as the pod is removed from the `Service` (this happens almost
+   immediately after `SIGTERM`, independent of the readiness probe), new
+   connections to `chat-api.fedorov.it` simply find no backend — the
+   Cloudflare Tunnel Ingress (`deploy/manifests/ingress.yaml`) sees an empty
+   endpoint list until the new pod becomes `Ready`.
 
-**Итоговая оценка окна недоступности сигналинга** (вывод из чтения кода, **не
-подтверждён живым тестом с активным звонком** — если эта цифра важна
-оперативно, стоит явно её проверить деплоем во время реального звонка):
+**Overall estimate of the signaling downtime window** (a conclusion from
+reading the code, **not confirmed by a live test with an active call** — if
+this figure matters operationally, it's worth explicitly verifying it with a
+deploy during a real call):
 
-- Если в момент деплоя есть хоть один активный созвон (открытые WS с
-  хартбитом) — старый под скорее всего доживает почти до полных **30с**
-  (grace period), затем `SIGKILL`; плюс ~5–10с на старт и первую успешную
-  readiness-пробу нового под'а. **Итого ориентировочно 35–40с**, в течение
-  которых: (а) никто не может ни зайти в комнату заново, ни впервые войти по
-  ссылке, (б) уже подключённые участники не могут пройти ICE-restart/новую
-  сборку пары, если она вдруг понадобится именно в этом окне.
-- Если в момент деплоя активных созвонов нет — старому процессу ничего не
-  мешает завершиться сразу по `SIGTERM` (никаких открытых сокетов, которые
-  нужно было бы держать), и окно сжимается до, по сути, времени старта нового
-  под'а (~5–10с).
-- **Важный нюанс уровня протокола, объясняющий, почему варианты 1 и 2 ниже
-  сложнее, чем кажутся:** `GET /ws` не принимает `roomId` ни в пути, ни в
-  query-параметрах вообще (`docs/signaling-protocol.md` §2.7) — `roomId`
-  появляется только **внутри первого WS-сообщения** `join-room` уже **после**
-  успешного апгрейда. Значит, никакой L7-прокси, маршрутизирующий по
-  Host/path (в том числе тот, что стоит перед этим сервисом сейчас —
-  `cloudflare-tunnel-ingress-controller`, см. ниже), физически не может
-  различить «это WS для комнаты A» и «это WS для комнаты B» до того, как
-  соединение уже установлено с КАКИМ-то backend'ом.
+- If there's at least one active call at the moment of deploy (open WS
+  connections with a heartbeat) — the old pod most likely lives almost the
+  full **30s** (grace period), then gets `SIGKILL`; plus ~5–10s for the new
+  pod to start and pass its first successful readiness probe. **Total,
+  roughly 35–40s**, during which: (a) nobody can either re-enter a room or
+  enter one for the first time via a link, (b) already-connected participants
+  can't go through an ICE restart/new pair setup if one happens to be needed
+  exactly in this window.
+- If there are no active calls at the moment of deploy — nothing stops the
+  old process from terminating immediately on `SIGTERM` (no open sockets that
+  need to be held), and the window shrinks to essentially the new pod's
+  startup time (~5–10s).
+- **An important protocol-level nuance that explains why options 1 and 2
+  below are harder than they sound:** `GET /ws` doesn't accept `roomId`
+  either in the path or in query parameters at all
+  (`docs/signaling-protocol.md` §2.7) — `roomId` only appears **inside the
+  first WS message**, `join-room`, **after** a successful upgrade. That means
+  no L7 proxy routing by Host/path (including the one currently in front of
+  this service — `cloudflare-tunnel-ingress-controller`, see below) can
+  physically distinguish "this is a WS for room A" from "this is a WS for
+  room B" before the connection has already been established with SOME
+  backend.
 
-**Что стоит перед сервером сейчас.** Не «просто reverse proxy» — конкретно
-`cloudflare-tunnel-ingress-controller`, уже развёрнутый на кластере
-(`deploy/manifests/ingress.yaml`, обычный k8s `Ingress`, маршрутизация по
-`Host: chat-api.fedorov.it` → `Service chat` → под). Это стандартный
-Host/path-based L7-роутер поверх Cloudflare Tunnel — он **не** умеет
-заглядывать в тело WS-сообщений и в принципе не предназначен для маршрутизации
-по данным внутри уже установленного соединения. Раздача статики фронтенда с
-июля 2026 уехала на Cloudflare Pages (Ш2, см. `ingress.yaml`, `README.md`
-«Топология Ш2») — сам backend теперь отвечает только на `chat-api.fedorov.it`
-за API/WS.
+**What sits in front of the server today.** Not "just a reverse proxy" —
+specifically `cloudflare-tunnel-ingress-controller`, already deployed in the
+cluster (`deploy/manifests/ingress.yaml`, an ordinary k8s `Ingress`, routing
+by `Host: chat-api.fedorov.it` → `Service chat` → pod). This is a standard
+Host/path-based L7 router on top of Cloudflare Tunnel — it **cannot** look
+into the body of WS messages and isn't designed at all to route based on data
+inside an already-established connection. Serving the frontend's static
+assets moved to Cloudflare Pages as of July 2026 (S2, see `ingress.yaml`,
+`README.md` "S2 Topology") — the backend itself now answers only on
+`chat-api.fedorov.it`, for API/WS.
 
-**Что реально не рвётся — и это ключевой факт для всей Части 1.**
-`docs/self-hosting.md` §7.2 формулирует это прямо: медиа и чат — P2P и
-продолжают работать через обрыв сигналинга. `docs/webrtc-mesh.md` §4
-объясняет механику: **первое** рукопожатие пары и любой ICE-restart всегда
-идут через сервер, но **любая последующая** ренеготиация уже установленной
-пары (добавление/снятие трека, переключение камеры) идёт по data-channel
-bus напрямую между двумя браузерами, минуя сервер вообще. То есть в течение
-всего окна из п.5 выше:
+**What actually doesn't break — and this is the key fact for all of Part
+1.** `docs/self-hosting.md` §7.2 states this directly: media and chat are
+P2P and keep working through a signaling outage. `docs/webrtc-mesh.md` §4
+explains the mechanics: the **first** handshake of a pair and any ICE
+restart always go through the server, but **any subsequent** renegotiation
+of an already-established pair (adding/removing a track, switching cameras)
+goes over the data-channel bus directly between the two browsers, bypassing
+the server entirely. That means, throughout the whole window from point 5
+above:
 
-- уже установленные mesh-пары продолжают передавать видео/аудио/чат/файлы —
-  сервер им для этого не нужен;
-- уже начатый шаринг экрана продолжает идти как медиа-поток (сама передача —
-  та же mesh-пара, серверу тут делать нечего); фронтенд к тому же сам
-  переустанавливает статус «шарю» после реконнекта (`self-hosting.md` §7.2:
-  «presenter's client automatically resumes it»);
-- клиентский авто-reconnect (`static/room.js`) начинает попытки немедленно
-  (первая — без задержки), дальше backoff `1с→2с→4с→8с` (повторяется по 8с)
-  с общим бюджетом **120с** (`RECONNECT_BACKOFF_MS`,
-  `RECONNECT_TOTAL_BUDGET_MS`) — с запасом перекрывает оценённое окно в
-  35–40с;
-- если сервер после рестарта не помнит комнату (памяти не осталось), клиент
-  сам восстанавливает её через `PUT /api/rooms/{roomId}` перед повторным
-  `join-room` (`src/main.rs::restore_room`, `static/room.js::restoreRoomViaPut`) —
-  но восстановленная комната **не помнит** ни настроек лобби/гостевых прав, ни
-  того, кто был лидером (`leader_token: None`, лидером становится первый
-  вошедший) — это единственное, что при рестарте теряется помимо самого
-  сигналинга.
+- already-established mesh pairs keep transmitting video/audio/chat/files —
+  they don't need the server for this;
+- screen sharing already in progress continues as a media stream (the
+  transfer itself is the same mesh pair, the server has nothing to do here);
+  the frontend also re-establishes the "sharing" status itself after
+  reconnecting (`self-hosting.md` §7.2: "presenter's client automatically
+  resumes it");
+- the client-side auto-reconnect (`static/room.js`) starts trying
+  immediately (the first attempt has no delay), then backs off
+  `1s→2s→4s→8s` (repeating at 8s) with a total budget of **120s**
+  (`RECONNECT_BACKOFF_MS`, `RECONNECT_TOTAL_BUDGET_MS`) — comfortably
+  covering the estimated 35–40s window;
+- if the server no longer remembers the room after a restart (no memory
+  left), the client restores it itself via `PUT /api/rooms/{roomId}` before
+  re-sending `join-room` (`src/main.rs::restore_room`,
+  `static/room.js::restoreRoomViaPut`) — but the restored room **does not
+  remember** either the lobby/guest-permission settings or who was the
+  leader (`leader_token: None`, the first person to join becomes leader) —
+  this is the only thing lost on restart besides the signaling itself.
 
-**Вывод по «насколько это уже почти бесшовно».** Для уже установленных пар,
-которым не нужна ренеготиация именно в это окно — субъективно почти
-незаметно: короткий баннер «Reconnecting…», медиа не прерывается. Для тех, кто
-пытается зайти в комнату впервые или после реального обрыва сети именно в это
-окно — недоступность сигналинга реальна и ощутима (~30–40с). Что теряется
-безвозвратно при каждом деплое — не сам звонок, а **серверные настройки
-комнаты** (лобби, гостевые права, кто лидер) — это восстанавливается к
-дефолтам, а не переживает рестарт.
-
----
-
-### 1.1 Вариант — Graceful drain с параллельным новым контейнером
-
-**Механика.** Новый под поднимается рядом со старым; старый перестаёт
-принимать НОВЫЕ комнаты/участников, но донашивает уже открытые (до
-`MAX_ROOM_LIFETIME_SECONDS`, дефолт 3ч); прокси переключает НОВЫЙ трафик на
-новый под, пока старый не опустеет или не истечёт таймаут.
-
-**Что это даёт сверх текущего.** Полностью убирает окно «никто не может
-войти» — новые участники сразу попадают на новый под, пока старые доживают
-созвон на старом.
-
-**Сложность и риски — почему это на порядок сложнее, чем звучит.**
-Ключевая проблема — не «поднять второй под» (это тривиально в k8s), а
-**маршрутизация по roomId**, которой у используемого прокси физически нет
-(см. §1.0: `roomId` не в URL `/ws`, а внутри первого сообщения после апгрейда).
-Чтобы новые комнаты шли на новый под, а старые продолжали резолвиться на
-старый, нужен **отдельный WS-aware прокси-слой**, который сам терминирует
-`/ws`, читает первый `join-room`-фрейм, смотрит `roomId` и ТОЛЬКО ПОСЛЕ ЭТОГО
-решает, к какому backend'у проксировать байты дальше — `cloudflare-tunnel-ingress-controller`
-такого не делает и не предназначен для этого. Это отдельный проект, а не
-конфигурация:
-
-- нужна таблица «какой roomId создан на каком поде» (сама по себе новое
-  общее состояние, которое надо где-то хранить и синхронизировать —
-  иронично, ровно то, от чего проект сознательно отказался, храня комнаты
-  только в памяти одного процесса);
-- при обрыве и reconnect клиент должен попасть **на тот же** под, где создана
-  его комната, а не на «текущий активный» — то есть даже reconnect-логика
-  прокси должна знать про привязку комнаты к поду;
-- если строго дожидаться, пока старый под опустеет естественным образом,
-  цикл одного деплоя может растянуться до 3 часов (потолок длительности
-  созвона) — приемлемо только для редких, не для частых деплоев;
-- два процесса с независимой памятью комнат одновременно — это ровно
-  сценарий split-brain, которого `replicas: 1` + `Recreate` сознательно
-  избегает (см. комментарий в `deployment.yaml` и `src/state.rs`); ошибка в
-  роутинге означает участников, случайно раскиданных по двум подам, которые
-  не видят друг друга.
-
-**Оценка:** высокая сложность, ориентировочно **5–10 человеко-дней** только на
-сам WS-aware роутер плюс тестирование сценариев переключения; риск
-split-brain при любой ошибке маршрутизации.
+**Conclusion on "how close to seamless is this already".** For already-
+established pairs that don't need renegotiation exactly during this window —
+subjectively it's almost unnoticeable: a brief "Reconnecting…" banner, media
+isn't interrupted. For those trying to enter a room for the first time, or
+who suffer a real network drop exactly during this window — the signaling
+outage is real and noticeable (~30–40s). What's irrevocably lost on every
+deploy isn't the call itself, but the **server-side room settings** (lobby,
+guest permissions, who's the leader) — these reset to defaults rather than
+surviving the restart.
 
 ---
 
-### 1.2 Вариант — Blue-green с липкостью по roomId
+### 1.1 Option — Graceful Drain with a Parallel New Container
 
-**Механика.** Два полных стека (blue/green); новые комнаты идут на активный
-(«green»), старые донашиваются на предыдущем («blue») до опустошения/истечения
-`MAX_ROOM_LIFETIME_SECONDS`, потом blue выключается.
+**Mechanics.** A new pod comes up alongside the old one; the old one stops
+accepting NEW rooms/participants but keeps serving out the already-open ones
+(up to `MAX_ROOM_LIFETIME_SECONDS`, default 3h); the proxy switches NEW
+traffic to the new pod until the old one empties out or the timeout expires.
 
-**Что это даёт сверх текущего.** То же самое, что вариант 1.1 — устранение
-окна «нельзя войти» для новых участников, только через дублирование всей
-инфраструктуры, а не координацию одного стека.
+**What this adds over the current setup.** It fully removes the "nobody can
+enter" window — new participants land on the new pod immediately, while
+existing participants ride out their call on the old one.
 
-**Сложность и риски.** По сути это тот же вариант 1.1: необходимый
-строительный блок — тот же WS-aware sticky-роутер по `roomId`, потому что
-проблема (прокси не видит `roomId` до апгрейда) не зависит от того,
-называете вы это «graceful drain» или «blue-green». Отличия чисто
-организационные:
+**Complexity and risks — why this is an order of magnitude harder than it
+sounds.** The key problem isn't "bring up a second pod" (that's trivial in
+k8s), but **routing by `roomId`**, which the proxy in use physically doesn't
+have (see §1.0: `roomId` isn't in the `/ws` URL, it's inside the first
+message after the upgrade). For new rooms to land on the new pod while old
+ones keep resolving to the old one, you need a **separate WS-aware proxy
+layer** that itself terminates `/ws`, reads the first `join-room` frame,
+looks at `roomId`, and ONLY THEN decides which backend to proxy the bytes to
+— `cloudflare-tunnel-ingress-controller` doesn't do this and isn't meant to.
+This is a separate project, not a configuration change:
 
-- не нужно ждать полного опустошения ОДНОГО под'а перед тем, как считать
-  деплой «завершённым» — можно просто задеплоить green и постепенно выключить
-  blue, когда сочтёте нужным (те же до 3ч, если хотите строго «никого не
-  бросить»);
-- цена — двойная инфраструктура на время оверлапа (два полных backend'а,
-  два DNS/ingress-таргета) вместо одного координируемого стека;
-- те же риски split-brain при ошибке роутинга, что в 1.1.
+- you need a table of "which `roomId` was created on which pod" (itself
+  new shared state that has to be stored and synchronized somewhere —
+  ironically, exactly what the project deliberately opted out of by keeping
+  rooms only in the memory of a single process);
+- on a drop and reconnect, the client must land on **the same** pod where
+  its room was created, not on "whichever is currently active" — meaning even
+  the proxy's reconnect logic must know about the room-to-pod binding;
+- if you strictly wait for the old pod to empty out naturally, a single
+  deploy cycle could stretch out to 3 hours (the call-duration ceiling) —
+  acceptable only for infrequent, not frequent, deploys;
+- two processes with independent room memory at the same time is exactly
+  the split-brain scenario that `replicas: 1` + `Recreate` deliberately
+  avoids (see the comment in `deployment.yaml` and `src/state.rs`); a routing
+  bug means participants accidentally scattered across two pods who can't
+  see each other.
 
-**Оценка:** тот же порядок сложности, что 1.1(**5–10 человеко-дней** на
-роутер) **+1–2 дня** на организацию параллельного полного стека
-(DNS/ingress на два бэкенда) — суммарно не дешевле, местами дороже 1.1 при
-той же самой нерешённой архитектурной проблеме.
-
----
-
-### 1.3 Вариант — SO_REUSEPORT / передача слушающего сокета
-
-**Механика.** Старый и новый процесс на короткое время одновременно слушают
-один порт (`SO_REUSEPORT`, ядро балансирует новые `SYN` между ними) или
-слушающий файловый дескриптор передаётся новому процессу напрямую
-(`systemd`-socket-activation, `LISTEN_FDS`, паттерн вроде `tableflip`) — так,
-чтобы вообще не было момента, когда порт не прослушивается никем.
-
-**Насколько это применимо к axum/tokio.** Технически применимо и хорошо
-документировано в экосистеме — через крейт `socket2` можно создать сокет
-с `SO_REUSEPORT` и передать его в `tokio::net::TcpListener::from_std`, либо
-принять уже готовый fd от `systemd` через `LISTEN_FDS`. Никаких
-принципиальных препятствий со стороны axum/tokio нет.
-
-**Что это даёт, если состояние всё равно в памяти — вывод: почти ничего в
-этом проекте.** Ключевое наблюдение из §1.0: реальный простой здесь **не**
-вызван «моментом, когда порт никем не прослушивается» — слушающий сокет и
-так закрывается почти мгновенно вместе с уходом под'а из `Service`, задолго
-до истечения `terminationGracePeriodSeconds`. Настоящая задержка — это (а)
-ожидание, пока `Recreate` дождётся полного завершения СТАРОГО под'а (до 30с),
-и (б) холодный старт нового. `SO_REUSEPORT`/fd-передача решает только проблему
-(а)-подобного рода «щели между закрытием старого listener и открытием
-нового» — а её здесь и так почти нет (щель — это микросекунды до момента,
-пока сам процесс жив, но `Recreate` всё равно ждёт **весь** процесс, не
-только его listener, что убивает выгоду техники). Даже если довести
-листенер-передачу до идеала, у вас всё равно останутся ДВА процесса с
-несовместимой in-memory картой комнат в момент перекрытия — то есть та же
-проблема, что в 1.1/1.2, просто без выигрыша, ради которого стоило бы её
-решать именно этим способом.
-
-**Оценка:** технически простая, но **самостоятельно бесполезная** здесь техника
-(экономит доли секунд там, где и так теряются десятки секунд по другой
-причине) — имеет смысл только как мелкая добавка НАД полноценным
-роутером из 1.1/1.2, если те когда-либо будут строиться, не как отдельное
-решение.
+**Estimate:** high complexity, roughly **5–10 person-days** just for the
+WS-aware router itself, plus testing the switchover scenarios; split-brain
+risk on any routing bug.
 
 ---
 
-### 1.4 Вариант — State handoff (сериализация комнат в новый процесс)
+### 1.2 Option — Blue-Green with roomId Stickiness
 
-**Механика.** Старый процесс при `SIGTERM` сериализует
-`HashMap<String, Room>` (или её часть) в новый процесс (через файл/сокет),
-новый процесс десериализует и продолжает работу с тем же состоянием.
+**Mechanics.** Two full stacks (blue/green); new rooms go to the active one
+("green"), old ones keep running out on the previous one ("blue") until they
+empty out or `MAX_ROOM_LIFETIME_SECONDS` expires, then blue is switched off.
 
-**Честная оценка — упирается в то, что самое важное в `Room` сериализовать
-нельзя.** `Participant::tx` (`src/state.rs`) — это `mpsc::UnboundedSender`,
-привязанный к конкретной tokio-задаче конкретного живого TCP-соединения
-**внутри процесса-владельца**. Ни сам канал, ни тем более установленное
-TCP/WebSocket-соединение нельзя передать другому процессу — это не задача
-сериализации данных, а миграция установленного сетевого соединения, которая
-в общем случае не решена без специального прокси-слоя перед приложением
-(который сам никогда не перезапускается) или технологий уровня MPTCP. Значит,
-«хендовер состояния» в реальности мог бы сериализовать только метаданные:
-имена, `settings` (лобби/гостевые права), `leader_id`, `screen_owner`,
-`created_at` — но не сами соединения. Клиенту всё равно придётся
-переустанавливать WS с нуля через тот же `join-room`, что и сегодня.
+**What this adds over the current setup.** The same thing as option 1.1 —
+eliminating the "can't enter" window for new participants, just by
+duplicating the whole infrastructure instead of coordinating a single stack.
 
-**Стоит ли оно того при существующем клиентском recovery — нет.** Разница с
-сегодняшним `PUT /api/rooms/{id}`-восстановлением (тоже создаёт комнату
-заново, просто с дефолтными настройками) — только в том, что настройки
-лобби/гостевых прав/лидерства переживут рестарт, а не сбросятся. Это не
-уменьшает окно недоступности сигналинга ни на секунду — реконнект всё равно
-идёт по тому же пути и требует того же времени. Выигрыш узкий (сохранение
-конфигурации комнаты, а не доступности), а частота, с которой кто-то реально
-жаловался бы на сброс лобби/лидера при плановом деплое (редком событии),
-скорее всего низкая.
+**Complexity and risks.** This is essentially the same as option 1.1: the
+necessary building block is the same WS-aware sticky router keyed on
+`roomId`, because the problem (the proxy can't see `roomId` before the
+upgrade) doesn't depend on whether you call it "graceful drain" or
+"blue-green". The differences are purely organizational:
 
-**Оценка:** средняя сложность (**2–4 человеко-дня** на serialize/deserialize
-`Room` без `tx` + загрузку при старте), но **не рекомендуется** — цена/выгода
-не оправдана: решает не ту проблему, которая на самом деле болит (простой
-сигналинга), а другую, довольно нишевую (потеря конфигурации комнаты).
+- you don't need to wait for ONE pod to fully empty out before considering
+  the deploy "finished" — you can just deploy green and gradually turn off
+  blue whenever you see fit (still up to 3h if you want to strictly "leave
+  nobody behind");
+- the cost is double infrastructure during the overlap (two full
+  backends, two DNS/ingress targets) instead of one coordinated stack;
+- the same split-brain risks on a routing bug as in 1.1.
+
+**Estimate:** the same order of complexity as 1.1 (**5–10 person-days** for
+the router) **+1–2 days** for setting up a parallel full stack (DNS/ingress
+for two backends) — overall no cheaper, in places more expensive than 1.1,
+for the same unresolved architectural problem.
 
 ---
 
-### 1.5 Вариант — Ничего не делать сверх текущего
+### 1.3 Option — SO_REUSEPORT / Passing the Listening Socket
 
-**Аргументы за.** Из §1.0: реальная длительность разрыва — порядка 30–40с в
-худшем случае (есть активный созвон в момент деплоя), заметно меньше, если
-активных созвонов нет. Всё это время уже установленные mesh-пары продолжают
-передавать медиа/чат/файлы без участия сервера (`webrtc-mesh.md` §4) —
-сигналинг нужен только (а) новым участникам, (б) ICE-restart уже
-установленной пары, событию, которое не обязано совпасть именно с окном
-деплоя. Клиентский авто-reconnect (баннер + backoff, бюджет 120с) целиком
-перекрывает оценённое окно — пользователь в устоявшемся звонке видит короткий
-баннер «Reconnecting…», не разрыв разговора. Частота деплоев для проекта
-такого масштаба (личный/маленький self-hosted сервис, деплой гейтится
-зелёными тестами) — не событие несколько раз в минуту, а редкое плановое
-действие.
+**Mechanics.** The old and new process briefly listen on the same port at
+the same time (`SO_REUSEPORT`, the kernel balances new `SYN`s between them),
+or the listening file descriptor is passed directly to the new process
+(`systemd` socket activation, `LISTEN_FDS`, a pattern like `tableflip`) — so
+there's never a moment when nobody is listening on the port at all.
 
-**Дешёвое улучшение, не требующее архитектурных изменений (стоит рассмотреть
-отдельно от «ничего не делать» в чистом виде).** Основной вклад в 30-секундное
-окно — то, что старый процесс НЕ закрывает активно уже открытые WS-сокеты
-сам, а просто ждёт `SIGKILL` по истечении grace period (см. п.2 в §1.0).
-Добавить в `shutdown_signal` явную рассылку `Close`-фрейма (с указанием
-причины) всем открытым соединениям сразу по получении `SIGTERM`, вместо
-пассивного ожидания, — резко сократило бы этот конкретный компонент простоя
-(с ~30с до, вероятно, доли секунды на сам broadcast), без единого из рисков
-split-brain, которыми чреваты варианты 1.1–1.4: это изменение одного процесса,
-не координация двух. Это не убирает окно «новый под ещё не готов»
-(~5–10с холодного старта), но убирает искусственное ожидание grace period.
-Оценка: низкая сложность (**~0.5–1 человеко-день**), стоит рассмотреть
-НЕЗАВИСИМО от итогового решения по вариантам 1.1–1.5 — это чистое улучшение
-без новых режимов отказа.
+**How applicable this is to axum/tokio.** Technically applicable and well
+documented in the ecosystem — the `socket2` crate can create a socket with
+`SO_REUSEPORT` and hand it to `tokio::net::TcpListener::from_std`, or accept
+an already-ready fd from `systemd` via `LISTEN_FDS`. There are no
+fundamental obstacles on the axum/tokio side.
 
-**Что при этом остаётся честно признать нерешённым.** Окно ~5–10с холодного
-старта нового под'а остаётся при любом раскладе, пока используется
-`Recreate` (см. §1.3 — почему `SO_REUSEPORT` тут не помогает без роутера). Кто
-пытается зайти именно в эти секунды — получит `room-not-found`/таймаут и
-включится в тот же клиентский reconnect-цикл, что и обычно.
+**What this gives you if state lives in memory anyway — conclusion: almost
+nothing in this project.** The key observation from §1.0: the real downtime
+here is **not** caused by "a moment when nobody listens on the port" — the
+listening socket already closes almost instantly as the pod leaves the
+`Service`, long before `terminationGracePeriodSeconds` expires. The real
+delay is (a) waiting for `Recreate` to wait for the OLD pod to fully
+terminate (up to 30s), and (b) the new one's cold start.
+`SO_REUSEPORT`/fd-passing only solves problem (a)-like "gap between closing
+the old listener and opening the new one" — and there's almost no such gap
+here to begin with (the gap is microseconds, for as long as the process
+itself is alive, but `Recreate` waits for the **whole** process anyway, not
+just its listener, which kills the benefit of the technique). Even if you
+perfect the listener handover, you'd still end up with TWO processes with
+incompatible in-memory room maps at the moment of overlap — the same
+problem as in 1.1/1.2, just without the payoff that would justify solving it
+this particular way.
 
----
-
-### 1.6 Рекомендация
-
-> Реализовано 2026-07-16 (broadcast `Close` 1012 по `SIGTERM` + ~500мс на flush).
-
-**Оставить `Recreate` + однопроцессную модель как есть**, дополнив её
-дешёвым улучшением из §1.5 (активная рассылка `Close` по `SIGTERM` вместо
-пассивного ожидания `SIGKILL`) — это единственное изменение из всего
-рассмотренного, которое даёт измеримый выигрыш (убирает ожидание grace
-period там, где оно сегодня чисто искусственное) при нулевом новом риске и
-трудозатратах меньше человеко-дня.
-
-Варианты 1.1/1.2 (единственные, что реально закрывают окно «нельзя зайти
-новому участнику») упираются в один и тот же нерешённый архитектурный
-вопрос — `roomId` невидим для прокси до апгрейда WS — и требуют
-построения выделенного WS-aware sticky-роутера (**5–10+ человеко-дней**,
-плюс новый класс рисков split-brain), что для текущего масштаба проекта
-(single-replica by design, редкие деплои, самостоятельно восстанавливающиеся
-клиенты) не оправдано: стоимость решения сильно превышает стоимость
-проблемы, которую оно решает. Вариант 1.3 самостоятельно бесполезен без
-1.1/1.2. Вариант 1.4 решает не ту проблему, которая болит (конфигурацию
-комнаты, а не доступность сигналинга).
-
-Если проект вырастет до многих одновременных активных комнат и заметной
-частоты деплоев в течение дня (не сегодняшний профиль использования) — тогда
-и только тогда имеет смысл вернуться к 1.1/1.2, потому что именно частота
-деплоев умножает разовую стоимость 30–40-секундного окна на количество
-деплоев в день.
+**Estimate:** a technically simple but **useless on its own** technique here
+(it saves fractions of a second in a place where tens of seconds are lost
+for an unrelated reason anyway) — it only makes sense as a small addition ON
+TOP of the full router from 1.1/1.2, if those are ever built, not as a
+standalone solution.
 
 ---
 
-## Часть 2. Ёмкость одного инстанса
+### 1.4 Option — State Handoff (Serializing Rooms into a New Process)
 
-### 2.1 Что тратится на комнату/участника (по коду)
+**Mechanics.** On `SIGTERM`, the old process serializes the
+`HashMap<String, Room>` (or part of it) into the new process (via a
+file/socket); the new process deserializes it and continues operating with
+the same state.
 
-**Структуры (`src/state.rs`).**
+**An honest assessment — this runs into the fact that the most important
+part of `Room` can't be serialized.** `Participant::tx` (`src/state.rs`) is
+an `mpsc::UnboundedSender` bound to a specific tokio task of a specific live
+TCP connection **inside the owning process**. Neither the channel itself,
+nor especially the established TCP/WebSocket connection, can be handed to
+another process — this isn't a data-serialization problem, it's migrating an
+established network connection, which in general isn't solved without a
+dedicated proxy layer in front of the application (one that never itself
+restarts) or MPTCP-level technology. So a "state handover" could in reality
+only serialize metadata: names, `settings` (lobby/guest permissions),
+`leader_id`, `screen_owner`, `created_at` — but not the connections
+themselves. The client would still have to re-establish the WS from scratch
+via the same `join-room` as today.
+
+**Is it worth it given the existing client-side recovery — no.** The
+difference from today's `PUT /api/rooms/{id}` restoration (which also
+re-creates the room, just with default settings) is only that the
+lobby/guest-permission/leadership settings would survive the restart instead
+of resetting. This doesn't shrink the signaling downtime window by a single
+second — the reconnect still follows the same path and takes the same time.
+The payoff is narrow (preserving room configuration, not availability), and
+how often anyone would actually complain about a lobby/leader reset on a
+planned deploy (a rare event) is probably low.
+
+**Estimate:** medium complexity (**2–4 person-days** for serializing/
+deserializing `Room` without `tx` plus loading it at startup), but **not
+recommended** — the cost/benefit isn't justified: it solves not the problem
+that actually hurts (signaling downtime), but a different, fairly niche one
+(loss of room configuration).
+
+---
+
+### 1.5 Option — Do Nothing Beyond the Current Setup
+
+**Arguments for.** From §1.0: the real outage duration is on the order of
+30–40s in the worst case (an active call in progress at deploy time),
+noticeably less if there are no active calls. Throughout this whole time,
+already-established mesh pairs keep transmitting media/chat/files without
+the server's involvement (`webrtc-mesh.md` §4) — signaling is only needed
+for (a) new participants, (b) an ICE restart of an already-established pair,
+an event that doesn't necessarily coincide with the deploy window. The
+client-side auto-reconnect (banner + backoff, 120s budget) fully covers the
+estimated window — a user in an ongoing call sees a brief "Reconnecting…"
+banner, not a dropped conversation. The deploy frequency for a project of
+this scale (a personal/small self-hosted service, deploys gated by green
+tests) isn't an event that happens several times a minute, but a rare,
+planned action.
+
+**A cheap improvement that requires no architectural changes (worth
+considering separately from "do nothing" in its pure form).** The main
+contributor to the 30-second window is that the old process does NOT
+actively close the already-open WS sockets itself, but simply waits for
+`SIGKILL` once the grace period expires (see point 2 in §1.0). Adding an
+explicit broadcast of a `Close` frame (with a reason) to all open
+connections to `shutdown_signal`, right when `SIGTERM` is received, instead
+of passively waiting, would sharply cut this specific component of the
+downtime (from ~30s to, probably, a fraction of a second for the broadcast
+itself), without any of the split-brain risks that options 1.1–1.4 carry:
+this is a single-process change, not coordination between two. It doesn't
+remove the "new pod isn't ready yet" window (~5–10s of cold start), but it
+removes the artificial wait for the grace period. Estimate: low complexity
+(**~0.5–1 person-day**), worth considering INDEPENDENTLY of the final
+decision on options 1.1–1.5 — it's a pure improvement with no new failure
+modes.
+
+**What's honestly left unresolved.** The ~5–10s cold-start window for the
+new pod remains no matter what, as long as `Recreate` is used (see §1.3 —
+why `SO_REUSEPORT` doesn't help here without a router). Anyone trying to
+enter during exactly these seconds will get `room-not-found`/a timeout and
+fall into the same client-side reconnect cycle as usual.
+
+---
+
+### 1.6 Recommendation
+
+> Implemented 2026-07-16 (broadcast `Close` 1012 on `SIGTERM` + ~500ms to flush).
+
+**Keep `Recreate` + the single-process model as they are**, adding the
+cheap improvement from §1.5 (actively broadcasting `Close` on `SIGTERM`
+instead of passively waiting for `SIGKILL`) — this is the only change out of
+everything considered that delivers a measurable win (removing the wait for
+the grace period where it's purely artificial today) at zero new risk and
+less than a person-day of effort.
+
+Options 1.1/1.2 (the only ones that actually close the "a new participant
+can't enter" window) run into the same unresolved architectural question —
+`roomId` is invisible to the proxy before the WS upgrade — and require
+building a dedicated WS-aware sticky router (**5–10+ person-days**, plus a
+new class of split-brain risks), which isn't justified for the project's
+current scale (single-replica by design, infrequent deploys, self-healing
+clients): the cost of the solution far exceeds the cost of the problem it
+solves. Option 1.3 is useless on its own without 1.1/1.2. Option 1.4 solves
+the wrong problem (room configuration, not signaling availability).
+
+If the project grows to many simultaneously active rooms and a noticeable
+deploy frequency within a day (not today's usage profile) — then, and only
+then, does it make sense to come back to 1.1/1.2, because it's precisely the
+deploy frequency that multiplies the one-time cost of the 30–40-second
+window by the number of deploys per day.
+
+---
+
+## Part 2. Single-Instance Capacity
+
+### 2.1 What a Room/Participant Costs (From the Code)
+
+**Structures (`src/state.rs`).**
 
 - `Participant { tx: PeerTx, name: Option<String>, epub: Option<String>, joined_at: Instant }` —
-  `tx` — хендл `mpsc::UnboundedSender` (несколько слов указателей на общий
-  буфер очереди, сам буфер растёт по фактическим сообщениям в очереди, а не
-  выделяется заранее); `name` — зашифрованный блоб до `CHAT_NAME_MAX_CHARS`=512
-  символов (`src/ws.rs`), на практике заметно короче (базовое имя + AES-GCM
-  overhead + base64, реально десятки-сотня байт, не 512); `epub` — до
-  `EPUB_MAX_CHARS`=200 символов (реальный размер ~87 символов, эфемерный
-  ECDH P-256 ключ); `joined_at` — `Instant`, 16 байт. **Оценка одного
-  `Participant`: порядка 200–800 байт** в типичном случае (пара сотен байт
-  структуры + heap-аллокации строк), до ~1–1.2КБ в худшем случае (имя и epub
-  у верхней границы лимитов).
-- `PendingParticipant` — та же форма, тот же порядок величины; лимит
-  `MAX_PENDING`=10 ожидающих на комнату (`src/state.rs`), отдельно от
-  участников.
+  `tx` is an `mpsc::UnboundedSender` handle (a few words' worth of pointers
+  into a shared queue buffer; the buffer itself grows with the messages
+  actually queued, it isn't preallocated); `name` is an encrypted blob up to
+  `CHAT_NAME_MAX_CHARS`=512 characters (`src/ws.rs`), in practice noticeably
+  shorter (base name + AES-GCM overhead + base64, realistically tens to a
+  hundred bytes, not 512); `epub` is up to `EPUB_MAX_CHARS`=200 characters
+  (real size ~87 characters, an ephemeral ECDH P-256 key); `joined_at` is an
+  `Instant`, 16 bytes. **Estimate for one `Participant`: on the order of
+  200–800 bytes** in the typical case (a couple hundred bytes of struct +
+  heap allocations for strings), up to ~1–1.2KB in the worst case (name and
+  epub at the upper bound of their limits).
+- `PendingParticipant` — the same shape, the same order of magnitude; a
+  limit of `MAX_PENDING`=10 waiting entrants per room (`src/state.rs`),
+  separate from participants.
 - `Room { participants: HashMap<...>, screen_owner: Option<String>, emptied_at: Option<Instant>, leader_id: Option<String>, leader_token: Option<String>, settings: RoomSettings, pending: HashMap<...>, created_at: Instant }` —
-  собственные поля структуры малы (несколько `Option<String>`/`Instant`,
-  `leader_token` — UUID-строка ~36 байт, `RoomSettings` — несколько булевых
-  флагов). Основная память комнаты — это её `participants`/`pending`
-  `HashMap`, то есть сумма `Participant`-ов внутри (см. выше) плюс
-  накладные расходы самого `HashMap` (ключ — `String` peerId, UUID ~36
-  байт + служебные байты бакета).
+  the struct's own fields are small (a few `Option<String>`/`Instant`,
+  `leader_token` is a UUID string ~36 bytes, `RoomSettings` is a handful of
+  boolean flags). The bulk of a room's memory is its `participants`/
+  `pending` `HashMap`s, i.e. the sum of the `Participant`s inside them (see
+  above) plus the `HashMap`'s own overhead (the key is a `String` peerId,
+  UUID ~36 bytes + bucket bookkeeping bytes).
 
-**Оценка на одну заполненную комнату** (6 участников по дефолту
-`DEFAULT_MAX_PARTICIPANTS`, без активного лобби): порядка
-**6 × ~0.5–1КБ + ~0.3–0.5КБ на саму структуру `Room`/`HashMap`-overhead ≈
-3–6КБ на комнату**. С полным лобби (10 ожидающих, `MAX_PENDING`) — плюс ещё
-~5–10КБ. Это заметно меньше, чем память самих WS-соединений (ниже) — состояние
-комнаты в этом проекте дешёвое почти по определению: сервер хранит только
-идентификаторы, имена-блобы и таймстемпы, никогда — медиа или историю чата
-(`src/state.rs`, модульный doc-comment: «Чат сервер вообще не хранит»).
+**Estimate for one full room** (6 participants at the default
+`DEFAULT_MAX_PARTICIPANTS`, no active lobby): on the order of **6 ×
+~0.5–1KB + ~0.3–0.5KB for the `Room` struct/`HashMap` overhead itself ≈
+3–6KB per room**. With a full lobby (10 waiting, `MAX_PENDING`) — plus
+another ~5–10KB. This is noticeably less than the memory of the WS
+connections themselves (below) — room state in this project is cheap almost
+by definition: the server only stores identifiers, name blobs, and
+timestamps, never media or chat history (`src/state.rs`, module doc comment:
+"the chat server doesn't store anything at all").
 
-**Память на одно WS-соединение (сервер + буферы).** Внешние источники
-называют диапазон **2–10КБ на idle-соединение и 10–100КБ+ на активное**
-(с непустой очередью сообщений) для типичного tokio/axum-based
-WS-сервера — см. [websocket.org][ws-limits]. Важная деталь именно для этого
-проекта: сервер сам явно каппит размер сообщения/фрейма до **64КБ**
-(`WS_MAX_MESSAGE_SIZE`/`WS_MAX_FRAME_SIZE`, `src/ws.rs`) — это верхняя
-граница на случай атаки, а не типичный размер сообщения. Реальные сообщения
-этого протокола — крошечные: JSON-события `join-room`/`peer-joined`/ping-pong
-(десятки-сотни байт) и релей SDP/ICE, каппнутый на **16КБ**
-(`RELAY_MAX_BYTES`). Значит, для этого конкретного протокола реалистичное
-потребление на соединение должно сидеть у **нижней границы** упомянутого
-внешнего диапазона (ближе к 2–10КБ, а не к 100КБ) — это вывод из анализа
-кода, не независимо измеренная величина; при необходимости точной цифры
-стоит замерить `RSS` живого процесса под нагрузкой (`kubectl top pod` /
-`docker stats`), а не полагаться только на эту оценку.
+**Memory per WS connection (server + buffers).** External sources cite a
+range of **2–10KB for an idle connection and 10–100KB+ for an active one**
+(with a non-empty message queue) for a typical tokio/axum-based WS server —
+see [websocket.org][ws-limits]. An important detail specific to this
+project: the server itself explicitly caps message/frame size at **64KB**
+(`WS_MAX_MESSAGE_SIZE`/`WS_MAX_FRAME_SIZE`, `src/ws.rs`) — this is an upper
+bound for the case of an attack, not a typical message size. This protocol's
+actual messages are tiny: JSON events `join-room`/`peer-joined`/ping-pong
+(tens to hundreds of bytes) and SDP/ICE relaying, capped at **16KB**
+(`RELAY_MAX_BYTES`). So, for this specific protocol, realistic per-connection
+consumption should sit at the **lower end** of the external range mentioned
+(closer to 2–10KB, not 100KB) — this is a conclusion from code analysis, not
+an independently measured figure; if an exact number is needed, it's worth
+measuring the live process's `RSS` under load (`kubectl top pod` /
+`docker stats`) rather than relying solely on this estimate.
 
-**Базовая память процесса.** Независимый бенчмарк [Sharkbench][sharkbench]
-даёт **~6МБ RSS** для «hello world» на axum/tokio — этот проект чуть тяжелее
-(добавлены `hmac`/`sha1`/`base64`/`uuid`/`tracing-subscriber`, но не
-принципиально другого порядка). Собственная оценка автора манифеста в
-`deploy/manifests/deployment.yaml` (`requests: { memory: 32Mi }`,
-комментарий «Rust-сервер сигналинга лёгкий») — независимый анкор того же
-порядка величины: оператор уже закладывает базовую память процесса в
-единицы-десятки МБ, не в сотни. **Итоговая рабочая оценка базовой памяти
-процесса (без соединений/комнат): 10–30МБ** — оценка, не измерение; стоит
-подтвердить `kubectl top pod` на реальном инстансе, если цифра понадобится
-как факт, а не ориентир.
+**Base process memory.** The independent [Sharkbench][sharkbench] benchmark
+gives **~6MB RSS** for a "hello world" on axum/tokio — this project is a bit
+heavier (with `hmac`/`sha1`/`base64`/`uuid`/`tracing-subscriber` added, but
+not a fundamentally different order of magnitude). The manifest author's own
+estimate in `deploy/manifests/deployment.yaml` (`requests: { memory: 32Mi }`,
+comment "Rust signaling server is lightweight") is an independent anchor of
+the same order of magnitude: the operator already budgets base process
+memory in the single-to-tens-of-MB range, not hundreds. **Overall working
+estimate of base process memory (without connections/rooms): 10–30MB** — an
+estimate, not a measurement; worth confirming with `kubectl top pod` on a
+real instance if the figure is needed as a fact rather than a ballpark.
 
 ### 2.2 CPU
 
-Сервер **не декодирует и не хранит медиа** — вся его работа с точки зрения
-CPU это (а) периодический хартбит, (б) короткие всплески релея при
-установке/перестройке соединений, (в) реапер, (г) rate-limit проверки.
+The server **neither decodes nor stores media** — from a CPU standpoint its
+entire job is (a) the periodic heartbeat, (b) short relay bursts during
+connection setup/rebuilding, (c) the reaper, (d) rate-limit checks.
 
-- **Хартбит:** `PING_INTERVAL`=20с на соединение (`src/ws.rs`) — при `N`
-  открытых соединениях это `N/20` `Ping`-фреймов в секунду, каждый — запись
-  нескольких байт в уже открытый сокет. Даже при `N`=3000 (500 комнат ×
-  6 участников, предел дефолтного `MAX_ROOMS`) это 150 крошечных
-  записей/сек — далеко меньше 1% одного ядра.
-- **Установка соединения:** из `docs/research-marketing.md` §9 (внутренний
-  источник, те же цифры уже посчитаны для маркетингового аргумента «нагрузка
-  ≈ 0», здесь используются как основа для CPU-оценки) — один зашифрованный
-  SDP-blob ~2–8КБ, ICE-кандидат ~0.5–1.5КБ; заполнение комнаты из 6 участников
-  — full mesh, 15 пар, десятки КБ до невысокой сотни КБ суммарно, ОДНОРАЗОВО.
-  На каждое такое сообщение сервер делает: один `serde_json::from_str`
-  (парсинг), один `HashMap`-лукап целевого peerId, один `serde_json::to_string`
-  (сериализация обратно) и один `mpsc`-send — всё в памяти, без I/O кроме
-  самого сокета. Это микросекунды CPU на сообщение на любом современном
-  процессоре. Даже нереалистичный «идеальный шторм» — все 500 комнат
-  одновременно заполняются 6 участниками в одну секунду (крайний, на практике
-  не встречающийся случай) — это порядка 500×6×10 ≈ 30 000 крошечных
-  сообщений, то есть низкие десятки миллисекунд суммарного CPU-времени,
-  растянутые к тому же на реальное время, за которое люди физически
-  переходят по ссылкам (секунды, не единый момент).
-- **Rate-limit сам по себе ограничивает возможный шторм:** `RELAY_RATE_LIMIT`=100
-  сообщений/10с на соединение и отдельные per-IP лимиты на создание комнат и
-  попадание в лобби (`ROOM_CREATION_IP_LIMIT`/`PENDING_JOIN_IP_LIMIT` = 10/60с,
-  `src/state.rs`) — злонамеренный или случайный всплеск с одного
-  соединения/IP упирается в эти потолки раньше, чем начинает быть заметен
-  для CPU.
-- **Реапер:** один тик/сек, линейный проход по карте комнат без `.await`
-  внутри лока (`state::reap_rooms`) — тривиально при масштабе в сотни
-  записей.
-- **TLS не на этом процессе:** терминация TLS происходит на
-  Cloudflare Tunnel/реверс-прокси перед сервером (`docs/self-hosting.md` §3),
-  не в самом Rust-процессе — значит, характерная для веб-серверов
-  CPU-стоимость TLS-хендшейка на новое соединение (внешние источники называют
-  порядок **1000–3000 хендшейков/сек на одно ядро** как типичный потолок,
-  см. [websocket.org][ws-limits]) сюда вообще не относится — апгрейд `/ws` на
-  этом процессе — это обычный HTTP `Upgrade`, без криптографии.
+- **Heartbeat:** `PING_INTERVAL`=20s per connection (`src/ws.rs`) — with `N`
+  open connections that's `N/20` `Ping` frames per second, each a write of a
+  few bytes into an already-open socket. Even at `N`=3000 (500 rooms × 6
+  participants, the default `MAX_ROOMS` ceiling) that's 150 tiny writes/sec —
+  far less than 1% of one core.
+- **Connection setup:** from `docs/research-marketing.md` §9 (an internal
+  source, the same figures already computed for the "load ≈ 0" marketing
+  argument, used here as the basis for the CPU estimate) — one encrypted SDP
+  blob is ~2–8KB, an ICE candidate ~0.5–1.5KB; filling a 6-participant room
+  — full mesh, 15 pairs — is tens of KB up to a low hundred KB in total, ONE
+  TIME ONLY. For every such message the server does: one
+  `serde_json::from_str` (parsing), one `HashMap` lookup for the target
+  peerId, one `serde_json::to_string` (serializing back), and one `mpsc`
+  send — all in memory, with no I/O beyond the socket itself. That's
+  microseconds of CPU per message on any modern processor. Even an
+  unrealistic "perfect storm" — all 500 rooms filling up with 6 participants
+  simultaneously within one second (an extreme case that doesn't occur in
+  practice) — is on the order of 500×6×10 ≈ 30 000 tiny messages, i.e. low
+  tens of milliseconds of total CPU time, spread out moreover over the real
+  time it takes people to physically click links (seconds, not a single
+  instant).
+- **The rate limit itself bounds any possible burst:** `RELAY_RATE_LIMIT`=100
+  messages/10s per connection, and separate per-IP limits on room creation
+  (`ROOM_CREATION_IP_LIMIT`=3/60s) and lobby entry (`PENDING_JOIN_IP_LIMIT`=10/60s,
+  `src/state.rs`) — a malicious or accidental burst from a single
+  connection/IP hits these ceilings before it becomes noticeable to
+  the CPU.
+- **Reaper:** one tick/sec, a linear pass over the room map with no
+  `.await` inside the lock (`state::reap_rooms`) — trivial at a scale of
+  hundreds of entries.
+- **TLS isn't on this process:** TLS termination happens at the Cloudflare
+  Tunnel/reverse proxy in front of the server (`docs/self-hosting.md` §3),
+  not in the Rust process itself — meaning the CPU cost typical of web
+  servers for a TLS handshake on a new connection (external sources cite a
+  typical ceiling on the order of **1000–3000 handshakes/sec per core**, see
+  [websocket.org][ws-limits]) doesn't apply here at all — the `/ws` upgrade
+  on this process is a plain HTTP `Upgrade`, with no cryptography.
 
-**Вывод: CPU практически никогда не становится узким местом** ни на одном из
-реалистичных размеров инстанса — потолок определяется памятью на соединение
-и операторскими лимитами (`MAX_ROOMS`/`MAX_PARTICIPANTS`), а не «вычислениями».
+**Conclusion: CPU practically never becomes the bottleneck** at any
+realistic instance size — the ceiling is set by per-connection memory and
+operator-configured limits (`MAX_ROOMS`/`MAX_PARTICIPANTS`), not by
+"computation".
 
-### 2.3 Порты и файловые дескрипторы
+### 2.3 Ports and File Descriptors
 
-**Разбор частого заблуждения «порты кончатся».** У сервера **один** слушающий
-порт (`PORT`, дефолт 3000 вне контейнера / 8080 внутри — `docs/self-hosting.md`
-§6), занятый ровно один раз на весь срок жизни процесса
-(`tokio::net::TcpListener::bind`, `src/main.rs`). Этот порт никогда не
-«расходуется» подключениями клиентов — сколько бы клиентов ни подключилось,
-слушающий порт остаётся один. Каждое принятое WS-подключение — это отдельный
-**файловый дескриптор** (accept'нутый socket, идентифицируемый парой
-`(server_ip:server_port, client_ip:client_port)`), а не отдельный порт на
-сервере: то, что действительно ограничено числом ~64K — это диапазон
-**клиентских** эфемерных портов, и он не является узким местом здесь, потому
-что каждый клиент открывает одно-два соединения к серверу, а не десятки
-тысяч.
+**Debunking the common misconception that "ports will run out".** The
+server has **one** listening port (`PORT`, default 3000 outside the
+container / 8080 inside — `docs/self-hosting.md` §6), bound exactly once for
+the entire lifetime of the process (`tokio::net::TcpListener::bind`,
+`src/main.rs`). This port is never "consumed" by client connections — no
+matter how many clients connect, there's still exactly one listening port.
+Each accepted WS connection is a separate **file descriptor** (an accepted
+socket, identified by the pair `(server_ip:server_port,
+client_ip:client_port)`), not a separate port on the server: what's actually
+limited to roughly ~64K is the range of **client-side** ephemeral ports, and
+it isn't a bottleneck here, because each client opens one or two connections
+to the server, not tens of thousands.
 
-**Исходящих соединений у сервера нет вовсе.** Ни базы данных, ни внешнего
-API, ни HTTP-клиента к чему-либо — по `Cargo.toml` в зависимостях нет ни
-одного HTTP/DB-клиентского крейта, только серверные (`axum`, `tokio`, `uuid`,
-`hmac`/`sha1`/`base64` для TURN-креденшлов — чистые вычисления, не сетевые
-вызовы). Значит, у процесса в принципе не может возникнуть исчерпание
-**собственных исходящих** эфемерных портов — проблема, которая реально бывает
-у сервисов-прокси/сервисов с исходящими вызовами к бэкенду, но структурно не
-применима здесь.
+**The server has no outbound connections at all.** No database, no
+external API, no HTTP client to anything — per `Cargo.toml`, there isn't a
+single HTTP/DB client crate among the dependencies, only server-side ones
+(`axum`, `tokio`, `uuid`, `hmac`/`sha1`/`base64` for TURN credentials — pure
+computation, not network calls). So the process can, in principle, never run
+out of its **own outbound** ephemeral ports — a problem that genuinely
+occurs for proxy services/services making outbound calls to a backend, but
+that structurally doesn't apply here.
 
-**Реальный ограничитель — `ulimit -n` / `LimitNOFILE` процесса.** Современные
-`containerd`/`systemd`-дефолты по данным поиска обычно **1 048 576**
-([devopsbeast/moby issue][fd-limits]), но старые/нестандартно настроенные
-системы иногда наследуют исторический дефолт **1024** — это **не
-подтверждено для конкретного сервера этого проекта (KubeSolo)** и стоит
-явно проверить (`cat /proc/<pid>/limits` внутри под'а), а не предполагать.
-Если лимит окажется на нижней границе (1024), это ограничило бы сервер
-максимум ~1000 одновременных соединений (~166 комнат по 6 участников) — то
-есть **ниже** дефолтного `MAX_ROOMS=500` (которое при полной заполненности
-дало бы 3000 соединений). Это дешёвая проверка с дешёвым фиксом (явный
-`ulimit`/`securityContext` в манифесте), если понадобится поднимать
-`MAX_ROOMS` выше нескольких сотен комнат.
+**The real limiter is the process's `ulimit -n` / `LimitNOFILE`.** Modern
+`containerd`/`systemd` defaults, per web search, are usually **1 048 576**
+([devopsbeast/moby issue][fd-limits]), but old or non-standard systems
+sometimes inherit the historical default of **1024** — this is **not
+confirmed for this project's specific server (KubeSolo)** and is worth
+explicitly checking (`cat /proc/<pid>/limits` inside the pod) rather than
+assuming. If the limit turns out to be at the lower bound (1024), that would
+cap the server at a maximum of ~1000 simultaneous connections (~166 rooms of
+6 participants) — i.e. **below** the default `MAX_ROOMS=500` (which, fully
+filled, would produce 3000 connections). This is a cheap check with a cheap
+fix (an explicit `ulimit`/`securityContext` in the manifest) if `MAX_ROOMS`
+ever needs to go above a few hundred rooms.
 
-**На практике при дефолтных настройках ограничитель — не FD, а сам
-`MAX_ROOMS`.** 500 комнат × 6 участников = 3000 FD в худшем случае — заведомо
-ниже даже пессимистичного FD-лимита в 1024 (если тот вдруг окажется таким
-низким, порог сработает даже раньше, чем `MAX_ROOMS`; если лимит — современный
-дефолт в миллион, `MAX_ROOMS` остаётся единственным реальным потолком).
+**In practice, with default settings, the limiter isn't FDs but `MAX_ROOMS`
+itself.** 500 rooms × 6 participants = 3000 FDs in the worst case —
+comfortably below even the pessimistic FD limit of 1024 (if it does turn out
+that low, the threshold would kick in even before `MAX_ROOMS`; if the limit
+is the modern default of a million, `MAX_ROOMS` remains the only real
+ceiling).
 
-### 2.4 Сеть
+### 2.4 Network
 
-Из §2.2 и `docs/research-marketing.md` §9: разовый всплеск на заполнение
-одной шестиместной комнаты — **десятки КБ, в худшем случае невысокая сотня
-КБ**, ОДНОРАЗОВО, при входе. Хартбит — по паре байт `Ping`/`Pong` на
-соединение каждые 20с: при 3000 соединениях это ~150 крошечных
-кадров/сек — суммарный трафик хартбита исчезающе мал (заметно меньше 1КБ/с
-агрегатно). Итоговый сетевой профиль сервера почти целиком состоит из
-коротких пульсаций при входе участников, не из непрерывного потока — даже
-нереалистичный сценарий «все 500 комнат заполняются одновременно» даёт
-верхнюю границу порядка 500×100КБ = 50МБ, растянутых на реальное время
-переходов по ссылкам, а не как истинный мгновенный всплеск — доступно даже
-на самом дешёвом тарифе VPS с сотней Мбит/с.
+From §2.2 and `docs/research-marketing.md` §9: a one-time burst for filling
+a single six-seat room is **tens of KB, in the worst case a low hundred
+KB**, ONE TIME ONLY, on entry. The heartbeat is a couple of bytes of
+`Ping`/`Pong` per connection every 20s: at 3000 connections that's ~150 tiny
+frames/sec — the aggregate heartbeat traffic is vanishingly small (noticeably
+less than 1KB/s in aggregate). The server's overall network profile consists
+almost entirely of short pulses as participants join, not a continuous
+stream — even the unrealistic scenario of "all 500 rooms filling up at
+once" gives an upper bound of roughly 500×100KB = 50MB, spread over the real
+time it takes people to click links, not as a genuine instantaneous spike —
+achievable even on the cheapest VPS plan with a hundred Mbit/s.
 
-### 2.5 Итоговая таблица по размерам инстанса
+### 2.5 Summary Table by Instance Size
 
-Оценки — на основе разделов 2.1–2.4, с явно обозначенными допущениями:
-~10–30МБ база процесса, ~2–10КБ на WS-соединение (нижняя часть внешнего
-диапазона — обоснование в §2.1), ~3–6КБ на заполненную 6-местную комнату
-сверх стоимости самих соединений её участников.
+Estimates are based on sections 2.1–2.4, with explicitly stated
+assumptions: ~10–30MB base process, ~2–10KB per WS connection (the lower
+part of the external range — the rationale is in §2.1), ~3–6KB for a full
+6-seat room on top of the cost of its participants' connections themselves.
 
-| Размер инстанса | Память доступна под комнаты (после базы процесса + запаса ОС/k8s ~20–30МБ) | Теоретический потолок по памяти (участники) | Реальное узкое место при дефолтах | Рекомендуемый `MAX_ROOMS` |
+| Instance size | Memory available for rooms (after process base + ~20–30MB OS/k8s overhead) | Theoretical memory ceiling (participants) | Real bottleneck at defaults | Recommended `MAX_ROOMS` |
 |---|---|---|---|---|
-| 1 vCPU / 512МБ | ≈480МБ | ~48 000 участников (~8000 комнат по 6) | **`MAX_ROOMS`=500 (DoS-лимит), не память/CPU** — при дефолте занята <1% доступной памяти под соединения; FD-лимит нужно проверить, если планируется поднимать потолок выше пары тысяч соединений | оставить дефолт **500**; поднимать только после проверки `ulimit -n` на хосте |
-| 1 vCPU / 1ГБ | ≈980МБ | ~98 000 участников | Тот же вывод — память/CPU не задействованы даже близко к пределу; при желании более «занятого» инстанса это уже тот размер, где имеет смысл поднимать `MAX_ROOMS` | можно поднять до **1000–2000**, если нужен более людный публичный инстанс — всё ещё далеко от физических пределов, ограничитель сместится на FD/ulimit и на то, сколько одновременных join-всплесков считается приемлемым |
-| 2 vCPU / 4ГБ | ≈4000МБ | ~400 000 участников | CPU-запас (2 ядра) добавляет устойчивость к churn (одновременным подключениям/переподключениям), но при этом протоколе churn — не про TLS-хендшейки (TLS не на этом процессе, см. §2.2) — практический потолок здесь снова не память/CPU, а FD-лимит и операторская готовность держать много комнат одновременно | можно поднять до нескольких тысяч, если появится реальный кейс (публичный многолюдный инстанс) — но перепроверить `LimitNOFILE` заранее, это станет первым реальным ограничителем |
+| 1 vCPU / 512MB | ≈480MB | ~48 000 participants (~8000 rooms of 6) | **`MAX_ROOMS`=500 (DoS limit), not memory/CPU** — at the default, <1% of available memory for connections is used; the FD limit needs to be checked if the ceiling is ever raised above a couple thousand connections | keep the default **500**; raise only after checking `ulimit -n` on the host |
+| 1 vCPU / 1GB | ≈980MB | ~98 000 participants | Same conclusion — memory/CPU aren't engaged anywhere near their limit; if a "busier" instance is desired, this is the size where raising `MAX_ROOMS` starts to make sense | can be raised to **1000–2000** if a more populated public instance is needed — still far from physical limits, the limiter shifts to FD/ulimit and to how many simultaneous join bursts are considered acceptable |
+| 2 vCPU / 4GB | ≈4000MB | ~400 000 participants | The CPU headroom (2 cores) adds resilience to churn (simultaneous connects/reconnects), but for this protocol churn isn't about TLS handshakes (TLS isn't on this process, see §2.2) — the practical ceiling here again isn't memory/CPU but the FD limit and the operator's willingness to hold that many rooms at once | can be raised to several thousand if a real use case appears (a busy public instance) — but re-check `LimitNOFILE` beforehand, it'll become the first real limiter |
 
-### 2.6 Рекомендация по MAX_ROOMS
+### 2.6 Recommendation for MAX_ROOMS
 
-Главный вывод раздела: **на всех трёх практических размерах инстанса реальным
-ограничителем при дефолтных настройках остаётся сам `MAX_ROOMS`
-(осознанный DoS-лимит, `DEFAULT_MAX_ROOMS`=500, `src/state.rs`), а не
-физическая нехватка памяти, CPU, портов или сети** — запас по памяти на
-самом дешёвом рассмотренном тарифе (1 vCPU/512МБ) на порядки превышает то,
-что нужно для дефолтной конфигурации. Практическая рекомендация:
+The section's main conclusion: **across all three practical instance sizes,
+the real limiter under default settings remains `MAX_ROOMS` itself (a
+deliberate DoS limit, `DEFAULT_MAX_ROOMS`=500, `src/state.rs`), not a
+physical shortage of memory, CPU, ports, or network** — the memory headroom
+on even the cheapest plan considered (1 vCPU/512MB) exceeds by orders of
+magnitude what the default configuration needs. Practical recommendation:
 
-- Для персонального/маленького self-hosted инстанса (типичный кейс этого
-  проекта) — **оставить дефолт 500** на любом из трёх размеров: он уже
-  выбран не из-за ресурсных ограничений, а как консервативная защита от
-  флуда (H2, `docs/security.md` §4), и поднимать его без реальной
-  потребности не даёт выгоды.
-- Если появляется конкретная причина держать больше комнат одновременно
-  (публичный многолюдный инстанс) — сначала проверить `ulimit -n`/`LimitNOFILE`
-  внутри реально работающего под'а (это единственная цифра из раздела 2.3,
-  не подтверждённая для конкретного сервера), затем поднимать `MAX_ROOMS`
-  постепенно, ориентируясь на реальную память (`kubectl top pod`), а не на
-  оценки из этого документа.
+- For a personal/small self-hosted instance (the typical case for this
+  project) — **keep the default of 500** on any of the three sizes: it was
+  already chosen not because of resource constraints but as a conservative
+  defense against flooding (H2, `docs/security.md` §4), and raising it
+  without a real need brings no benefit.
+- If there's a concrete reason to hold more rooms simultaneously (a busy
+  public instance) — first check `ulimit -n`/`LimitNOFILE` inside the
+  actually running pod (this is the one figure from section 2.3 not
+  confirmed for the specific server), then raise `MAX_ROOMS` gradually,
+  guided by actual memory usage (`kubectl top pod`), not by the estimates in
+  this document.
 
-### 2.7 Точный расчёт памяти: 10 / 100 / 1 000 / 1 000 000 комнат × 3 участника
+### 2.7 Precise Memory Calculation: 10 / 100 / 1 000 / 1 000 000 Rooms × 3 Participants
 
-В отличие от §2.1 (инженерная прикидка «в столбик») здесь структурная память
-измерена, а не оценена на глаз: собран отдельный (вне этого репозитория)
-Rust-бинарь с ПОЛНЫМИ копиями полей `Participant`/`PendingParticipant`/`Room`
-из `src/state.rs` (те же типы: `mpsc::UnboundedSender<T>`, `Option<String>`,
-`std::time::Instant`, `std::collections::HashMap` — тот же hashbrown, что и в
-проде, начиная с Rust 1.36), под глобальным аллокатором-обёрткой, которая на
-каждый `alloc`/`dealloc` вызывает glibc `malloc_usable_size` — то есть считает
-РЕАЛЬНО отданные аллокатором байты (с округлением до size-class), а не
-задекларированный `Layout::size()`. Собрано и запущено в `rust:slim-bookworm`
-(`--platform linux/amd64`) — та же дистрибуция/glibc-семья, что у
-`gcr.io/distroless/cc-debian12`, на который собирается прод-образ
-(`Dockerfile`), значит поведение allocator'а репрезентативно для реального
-деплоя. `peerId` генерировался буквально как `generate_peer_id()`
-(`Uuid::new_v4().to_string()`), `roomId` — как `generate_room_id()`
-(8 символов из того же алфавита), `epub` — строка длины 87 символов
-(реальная длина ECDH P-256 base64url ключа, см. `src/ws.rs`,
-`EPUB_MAX_CHARS`=200 — каппится сильно выше реального размера). Ниже —
-результаты этого прогона (не гипотетические, а фактически измеренные числа);
-там, где приведена не измеренная, а внешняя/справочная величина (WS-буферы
-сокета), это явно помечено.
+Unlike §2.1 (an engineering back-of-the-envelope estimate), here structural
+memory is measured, not eyeballed: a separate Rust binary (outside this
+repository) was built with FULL copies of the `Participant`/
+`PendingParticipant`/`Room` fields from `src/state.rs` (the same types:
+`mpsc::UnboundedSender<T>`, `Option<String>`, `std::time::Instant`,
+`std::collections::HashMap` — the same hashbrown as in prod, since Rust
+1.36), under a global allocator wrapper that calls glibc
+`malloc_usable_size` on every `alloc`/`dealloc` — i.e. it counts the bytes
+the allocator ACTUALLY handed out (rounded to a size class), not the
+declared `Layout::size()`. Built and run in `rust:slim-bookworm`
+(`--platform linux/amd64`) — the same distro/glibc family as
+`gcr.io/distroless/cc-debian12`, which the prod image is built on
+(`Dockerfile`), so the allocator's behavior is representative of the real
+deploy. `peerId` was generated literally as `generate_peer_id()`
+(`Uuid::new_v4().to_string()`), `roomId` as `generate_room_id()` (8
+characters from the same alphabet), `epub` as a string 87 characters long
+(the real length of an ECDH P-256 base64url key, see `src/ws.rs`,
+`EPUB_MAX_CHARS`=200 — capped well above the real size). Below are the
+results of this run (not hypothetical, but actually measured numbers); where
+a figure is not measured but external/reference (socket WS buffers), this is
+explicitly marked.
 
-**1) Точные размеры типов (`std::mem::size_of`, x86_64 Linux/glibc, замерено):**
+**1) Exact type sizes (`std::mem::size_of`, x86_64 Linux/glibc, measured):**
 
-| Тип | Размер | Комментарий |
+| Type | Size | Comment |
 |---|---|---|
-| `String` | 24 байта | ptr+len+cap, как и ожидалось (3 машинных слова) |
-| `Option<String>` | 24 байта | **без накладных** — компилятор использует niche-оптимизацию (ненулевой указатель `String` даёт свободный битовый паттерн для `None`), лишнего тэга нет |
-| `Instant` | 16 байт | на Linux — по сути `timespec` (sec+nsec, 2×i64) |
-| `Option<Instant>` | 16 байт | тоже без накладных — тот же niche-трюк применим и здесь на этой платформе (не гарантия ABI на все таргеты, но факт для x86_64 Linux) |
-| `RoomSettings` (5×`bool`) | 5 байт | `bool` align=1, никакого паддинга |
-| `mpsc::UnboundedSender<T>` (`PeerTx`) | **8 байт, ВСЕГДА** | проверено на `T`=1-байтовый enum и на `T`=4096-байтовый enum — размер идентичен (8 байт) в обоих случаях: `Sender` — это тонкий указатель на общий `Arc`-подобный `Chan`, его размер НЕ зависит от размера/типа переносимых сообщений |
-| `Participant` / `PendingParticipant` | 72 байта | `tx`(8)+`name: Option<String>`(24)+`epub: Option<String>`(24)+`joined_at: Instant`(16) — без паддинга, ровно сумма полей |
-| `Room` | 208 байт | `participants`-карта(48)+`screen_owner`(24)+`emptied_at`(16)+`leader_id`(24)+`leader_token`(24)+`settings`(8 с паддингом)+`pending`-карта(48)+`created_at`(16) |
-| `HashMap<K,V>` (пустая, только заголовок) | 48 байт | сам `RawTable`/указатели, без единого бакета — hashbrown аллоцирует бакеты лениво, при первой вставке |
+| `String` | 24 bytes | ptr+len+cap, as expected (3 machine words) |
+| `Option<String>` | 24 bytes | **no overhead** — the compiler uses niche optimization (`String`'s non-null pointer gives a free bit pattern for `None`), no extra tag |
+| `Instant` | 16 bytes | on Linux — essentially a `timespec` (sec+nsec, 2×i64) |
+| `Option<Instant>` | 16 bytes | also no overhead — the same niche trick applies here too on this platform (not an ABI guarantee across all targets, but a fact for x86_64 Linux) |
+| `RoomSettings` (5×`bool`) | 5 bytes | `bool` align=1, no padding |
+| `mpsc::UnboundedSender<T>` (`PeerTx`) | **8 bytes, ALWAYS** | verified for `T`=a 1-byte enum and `T`=a 4096-byte enum — the size is identical (8 bytes) in both cases: `Sender` is a thin pointer to a shared `Arc`-like `Chan`, its size does NOT depend on the size/type of the messages carried |
+| `Participant` / `PendingParticipant` | 72 bytes | `tx`(8)+`name: Option<String>`(24)+`epub: Option<String>`(24)+`joined_at: Instant`(16) — no padding, exactly the sum of the fields |
+| `Room` | 208 bytes | `participants` map(48)+`screen_owner`(24)+`emptied_at`(16)+`leader_id`(24)+`leader_token`(24)+`settings`(8 with padding)+`pending` map(48)+`created_at`(16) |
+| `HashMap<K,V>` (empty, header only) | 48 bytes | the `RawTable`/pointers themselves, with not a single bucket — hashbrown allocates buckets lazily, on first insert |
 
-**2) Реальные heap-аллокации строк (измерено через `malloc_usable_size`, включая округление до size-class аллокатора):**
+**2) Real heap allocations for strings (measured via `malloc_usable_size`, including rounding to the allocator's size class):**
 
-| Строка | Запрошено (символов/байт) | Реально отдано glibc | Накладные аллокатора |
+| String | Requested (chars/bytes) | Actually given by glibc | Allocator overhead |
 |---|---|---|---|
-| `roomId` (8 симв., `generate_room_id()`) | 8 | **24 байта** | glibc-«пол»: минимальный usable-размер чанка на x86_64 ≈24 байта (min chunk 32B minus 8B заголовка) — для ЛЮБОЙ настолько маленькой строки меньше не выйдет, даже если реально нужен 1 байт |
-| `peerId` (36 симв. UUID, `Uuid::new_v4().to_string()`) | 36 | **40 байт** | (36+8)/16→3×16=48, 48-8=40 — типовая округлённая формула glibc для этого диапазона |
-| `epub` (87 симв. base64url ECDH-ключ) | 87 | **88 байт** | (87+8)/16→6×16=96, 96-8=88 |
-| зашифрованный `name`-блоб (~48 симв., реалистичный размер: iv 12B+шифртекст+tag 16B в base64) | 48 | **56 байт** | (48+8)/16→4×16=64, 64-8=56 |
+| `roomId` (8 chars, `generate_room_id()`) | 8 | **24 bytes** | glibc's "floor": the minimum usable chunk size on x86_64 is ≈24 bytes (min chunk 32B minus 8B header) — for ANY string this small, it can't get any smaller, even if only 1 byte is actually needed |
+| `peerId` (36-char UUID, `Uuid::new_v4().to_string()`) | 36 | **40 bytes** | (36+8)/16→3×16=48, 48-8=40 — glibc's typical rounding formula for this range |
+| `epub` (87-char base64url ECDH key) | 87 | **88 bytes** | (87+8)/16→6×16=96, 96-8=88 |
+| encrypted `name` blob (~48 chars, realistic size: iv 12B+ciphertext+tag 16B in base64) | 48 | **56 bytes** | (48+8)/16→4×16=64, 64-8=56 |
 
-**3) Один `Participant` целиком, реалистичный текущий протокол (v2: клиент всегда шлёт `name=null` в `join-room` — сервер лишь сохраняет опак для обратной совместимости со старыми клиентами, см. doc-comment `src/protocol.rs` над `ClientMessage::JoinRoom`/`ServerMessage::PeerJoined`; `epub` присутствует):**
+**3) One `Participant` in full, the realistic current protocol (v2: the
+client always sends `name=null` in `join-room` — the server merely keeps
+the field for backward compatibility with old clients, see the doc comment
+in `src/protocol.rs` above `ClientMessage::JoinRoom`/`ServerMessage::PeerJoined`;
+`epub` is present):**
 
-- `sizeof(Participant)` (встроен в слот `HashMap`, без отдельной аллокации) = **72 байта**
-- `epub`-heap = **88 байт**
-- `name` = `None` ⇒ **0 байт heap** (у легаси-клиента с реальным именем добавилось бы ещё ~56 байт, см. таблицу выше)
-- **Итого один `Participant` (v2, есть `epub`, нет `name`): 72 (struct) + 88 (epub) = 160 байт**, плюс ключ `peerId` в карте (40 байт heap + 24 байта заголовка `String` = 64 байта) — то есть **одна запись `(peerId → Participant)` в HashMap ≈ 224 байта «сырых» данных** до накладных самой хеш-таблицы.
+- `sizeof(Participant)` (embedded in the `HashMap` slot, no separate allocation) = **72 bytes**
+- `epub` heap = **88 bytes**
+- `name` = `None` ⇒ **0 bytes heap** (a legacy client with a real name would
+  add another ~56 bytes, see the table above)
+- **Total for one `Participant` (v2, has `epub`, no `name`): 72 (struct) +
+  88 (epub) = 160 bytes**, plus the `peerId` key in the map (40 bytes heap +
+  24 bytes `String` header = 64 bytes) — meaning **one `(peerId →
+  Participant)` entry in the HashMap ≈ 224 "raw" bytes** before the hash
+  table's own overhead.
 
-**4) `HashMap<String, Participant>` с 3 реальными записями (полный проход: 3 канала `mpsc::unbounded_channel` + 3 `String`-ключа + 3 `epub`-строки + сама таблица hashbrown) — измерено целиком: 2.45 KiB** (≈836 байт/участника, то есть накладные самой хеш-таблицы + канала добавляют к «сырым» 224 байтам ещё ~600 байт на запись). Основной вклад в эти ~600 байт — не сам hashbrown (у него для 3 записей заведомо ≤8 бакетов по 1 контрольному байту каждый, то есть считанные байты; максимальный коэффициент загрузки hashbrown — 7/8, [округление до степени двух][hashbrown-lf]), а собственная внутренняя аллокация `tokio::sync::mpsc`-канала (блок очереди сообщений + семафор + служебные поля Receiver-стороны) — она создаётся один раз на соединение независимо от того, сколько раз клонируется `Sender`, и это НЕ структура нашего кода, а cost tokio-примитива, который наш код обязан платить за сам факт «одно соединение = один канал».
+**4) `HashMap<String, Participant>` with 3 real entries (a full run: 3
+`mpsc::unbounded_channel` channels + 3 `String` keys + 3 `epub` strings +
+the hashbrown table itself) — measured as a whole: 2.45 KiB** (≈836
+bytes/participant, meaning the hash table's own overhead plus the channel
+add roughly 600 more bytes per entry on top of the "raw" 224 bytes). The main
+contributor to those ~600 bytes isn't hashbrown itself (for 3 entries it has
+at most ≤8 buckets of 1 control byte each — a handful of bytes; hashbrown's
+maximum load factor is 7/8, [rounded to a power of two][hashbrown-lf]), but
+the `tokio::sync::mpsc` channel's own internal allocation (the message-queue
+block + semaphore + Receiver-side bookkeeping fields) — it's created once
+per connection regardless of how many times the `Sender` is cloned, and this
+is NOT a structure of our own code, but the cost of the tokio primitive that
+our code has to pay for the mere fact that "one connection = one channel".
 
-**5) Целая `Room` с 3 участниками (структурная память нашего кода, включая `leader_id`, пустой `pending`, дефолтные `settings`) — измерено целиком: 2.45 KiB** — совпадает (в пределах округления) с чистой картой участников из п.4: остальные поля `Room` (`screen_owner=None`, `leader_token=None` — токен уже сожжён к моменту устоявшегося звонка, `pending` — пустая карта, `settings` — 5 байт без heap) в типичном 3-местном звонке практически ничего не добавляют сверху.
+**5) A whole `Room` with 3 participants (our code's structural memory,
+including `leader_id`, an empty `pending`, default `settings`) — measured as
+a whole: 2.45 KiB** — matching (within rounding) the plain participant map
+from point 4: `Room`'s remaining fields (`screen_owner=None`,
+`leader_token=None` — the token is already burned by the time a call has
+settled, `pending` — an empty map, `settings` — 5 bytes, no heap) add
+essentially nothing on top for a typical 3-seat call.
 
-**6) Масштабный замер — НЕ экстраполяция, а буквальный прогон N настоящих `Room` в `HashMap<String, Room>` (реальный глобальный `SharedRooms`):**
+**6) Scale measurement — NOT an extrapolation, but a literal run of N real
+`Room`s inside a `HashMap<String, Room>` (the actual global `SharedRooms`):**
 
-| N комнат | Соединений (×3) | Структурная память (измерено) | Байт/комнату | Байт/участника |
+| N rooms | Connections (×3) | Structural memory (measured) | Bytes/room | Bytes/participant |
 |---|---|---|---|---|
 | 10 | 30 | 29.13 KiB | ~2 983 | ~994 |
 | 100 | 300 | 282.45 KiB | ~2 892 | ~964 |
@@ -661,287 +710,302 @@ Rust-бинарь с ПОЛНЫМИ копиями полей `Participant`/`Pen
 | 100 000 | 300 000 | 271.6 MiB | ~2 848 | ~949 |
 | **1 000 000** | **3 000 000** | **2.586 GiB** | **~2 777** | **~926** |
 
-Число байт/комнату стабилизируется в узком коридоре **~2.8–3.1 КБ/комнату
-(~0.9–1.0 КБ/участника)** на всех порядках величины — рост от 10 до
-1 000 000 комнат линейный, без сюрпризов вроде деградации hashbrown на
-крупных таблицах.
+The bytes/room figure stabilizes in a narrow band of **~2.8–3.1 KB/room
+(~0.9–1.0 KB/participant)** across all orders of magnitude — growth from 10
+to 1 000 000 rooms is linear, with no surprises like hashbrown degrading on
+large tables.
 
-**7) WS-накладные (буферы сокета/tungstenite-tokio на соединение) — это
-ВНЕШНЯЯ, не измеренная в этом прогоне величина: переиспользуется уже
-сделанная в §2.1 оценка 2–10КБ/idle-соединение** (нижняя часть диапазона
-[websocket.org][ws-limits], обоснование, почему для ЭТОГО протокола
-реалистичнее нижняя граница — там же). Как и в §2.1: это **на порядок
-больше структурной памяти на соединение** (0.9–1КБ структур против 2–10КБ
-WS-буферов) — то есть даже здесь, при точном замере структур, доминирует не
-код этого проекта, а сам факт держать открытый TCP/WS-сокет.
+**7) WS overhead (socket/tungstenite-tokio buffers per connection) is an
+EXTERNAL figure, not measured in this run: it reuses the 2–10KB/idle
+connection estimate already made in §2.1** (the lower part of the range
+[websocket.org][ws-limits], the rationale for why the lower bound is more
+realistic for THIS protocol is there too). As in §2.1: this is **an order of
+magnitude larger than the structural memory per connection** (0.9–1KB of
+structures versus 2–10KB of WS buffers) — meaning even here, with an exact
+measurement of the structures, what dominates isn't this project's code but
+the plain fact of holding an open TCP/WS socket.
 
-**Итоговая таблица (структурная память — измерено; WS-накладные — внешняя
-оценка §2.1; база процесса — измеренный прод-пик почти при нулевой нагрузке:
-`working_set` 2.34 MiB / RSS 1.41 MiB, используется как нижний якорь):**
+**Summary table (structural memory — measured; WS overhead — external
+estimate from §2.1; process base — a measured prod peak at near-zero load:
+`working_set` 2.34 MiB / RSS 1.41 MiB, used as the lower anchor):**
 
-| Комнат × 3 | Соединений | Структурная память (измерено) | + WS-накладные (2–10КБ×соединений) | = Итого без базы | + база процесса (~2.34 MiB) | Итого |
+| Rooms × 3 | Connections | Structural memory (measured) | + WS overhead (2–10KB×connections) | = Total without base | + process base (~2.34 MiB) | Total |
 |---|---|---|---|---|---|---|
 | 10 | 30 | 0.028 MiB | 0.06–0.29 MiB | 0.09–0.32 MiB | +2.34 MiB | **≈2.4–2.7 MiB** |
 | 100 | 300 | 0.28 MiB | 0.59–2.93 MiB | 0.86–3.21 MiB | +2.34 MiB | **≈3.2–5.6 MiB** |
 | 1 000 | 3 000 | 2.91 MiB | 5.86–29.30 MiB | 8.77–32.21 MiB | +2.34 MiB | **≈11.1–34.6 MiB** |
-| **1 000 000** | **3 000 000** | **2.586 GiB** | **5.72–28.61 GiB** | **8.31–31.19 GiB** | +0.002 GiB (не влияет) | **≈8.3–31.2 GiB** |
+| **1 000 000** | **3 000 000** | **2.586 GiB** | **5.72–28.61 GiB** | **8.31–31.19 GiB** | +0.002 GiB (negligible) | **≈8.3–31.2 GiB** |
 
-Заметки к таблице:
+Notes on the table:
 
-- **1 000 комнат уже вдвое превышает `DEFAULT_MAX_ROOMS`=500** — на
-  дефолтных настройках сервер отдаст `503` на создание 501-й комнаты задолго
-  до того, как речь зайдёт о памяти (это тот же вывод, что в §2.6, здесь
-  просто явно показан на конкретной цифре из условия задачи).
-- Измеренная база процесса (2.34 MiB working_set / 1.41 MiB RSS, прод-пик
-  почти без нагрузки) заметно **меньше**, чем оценка «10–30МБ» в §2.1 —
-  та оценка была построена на внешних ориентирах (Sharkbench-бенчмарк,
-  `requests: 32Mi` в манифесте) и оказалась консервативной; реальный процесс
-  легче. Это не противоречие, а уточнение: §2.1 намеренно не переписан (он
-  и был помечен как «оценка, не факт»), а этот раздел даёт более точный
-  нижний якорь там, где он есть.
-- Уже на 1 000 комнатах структурная память (2.91 MiB) **сопоставима с самой
-  базой процесса** (2.34 MiB) — то есть на этом масштабе структуры кода
-  впервые становятся заметны на фоне базы, но всё ещё меньше WS-накладных.
+- **1 000 rooms already doubles `DEFAULT_MAX_ROOMS`=500** — with default
+  settings the server will return `503` when creating the 501st room, long
+  before memory even becomes a question (this is the same conclusion as in
+  §2.6, just explicitly demonstrated here on a concrete figure from the
+  problem statement).
+- The measured process base (2.34 MiB working_set / 1.41 MiB RSS, a prod
+  peak at near-zero load) is noticeably **smaller** than the "10–30MB"
+  estimate in §2.1 — that estimate was built on external reference points
+  (the Sharkbench benchmark, `requests: 32Mi` in the manifest) and turned
+  out to be conservative; the real process is lighter. This isn't a
+  contradiction but a refinement: §2.1 is deliberately left unrewritten (it
+  was already marked as "an estimate, not a fact"), and this section
+  provides a more precise lower anchor where one is available.
+- Already at 1 000 rooms, structural memory (2.91 MiB) is **comparable to
+  the process base itself** (2.34 MiB) — meaning at this scale the code's
+  structures first become noticeable against the base, but are still
+  smaller than the WS overhead.
 
-**Главный вывод для 1 000 000 комнат: упор НЕ в структурную память.**
-2.586 GiB измеренной структурной памяти плюс 5.7–28.6 GiB WS-буферов дают
-**~8.3–31.2 GiB суммарно** — это укладывается в память одной крупной машины
-(десятки ГБ ОЗУ — не экзотика для выделенного сервера), то есть память саму
-по себе есть шанс «просто купить». Но до неё в реальности не доедешь по трём
-независимым причинам, все — из кода/конфигурации этого проекта, не из
-абстрактных пределов:
+**The main conclusion for 1 000 000 rooms: the bottleneck is NOT structural
+memory.** 2.586 GiB of measured structural memory plus 5.7–28.6 GiB of WS
+buffers give **~8.3–31.2 GiB in total** — this fits within the memory of one
+large machine (tens of GB of RAM isn't exotic for a dedicated server),
+meaning there's a chance memory itself could "just be bought". But in
+reality you'd never get there, for three independent reasons, all stemming
+from this project's code/configuration, not from abstract limits:
 
-1. **Файловые дескрипторы.** 3 000 000 одновременных соединений — это
-   3 000 000 FD на процесс. Даже щедрый современный дефолт
-   `LimitNOFILE`=1 048 576 ([fd-limits], уже процитирован в §2.3) **втрое
-   меньше** необходимого — нужен явный, специально поднятый ulimit далеко
-   за пределами типичных дефолтов, а не «современная система и так справится».
-2. **Реапер и единый глобальный `Mutex`.** `state::reap_rooms` (`src/state.rs`)
-   раз в `REAPER_INTERVAL`=1 секунду делает **линейный проход по ВСЕЙ**
-   `HashMap<String, Room>` (`HashMap::retain`) под одним и тем же
-   `std::sync::Mutex`, которым же защищены `join-room`/`leave`/релей —
-   при 1 000 000 записей (и 3 000 000 вложенных участников, которых реапер
-   тоже обходит на каждой комнате при проверке пустоты) это не «пренебрежимо
-   дешёвая проверка», как для сотен комнат (см. её же doc-comment и §2.2),
-   а полноценный проход по многомиллионной структуре данных **каждую
-   секунду**, держащий единственный лок, которым синхронизировано вообще
-   всё остальное — новый, качественно другой источник задержки/contention,
-   которого не существует на масштабе, для которого сервер написан
-   (`DEFAULT_MAX_ROOMS`=500, «единицы комнат» — см. doc-comment модуля
-   `state.rs`).
-3. **`MAX_ROOMS` и однопроцессная модель.** `DEFAULT_MAX_ROOMS`=500 отсекает
-   всё это на 3 порядка раньше, чем вопрос о памяти успевает встать — это
-   осознанный DoS-лимит (§2.6), а не забытая настройка. А даже если его
-   поднять — весь стейт живёт в `Arc<Mutex<HashMap>>` ОДНОГО процесса
-   (`SharedRooms`), и Часть 1 этого документа (§1.6) прямо называет текущую
-   архитектуру «single-replica by design»: горизонтального шардинга комнат
-   между несколькими инстансами не существует. 1 000 000 комнат на одном
-   процессе — это не вопрос «дать больше RAM», а вопрос **другой
-   архитектуры** (шардинг/кластер), которой в проекте нет и которую этот
-   документ не проектирует.
+1. **File descriptors.** 3 000 000 simultaneous connections means
+   3 000 000 FDs for the process. Even the generous modern default
+   `LimitNOFILE`=1 048 576 ([fd-limits], already cited in §2.3) is **three
+   times less** than what's needed — an explicit, specially raised ulimit
+   far beyond typical defaults is required, it's not a case of "a modern
+   system will just handle it".
+2. **The reaper and a single global `Mutex`.** `state::reap_rooms`
+   (`src/state.rs`) does a **linear pass over the ENTIRE**
+   `HashMap<String, Room>` (`HashMap::retain`) once every
+   `REAPER_INTERVAL`=1 second, under the very same `std::sync::Mutex` that
+   also guards `join-room`/`leave`/relaying — at 1 000 000 entries (and
+   3 000 000 nested participants, which the reaper also walks through for
+   each room when checking whether it's empty), this is no longer a
+   "negligibly cheap check" the way it is for hundreds of rooms (see its own
+   doc comment and §2.2), but a full pass over a multi-million-entry data
+   structure **every second**, holding the single lock that synchronizes
+   literally everything else — a new, qualitatively different source of
+   latency/contention that doesn't exist at the scale the server was
+   written for (`DEFAULT_MAX_ROOMS`=500, "a handful of rooms" — see the doc
+   comment of the `state.rs` module).
+3. **`MAX_ROOMS` and the single-process model.** `DEFAULT_MAX_ROOMS`=500
+   cuts all of this off 3 orders of magnitude before the question of memory
+   even has a chance to come up — this is a deliberate DoS limit (§2.6), not
+   a forgotten setting. And even if it were raised — the entire state lives
+   in the `Arc<Mutex<HashMap>>` of ONE process (`SharedRooms`), and Part 1 of
+   this document (§1.6) explicitly calls the current architecture
+   "single-replica by design": there is no horizontal sharding of rooms
+   across multiple instances. 1 000 000 rooms on one process isn't a
+   question of "give it more RAM", but a question of **a different
+   architecture** (sharding/clustering), which this project doesn't have and
+   which this document doesn't design.
 
-Короче: структуры (`Participant`/`Room`/`HashMap`) — измеренно дёшевы
-(единицы КБ на комнату на любом масштабе); WS-буферы соединений доминируют
-над ними на порядок; а настоящий потолок при 1 000 000 комнат — это
-FD-лимит, стоимость реапера на единый лок и сам `MAX_ROOMS`, а не нехватка
-памяти как таковой.
+In short: the structures (`Participant`/`Room`/`HashMap`) are measurably
+cheap (a few KB per room at any scale); the WS connection buffers dominate
+them by an order of magnitude; and the real ceiling at 1 000 000 rooms is
+the FD limit, the reaper's cost on the single lock, and `MAX_ROOMS` itself —
+not a shortage of memory as such.
 
 ---
 
-### 2.8 Самое слабое место ТЕКУЩЕГО сервера (по ресурсам)
+### 2.8 The Weakest Point of the CURRENT Server (Resource-Wise)
 
-Замеренные характеристики текущего прод-узла (`contabo3858312`, kubesolo,
-одна нода/одна реплика, 2026-07-16):
+Measured characteristics of the current prod node (`contabo3858312`,
+kubesolo, one node/one replica, 2026-07-16):
 
-| Ресурс | Значение | Запас |
+| Resource | Value | Headroom |
 |---|---|---|
-| CPU | 4 vCPU (amd64) | пик чата 24m = **0.6% одного ядра** |
-| RAM | 7.9 GiB | пик чата 2.3 MiB working set — на 3 порядка ниже |
-| FD (`nofile` для контейнеров) | ~1 073 741 816 (≈1 млрд) | не 1024-дефолт — щедро сконфигурировано; **не узкое место здесь** |
-| `fs.file-max` | практически без лимита (2^63) | — |
-| `net.core.somaxconn` | 4096 | accept-очередь; важна только при залповом наплыве одновременных connect'ов |
+| CPU | 4 vCPU (amd64) | chat peak 24m = **0.6% of one core** |
+| RAM | 7.9 GiB | chat peak 2.3 MiB working set — 3 orders of magnitude lower |
+| FD (`nofile` for containers) | ~1 073 741 816 (≈1 billion) | not the 1024 default — generously configured; **not a bottleneck here** |
+| `fs.file-max` | practically unlimited (2^63) | — |
+| `net.core.somaxconn` | 4096 | accept queue; matters only under a burst of simultaneous connects |
 
-Вывод, который важнее всех цифр из §2.1–2.7: **на этом сервере самое слабое
-место — не железо, а единственный глобальный лок состояния.** Все комнаты
-живут в `Arc<Mutex<HashMap<String, Room>>>` (`src/main.rs:203`,
-`std::sync::Mutex` — даже не `RwLock`). Один и тот же лок берут:
+The conclusion that matters more than all the figures from §2.1–2.7: **on
+this server, the weakest point isn't the hardware, it's the single global
+state lock.** All rooms live in an `Arc<Mutex<HashMap<String, Room>>>`
+(`src/main.rs:203`, `std::sync::Mutex` — not even a `RwLock`). The same lock
+is taken by:
 
-- каждый релей `offer`/`answer`/`ice-candidate`/`stream-info`/`name-announce`
+- every relay of `offer`/`answer`/`ice-candidate`/`stream-info`/`name-announce`
   (`src/ws.rs`),
-- каждый `join-room`/`approve`/`reject`, `POST`/`PUT /api/rooms`
+- every `join-room`/`approve`/`reject`, `POST`/`PUT /api/rooms`
   (`src/main.rs:348,434`),
-- **реапер — раз в секунду полным проходом по всей карте комнат**
-  (`src/state.rs:218-222`, `REAPER_INTERVAL=1с`, `rooms.lock().unwrap()`).
+- **the reaper — once a second, in a full pass over the entire room map**
+  (`src/state.rs:218-222`, `REAPER_INTERVAL=1s`, `rooms.lock().unwrap()`).
 
-Следствия по нарастанию нагрузки (при том, что RAM/FD/сеть ещё бездонны):
+Consequences as load grows (while RAM/FD/network are still bottomless):
 
-1. **Лок сериализует весь сигналинг.** Сколько бы ни было ядер (здесь 4),
-   пропускная способность релея упирается в то, как быстро **одно** ядро
-   прогоняет критические секции по очереди. Это theoretical weakest link:
-   при всплеске установки соединений/ренегоциаций throughput ограничен
-   локом, а не суммой ядер. CPU-графики при этом будут показывать ~1 занятое
-   ядро из 4 — остальные простаивают не от нехватки работы, а от ожидания
-   лока.
-2. **Реапер — усилитель contention.** Его проход `O(комнат)` под тем же
-   локом раз в секунду при сотнях-тысячах комнат ещё незаметен (микросекунды),
-   но растёт линейно и при десятках-сотнях тысяч комнат начинает
-   периодически «замораживать» весь релей на длительность прохода каждую
-   секунду — раньше, чем закончится RAM.
-3. **`somaxconn=4096`** — вторичный: при залпе >4096 одновременно
-   устанавливаемых TCP-соединений (не установленных, а именно в момент
-   рукопожатия) избыток отвергается ядром до accept. Для честного трафика
-   недостижимо, но релевантно как вектор всплеска.
+1. **The lock serializes all signaling.** No matter how many cores there
+   are (4 here), relay throughput is bounded by how fast **one** core can
+   run through the critical sections in sequence. This is the theoretical
+   weakest link: under a burst of connection setups/renegotiations,
+   throughput is limited by the lock, not by the sum of the cores. CPU
+   graphs, meanwhile, will show ~1 busy core out of 4 — the rest sit idle
+   not from a lack of work, but from waiting on the lock.
+2. **The reaper is a contention amplifier.** Its `O(rooms)` pass under the
+   same lock, once a second, is still unnoticeable at hundreds-to-thousands
+   of rooms (microseconds), but grows linearly, and at tens-to-hundreds of
+   thousands of rooms it starts periodically "freezing" the entire relay for
+   the duration of the pass, every second — sooner than RAM runs out.
+3. **`somaxconn=4096`** — secondary: on a burst of >4096 simultaneously
+   handshaking TCP connections (not already established, but exactly at the
+   handshake moment), the excess gets rejected by the kernel before accept.
+   Unreachable for legitimate traffic, but relevant as a burst vector.
 
-Порядок исчерпания на этом железе (4 vCPU / 8 GiB / щедрый FD): **сначала
-contention на глобальном `Mutex` (эффективно одноядерный потолок сигналинга)
-→ затем стоимость реапера на том же локе → и только потом, далеко за
-`MAX_ROOMS=500`, RAM (~1 млн соединений, см. §2.7).** FD и сеть на этом узле
-не станут узким местом ни при каком реалистичном числе комнат.
+The order of exhaustion on this hardware (4 vCPU / 8 GiB / generous FD):
+**first, contention on the global `Mutex` (effectively a single-core ceiling
+on signaling) → then the cost of the reaper on that same lock → and only
+after that, way past `MAX_ROOMS=500`, RAM (~1 million connections, see
+§2.7).** FDs and the network won't become a bottleneck on this node at any
+realistic number of rooms.
 
-Что бы это расшивало (если бы понадобилось — сейчас НЕ нужно, нагрузка
-ничтожна): шардинг карты комнат на N независимых `Mutex` по хэшу `roomId`
-(классический sharded-map, убирает глобальную сериализацию почти бесплатно),
-и/или реапер по отдельному индексу дедлайнов вместо полного скана под общим
-локом. Обе правки — оптимизация «на будущее»; при текущих 0.6% ядра и
-2.3 MiB это чисто теоретический потолок, а не проблема.
+What would unblock this (if it were ever needed — right now it isn't, the
+load is negligible): sharding the room map into N independent `Mutex`es by a
+hash of `roomId` (the classic sharded-map approach, which removes global
+serialization almost for free), and/or a reaper working off a separate
+deadline index instead of a full scan under the shared lock. Both changes
+are "for the future" optimizations; at the current 0.6% of a core and
+2.3 MiB, this is a purely theoretical ceiling, not a problem.
 
 ---
 
-### 2.9 FD-лимиты по факту и потолок после тюнинга (замерено 2026-07-16)
+### 2.9 FD Limits in Practice and the Ceiling After Tuning (Measured 2026-07-16)
 
-Проверил реальные лимиты процесса сервера в проде (через хост, минуя
-distroless-под — `crictl inspect` → `/proc/<pid>/limits`):
+I checked the server process's real limits in prod (via the host, bypassing
+the distroless pod — `crictl inspect` → `/proc/<pid>/limits`):
 
-| Уровень | Лимит | Вывод |
+| Level | Limit | Conclusion |
 |---|---|---|
-| Процесс чата в поде (`nofile` soft=hard) | **1 073 741 816** (~1 млрд) | FD уже фактически без потолка |
-| Открыто FD сейчас | 129 | из миллиарда |
-| containerd `LimitNOFILE` | 1 073 741 816 | под наследует его — отсюда миллиард в поде |
-| Нода `fs.file-max` | 9.2×10^18 (2^63) | системного потолка нет |
-| Нода `fs.nr_open` | 1 073 741 816 | верхняя граница на процесс |
-| `fs.file-nr` (занято сейчас) | 4000 | вся нода |
-| `net.core.somaxconn` | 4096 | accept-очередь — умеренно, тюнится |
-| `net.ipv4.tcp_max_syn_backlog` | 512 | SYN-очередь — низко, тюнится |
-| `ip_local_port_range` | 32768–60999 | **нерелевантно серверу**: он только принимает входящие на ОДИН порт, исходящих не делает — «порты кончатся» его не касается (§2.3) |
-| RAM ноды | 7.9 GiB (сейчас свободно ~4.3, остальное — prometheus/прочие поды) | |
+| Chat process in the pod (`nofile` soft=hard) | **1 073 741 816** (~1 billion) | FDs are already, in practice, unbounded |
+| FDs open right now | 129 | out of a billion |
+| containerd `LimitNOFILE` | 1 073 741 816 | the pod inherits it — hence the billion in the pod |
+| Node `fs.file-max` | 9.2×10^18 (2^63) | no system-wide ceiling |
+| Node `fs.nr_open` | 1 073 741 816 | the upper bound per process |
+| `fs.file-nr` (currently in use) | 4000 | whole node |
+| `net.core.somaxconn` | 4096 | accept queue — moderate, tunable |
+| `net.ipv4.tcp_max_syn_backlog` | 512 | SYN queue — low, tunable |
+| `ip_local_port_range` | 32768–60999 | **irrelevant to the server**: it only accepts inbound connections on ONE port and makes no outbound ones — "running out of ports" doesn't concern it (§2.3) |
+| Node RAM | 7.9 GiB (currently ~4.3 free, the rest is prometheus/other pods) | |
 | CPU | 4 vCPU | |
 
-**Главный вывод по FD: тюнить нечего — он уже выкручен на максимум** (и
-containerd, и нода дают ~1 млрд, занято 129). Единственное, что осмысленно
-подкрутить на сетевом уровне, — очереди приёма под залповый наплыв:
-`somaxconn` 4096 → 65535 и `tcp_max_syn_backlog` 512 → 8192 (одна строка
-sysctl; защищает от отбрасывания соединений при одновременном подключении
-многих тысяч клиентов, но не влияет на удержание уже установленных).
+**The main conclusion on FDs: there's nothing to tune — it's already
+cranked to the max** (both containerd and the node give ~1 billion, 129 in
+use). The only thing worth tuning at the network level is the accept queues
+for burst arrivals: `somaxconn` 4096 → 65535 and `tcp_max_syn_backlog` 512 →
+8192 (a one-line sysctl change; protects against dropped connections when
+many thousands of clients connect at once, but doesn't affect holding
+already-established ones).
 
-#### Сколько можно держать после тюнинга — на ЭТОМ железе (4 vCPU / 8 GiB)
+#### How Much Can Be Held After Tuning — on THIS Hardware (4 vCPU / 8 GiB)
 
-FD снят с уравнения (он бесконечен), `MAX_ROOMS` — просто env, поднимается до
-любого числа. Остаются **два разных потолка**, и путать их нельзя:
+FDs are removed from the equation (effectively infinite), `MAX_ROOMS` is
+just an env var that can be raised to any number. What remains are **two
+different ceilings**, and they must not be conflated:
 
-**(A) Статическое удержание уже установленных соединений — упирается в RAM.**
-Стоимость одного простаивающего WS ≈ структура (~1 КБ, §2.7) + буферы
-tokio/tungstenite (~4–16 КБ, оценка §2.1). Если отдать чату ~4 GiB (реально
-свободно сейчас) или ~7 GiB (если нода только под чат):
+**(A) Statically holding already-established connections — bounded by RAM.**
+The cost of one idle WS ≈ structure (~1 KB, §2.7) + tokio/tungstenite
+buffers (~4–16 KB, estimate from §2.1). If chat is given ~4 GiB (actually
+free right now) or ~7 GiB (if the node is chat-only):
 
-| Бюджет RAM чату | При 8 КБ/соединение | При 16 КБ/соединение |
+| RAM budget for chat | At 8 KB/connection | At 16 KB/connection |
 |---|---|---|
-| 4 GiB | ~500 000 соединений ≈ **~165 000 комнат ×3** | ~260 000 ≈ ~85 000 комнат |
-| 7 GiB | ~900 000 соединений ≈ **~300 000 комнат ×3** | ~450 000 ≈ ~150 000 комнат |
+| 4 GiB | ~500 000 connections ≈ **~165 000 rooms ×3** | ~260 000 ≈ ~85 000 rooms |
+| 7 GiB | ~900 000 connections ≈ **~300 000 rooms ×3** | ~450 000 ≈ ~150 000 rooms |
 
-То есть по памяти на этой коробке реалистично **сотни тысяч одновременных
-участников** (десятки–сотни тысяч комнат по 3), если звонки уже установлены
-и сигналинг молчит.
+So, memory-wise, on this box, **hundreds of thousands of simultaneous
+participants** are realistic (tens to hundreds of thousands of 3-person
+rooms), provided the calls are already established and signaling is quiet.
 
-**(B) Скорость установки/ренегоциации — упирается в глобальный `Mutex`
-(§2.8), а не в RAM.** Все join/leave/relay сериализуются одним локом на одно
-ядро. Поэтому число (A) достижимо только если соединения держатся долго и
-почти не генерируют сигналинг после setup (типичный созвон именно такой:
-буря SDP/ICE в первые секунды, дальше тишина). При высоком churn (постоянные
-входы/выходы) реальный потолок — это **пропускная способность лока в
-join/сек**, и она наступит намного раньше, чем RAM: 4 ядра тут не помогают,
-работает фактически одно.
+**(B) Setup/renegotiation speed — bounded by the global `Mutex` (§2.8), not
+by RAM.** All join/leave/relay operations are serialized by one lock onto
+one core. So figure (A) is only reachable if connections are held for a long
+time and generate almost no signaling after setup (a typical call is exactly
+like that: a burst of SDP/ICE in the first seconds, then silence). Under
+high churn (constant joins/leaves), the real ceiling is the **lock's
+throughput in joins/sec**, and it will be hit far sooner than RAM: 4 cores
+don't help here, effectively only one is doing the work.
 
-**Практический итог:** после тюнинга (`somaxconn`/`syn_backlog` вверх,
-`MAX_ROOMS` вверх — FD трогать не надо) этот сервер удержит **порядка
-100 000–300 000 одновременных участников в установленных звонках**
-(десятки–сотни тысяч комнат по 3), ограниченный памятью. Но устойчивый темп
-*новых* подключений ограничен единственным локом (§2.8) — если цель именно
-высокая churn-нагрузка, сначала нужен шардинг карты комнат (§2.8), а не
-докупка RAM/ядер. Для нынешней реальной нагрузки (пик 2.3 MiB / 0.6% ядра,
-§раздел выше) оба потолка недостижимо далеко.
+**Practical bottom line:** after tuning (`somaxconn`/`syn_backlog` up,
+`MAX_ROOMS` up — no need to touch FDs), this server would hold **roughly
+100 000–300 000 simultaneous participants in established calls** (tens to
+hundreds of thousands of 3-person rooms), limited by memory. But the
+sustainable rate of *new* connections is limited by the single lock (§2.8)
+— if the goal is specifically high churn load, room-map sharding (§2.8) is
+needed first, not buying more RAM/cores. For the current real load (peak
+2.3 MiB / 0.6% of a core, section above), both ceilings are unreachably far
+away.
 
 ---
 
-### 2.10 Открытые порты пода и нужны ли UDP (замерено 2026-07-16)
+### 2.10 Pod Open Ports and Whether UDP Is Needed (Measured 2026-07-16)
 
-Проверил реальные слушающие сокеты (netns пода через `nsenter`, конфиги k8s,
-firewall хоста через `nft`):
+I checked the real listening sockets (the pod's netns via `nsenter`, k8s
+configs, the host firewall via `nft`):
 
-**Сам чат-сервер (бинарь `screenshare`) слушает ТОЛЬКО TCP 8080. Ни одного
-UDP.** Это чистый сигналинг-релей по WebSocket поверх TCP — у него UDP-портов
-нет и не было. Значит «много UDP, которые я открывал» — это **не про чат**, а
-про отдельный компонент.
+**The chat server itself (the `screenshare` binary) listens ONLY on TCP
+8080. Not a single UDP port.** It's a pure signaling relay over WebSocket on
+top of TCP — it has no UDP ports and never had any. So "the many UDP ports I
+had opened" are **not about chat** at all, but about a separate component.
 
-**UDP держит отдельный `turn-server`** (namespace `turn`, образ
-`ghcr.io/mycrl/turn-server`, `hostNetwork=true`). Firewall хоста (`nft`)
-открывает под него:
+**UDP is held by a separate `turn-server`** (namespace `turn`, image
+`ghcr.io/mycrl/turn-server`, `hostNetwork=true`). The host firewall (`nft`)
+opens the following for it:
 
-| Порт(ы) UDP | Кто | Назначение |
+| UDP port(s) | Who | Purpose |
 |---|---|---|
-| 3478 | turn-server | STUN/TURN control — «пробивание NAT» в чистом виде |
-| **49160–49999** (840 портов) | turn-server relay | TURN **relay**-аллокации (из `turn-config`: `port-range="49160..49999"`, `realm=fedorov.it`) |
-| 51820 | WireGuard | VPN, к чату отношения не имеет — отдельное решение |
+| 3478 | turn-server | STUN/TURN control — "NAT punch-through" in its pure form |
+| **49160–49999** (840 ports) | turn-server relay | TURN **relay** allocations (from `turn-config`: `port-range="49160..49999"`, `realm=fedorov.it`) |
+| 51820 | WireGuard | VPN, unrelated to chat — a separate setup |
 
-**Нужны ли они — да, чат их активно использует.** Прод-эндпоинт
-`GET https://chat-api.fedorov.it/config` реально отдаёт клиентам:
+**Are they needed — yes, chat actively uses them.** The prod endpoint
+`GET https://chat-api.fedorov.it/config` really does hand clients:
 ```
-stun:stun.l.google.com:19302            (публичный STUN, fallback)
-turn:chat-udp.fedorov.it:3478           (свой TURN, HMAC-credential)
+stun:stun.l.google.com:19302            (public STUN, fallback)
+turn:chat-udp.fedorov.it:3478           (own TURN, HMAC-credential)
 ```
-То есть каждый клиент получает этот TURN как ICE-fallback.
+So every client gets this TURN server as an ICE fallback.
 
-**Но это ровно та развилка, что противоречит принципу «сервер только пробивает
-NAT»:**
-- **STUN (3478)** — и есть «пробивание NAT»: сервер помогает клиентам найти
-  свои внешние адреса, медиа через него НЕ идёт. Дёшево, полностью в духе
-  философии проекта, покрывает ~80–90% сетей. Оставлять безусловно.
-- **TURN relay (49160–49999)** — это уже НЕ пробивание NAT, а **прокачка
-  медиа через ваш сервер** для тех ~10–20% случаев (симметричный NAT,
-  строгие корпоративные/мобильные сети), где прямой P2P невозможен в
-  принципе. Без него такие звонки просто **не соединятся вообще**. Это
-  осознанный размен: reliability для меньшинства сетей против «сервер ничего
-  не прокачивает».
+**But this is exactly the fork in the road that conflicts with the "server
+only punches through NAT" principle:**
+- **STUN (3478)** — this is exactly "punching through NAT": the server
+  helps clients discover their external addresses, media does NOT flow
+  through it. Cheap, fully in the spirit of the project's philosophy,
+  covers ~80–90% of networks. Keep unconditionally.
+- **TURN relay (49160–49999)** — this is no longer punching through NAT,
+  it's **pumping media through your server** for that ~10–20% of cases
+  (symmetric NAT, strict corporate/mobile networks) where direct P2P is
+  fundamentally impossible. Without it, such calls simply **won't connect at
+  all**. This is a deliberate trade-off: reliability for a minority of
+  networks versus "the server relays nothing".
 
-Приватность при этом НЕ страдает: даже через TURN медиа остаётся
-DTLS-зашифрованным end-to-end (см. `docs/privacy.md` — TURN несёт
-непрозрачные байты, читать их не может). Цена TURN relay — **трафик VPS**
-(релеенное видео идёт через канал сервера, в отличие от P2P), и это
-единственное, что реально «стоит» на этих 840 портах.
+Privacy doesn't suffer here: even through TURN, media stays DTLS-encrypted
+end-to-end (see `docs/privacy.md` — TURN carries opaque bytes and can't read
+them). The cost of TURN relay is **VPS traffic** (relayed video goes through
+the server's link, unlike P2P), and that's the only thing that really
+"costs" anything on these 840 ports.
 
-**Вердикт по UDP-портам:**
-1. **3478 (STUN)** — оставить, это и есть «пробивание NAT», медиа не трогает.
-2. **49160–49999 (TURN relay)** — нужны, ПОКА нужен fallback для
-   симметричного NAT. Если строго минимизировать роль сервера до «только
-   пробивание» и смириться, что ~10–20% звонков в неудобных сетях не
-   соединятся, — этот диапазон и весь turn-server можно убрать, оставив
-   только STUN. Это продуктовое решение (надёжность vs чистота принципа), не
-   техническая необходимость.
-3. Диапазон **избыточно широк для текущей нагрузки**: 840 UDP-портов = сотни
-   одновременных relay-сессий. При нынешнем трафике хватило бы ~50–100 портов
-   (напр. `49160..49260`); сузить безопасно, если хочется меньше открытой
-   поверхности, — но и не срочно.
-4. **51820 (WireGuard)** — не относится к чату, решать отдельно.
+**Verdict on the UDP ports:**
+1. **3478 (STUN)** — keep it, this is exactly "NAT punch-through", it
+   doesn't touch media.
+2. **49160–49999 (TURN relay)** — needed AS LONG AS a fallback for
+   symmetric NAT is needed. If the server's role is strictly minimized to
+   "punch-through only" and it's acceptable that ~10–20% of calls on
+   awkward networks won't connect — this range and the entire turn-server
+   can be removed, leaving only STUN. This is a product decision
+   (reliability vs. purity of principle), not a technical necessity.
+3. The range is **excessively wide for the current load**: 840 UDP ports =
+   hundreds of simultaneous relay sessions. At current traffic, ~50–100
+   ports would suffice (e.g. `49160..49260`); narrowing it is safe if less
+   open surface is desired — but it's not urgent either.
+4. **51820 (WireGuard)** — unrelated to chat, to be decided separately.
 
-Важно не спутать: сужение/закрытие этих портов — про **turn-server**, не про
-чат-сервер (у того UDP нет вовсе). Чат от закрытия TURN не сломается —
-деградирует лишь связность в сложных сетях (клиенты откатятся на STUN-only и
-прямой P2P).
+Important not to conflate: narrowing/closing these ports is about the
+**turn-server**, not the chat server (which has no UDP at all). Chat won't
+break if TURN is closed — only connectivity on difficult networks will
+degrade (clients will fall back to STUN-only and direct P2P).
 
 ---
 
-## Источники
+## Sources
 
-Внутренние (этот репозиторий, актуальны на момент ресёрча):
+Internal (this repository, current as of the research date):
 `docs/self-hosting.md`, `docs/webrtc-mesh.md`, `docs/signaling-protocol.md`,
 `docs/research-marketing.md` §9, `docs/security.md`, `src/main.rs`,
 `src/ws.rs`, `src/state.rs`, `static/room.js`, `Cargo.toml`,
@@ -949,26 +1013,28 @@ DTLS-зашифрованным end-to-end (см. `docs/privacy.md` — TURN н�
 `deploy/manifests/deployment.yaml`, `deploy/manifests/ingress.yaml`,
 `deploy/manifests/service.yaml`.
 
-Внешние (веб-поиск, июль 2026):
+External (web search, July 2026):
 
 - [ws-limits] [WebSocket Connection Limits: The Real Bottlenecks](https://websocket.org/guides/connection-limits/) —
-  2–10КБ на idle-соединение, 10–100КБ+ на активное; FD-лимиты, `somaxconn`,
-  TLS-хендшейки/сек на ядро.
+  2–10KB per idle connection, 10–100KB+ per active one; FD limits,
+  `somaxconn`, TLS handshakes/sec per core.
 - [sharkbench] [Axum Benchmark — Sharkbench](https://sharkbench.dev/web/rust-axum) —
-  ~6МБ RSS для минимального axum/tokio-сервера.
+  ~6MB RSS for a minimal axum/tokio server.
 - [fd-limits] [Default per-container ulimits are too generous · moby/moby #38814](https://github.com/moby/moby/issues/38814);
-  общие данные по современным `containerd`/`systemd`-дефолтам `LimitNOFILE`.
-- Общие сведения о накладных расходах tokio-задачи (десятки-сотни байт на
-  задачу, в противовес мегабайтам стека у ОС-потока) — из документации и
-  распространённых источников экосистемы tokio, использованы как
-  качественный, не количественный аргумент в §2.1/2.2.
+  general data on modern `containerd`/`systemd` `LimitNOFILE` defaults.
+- General information about the overhead of a tokio task (tens to hundreds
+  of bytes per task, versus megabytes of stack for an OS thread) — from the
+  documentation and common sources in the tokio ecosystem, used as a
+  qualitative, not quantitative, argument in §2.1/2.2.
 - [hashbrown-lf] [`hashbrown::raw::RawTable`](https://rust-lang.github.io/hashbrown/hashbrown/raw/struct.RawTable.html) —
-  максимальный коэффициент загрузки 7/8, размер таблицы — степень двойки;
-  использовано в §2.7 как объяснение (не измерение — измерение там своё,
-  через `malloc_usable_size`) того, почему накладные хеш-таблицы малы
-  относительно накладных `tokio::sync::mpsc`-канала на запись.
-- §2.7 (точный расчёт памяти) — НЕ веб-источник, а собственный замер этого
-  ресёрча: отдельный Rust-бинарь с копиями типов `src/state.rs` под
-  glibc `malloc_usable_size`-инструментированным аллокатором, собран и
-  запущен в `rust:slim-bookworm --platform linux/amd64` (та же glibc-семья,
-  что у прод-образа `gcr.io/distroless/cc-debian12`, см. `Dockerfile`).
+  maximum load factor 7/8, table size is a power of two; used in §2.7 as an
+  explanation (not a measurement — that section has its own measurement, via
+  `malloc_usable_size`) of why hash-table overhead is small relative to the
+  `tokio::sync::mpsc` channel's overhead per entry.
+- §2.7 (the precise memory calculation) is NOT a web source, but this
+  research's own measurement: a separate Rust binary with copies of the
+  `src/state.rs` types under a glibc `malloc_usable_size`-instrumented
+  allocator, built and run in `rust:slim-bookworm --platform linux/amd64`
+  (the same glibc family as the prod image `gcr.io/distroless/cc-debian12`,
+  see `Dockerfile`).
+</content>
