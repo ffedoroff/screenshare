@@ -37,11 +37,13 @@ metrics-exporter-prometheus = { version = "0.15", default-features = false }
 # above, so they land in the SAME global recorder/registry this process
 # already installs in `main()` — no second Prometheus registry, no second
 # `/metrics` endpoint to scrape. `default-features = false` + an explicit
-# feature list: only the UDP/TCP data plane + the metrics facade — NOT
-# upstream's own `api` (tonic/axum-server gRPC control plane) or `ssl`
-# (rustls) features, which this embedding doesn't use and which the default
-# (split, production) build must not pull in at all.
-turn-server = { git = "https://github.com/ffedoroff/turn-rs", rev = "95bc72188ba01ce447cf438e635b083a49516889", default-features = false, features = ["udp", "tcp", "metrics-facade"], optional = true }
+# feature list: the UDP/TCP data plane + the metrics facade, plus `ssl`
+# (rustls) so the embedded server can terminate TLS on the optional
+# TURNS/443 interface (see src/embedded_turn.rs) for "443-only" networks —
+# NOT upstream's own `api` (tonic/axum-server gRPC control plane), which
+# this embedding doesn't use and which the default (split, production)
+# build must not pull in at all.
+turn-server = { git = "https://github.com/ffedoroff/turn-rs", rev = "95bc72188ba01ce447cf438e635b083a49516889", default-features = false, features = ["udp", "tcp", "metrics-facade", "ssl"], optional = true }
 
 [features]
 # Off by default: production stays "split" — turn-rs runs as its own

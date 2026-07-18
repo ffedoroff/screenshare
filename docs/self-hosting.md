@@ -11,6 +11,7 @@
 - [5. TURN (Optional)](#5-turn-optional)
   - [5.1 Rotating the Shared Secret](#51-rotating-the-shared-secret)
   - [5.2 Embedded TURN (Single-Binary)](#52-embedded-turn-single-binary)
+  - [5.3 TURNS/443 (TLS Fallback for "443-Only" Networks)](#53-turns443-tls-fallback-for-443-only-networks)
 - [6. Environment Variables](#6-environment-variables)
 - [7. Operational Notes](#7-operational-notes)
   - [7.1 Single Replica, In-Memory State](#71-single-replica-in-memory-state)
@@ -299,6 +300,66 @@ of its own (no in-flight HTTP requests to finish; abandoning in-progress
 UDP relay sessions on shutdown is acceptable). `SIGKILL`, as always, cannot
 be intercepted by anything in the process.
 
+### 5.3 TURNS/443 (TLS Fallback for "443-Only" Networks)
+
+Some networks (airports, hotels, corporate guest Wi-Fi) allow outbound
+**TCP 443 only** — everything else, including plain TURN on UDP 3478 or
+TCP 3478, is blocked. On a network like that, signaling still works (it's
+WSS on 443), but every ICE path fails and the call never connects at all —
+see the Sofia Airport snapshot in
+[`network-profiles.md`](network-profiles.md#sofia-airport-sof--public-wi-fi--2026-07-17)
+for a concrete example. TURN over TLS on port 443 (TURNS/443) is the
+standard fallback: it multiplexes with ordinary HTTPS traffic on the one
+port these networks actually let out.
+
+To add a TURNS/443 listener:
+
+1. **Get a TLS certificate for your TURN server's hostname.** This is a
+   normal PEM cert + private key, the same as you'd use for any HTTPS
+   endpoint — just issued for the hostname clients reach your TURN server
+   at. If you don't have automated issuance (e.g. no `cert-manager` in your
+   cluster), Let's Encrypt via a DNS-01 challenge (most DNS providers,
+   including Cloudflare, support this) works well here, since TCP 443 on
+   the TURN host is TURN itself, not a webserver an HTTP-01 challenge could
+   reach.
+2. **Add a second TCP/TLS interface to your TURN server's config.** For
+   `turn-rs`, alongside the existing UDP interface, add:
+   ```toml
+   [[server.interfaces]]
+   transport = "tcp"
+   listen = "0.0.0.0:443"
+   external = "<public IP>:443"
+
+   [server.interfaces.ssl]
+   private-key = "/path/to/tls.key"
+   certificate-chain = "/path/to/tls.crt"
+   ```
+   See [`../deploy/manifests/turn.yaml`](../deploy/manifests/turn.yaml) for
+   how this project's own production TURN deployment mounts the cert/key
+   and wires this in.
+3. **Open TCP 443 in your host/cloud firewall** for the TURN server, the
+   same way you already opened UDP 3478 and the relay port range for plain
+   TURN.
+4. **Point this project's backend at the new listener** by setting
+   `TURN_TLS_URL` — see [§6](#6-environment-variables) — to
+   `turns:<your-turn-host>:443?transport=tcp`. Once set, `/config` hands
+   clients this TURNS URL in addition to the plain `TURN_URL` one, so
+   clients on unrestricted networks still use UDP/plain TCP TURN, and
+   clients on "443-only" networks fall back to TURNS/443.
+
+For the [embedded TURN](#52-embedded-turn-single-binary) build, there's no
+separate `config.toml` to edit: set `TURN_TLS_CERT` / `TURN_TLS_KEY` (paths
+to the same PEM cert/key from step 1, readable inside the container) and
+`TURN_EXTERNAL_IP` — see [§6](#6-environment-variables) — and the embedded
+server opens its own TLS interface on 443 alongside its plain UDP one.
+
+**Certificate renewal is manual, for now.** Without `cert-manager` (or
+equivalent) in front of it, the TLS cert configured in step 1 does not
+renew itself — Let's Encrypt certs expire roughly every 90 days, so plan to
+re-issue and re-deploy it on that cadence (or automate it yourself; that's
+a natural next step once this is running, not something this project's
+deploy scripts do for you today).
+
 ## 6. Environment Variables
 
 | Variable | Required | Default | Purpose |
@@ -319,6 +380,8 @@ be intercepted by anything in the process.
 | `TURN_EXTERNAL_IP` | no (recommended, embedded TURN only) | unset | This host's public IP, advertised in relay candidates handed to embedded-TURN clients — see [§5.2](#52-embedded-turn-single-binary) |
 | `TURN_REALM` | no (embedded TURN only) | `localhost` | TURN realm for the embedded server — see [§5.2](#52-embedded-turn-single-binary) |
 | `TURN_PORT_RANGE` | no (embedded TURN only) | turn-rs's own default range | UDP relay port range for the embedded server, format `START-END` (e.g. `49160-49999`) — see [§5.2](#52-embedded-turn-single-binary) |
+| `TURN_TLS_URL` | no | unset | TURNS URL for the "443-only network" fallback, e.g. `turns:your-turn-host:443?transport=tcp` — split topology only, points at the second TCP/TLS interface described in [§5.3](#53-turns443-tls-fallback-for-443-only-networks). When set, `/config` hands clients this URL in addition to `TURN_URL` |
+| `TURN_TLS_CERT` / `TURN_TLS_KEY` | no (embedded TURN only) | unset | Paths to the PEM certificate chain / private key for the embedded server's own TURNS/443 TLS interface — see [§5.3](#53-turns443-tls-fallback-for-443-only-networks). Without both set, the embedded server does not open a TLS listener |
 | `APP_VERSION` / `GIT_COMMIT` / `BUILD_DATE` | no (build args, not runtime env) | `dev` / `unknown` / `unknown` | Baked in at image build time, surfaced via `/version.json` |
 
 If `TURN_URL` is unset, clients get STUN only from `/config` — fine unless

@@ -862,16 +862,16 @@ fn turn_hmac_credential(secret: &str, username: &str) -> String {
 /// nothing at all is set — the client only gets STUN, as before.
 async fn ice_config() -> Json<serde_json::Value> {
     let mut servers = vec![json!({ "urls": "stun:stun.l.google.com:19302" })];
+    let static_secret = std::env::var("TURN_STATIC_SECRET")
+        .ok()
+        .filter(|s| !s.is_empty());
     if let Ok(url) = std::env::var("TURN_URL") {
         if !url.is_empty() {
             let mut turn = json!({ "urls": url });
-            let static_secret = std::env::var("TURN_STATIC_SECRET")
-                .ok()
-                .filter(|s| !s.is_empty());
-            if let Some(secret) = static_secret {
+            if let Some(secret) = &static_secret {
                 let expiry = unix_now_secs() + TURN_CRED_TTL_SECONDS;
                 let username = format!("{expiry}:chat");
-                let credential = turn_hmac_credential(&secret, &username);
+                let credential = turn_hmac_credential(secret, &username);
                 turn["username"] = json!(username);
                 turn["credential"] = json!(credential);
             } else {
@@ -884,6 +884,37 @@ async fn ice_config() -> Json<serde_json::Value> {
                 }
             }
             servers.push(turn);
+        }
+    }
+    // TURN over TLS on port 443 (TURNS/443) — the only path that works for
+    // "443-only" networks (airport/hotel Wi-Fi that blocks everything but
+    // outbound TCP 443; see docs/network-profiles.md, "Sofia Airport"). This
+    // is additive to `TURN_URL` above: it's the same TURN realm/auth, just a
+    // different transport/port, so it reuses the SAME `TURN_STATIC_SECRET`
+    // and produces the SAME HMAC username/credential pair (recomputed here
+    // since the expiry timestamp is embedded in the username and we want a
+    // fresh one, but it's the identical secret + identical derivation as the
+    // plain TURN entry above). Pushed last so the browser only falls back to
+    // it after trying STUN and the regular TURN listener (udp/tcp) first.
+    if let Ok(tls_url) = std::env::var("TURN_TLS_URL") {
+        if !tls_url.is_empty() {
+            let mut turn_tls = json!({ "urls": tls_url });
+            if let Some(secret) = &static_secret {
+                let expiry = unix_now_secs() + TURN_CRED_TTL_SECONDS;
+                let username = format!("{expiry}:chat");
+                let credential = turn_hmac_credential(secret, &username);
+                turn_tls["username"] = json!(username);
+                turn_tls["credential"] = json!(credential);
+            } else {
+                // Backward-compatibility fallback — the old static pair.
+                if let Ok(user) = std::env::var("TURN_USERNAME") {
+                    turn_tls["username"] = json!(user);
+                }
+                if let Ok(pass) = std::env::var("TURN_PASSWORD") {
+                    turn_tls["credential"] = json!(pass);
+                }
+            }
+            servers.push(turn_tls);
         }
     }
     Json(json!({ "iceServers": servers }))

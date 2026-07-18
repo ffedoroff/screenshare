@@ -72,6 +72,18 @@ services:
       # TURN_REALM: "your-domain.example"
       # TURN_PORT_RANGE: "49160-49999"
 
+      # Optional: TURNS/443 (TLS) fallback for "443-only" networks (airports,
+      # hotels, corporate guest Wi-Fi) where nothing but TCP 443 egresses —
+      # see docs/self-hosting.md §5.3 and docs/network-profiles.md. Needs a
+      # PEM cert/key for this host's TURN hostname, mounted into the
+      # container (see the commented `volumes:` below), plus TURN_TLS_URL so
+      # /config actually hands it to clients. Port 443 is already reachable
+      # here thanks to network_mode: host — just make sure your host/cloud
+      # firewall allows inbound TCP 443 too.
+      # TURN_TLS_CERT: "/etc/turn-tls/tls.crt"
+      # TURN_TLS_KEY: "/etc/turn-tls/tls.key"
+      # TURN_TLS_URL: "turns:203.0.113.10:443?transport=tcp"
+
       # Room lifecycle knobs — all optional, defaults are sane for
       # self-hosting. Uncomment to override (see docs/self-hosting.md §6).
       # MAX_ROOM_LIFETIME_SECONDS: "10800"   # hard cap per room, default 3h
@@ -87,3 +99,8 @@ services:
       timeout: 3s
       retries: 5
       start_period: 5s
+
+    # Optional, only if using TURNS/443 above: bind-mount the PEM cert/key
+    # referenced by TURN_TLS_CERT/TURN_TLS_KEY into the container, read-only.
+    # volumes:
+    #   - /path/on/host/tls:/etc/turn-tls:ro
