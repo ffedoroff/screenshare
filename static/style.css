@@ -833,19 +833,14 @@ body {
   aspect-ratio: auto;
 }
 
-/* Maximized video in PORTRAIT: fill the tall box by height and crop the sides
-   (object-fit: cover) instead of letterboxing a landscape 16:9 frame into a
-   short centered band (contain). A landscape frame can't be both full-height
-   AND uncropped on a portrait screen — cover trades some side crop for a big,
-   screen-filling picture, which is what's wanted on a phone held upright.
-   Landscape orientation keeps the default contain (see .tile-video) — there a
-   16:9 frame fills without cropping. Mirror transform on the own tile is
-   unaffected by object-fit. */
-@media (orientation: portrait) {
-  .tile--maximized .tile-video {
-    object-fit: cover;
-  }
-}
+/* The maximized video keeps the default object-fit: contain everywhere (see
+   .tile-video) — the whole frame is always visible, never cropped. On a
+   portrait phone a landscape source is letterboxed (black bars left/right or
+   top/bottom); a portrait/matching source fills the now-full-height box. cover
+   was tried to fill portrait height but cropped the sides of mismatched-aspect
+   frames, which is worse — showing the full frame is the safer default for a
+   call. (No side-crop vs. full-height for a landscape frame on a portrait
+   screen is a genuine either/or; contain is chosen.) */
 
 .tile--maximized .tile-name {
   top: calc(var(--space-3) + env(safe-area-inset-top));
