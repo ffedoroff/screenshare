@@ -1252,13 +1252,13 @@ function createTile(peerId, name, isOwn) {
   micOff.innerHTML = MIC_OFF_ICON_SVG; // static markup, not user data
 
   // Speed badge (see static/style.css: .tile-speed, static/room.js:
-  // updateTileSpeedBadges) — hidden by default: speed isn't known before
-  // the first tick of the speed poller where two traffic snapshots have
-  // already accumulated for this peer (see pollPeerStats). Pinned
-  // top-left, always (see static/style.css) — top-right is mic, bottom-center
-  // is the name pill, so top-left is the one corner left free.
+  // updateTileSpeedBadges) — ALWAYS visible; shows a "…" placeholder until the
+  // first speed value is known (the poller needs two traffic snapshots for
+  // this peer, see pollPeerStats). Pinned top-left (top-right is mic,
+  // bottom-center is the name pill).
   const speed = document.createElement('span');
-  speed.className = 'tile-speed hidden';
+  speed.className = 'tile-speed';
+  speed.textContent = '…';
   speed.setAttribute('aria-hidden', 'true');
 
   tile.appendChild(video);
@@ -2219,24 +2219,15 @@ function updateTileSpeedBadges() {
   for (const [peerId, entry] of peers) {
     const cached = peerLastStats.get(peerId);
     const downRate = cached ? cached.downRate : null;
-    if (downRate == null) {
-      entry.tile.speedEl.classList.add('hidden');
-    } else {
-      entry.tile.speedEl.textContent = formatSpeedBadge(downRate);
-      entry.tile.speedEl.classList.remove('hidden');
-    }
+    // Always visible (see createTile) — "…" until the first rate is known.
+    entry.tile.speedEl.textContent = downRate == null ? '…' : formatSpeedBadge(downRate);
     if (cached && cached.upRate != null) {
       totalUpRate = (totalUpRate || 0) + cached.upRate;
     }
   }
 
   if (!ownTile) return;
-  if (totalUpRate == null) {
-    ownTile.speedEl.classList.add('hidden');
-  } else {
-    ownTile.speedEl.textContent = `↑ ${formatSpeedBadge(totalUpRate)}`;
-    ownTile.speedEl.classList.remove('hidden');
-  }
+  ownTile.speedEl.textContent = totalUpRate == null ? '↑ …' : `↑ ${formatSpeedBadge(totalUpRate)}`;
 }
 
 /**

@@ -992,21 +992,20 @@ body {
    circle) is the one on screen instead. */
 .tile-name {
   position: absolute;
-  bottom: var(--space-2);
+  /* Hug the bottom edge (var(--space-1)) and stay compact — take as little
+     room as possible over the video (per request). */
+  bottom: var(--space-1);
   left: 50%;
   transform: translateX(-50%);
   display: flex;
   align-items: center;
-  gap: 4px;
-  padding: var(--space-1) var(--space-2);
+  gap: 3px;
+  padding: 1px var(--space-2);
   background: rgba(0, 0, 0, 0.55);
   backdrop-filter: blur(2px);
   color: #fff;
   border-radius: var(--radius);
-  /* Larger than before (was 0.72rem) — a plain name without "You (...)"/role
-     takes up less room, leaving margin to increase the font size (see task item 5
-     and static/room.js: createTile/tileDisplayName). */
-  font-size: 0.85rem;
+  font-size: 0.75rem;
   font-weight: 600;
   max-width: calc(100% - var(--space-4));
 }
@@ -2793,10 +2792,10 @@ body {
    or doesn't exist yet at all; per the task, both cases show the icon. */
 .tile-mic-off {
   position: absolute;
-  top: var(--space-2);
-  right: var(--space-2);
-  width: 22px;
-  height: 22px;
+  top: var(--space-1);
+  right: var(--space-1);
+  width: 18px;
+  height: 18px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -2807,8 +2806,8 @@ body {
 }
 
 .tile-mic-off svg {
-  width: 14px;
-  height: 14px;
+  width: 11px;
+  height: 11px;
   display: block;
 }
 
@@ -2822,14 +2821,14 @@ body {
    must not intercept that. */
 .tile-speed {
   position: absolute;
-  left: var(--space-2);
-  top: var(--space-2);
-  padding: 2px var(--space-2);
+  left: var(--space-1);
+  top: var(--space-1);
+  padding: 1px var(--space-1);
   background: rgba(0, 0, 0, 0.55);
   backdrop-filter: blur(2px);
   color: #fff;
   border-radius: var(--radius);
-  font-size: 0.68rem;
+  font-size: 0.6rem;
   font-variant-numeric: tabular-nums;
   pointer-events: none;
 }
