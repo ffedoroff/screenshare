@@ -825,6 +825,14 @@ body {
   border: none;
   background: #000;
   cursor: zoom-out;
+  /* Drop the base .tile's aspect-ratio: 16/9 — a maximized tile must FILL its
+     positioned box (the whole viewport, or viewport-minus-strip in spotlight),
+     not stay 16:9. Keeping 16:9 made the tile a short wide band pinned to the
+     top on a portrait phone (landscape happened to fill, hence "looks nice"
+     only sideways). With aspect-ratio: auto the box fills the area and the
+     inner .tile-video (object-fit: contain) centers the actual frame —
+     letterboxed top/bottom in portrait, filling in landscape. */
+  aspect-ratio: auto;
 }
 
 .tile--maximized .tile-name {
