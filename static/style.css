@@ -768,10 +768,6 @@ body {
   max-width: 56px;
 }
 
-.tiles-grid--spotlight .tile:not(.tile--maximized) .tile-placeholder-name {
-  font-size: 0.65rem;
-}
-
 /* Mobile: a horizontal strip at the bottom instead of a vertical one on the right — see
    @media (max-width: 640px) at the end of the file for .tiles-grid--spotlight/
    .tiles-grid--spotlight .tile/.tile--maximized (the shared mobile tile block
@@ -843,8 +839,9 @@ body {
    screen is a genuine either/or; contain is chosen.) */
 
 .tile--maximized .tile-name {
-  top: calc(var(--space-3) + env(safe-area-inset-top));
-  left: calc(var(--space-3) + env(safe-area-inset-left));
+  bottom: calc(var(--space-3) + env(safe-area-inset-bottom));
+  left: 50%;
+  transform: translateX(-50%);
   font-size: 0.85rem;
   padding: var(--space-1) var(--space-3);
 }
@@ -919,7 +916,14 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: clamp(1.4rem, 13cqw, 4rem);
+  /* Bumped noticeably larger (was clamp(1.4rem, 13cqw, 4rem)) per request —
+     the circle itself (width/max-width above) is UNCHANGED, only the glyph
+     inside grows: at the largest tiles the clamp still tops out well under
+     the 176px circle (5.5rem = 88px, well inside a 176px-diameter circle
+     centered by the flex box above), and at the smallest tiles (6
+     participants on a phone, circle pinned to min-width: 52px) the raised
+     floor (1.9rem = ~30px) still leaves comfortable margin in the circle. */
+  font-size: clamp(1.9rem, 20cqw, 5.5rem);
   font-weight: 700;
   color: #fff;
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
@@ -932,46 +936,39 @@ body {
 
 /* The leader crown ABOVE the avatar circle (see task item 4) — absolutely
    positioned relative to the circle itself (parent is .tile-placeholder-avatar,
-   see above), centered horizontally. transform: translate(-50%, -62%) —
-   badges onto the circle's top edge (the crown's center is slightly above the border), rather than
-   fully lifted above it: on regular tiles (1-4 participants, or 5-6 on
-   desktop) there's enough room for a fully lifted crown too, but on the
-   smallest tiles (6 participants on a phone, 2x3, see task item 6 — there
-   avatar+name already occupy the tile's full height snugly, see .tile-placeholder:
-   gap) the "fully above" option would get clipped by the tile's top border
-   (.tile: overflow: hidden). A badge overlay is the standard compromise for this
-   case (like unread badges over icons) and still reads as
-   "crown above circle" visually. Size — also cqw, in sync with the letter in the circle,
-   but with a narrower range (the crown shouldn't dominate the
-   avatar itself). Selecting through the parent (not just .tile-crown--placeholder) —
-   raises the specificity above the general .tile-crown rule below
-   (otherwise both would have the same specificity, and file order would decide who
-   wins — fragile). */
+   see above), centered horizontally. Lowered per request (was
+   translate(-50%, -62%), floating well above the circle) — transform:
+   translate(-50%, -30%) now sits it right on the circle's top rim, dipping
+   noticeably into the circle instead of hovering over it, while still
+   reading as "crown above/on the avatar" rather than merging into it. On
+   the smallest tiles (6 participants on a phone, 2x3, see task item 6 —
+   there avatar+name already occupy the tile's full height snugly, see
+   .tile-placeholder: gap) this lower position also has an practical upside:
+   it's no longer close to being clipped by the tile's top border (.tile:
+   overflow: hidden), unlike the old, higher-floating position. Size — also
+   cqw, in sync with the letter in the circle, but with a narrower range
+   (the crown shouldn't dominate the avatar itself). Selecting through the
+   parent (not just .tile-crown--placeholder) — raises the specificity above
+   the general .tile-crown rule below (otherwise both would have the same
+   specificity, and file order would decide who wins — fragile). */
 .tile-placeholder-avatar .tile-crown--placeholder {
   position: absolute;
   top: 0;
   left: 50%;
-  transform: translate(-50%, -62%);
+  transform: translate(-50%, -30%);
   width: clamp(28px, 18cqw, 52px);
   height: clamp(28px, 18cqw, 52px);
 }
 
-/* The name under the avatar — large (not a small caption). In this mode the name
-   isn't duplicated in the tile's corner (.tile-name), see .tile-name.hidden in
-   static/room.js: setTileVideoVisible/createTile. font-size — also a clamp based on
-   cqh (see .tile-placeholder/.tile: container-type above) for the same reason
-   as gap: on the smallest tiles (6 participants on a phone) the name must
-   shrink rather than get clipped in height along with the avatar. */
+/* Used to show the name large, under the avatar, only on the no-video
+   placeholder (a second copy of the name next to the corner .tile-name
+   badge that only showed during video). The name now lives in exactly ONE
+   place regardless of state — the bottom-center .tile-name pill, always
+   visible (see below) — so this second copy is retired: kept as a DOM/JS
+   sink (static/room.js still writes the name into it, harmless) but
+   CSS-hidden so it never renders and never duplicates .tile-name. */
 .tile-placeholder-name {
-  color: #fff;
-  font-weight: 600;
-  font-size: clamp(0.7rem, 12cqh, 1.3rem);
-  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
-  max-width: 88%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  text-align: center;
+  display: none;
 }
 
 .tiles-grid--solo .tile-placeholder-avatar,
@@ -981,20 +978,23 @@ body {
   max-width: 130px;
 }
 
-.tiles-grid--compact .tile-placeholder-name {
-  font-size: 0.8rem;
-}
-
-/* The name (+ the leader crown inline before it, see static/room.js: createTile) —
-   the top-left corner during video (the bottom-left used to hold the caption);
-   the top-right/bottom-right remain reserved for .tile-mic-off/.tile-speed unchanged.
-   Hidden (the .hidden class) while there's no video — see setTileVideoVisible: on
-   the placeholder, the name is already shown large in the center (.tile-placeholder-name above),
-   so there's no need to repeat it in the corner. */
+/* The name (+ the leader crown inline before it, see static/room.js:
+   createTile) — pinned bottom-center of the tile, ALWAYS visible, both
+   during video and on the no-video placeholder (previously: top-left corner,
+   shown only during video, with a separate large copy under the placeholder
+   avatar — see the now display:none .tile-placeholder-name above). One name,
+   one place, in every state. left: 50% + transform: translateX(-50%) center
+   it regardless of the pill's actual (content-driven) width; top-right/
+   top-left remain reserved for .tile-mic-off/.tile-speed. The inline crown
+   (.tile-crown, a child here) is additionally gated by
+   static/room.js: setTileVideoVisible so it only shows while video is on —
+   without video the OTHER crown (.tile-crown--placeholder, above the avatar
+   circle) is the one on screen instead. */
 .tile-name {
   position: absolute;
-  top: var(--space-2);
-  left: var(--space-2);
+  bottom: var(--space-2);
+  left: 50%;
+  transform: translateX(-50%);
   display: flex;
   align-items: center;
   gap: 4px;
@@ -2813,16 +2813,17 @@ body {
 }
 
 /* ---------- Speed badge on a tile (see static/room.js: updateTileSpeedBadges) ---------- */
-/* Bottom-right corner — the only free spot: both top corners are taken by the name
-   (+ the leader crown inline) and the "mic off" indicator (see above). Hidden by
-   default (createTile) — shown only once at least one speed value
-   has been computed for this peer. pointer-events: none —
+/* Top-left corner, ALWAYS (was bottom-right) — top-right is the "mic off"
+   indicator, bottom-center is the name pill (see .tile-name/.tile-mic-off),
+   which leaves top-left as the one corner free in every state, video or
+   placeholder. Hidden by default (createTile) — shown only once at least
+   one speed value has been computed for this peer. pointer-events: none —
    clicking the tile toggles maximization (see static/room.js: createTile), the badge
    must not intercept that. */
 .tile-speed {
   position: absolute;
-  right: var(--space-2);
-  bottom: var(--space-2);
+  left: var(--space-2);
+  top: var(--space-2);
   padding: 2px var(--space-2);
   background: rgba(0, 0, 0, 0.55);
   backdrop-filter: blur(2px);
@@ -2834,8 +2835,8 @@ body {
 }
 
 .tile--maximized .tile-speed {
-  right: calc(var(--space-3) + env(safe-area-inset-right));
-  bottom: calc(var(--space-3) + env(safe-area-inset-bottom));
+  left: calc(var(--space-3) + env(safe-area-inset-left));
+  top: calc(var(--space-3) + env(safe-area-inset-top));
   font-size: 0.8rem;
   padding: var(--space-1) var(--space-3);
 }

@@ -1200,22 +1200,33 @@ function createTile(peerId, name, isOwn) {
   avatar.appendChild(letter);
   placeholder.appendChild(avatar);
 
+  // Kept only as a text sink for backward-compatible name-writing code
+  // paths (updatePeerTileName/updateOwnTileLabel still write into it) —
+  // CSS-hidden (see static/style.css: .tile-placeholder-name) now that the
+  // name lives in ONE place, the bottom-center pill (label, below) visible
+  // in both video and placeholder states.
   const placeholderName = document.createElement('div');
   placeholderName.className = 'tile-placeholder-name';
   placeholder.appendChild(placeholderName);
 
-  // Corner caption (visible only while video is on — see
-  // setTileVideoVisible below: on the placeholder the name is already
-  // shown large and centered, no point duplicating it in the corner).
-  // Leader crown — inline before the name in this same badge (video mode,
-  // see the placeholderCrown comment above about the placeholder solution).
+  // The name pill — now ALWAYS visible (bottom-center of the tile, both
+  // with and without video, see static/style.css: .tile-name), not just a
+  // "corner caption during video" anymore. Leader crown — inline before the
+  // name in this same badge, but shown ONLY while video is on (see
+  // setTileVideoVisible, which drives crown.style.display) — without video,
+  // placeholderCrown above the avatar circle is the one on screen instead,
+  // and showing both at once would double up the crown.
   const label = document.createElement('div');
-  label.className = 'tile-name hidden';
+  label.className = 'tile-name';
 
   const crown = document.createElement('span');
   crown.className = 'tile-crown hidden';
   crown.setAttribute('aria-hidden', 'true');
   crown.innerHTML = CROWN_ICON_SVG; // static markup, not user data
+  // No video at creation time (see video.className above) — force the
+  // inline crown hidden regardless of leader status until setTileVideoVisible(tile, true)
+  // runs; see that function for why this is an inline style, not a class.
+  crown.style.display = 'none';
   label.appendChild(crown);
 
   const labelText = document.createElement('span');
@@ -1243,9 +1254,9 @@ function createTile(peerId, name, isOwn) {
   // Speed badge (see static/style.css: .tile-speed, static/room.js:
   // updateTileSpeedBadges) — hidden by default: speed isn't known before
   // the first tick of the speed poller where two traffic snapshots have
-  // already accumulated for this peer (see pollPeerStats). The free corner
-  // is bottom-right (the top ones are taken by the name/crown and mic, see
-  // static/style.css).
+  // already accumulated for this peer (see pollPeerStats). Pinned
+  // top-left, always (see static/style.css) — top-right is mic, bottom-center
+  // is the name pill, so top-left is the one corner left free.
   const speed = document.createElement('span');
   speed.className = 'tile-speed hidden';
   speed.setAttribute('aria-hidden', 'true');
@@ -1437,11 +1448,14 @@ function isPeerLeader(peerId) {
 /**
  * Update the crown on the tiles (our own and all current peers) for the new
  * leaderId + our own tile's caption. Each tile carries TWO crowns (see
- * createTile) — crownEl (corner of the name badge, visible during video)
- * and placeholderCrownEl (above the placeholder avatar circle, visible
- * without video) — toggled together, since video/placeholder are mutually
- * exclusive (see setTileVideoVisible), but rather than depending on which
- * one is currently visible, we simply keep both up to date at all times.
+ * createTile) — crownEl (inline in the name pill, meant for the video
+ * state) and placeholderCrownEl (above the placeholder avatar circle,
+ * meant for the no-video state) — toggled together here purely by leader
+ * status, since which one is ACTUALLY on screen (video vs. placeholder) is
+ * governed independently by setTileVideoVisible (crownEl.style.display) and
+ * by placeholderEl's own hidden state (which hides placeholderCrownEl along
+ * with the rest of the placeholder). The two mechanisms compose regardless
+ * of call order: at most one of the two crowns is ever visible at a time.
  */
 function setLeaderIndicator(newLeaderId) {
   leaderId = newLeaderId || null;
@@ -1498,17 +1512,28 @@ function setTileSpeaking(peerId, speaking) {
 }
 
 /**
- * A single point that toggles a tile's video/placeholder/corner caption —
- * keeps all three in sync (our own ownTile or someone else's
- * peers.get(id).tile) and itself triggers auto-exit from maximization. The
- * corner caption .tile-name is visible ONLY while video is on — on the
- * placeholder the name is already shown large and centered (see
- * createTile/.tile-placeholder-name), no point duplicating it in the corner.
+ * A single point that toggles a tile's video/placeholder — keeps both in
+ * sync (our own ownTile or someone else's peers.get(id).tile) and itself
+ * triggers auto-exit from maximization. tile.labelEl (.tile-name, the
+ * bottom-center name pill) is NOT toggled here anymore — it's always
+ * visible in both states (see createTile/style.css).
+ *
+ * The one thing that DOES still depend on video visibility is the inline
+ * leader crown inside the name pill (tile.crownEl): it must show ONLY
+ * while video is on, because without video the OTHER crown
+ * (placeholderCrownEl, above the avatar circle — see createTile) is the one
+ * on screen, and it's already auto-hidden whenever placeholderEl itself is
+ * hidden (a hidden parent hides all its children regardless of their own
+ * classes). Forcing crownEl via an inline style (rather than a class) keeps
+ * it independent from the leader-driven 'hidden' class toggled in
+ * setLeaderIndicator: whichever of the two runs last still leaves exactly
+ * one crown on screen, with no ordering dependency between the two
+ * functions.
  */
 function setTileVideoVisible(tile, show) {
   tile.videoEl.classList.toggle('hidden', !show);
   tile.placeholderEl.classList.toggle('hidden', show);
-  tile.labelEl.classList.toggle('hidden', !show);
+  tile.crownEl.style.display = show ? '' : 'none';
   exitMaximizeIfHidden(tile, show);
 }
 
@@ -3146,9 +3171,12 @@ function showJoinModal() {
   // null`). !value — in case the field already contains something (it
   // shouldn't at this point, but we don't overwrite it just in case).
   if (!joinNameInputEl.value) joinNameInputEl.value = NameGen.userName();
-  joinNameInputEl.focus();
-  // Deliberately NOT .select() — the generated name shouldn't come up
-  // highlighted; the cursor just sits in the field so you can edit if you want.
+  // The name field is NOT focused or selected by default — the generated name
+  // shouldn't come up active/highlighted, and on a phone we don't want the
+  // keyboard popping up on open. Focus the Join button instead so it's the
+  // default action (Enter/tap joins immediately); the user taps the field only
+  // if they want to edit the name.
+  joinModalButtonEl.focus();
 }
 
 function hideJoinModal() {
@@ -3178,12 +3206,11 @@ joinNameInputEl.addEventListener('keydown', (event) => {
 });
 
 // The "regenerate" button next to the name field (see showJoinModal) —
-// rolls a new NameGen.userName() and returns focus to the field. NOT
-// .select() — the new name shouldn't come up highlighted (same as the
-// initial prefill in showJoinModal).
+// rolls a new NameGen.userName(). It does NOT focus or select the field: the
+// name stays inactive/unhighlighted and the Join button remains the default
+// (consistent with showJoinModal not activating the field).
 joinNameRegenButtonEl.addEventListener('click', () => {
   joinNameInputEl.value = NameGen.userName();
-  joinNameInputEl.focus();
 });
 
 async function init() {
