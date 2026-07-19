@@ -2568,6 +2568,13 @@ body {
   .tiles-grid--spotlight .tile--maximized {
     right: 0;
     bottom: 110px; /* strip tile height (100px) + gap (var(--space-2)) + margin */
+    /* Reset the strip tiles' fixed height:100px (from `.tiles-grid--spotlight
+       .tile` just above — same specificity, but it wins by source order) so the
+       top/bottom insets actually define this tile's height. Without this the
+       maximized tile stayed 100px tall pinned to the top, and object-fit: cover
+       just filled that 100px band — the "still short at the top" bug. */
+    height: auto;
+    width: auto;
   }
 
   .control-panel {
