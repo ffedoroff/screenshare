@@ -1023,9 +1023,16 @@ const MOBILE_TILES_MEDIA_QUERY = '(max-width: 640px)';
  * sprawl into a single row/column, not because it's the "correct" layout
  * for that case.
  */
-function computeTileGridColumns(tileCount, isMobile) {
+function computeTileGridColumns(tileCount, isMobile, isPortrait) {
   if (tileCount <= 1) return 1;
-  if (isMobile) return 2;
+  if (isMobile) {
+    // Two participants on a portrait phone: stack them in ONE column (each
+    // tile full-width, one above the other) — two side-by-side tiles would be
+    // tiny on a narrow portrait screen. Landscape keeps 2 columns (side by
+    // side fills the wide screen), and 3+ tiles keep 2 columns either way.
+    if (isPortrait && tileCount === 2) return 1;
+    return 2;
+  }
   if (tileCount === 2) return 2;
   if (tileCount === 3) return 3;
   if (tileCount === 4) return 2;
@@ -1039,9 +1046,9 @@ function computeTileGridColumns(tileCount, isMobile) {
  * (containerHeight, divided by rows) — returns { cols, rows, tileWidth,
  * tileHeight } or null if the container/tile list is empty.
  */
-function computeFixedTileLayout(containerWidth, containerHeight, tileCount, gapPx, isMobile) {
+function computeFixedTileLayout(containerWidth, containerHeight, tileCount, gapPx, isMobile, isPortrait) {
   if (tileCount <= 0 || containerWidth <= 0 || containerHeight <= 0) return null;
-  const cols = computeTileGridColumns(tileCount, isMobile);
+  const cols = computeTileGridColumns(tileCount, isMobile, isPortrait);
   const rows = Math.ceil(tileCount / cols);
   const cellWidth = (containerWidth - gapPx * (cols - 1)) / cols;
   const cellHeight = (containerHeight - gapPx * (rows - 1)) / rows;
@@ -1122,7 +1129,8 @@ function layoutTilesGrid() {
   const width = Number.isFinite(cssMaxWidth) ? Math.min(stageWidth, cssMaxWidth) : stageWidth;
   const gapPx = parseFloat(getComputedStyle(tilesGridEl).columnGap) || 0;
   const isMobile = window.matchMedia(MOBILE_TILES_MEDIA_QUERY).matches;
-  const layout = computeFixedTileLayout(width, height, tileCount, gapPx, isMobile);
+  const isPortrait = window.matchMedia('(orientation: portrait)').matches;
+  const layout = computeFixedTileLayout(width, height, tileCount, gapPx, isMobile, isPortrait);
   if (!layout) return;
   const tileWidthPx = Math.floor(layout.tileWidth);
   const tileHeightPx = Math.floor(layout.tileHeight);
@@ -3139,7 +3147,8 @@ function showJoinModal() {
   // shouldn't at this point, but we don't overwrite it just in case).
   if (!joinNameInputEl.value) joinNameInputEl.value = NameGen.userName();
   joinNameInputEl.focus();
-  joinNameInputEl.select();
+  // Deliberately NOT .select() — the generated name shouldn't come up
+  // highlighted; the cursor just sits in the field so you can edit if you want.
 }
 
 function hideJoinModal() {
@@ -3169,13 +3178,12 @@ joinNameInputEl.addEventListener('keydown', (event) => {
 });
 
 // The "regenerate" button next to the name field (see showJoinModal) —
-// rolls a new NameGen.userName() and returns focus to the field with the
-// text selected, just like when the modal first opens, so you can start
-// typing over it right away if you don't like the generated name.
+// rolls a new NameGen.userName() and returns focus to the field. NOT
+// .select() — the new name shouldn't come up highlighted (same as the
+// initial prefill in showJoinModal).
 joinNameRegenButtonEl.addEventListener('click', () => {
   joinNameInputEl.value = NameGen.userName();
   joinNameInputEl.focus();
-  joinNameInputEl.select();
 });
 
 async function init() {
