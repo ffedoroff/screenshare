@@ -829,10 +829,22 @@ body {
      positioned box (the whole viewport, or viewport-minus-strip in spotlight),
      not stay 16:9. Keeping 16:9 made the tile a short wide band pinned to the
      top on a portrait phone (landscape happened to fill, hence "looks nice"
-     only sideways). With aspect-ratio: auto the box fills the area and the
-     inner .tile-video (object-fit: contain) centers the actual frame —
-     letterboxed top/bottom in portrait, filling in landscape. */
+     only sideways). With aspect-ratio: auto the box fills the area. */
   aspect-ratio: auto;
+}
+
+/* Maximized video in PORTRAIT: fill the tall box by height and crop the sides
+   (object-fit: cover) instead of letterboxing a landscape 16:9 frame into a
+   short centered band (contain). A landscape frame can't be both full-height
+   AND uncropped on a portrait screen — cover trades some side crop for a big,
+   screen-filling picture, which is what's wanted on a phone held upright.
+   Landscape orientation keeps the default contain (see .tile-video) — there a
+   16:9 frame fills without cropping. Mirror transform on the own tile is
+   unaffected by object-fit. */
+@media (orientation: portrait) {
+  .tile--maximized .tile-video {
+    object-fit: cover;
+  }
 }
 
 .tile--maximized .tile-name {
