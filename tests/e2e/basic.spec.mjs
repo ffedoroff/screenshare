@@ -804,15 +804,21 @@ async function main() {
       await step(
         'For Petya, a speed badge for incoming appears on Vasya\'s tile, and on his own tile — outgoing (with "↑")',
         async () => {
+          // .tile-speed-rate, not the outer .tile-speed — the badge is now
+          // two children (rate + ping, see static/room.js: createTile/
+          // updateTileSpeedBadges); .tile-speed's OWN textContent
+          // concatenates both, and a real (even loopback) RTCPeerConnection
+          // typically has a ping by now, which would append "· NN ms" after
+          // the "…B/s" and break an end-anchored match against the parent.
           await petyaPage.waitForFunction(
-            (sel) => /B\/s$/.test(document.querySelector(`${sel} .tile-speed`)?.textContent || ''),
+            (sel) => /B\/s$/.test(document.querySelector(`${sel} .tile-speed-rate`)?.textContent || ''),
             vasyaTileSel,
             { polling: 500, timeout: 10_000 }
           );
           await waitForClassOnSelector(petyaPage, `${vasyaTileSel} .tile-speed`, 'hidden', false, 1000);
 
           await petyaPage.waitForFunction(
-            () => (document.querySelector('.tile--own .tile-speed')?.textContent || '').startsWith('↑'),
+            () => (document.querySelector('.tile--own .tile-speed-rate')?.textContent || '').startsWith('↑'),
             undefined,
             { polling: 500, timeout: 10_000 }
           );

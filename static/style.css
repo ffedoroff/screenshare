@@ -1,5 +1,6 @@
-/* Common styles: the room is always a dark stage (video call), the landing page
-   respects the system theme. Responsive layout, no UI libraries. Spacing follows
+/* Common styles: the whole app is always a dark stage (video call) — the
+   landing page uses the same fixed dark palette as the room, regardless of the
+   system theme. Responsive layout, no UI libraries. Spacing follows
    the 4/8/12/16/24/32 scale. */
 
 :root {
@@ -165,7 +166,8 @@ body {
   }
 }
 
-/* ---------- Landing page ---------- */
+/* ---------- Landing page: always dark, same fixed palette as the room
+   (see the :root vars above) — it does not respect prefers-color-scheme. ---------- */
 
 .landing-page {
   min-height: 100%;
@@ -679,6 +681,16 @@ body {
   flex: 0 0 168px;
 }
 
+/* This strip's tiles keep a fixed CSS aspect (the base .tile { aspect-ratio:
+   16/9 } — the packer doesn't size these, see clearPackedTileLayout), which
+   generally does NOT match the actual video's own aspect, unlike every
+   packed tile elsewhere (see the object-fit: cover comment on .tile-video)
+   — cover would crop a mismatched camera here. contain avoids that, same
+   trade-off as the pre-JS fallback grid. */
+.tiles-grid--compact .tile-video {
+  object-fit: contain;
+}
+
 /* ---------- Spotlight: maximized tile + strip of the other participants ----------
    The .tiles-grid--spotlight class on #tiles-grid is set SIMULTANEOUSLY with
    .tile--maximized on the chosen tile (see static/room.js:
@@ -734,6 +746,15 @@ body {
   height: auto;
 }
 
+/* Same reasoning as .tiles-grid--compact .tile-video above: these strip
+   tiles keep a fixed CSS aspect (200px wide x the base .tile's 16:9, or the
+   mobile override's 100px-tall — the packer doesn't size these, see
+   clearPackedTileLayout) that generally doesn't match the actual video's
+   aspect — cover would crop it, contain doesn't. */
+.tiles-grid--spotlight .tile:not(.tile--maximized) .tile-video {
+  object-fit: contain;
+}
+
 /* Small strip tiles: the speed indicator is unreadable at this size — hide it entirely;
    keep the name/crown but shrink them noticeably (on desktop there's room next
    to the video, and "who is this" is still useful to see in the strip). */
@@ -762,8 +783,13 @@ body {
   height: 10px;
 }
 
+/* min/max-width only — this sizes the CIRCLE (smaller than the default
+   52-176px range, to fit the small strip tiles). No font-size override
+   here anymore: the glyph is now sized in the circle's OWN cq units (see
+   .tile-placeholder-letter above), so it fills the same fraction of
+   whatever circle it ends up in without a per-mode number to keep in
+   sync. */
 .tiles-grid--spotlight .tile:not(.tile--maximized) .tile-placeholder-avatar {
-  font-size: 1.1rem;
   min-width: 32px;
   max-width: 56px;
 }
@@ -785,22 +811,43 @@ body {
   justify-content: center;
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
   /* Size-query container (cqw/cqh) for the placeholder with no video — see
-     .tile-placeholder-avatar/-name below: their sizes are tied to the SIZE
-     OF THE TILE ITSELF (not the viewport), so the letter/emoji in the circle and the caption
-     scale with the tile's actual size in the grid (task item 3), rather
-     than staying a flat constant regardless of whether there's currently 1 participant
-     fullscreen or 6 in a 3x2/2x3 grid. `size` (not just `inline-size`) —
-     the block size (height) of the tile is also always deterministic (either an explicit
-     grid-template-rows from layoutTilesGrid, or an aspect-ratio derived from width), so
-     cqh queries by height (see .tile-placeholder below — on the
-     smallest tiles, e.g. 6 participants on a phone, otherwise the avatar+name
-     wouldn't fit in height) can also be used safely. */
+     .tile-placeholder-avatar/-name below: the CIRCLE's own diameter (width:
+     34% + min/max-width) is tied to the SIZE OF THE TILE ITSELF (not the
+     viewport), so it scales with the tile's actual size in the grid (task
+     item 3), rather than staying a flat constant regardless of whether
+     there's currently 1 participant fullscreen or 6 packed side by side.
+     (The glyph INSIDE the circle no longer reads this container directly —
+     it has its own nested container-type: size on .tile-placeholder-avatar
+     itself, so the glyph-to-circle fill ratio stays exactly constant; see
+     the comment there.) `size` (not just `inline-size`) — the block size
+     (height) of the tile is also always deterministic (either
+     an explicit inline height set by the packer, see static/room.js:
+     applyPackedLayout, or the aspect-ratio below derived from width before
+     the packer's first run), so cqh queries by height (see .tile-placeholder
+     below — on the smallest tiles, e.g. 6 participants on a phone, otherwise
+     the avatar+name wouldn't fit in height) can also be used safely. */
   container-type: size;
   /* A click toggles maximization (see static/room.js: createTile/maximizeTile) —
      the cursor is pointer everywhere, not only when the video is visible (:has(.tile-video
      not -hidden) is unnecessarily complex for the same result: a click on the placeholder
      simply does nothing, which doesn't require a different cursor). */
   cursor: pointer;
+}
+
+/* Only a tile that's ALREADY been placed once by the packer (static/room.js:
+   layoutTilesGrid/applyPackedLayout) transitions its left/top/width/height —
+   a brand-new tile's FIRST geometry is applied with this class absent (see
+   applyPackedLayout: the class is added a frame later), so it appears at its
+   final spot immediately instead of visibly flying in from wherever an
+   un-positioned position:absolute box would otherwise default to. The
+   border-color/box-shadow pair is repeated from .tile above because the
+   `transition` shorthand fully REPLACES, rather than merges with, a
+   same-specificity rule's value for any element matching both selectors —
+   without repeating them here, a placed tile would lose its speaking-border
+   transition the moment it also became eligible for the layout one. */
+.tile--placed {
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, left 0.2s ease, top 0.2s ease, width 0.2s ease,
+    height 0.2s ease;
 }
 
 /* ---------- Maximizing a tile to full page (clicking a tile with video) ----------
@@ -829,14 +876,20 @@ body {
   aspect-ratio: auto;
 }
 
-/* The maximized video keeps the default object-fit: contain everywhere (see
-   .tile-video) — the whole frame is always visible, never cropped. On a
-   portrait phone a landscape source is letterboxed (black bars left/right or
-   top/bottom); a portrait/matching source fills the now-full-height box. cover
-   was tried to fill portrait height but cropped the sides of mismatched-aspect
-   frames, which is worse — showing the full frame is the safer default for a
-   call. (No side-crop vs. full-height for a landscape frame on a portrait
-   screen is a genuine either/or; contain is chosen.) */
+/* Unlike every other tile (see the object-fit: cover comment on .tile-video
+   below), the maximized tile's box is the VIEWPORT (or viewport-minus-strip
+   in spotlight) — not the video's own aspect ratio — so cover here WOULD
+   crop meaningfully instead of just ironing out sub-pixel rounding. contain
+   keeps the whole frame visible: on a portrait phone a landscape source is
+   letterboxed (black bars left/right or top/bottom); a portrait/matching
+   source fills the now-full-height box. cover was tried to fill portrait
+   height but cropped the sides of mismatched-aspect frames, which is worse —
+   showing the full frame is the safer default for a call. (No side-crop vs.
+   full-height for a landscape frame on a portrait screen is a genuine
+   either/or; contain is chosen.) */
+.tile--maximized .tile-video {
+  object-fit: contain;
+}
 
 .tile--maximized .tile-name {
   bottom: calc(var(--space-3) + env(safe-area-inset-bottom));
@@ -859,16 +912,23 @@ body {
 .tile-video {
   width: 100%;
   height: 100%;
-  /* Used to be cover (crops the frame to fill the tile) — changed to
-     contain: the card is now honest-16:9 (see best-fit in static/room.js:
-     layoutTilesGrid), and cropping someone else's video just to fill our grid is
-     not needed — when aspect ratios don't match (a non-16:9 camera), black bars
-     (letterboxing on the card's background) are better than cropped edges of a face. The same object-fit
-     that used to apply only to .tile--maximized is now consistent everywhere,
-     so a separate override for maximization is no longer needed. Mirroring one's own
-     video (.tile-video--mirror below) is a plain transform, object-fit
-     doesn't affect it. */
-  object-fit: contain;
+  /* cover, not contain: the packer (static/room.js: layoutTilesGrid,
+     tileAspectDescriptor, applyPackedLayout) now sizes the TILE BOX ITSELF
+     to the video's own intrinsic aspect ratio, rather than forcing every
+     tile into a fixed 16:9 box and letterboxing whatever doesn't match (the
+     old behavior — see git history for why contain was chosen back then).
+     Box aspect and video aspect match by construction here, so cover only
+     ever irons out sub-pixel rounding from integer-px placement — it does
+     NOT meaningfully crop. The one place this does NOT hold is the
+     maximized tile, whose box is the viewport (or viewport-minus-strip),
+     not the video's aspect — see the explicit contain override on
+     .tile--maximized .tile-video below. (The pre-JS CSS-grid fallback, see
+     .tiles-grid above, still forces a fixed 16:9 box — a video with a very
+     different aspect WOULD get cropped there; an acceptable trade-off for a
+     degraded no-JS state that the room's layout doesn't otherwise function
+     in anyway.) Mirroring one's own video (.tile-video--mirror below) is a
+     plain transform, object-fit doesn't affect it. */
+  object-fit: cover;
   display: block;
 }
 
@@ -897,14 +957,31 @@ body {
 
 /* The avatar circle — noticeably larger than before (was 30%/2.8rem) and strictly round
    (aspect-ratio: 1 + border-radius: 50%, min/max-width keep it round
-   at any tile width). font-size — clamp() based on cqw (inline-size of .tile,
-   see container-type in the same place), not a fixed rem: the letter/emoji grows and
-   shrinks together with the tile's actual size (including in the 3x2/2x3 grid from
-   task item 6), but never exceeds the circle's bounds either at 1 tile fullscreen
-   (the maximum is clamped from above), or at 6 small tiles on a phone
-   (the minimum is clamped from below so the letter doesn't collapse to a dot). position:
-   relative — anchor for the leader crown above the circle (.tile-crown--placeholder
-   below, see task item 4 and static/room.js: createTile). */
+   at any tile width). position: relative — anchor for the leader crown above
+   the circle (.tile-crown--placeholder below, see task item 4 and
+   static/room.js: createTile).
+   container-type: size — makes the CIRCLE ITSELF (not the outer .tile) the
+   query container for the glyph inside it (see .tile-placeholder-letter
+   below). This is deliberately a SECOND, independent size-query container
+   nested inside .tile's own (see container-type on .tile above): sizing the
+   glyph off cqw of .tile made the glyph-to-circle ratio drift with the
+   tile's own aspect ratio/mode (a wide tile and a narrow tile with the
+   SAME circle diameter produced different-looking glyph fill, and the
+   --solo/--compact/--spotlight blocks each needed their own hand-tuned
+   font-size override to compensate — see the removed rules previously
+   here). Once the glyph is sized in the circle's OWN cq units, the ratio is
+   identical by construction at every tile size and in every mode — no
+   per-mode override needed at all (only min/max-WIDTH overrides survive
+   below, and those size the CIRCLE, not the glyph-to-circle ratio).
+   `size` (not just `inline-size`) is safe here for the same reason it's
+   safe on .tile: both axes are definite (height comes from aspect-ratio: 1
+   applied to a width that's itself a definite %/min/max-width of the tile),
+   never from content — and since the box is a square, cqw/cqh/cqmin are
+   all numerically identical, so either could be used interchangeably below.
+   container-type does NOT clip descendants that overflow the container's
+   own box (that's the separate `overflow` property, left at its default
+   `visible` here) — so the leader crown above the circle, which
+   deliberately dips outside it, is unaffected by this. */
 .tile-placeholder-avatar {
   position: relative;
   width: 34%;
@@ -916,22 +993,78 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  /* Bumped noticeably larger (was clamp(1.4rem, 13cqw, 4rem)) per request —
-     the circle itself (width/max-width above) is UNCHANGED, only the glyph
-     inside grows: at the largest tiles the clamp still tops out well under
-     the 176px circle (5.5rem = 88px, well inside a 176px-diameter circle
-     centered by the flex box above), and at the smallest tiles (6
-     participants on a phone, circle pinned to min-width: 52px) the raised
-     floor (1.9rem = ~30px) still leaves comfortable margin in the circle. */
-  font-size: clamp(1.9rem, 20cqw, 5.5rem);
+  container-type: size;
   font-weight: 700;
   color: #fff;
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
   flex-shrink: 0;
 }
 
+/* Circular clipping wrapper around the glyph (see static/room.js:
+   createTile) — inset: 0 + border-radius: 50% + overflow: hidden clips
+   whatever is inside to exactly the avatar circle, like a zoomed photo
+   crop. This is what lets an EMOJI glyph be sized past the
+   inscribed-square geometry limit (a square glyph's corners poke out of a
+   circle as soon as its side exceeds ~70.7% of the diameter — which
+   effectively capped an unclipped emoji at ~60% visual fill and made it
+   read as a small sticker floating in a ring): the corners/edges of
+   square-ish emoji art are deliberately cropped by the circle and it reads
+   as a full-bleed avatar instead. The wrapper is a SIBLING of the crown,
+   not its parent — the crown (.tile-crown--placeholder below) must keep
+   overflowing the top rim UNclipped, so it stays a direct child of
+   .tile-placeholder-avatar (and is appended AFTER this wrapper in room.js:
+   both are positioned, so DOM order is paint order, and the crown's dip
+   into the circle must paint over the glyph, not under it). Letters live
+   inside this wrapper too but are sized to never actually reach the rim
+   (see .tile-placeholder-letter below) — a cropped picture looks
+   intentional, a cut-off letter looks broken. */
+.tile-placeholder-glyph-clip {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* The glyph itself — sized in the AVATAR's own cqw (see container-type
+   above), not a fixed rem and not the tile's cqw, so the glyph-to-circle
+   fill ratio is exactly constant everywhere. Letters and emoji get
+   DIFFERENT numbers with DIFFERENT acceptance rules, tuned empirically (a
+   throwaway harness rendered every candidate glyph into the real
+   .tile-placeholder-avatar circle and diffed painted pixels against an
+   empty circle, so this isn't just eyeballing two example letters):
+     - Letters (68cqw): must NEVER be visually cut by the clip wrapper
+       above — all text ink strictly inside the circle. A plain capital's
+       cap-height is only ~0.65-0.70em, so common letters (A/W/M, most
+       Cyrillic capitals) land comfortably inside; the binding constraint
+       is the worst REAL uppercase letter, Cyrillic Щ (wide AND a
+       descender tail), whose farthest ink reaches ~98% of the radius at
+       70cqw and touches the rim at 72cqw — but those numbers were
+       measured with the macOS system font only, and Segoe UI/Roboto
+       metrics differ slightly, so 68 keeps a cross-platform margin
+       (~3.8% on macOS). Do not raise it without re-running the glyph
+       sweep on every target platform.
+     - Emoji (90cqw): ink IS allowed to be clipped by the circle (that is
+       the point of the wrapper — a full-bleed crop), but nothing
+       important may be lost: across all ~30 emoji static/namegen.js can
+       hand out as an avatar (see ANIMALS there), the clipped-away area
+       must stay under ~10% of each glyph's total painted area. Measured
+       at 90cqw: worst is 🦜 at ~4.6% cropped (then 🐝 ~4.0%, 🦒 ~3.3% —
+       glyphs with wings/necks sticking far out of the face); round
+       animal faces — most of the namegen set — lose under 1% or nothing
+       and visually fill ~85-95% of the circle.
+   See static/room.js: firstGraphemeOf/isEmojiGrapheme for how `--emoji` is
+   applied to this element — a color emoji and a letter are never the same
+   DOM element at once, only one class ever applies. */
 .tile-placeholder-letter {
   line-height: 1;
+  font-size: 68cqw;
+}
+
+.tile-placeholder-letter--emoji {
+  font-size: 90cqw;
 }
 
 /* The leader crown ABOVE the avatar circle (see task item 4) — absolutely
@@ -945,19 +1078,28 @@ body {
    there avatar+name already occupy the tile's full height snugly, see
    .tile-placeholder: gap) this lower position also has an practical upside:
    it's no longer close to being clipped by the tile's top border (.tile:
-   overflow: hidden), unlike the old, higher-floating position. Size — also
-   cqw, in sync with the letter in the circle, but with a narrower range
-   (the crown shouldn't dominate the avatar itself). Selecting through the
-   parent (not just .tile-crown--placeholder) — raises the specificity above
-   the general .tile-crown rule below (otherwise both would have the same
-   specificity, and file order would decide who wins — fragile). */
+   overflow: hidden), unlike the old, higher-floating position. Size — cqw
+   of the AVATAR itself now (was the tile's cqw before the container-type
+   change above), for the same reason the letter moved: sized off the
+   tile, the crown-to-circle ratio drifted with the tile's own aspect/mode
+   just like the glyph did; sized off the circle it's always the same
+   fraction of the circle it sits on, everywhere. ~33cqw keeps roughly the
+   same on-screen size as the previous 18cqw-of-tile (the avatar circle
+   itself is roughly 34-55% of the tile's width depending on mode, see
+   width/min/max-width above and the per-mode overrides below, so 18/0.34 ≈
+   ~33-53 — 33cqw was picked, then confirmed visually, as sitting the same
+   way on the rim without dominating the circle at any tile size). Selecting
+   through the parent (not just .tile-crown--placeholder) — raises the
+   specificity above the general .tile-crown rule below (otherwise both
+   would have the same specificity, and file order would decide who wins —
+   fragile). */
 .tile-placeholder-avatar .tile-crown--placeholder {
   position: absolute;
   top: 0;
   left: 50%;
   transform: translate(-50%, -30%);
-  width: clamp(28px, 18cqw, 52px);
-  height: clamp(28px, 18cqw, 52px);
+  width: clamp(28px, 33cqw, 52px);
+  height: clamp(28px, 33cqw, 52px);
 }
 
 /* Used to show the name large, under the avatar, only on the no-video
@@ -971,9 +1113,11 @@ body {
   display: none;
 }
 
+/* min/max-width only — see the comment on the spotlight override above:
+   the glyph-to-circle ratio no longer needs a per-mode font-size, only the
+   circle's own size (min/max-width) differs here from the default. */
 .tiles-grid--solo .tile-placeholder-avatar,
 .tiles-grid--compact .tile-placeholder-avatar {
-  font-size: 2.2rem;
   min-width: 64px;
   max-width: 130px;
 }
@@ -2697,21 +2841,6 @@ body {
   }
 }
 
-/* ---------- Landing page: respects the system light theme.
-   The room always remains a dark stage, regardless of prefers-color-scheme —
-   the variables below are overridden only inside body.page-landing. ---------- */
-@media (prefers-color-scheme: light) {
-  body.page-landing {
-    --bg: #f4f5f7;
-    --bg-elevated: #ffffff;
-    --bg-elevated-2: #eef0f3;
-    --border: #dde1e6;
-    --text: #1a1d22;
-    --text-muted: #565c66;
-    --shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
-  }
-}
-
 /* ---------- Join-room modal (anonymity — see static/room.js) ----------
    Shown first, before connecting to signaling; z-index above .overlay
    (50), so it doesn't end up beneath it if both are somehow visible at the same time. */
@@ -2833,11 +2962,167 @@ body {
   pointer-events: none;
 }
 
+/* The badge is now TWO children, not one text node (see static/room.js:
+   createTile/updateTileSpeedBadges) — .tile-speed-rate is the existing
+   "↓ 320 KB/s"/"↑ …" text (no styling of its own; it just inherits
+   .tile-speed's font/color) and .tile-speed-rtt is the ping ("· 45 ms",
+   the separator is baked into the text itself, see updateTileSpeedBadges —
+   simpler than a flex gap that would also show up as empty space when the
+   span is blank pre-connect). Splitting into two elements is what lets
+   updateTileSpeedBadges update the rate on every poller tick without
+   clobbering the rtt (a single `speedEl.textContent = …` would wipe both).
+   Hidden below the LARGE size tier — see the @container blocks below. */
+.tile-speed-rtt {
+  margin-left: 2px;
+}
+
 .tile--maximized .tile-speed {
   left: calc(var(--space-3) + env(safe-area-inset-left));
   top: calc(var(--space-3) + env(safe-area-inset-top));
   font-size: 0.8rem;
   padding: var(--space-1) var(--space-3);
+}
+
+/* ---------- Size tiers for tile overlays (name pill / speed badge / mic icon) ----------
+   Product rule: video always wins the tile — the name pill + speed badge
+   together may cover AT MOST ~20% of the tile's own area, shrinking well
+   before that budget is at risk on a small card (today's fixed sizes above
+   are tuned for a roomy tile and can cover half of a small phone tile, per
+   the task). .tile is already a size-query container (container-type: size,
+   see the .tile rule near the top of this file) — these are plain UNNAMED
+   @container queries against that same container: nothing between .tile and
+   .tile-name/.tile-speed/.tile-mic-off declares its own container-type
+   (the other nested container in this file, .tile-placeholder-avatar, is a
+   sibling subtree for the avatar glyph, not an ancestor of these overlays),
+   so there is no ambiguity about which container these bind to.
+
+   Four tiers, gated on BOTH width and height so an extreme aspect ratio
+   (very wide but short, or very tall but narrow) can't read as "large" just
+   because one axis happens to be big:
+     - LARGE  (>=300px wide AND >=170px tall): the unchanged base rules
+       above/elsewhere in this file — name + speed + ping, today's sizes.
+     - MEDIUM (>=180w AND >=110h, below LARGE): name + speed, ping hidden;
+       name/speed typography trimmed a bit from LARGE (see the area math
+       below — a MEDIUM-sized tile is small enough that keeping LARGE's
+       full sizing would cross the ~20% budget on its own).
+     - SMALL  (>=130w AND >=90h, below MEDIUM): name only — the whole speed
+       badge (rate AND ping) is dropped. Sizes reuse the EXACT numbers of
+       the existing .tiles-grid--spotlight strip-tile precedent above
+       (0.62rem name / 12px crown / 16px mic-off with a 10px svg) so a tile
+       that's small "because of the spotlight strip" and one that's small
+       "because the grid packed many participants" read the same way.
+     - TINY   (below SMALL): no name, no speed badge — only the mic-off
+       icon (shrunk further) over the video/avatar.
+
+   Each block below is the COMPLEMENT of its tier's own ">= AND >=" test,
+   i.e. "max-width OR max-height" — it fires whenever EITHER axis falls
+   short, which is exactly the extreme-aspect case above. This also makes
+   the blocks nest correctly without an explicit "else": the not-SMALL
+   condition set is a strict subset of not-MEDIUM, itself a strict subset of
+   not-LARGE, so e.g. a TINY tile matches all three blocks and simply
+   accumulates every override (harmless — display: none stays display: none
+   however many times it's applied).
+
+   Plain single-class selectors throughout (.tile-name, .tile-speed, …) —
+   deliberately LOWER specificity than the two-tiers-of-class selectors used
+   by .tiles-grid--spotlight/.tile--maximized above (e.g. `.tiles-grid--spotlight
+   .tile:not(.tile--maximized) .tile-speed`): the cascade resolves PER
+   PROPERTY, not per rule block, so wherever those explicit per-mode rules
+   already set a property (display/font-size/padding/…), they keep winning
+   regardless of source order — these tiers only ever fill in properties
+   those modes leave untouched. That's what keeps this generic, "adapt to
+   whatever pixel size the tile actually ends up at" system from fighting
+   the deliberate spotlight-strip/maximized design.
+
+   ---- 20%-area sanity check (16:9 tile sized at each tier's WIDTH
+   threshold; height = width * 9/16 — see task item 4) ----
+   LARGE  @300x169  (50 625 px^2 tile): name pill ~284x18 = 5 112 px^2 +
+     speed-with-ping ~108x14 = 1 512 px^2 -> 6 624 px^2 = 13.1% of the tile.
+   MEDIUM @180x101  (18 225 px^2 tile): name pill ~158x16 = 2 534 px^2 +
+     speed-rate-only ~61x13 = 793 px^2 -> 3 327 px^2 = 18.3% of the tile.
+   SMALL  @130x73   ( 9 508 px^2 tile): name pill only ~110x16 = 1 768 px^2
+     = 18.6% of the tile (no speed badge at all).
+   TINY   @<130x<73: no pill, no badge — just the 14x14 mic icon
+     (196 px^2), ~2% of a tile this size.
+   All four stay at/under the ~20% budget; MEDIUM and SMALL are the
+   tightest, which is why their padding/font are trimmed below rather than
+   just carrying LARGE's numbers down unchanged. */
+@container (max-width: 299px), (max-height: 169px) {
+  /* Below LARGE (MEDIUM and smaller): drop the ping, trim the name pill and
+     rate badge slightly — see the area sanity check above. */
+  .tile-speed-rtt {
+    display: none;
+  }
+
+  .tile-name {
+    font-size: 0.68rem;
+    padding: 1px 6px;
+    max-width: 88%;
+  }
+
+  .tile-speed {
+    font-size: 0.58rem;
+    padding: 1px 5px;
+  }
+
+  .tile-crown {
+    width: 14px;
+    height: 14px;
+  }
+}
+
+@container (max-width: 179px), (max-height: 109px) {
+  /* Below MEDIUM (SMALL and smaller): the speed badge (rate AND ping) is
+     dropped entirely — per product rule, a small card drops speed before it
+     drops the name. Name-pill/crown/mic-off numbers below intentionally
+     match the .tiles-grid--spotlight strip-tile precedent above (~line 765)
+     — same "small tile" visual language everywhere, not a second hand-tuned
+     set of numbers to keep in sync. */
+  .tile-speed {
+    display: none;
+  }
+
+  .tile-name {
+    font-size: 0.62rem;
+    padding: 2px var(--space-1);
+    gap: 2px;
+    max-width: 85%;
+  }
+
+  .tile-crown {
+    width: 12px;
+    height: 12px;
+  }
+
+  .tile-mic-off {
+    width: 16px;
+    height: 16px;
+  }
+
+  .tile-mic-off svg {
+    width: 10px;
+    height: 10px;
+  }
+}
+
+@container (max-width: 129px), (max-height: 89px) {
+  /* Below SMALL (TINY): drop the name too — per product rule, a very small
+     card drops even the name. Only the mic-off icon (shrunk further than
+     the SMALL tier above) stays over the video/avatar — nothing else may
+     overlap it at this size. */
+  .tile-name {
+    display: none;
+  }
+
+  .tile-mic-off {
+    width: 14px;
+    height: 14px;
+  }
+
+  .tile-mic-off svg {
+    width: 8px;
+    height: 8px;
+  }
 }
 
 /* ---------- Lobby requests (leader only) ---------- */

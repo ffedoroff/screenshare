@@ -976,9 +976,25 @@ function firstGraphemeOf(str) {
  */
 function stripLeadingAvatarEmoji(trimmedName, grapheme) {
   if (!trimmedName || !grapheme) return trimmedName;
-  if (!/\p{Extended_Pictographic}/u.test(grapheme)) return trimmedName;
+  if (!isEmojiGrapheme(grapheme)) return trimmedName;
   const rest = trimmedName.slice(grapheme.length).trim();
   return rest || trimmedName;
+}
+
+/**
+ * Whether a grapheme cluster (see firstGraphemeOf above) is an emoji rather
+ * than a regular letter — \p{Extended_Pictographic} is the same reliable
+ * check used above in stripLeadingAvatarEmoji, factored out here because a
+ * second caller needs it: the avatar circle's glyph class (see createTile/
+ * updatePeerTileName below, and static/style.css:
+ * .tile-placeholder-letter--emoji). Letters and emoji need different
+ * font-sizing to look equally "full" inside the circle — a capital
+ * letter's cap-height is noticeably shorter than its own font-size (its em
+ * box), while a color emoji's glyph fills nearly the whole em box — so the
+ * circle needs to know which kind of glyph it's showing.
+ */
+function isEmojiGrapheme(grapheme) {
+  return !!grapheme && /\p{Extended_Pictographic}/u.test(grapheme);
 }
 
 /** Name to display under the avatar/in the tile corner — just the name, without the "Guest" placeholder if there already is one. */
@@ -986,84 +1002,609 @@ function tileDisplayName(trimmedName, grapheme) {
   return trimmedName ? stripLeadingAvatarEmoji(trimmedName, grapheme) : 'Guest';
 }
 
-// ---------- Tile grid layout: fixed grid for the 6-participant limit ----------
+// ---------- Tile grid layout: aspect-ratio-aware packing ("justified rows") ----------
 //
 // The room is limited to 6 participants by default (see
-// knownServerMaxParticipants above) — per the spec (item 6), the layout for
-// 1..6 tiles is FIXED and predictable (not "best of an N-way search over
-// column counts" as computeBestFitTileLayout used to do — that search
-// produced a variable number of columns depending on the stage shape, which
-// made it hard to fit both width and height at once without scrolling):
-// desktop — 1→1, 2→2, 3→3, 4→2×2, 5-6→3×2; mobile portrait (see @media
-// (max-width: 640px) in static/style.css) — always 2 columns (except for a
-// single tile).
+// knownServerMaxParticipants above), which is what makes the approach below
+// affordable: instead of a fixed column/row count per tileCount (the OLD
+// computeTileGridColumns/computeFixedTileLayout — see git history — which
+// forced every tile into the same 16:9 box regardless of what it actually
+// showed), the grid is now packed by BRUTE-FORCE SEARCH over candidate
+// layouts, scored by how much of the stage they cover with USEFUL content
+// (a video's own intrinsic aspect, or a flexible range for a no-video
+// placeholder) while still looking tidy. n<=6 keeps the full search cheap —
+// see partitionsIntoRows for the exact candidate count (a few hundred at
+// most), redone on every layout pass rather than cached.
 //
-// The tile itself still scales to a 16:9 aspect ratio and fits the MAXIMUM
-// possible size — but now with an EXPLICITLY fixed number of columns/rows,
-// rather than by search. Both grid tracks (grid-template-columns AND
-// grid-template-rows) are set inline in px — previously row height was left
-// to the CSS fallback `grid-auto-rows: minmax(0, 1fr)`, which, given the
-// non-deterministic (auto) height of #tiles-grid itself, could mismatch the
-// height actually verified by the fit computation. Explicit
-// grid-template-rows removes this ambiguity: the resulting grid height is
-// guaranteed to equal rows*tileHeight + gaps, i.e. exactly what was checked
-// to fit the stage height (see also the .room-page fix: height instead of
-// min-height in static/style.css — the other half of the same scrolling bug).
-const TILE_ASPECT_RATIO = 16 / 9;
+// The algorithm ("justified rows", the same family used by photo-gallery
+// grids):
+//   1. Every tile contributes an aspect (tileAspectDescriptor): a tile
+//      showing video uses the VIDEO's own videoWidth/videoHeight (falling
+//      back to 16:9 until loadedmetadata fires — see the listeners in
+//      createTile); a tile on its no-video placeholder (avatar + name, which
+//      visually adapts to any reasonable box) is marked `flexible` and can
+//      be resolved to any aspect in [1.0, 1.9] by the packer itself.
+//   2. Candidates = every row count 1..n, crossed with every CONTIGUOUS way
+//      to split the (possibly reordered) tile list into that many rows
+//      (partitionsIntoRows), crossed with a handful of orderings
+//      (orderPackerIndices: original DOM order; ascending/descending by
+//      aspect; portraits grouped first) — trying a sorted order lets the
+//      search discover partitions that keep visually similar tiles in the
+//      same row, at the cost of possibly reshuffling participants on
+//      screen, which is why a small stability bonus favors the original
+//      order in the final score (see scorePackerCandidate).
+//   3. Each candidate is sized in TWO variants, both scored, best kept:
+//      - "justified" (photo-gallery style, evaluatePackerCandidate): every
+//        row is stretched to the FULL available width — row height
+//        h_j = availWidth / sum(aspects in row) — with flexible tiles
+//        resolving their aspect toward the per-row share of the height
+//        budget ((availHeight - gaps) / rowCount; this both equalizes rows
+//        AND lets placeholder-heavy layouts actually use the stage height —
+//        see resolveFlexibleRowAspects for the underfill bug an earlier
+//        ideal-aspect-mean target caused). If the rows' total (plus gaps)
+//        would exceed the available height, EVERY row is scaled down
+//        UNIFORMLY (never up — a bigger scale would blow row width past
+//        what's available, since rows are already justified to fill it).
+//      - "equal-height" (evaluateEqualRowsCandidate): all rows share ONE
+//        height — the smallest of the per-row justified heights, capped at
+//        the per-row height budget — and rows are NOT stretched to full
+//        width; narrower rows are simply centered. This is what rescues
+//        identical-aspect tiles in uneven partitions (e.g. 3 cameras as
+//        2+1): justified rows would give the lone tile ~2x the pair's area
+//        (rejected by the fairness constraint in step 4), collapsing such
+//        tile counts into a single sliver-height row, while equal heights
+//        keep every tile the same size at a far better fill.
+//      Either way the resulting block, possibly short of the full
+//      width/height, is centered on both axes (pixelizePackedLayout).
+//   4. Candidates are scored by filled-area fraction of the stage, MINUS
+//      aesthetic penalties (row-height variance, a starved-looking last row,
+//      tiles below a readable minimum size, extreme width contrast between
+//      neighbors sharing a row, a fuller row hanging below an emptier one) —
+//      see scorePackerCandidate for the exact formula. A hard-ish constraint
+//      (heavy penalty, not outright rejection, so a fallback always exists)
+//      keeps every tile's area within ±30% of the candidate's mean tile
+//      area, per spec.
+//
+// Verified independently of the DOM by a throwaway node script during
+// development (see the task this shipped under) — the block below, from
+// `combinations` through `applySoloAreaCap`, touches no DOM API and can be
+// pasted into (or required by, via a small source-extraction shim) a plain
+// node script to exercise the math directly.
 
-// The same breakpoint as the mobile @media in static/style.css — the column
-// layout must match what the user actually sees.
-const MOBILE_TILES_MEDIA_QUERY = '(max-width: 640px)';
+const FALLBACK_VIDEO_ASPECT = 16 / 9; // used until a video's loadedmetadata fires (see createTile) — matches the old fixed layout's default so early frames don't look wildly different
+const FLEXIBLE_TILE_ASPECT_MIN = 1.0; // no-video placeholder tiles (avatar + name) can be packed at any aspect in this range — the content itself doesn't dictate one
+const FLEXIBLE_TILE_ASPECT_MAX = 1.9;
+const FLEXIBLE_TILE_ASPECT_IDEAL = 4 / 3; // representative aspect for the ordering heuristics (orderPackerIndices) and the pre-resolution descriptor default only — the aspect actually PACKED is resolved per row, see resolveFlexibleRowAspects
+const TILE_AREA_TOLERANCE = 0.3; // hard-ish constraint (spec item 2): no tile's area may deviate from the candidate's mean tile area by more than this fraction
+const MIN_READABLE_TILE_WIDTH_PX = 110;
+const MIN_READABLE_TILE_HEIGHT_PX = 80;
+const SOLO_MAX_AREA_FRACTION = 0.5; // see applySoloAreaCap
+const PACKER_ORDERINGS = ['original', 'ascending', 'descending', 'portrait-first'];
 
-/**
- * Number of columns for the fixed layout given tileCount (see comment
- * above). More than 6 tiles — a non-standard server configuration with an
- * increased participant limit — isn't described separately by the spec; we
- * use a generic reasonable fallback of ceil(sqrt(n)) so the grid doesn't
- * sprawl into a single row/column, not because it's the "correct" layout
- * for that case.
- */
-function computeTileGridColumns(tileCount, isMobile, isPortrait) {
-  if (tileCount <= 1) return 1;
-  if (isMobile) {
-    // Two participants on a portrait phone: stack them in ONE column (each
-    // tile full-width, one above the other) — two side-by-side tiles would be
-    // tiny on a narrow portrait screen. Landscape keeps 2 columns (side by
-    // side fills the wide screen), and 3+ tiles keep 2 columns either way.
-    if (isPortrait && tileCount === 2) return 1;
-    return 2;
+/** All k-combinations of `pool`, each returned as an ascending-order subset — the building block for partitionsIntoRows below. */
+function combinations(pool, k) {
+  const result = [];
+  const combo = [];
+  function recurse(start) {
+    if (combo.length === k) {
+      result.push(combo.slice());
+      return;
+    }
+    for (let i = start; i < pool.length; i++) {
+      combo.push(pool[i]);
+      recurse(i + 1);
+      combo.pop();
+    }
   }
-  if (tileCount === 2) return 2;
-  if (tileCount === 3) return 3;
-  if (tileCount === 4) return 2;
-  if (tileCount <= 6) return 3;
-  return Math.ceil(Math.sqrt(tileCount));
+  recurse(0);
+  return result;
 }
 
 /**
- * Maximum 16:9 tile size that fits SIMULTANEOUSLY both by width
- * (containerWidth, divided by cols accounting for gaps) and by height
- * (containerHeight, divided by rows) — returns { cols, rows, tileWidth,
- * tileHeight } or null if the container/tile list is empty.
+ * Every way to split `n` items (in whatever order they're given — the
+ * caller applies an ordering first, see orderPackerIndices) into exactly
+ * `rows` CONTIGUOUS, non-empty groups — e.g. n=4, rows=2 -> [[1,3], [2,2],
+ * [3,1]] (sizes of each row, left to right). This is "stars and bars":
+ * choosing rows-1 cut points among the n-1 gaps between items. With n
+ * capped at 6 (knownServerMaxParticipants) the total across all row counts
+ * is C(5,0)+C(5,1)+...+C(5,5) = 32 partitions per ordering — trivial to
+ * evaluate all of, many times a second if needed.
  */
-function computeFixedTileLayout(containerWidth, containerHeight, tileCount, gapPx, isMobile, isPortrait) {
-  if (tileCount <= 0 || containerWidth <= 0 || containerHeight <= 0) return null;
-  const cols = computeTileGridColumns(tileCount, isMobile, isPortrait);
-  const rows = Math.ceil(tileCount / cols);
-  const cellWidth = (containerWidth - gapPx * (cols - 1)) / cols;
-  const cellHeight = (containerHeight - gapPx * (rows - 1)) / rows;
-  if (cellWidth <= 0 || cellHeight <= 0) return null;
-  let tileWidth = cellWidth;
-  let tileHeight = tileWidth / TILE_ASPECT_RATIO;
-  if (tileHeight > cellHeight) {
-    // The column width would allow a tile taller than the row — scale by
-    // height instead (the 16:9 aspect ratio is preserved either way, the
-    // leftover width space is simply left empty on the edge thanks to
-    // justify-content: center).
-    tileHeight = cellHeight;
-    tileWidth = tileHeight * TILE_ASPECT_RATIO;
+function partitionsIntoRows(n, rows) {
+  if (rows <= 0 || rows > n || n <= 0) return [];
+  if (rows === 1) return [[n]];
+  const gapPositions = [];
+  for (let i = 1; i < n; i++) gapPositions.push(i);
+  return combinations(gapPositions, rows - 1).map((cuts) => {
+    const sizes = [];
+    let prev = 0;
+    for (const cut of cuts) {
+      sizes.push(cut - prev);
+      prev = cut;
+    }
+    sizes.push(n - prev);
+    return sizes;
+  });
+}
+
+/**
+ * One permutation of tile indices to try partitioning into rows (see
+ * partitionsIntoRows) — 'original' keeps the current DOM/participant order
+ * (checked first, and the only one eligible for the stability bonus in
+ * scorePackerCandidate); the others group visually-similar aspects together
+ * so the search can find partitions that keep a row's tiles from clashing.
+ * Flexible (placeholder) tiles are ranked by their IDEAL aspect for sorting
+ * purposes only — their real aspect is resolved per-row later.
+ */
+function orderPackerIndices(descriptors, orderingName) {
+  const idx = descriptors.map((_, i) => i);
+  const repAspect = (i) => (descriptors[i].flexible ? FLEXIBLE_TILE_ASPECT_IDEAL : descriptors[i].aspect);
+  switch (orderingName) {
+    case 'ascending':
+      return idx.slice().sort((a, b) => repAspect(a) - repAspect(b));
+    case 'descending':
+      return idx.slice().sort((a, b) => repAspect(b) - repAspect(a));
+    case 'portrait-first': {
+      // A STABLE partition (not a sort): portrait-ish tiles (aspect < 1)
+      // keep their original relative order, moved ahead of everything else.
+      // Mixing one narrow portrait tile into an otherwise-landscape row
+      // forces the WHOLE row to that tile's height (row height = width /
+      // sum-of-aspects, and a small aspect in the sum inflates 1/sum) —
+      // exactly the "extreme neighbor contrast" scorePackerCandidate's
+      // contrastPenalty frowns on. Trying this order gives the search a
+      // shot at a partition that puts portraits in a row of their own.
+      const portraits = idx.filter((i) => repAspect(i) < 1);
+      const rest = idx.filter((i) => repAspect(i) >= 1);
+      return portraits.concat(rest);
+    }
+    case 'original':
+    default:
+      return idx;
   }
-  return { cols, rows, tileWidth, tileHeight };
+}
+
+/** Slice an ordered index list into row groups of the given sizes (see partitionsIntoRows). */
+function buildRowGroups(order, rowSizes) {
+  const rows = [];
+  let pos = 0;
+  for (const size of rowSizes) {
+    rows.push(order.slice(pos, pos + size));
+    pos += size;
+  }
+  return rows;
+}
+
+/**
+ * Spec item 2 ("flexible tiles resolve their aspect within their range to
+ * help the row fit"): pick the aspect for every flexible tile in this row
+ * that would make the row's height, once justified to availWidth, equal
+ * `targetHeight` — clamped to [FLEXIBLE_TILE_ASPECT_MIN,
+ * FLEXIBLE_TILE_ASPECT_MAX]. The needed adjustment is split evenly across
+ * however many flexible tiles share the row; fixed-aspect (video) tiles are
+ * never touched. Returns { aspects: Map<origIdx, aspect>, height } — height
+ * is the row's ACTUAL resulting height (justified to full width), equal to
+ * targetHeight only if no clamping was needed.
+ *
+ * The caller picks the target. The justified variant
+ * (evaluatePackerCandidate) passes the per-row share of the height budget,
+ * (availHeight - gaps) / rowCount — NOT the row's height at the
+ * placeholders' "ideal" 4/3 aspect, as an earlier version did: steering
+ * toward the ideal meant an all-placeholder row never grew taller than its
+ * ideal-aspect height no matter how much unused stage height remained below
+ * (found by the scenario script: 3 placeholders on a 1200x700 stage packed
+ * as a single 292px-tall row, 40.6% fill, when the same row at aspect 1.0
+ * reaches 54% and a 2+1 equal-height split 75%). Targeting the height
+ * budget serves both goals at once: every row steers toward the SAME height
+ * (uniformity), and that height is the largest the stage can actually
+ * accommodate (fill). The equal-height variant (evaluateEqualRowsCandidate)
+ * passes its common row height instead — see the no-overflow argument
+ * there.
+ */
+function resolveFlexibleRowAspects(rowIndices, descriptors, availWidth, gapPx, targetHeight) {
+  const usableWidth = availWidth - gapPx * (rowIndices.length - 1);
+  const fixedIdx = rowIndices.filter((i) => !descriptors[i].flexible);
+  const flexIdx = rowIndices.filter((i) => descriptors[i].flexible);
+  const fixedAspectSum = fixedIdx.reduce((sum, i) => sum + descriptors[i].aspect, 0);
+
+  let flexAspect = FLEXIBLE_TILE_ASPECT_IDEAL;
+  if (flexIdx.length > 0 && targetHeight > 0 && usableWidth > 0) {
+    const neededAspectSum = usableWidth / targetHeight;
+    const neededFlexAspectEach = (neededAspectSum - fixedAspectSum) / flexIdx.length;
+    flexAspect = Math.min(FLEXIBLE_TILE_ASPECT_MAX, Math.max(FLEXIBLE_TILE_ASPECT_MIN, neededFlexAspectEach));
+  }
+
+  const aspects = new Map();
+  for (const i of fixedIdx) aspects.set(i, descriptors[i].aspect);
+  for (const i of flexIdx) aspects.set(i, flexAspect);
+
+  const sumAspect = rowIndices.reduce((sum, i) => sum + aspects.get(i), 0);
+  const height = usableWidth > 0 && sumAspect > 0 ? usableWidth / sumAspect : 0;
+  return { aspects, height };
+}
+
+/**
+ * Evaluate one (ordering, row-partition) pair in the JUSTIFIED variant (see
+ * step 3 of the big comment above): every row is stretched to the full
+ * available width, with flexible tiles resolved toward the per-row share of
+ * the height budget; all rows are scaled down UNIFORMLY if their natural
+ * total exceeds availHeight (never up — see that comment for why). Returns
+ * null for candidates that can't produce a usable geometry at all (e.g.
+ * more rows than the available height can fit even at a single px each)
+ * rather than a broken/negative layout. The `variant` tag on the result is
+ * purely for debuggability (the scenario script prints which variant won) —
+ * nothing downstream branches on it.
+ */
+function evaluatePackerCandidate(descriptors, order, rowSizes, availWidth, availHeight, gapPx) {
+  const rows = buildRowGroups(order, rowSizes);
+  const rowGapTotal = gapPx * (rows.length - 1);
+  const availableForRows = availHeight - rowGapTotal;
+  if (availableForRows <= 0) return null;
+  const targetHeight = availableForRows / rows.length;
+
+  const resolvedRows = rows.map((row) => resolveFlexibleRowAspects(row, descriptors, availWidth, gapPx, targetHeight));
+  const preScaleRowHeights = resolvedRows.map((r) => r.height);
+  if (preScaleRowHeights.some((h) => !(h > 0))) return null;
+
+  const preScaleBlockHeight = preScaleRowHeights.reduce((a, b) => a + b, 0) + rowGapTotal;
+  const scale = preScaleBlockHeight > availHeight ? availableForRows / (preScaleBlockHeight - rowGapTotal) : 1;
+  if (!(scale > 0)) return null;
+
+  const rowHeights = preScaleRowHeights.map((h) => h * scale);
+  const tiles = new Array(descriptors.length);
+  rows.forEach((rowIndices, j) => {
+    const { aspects } = resolvedRows[j];
+    const height = rowHeights[j];
+    for (const origIdx of rowIndices) {
+      const aspect = aspects.get(origIdx);
+      tiles[origIdx] = { width: height * aspect, height, aspect };
+    }
+  });
+
+  return { rows, rowHeights, tiles, variant: 'justified' };
+}
+
+/**
+ * Evaluate the same (ordering, row-partition) pair in the EQUAL-HEIGHT
+ * variant (see step 3 of the big comment above): every row gets the SAME
+ * height — the smallest of the per-row justified heights, capped at the
+ * per-row share of the height budget — and a row whose aspects don't fill
+ * availWidth at that height stays NARROWER (pixelizePackedLayout centers
+ * it) instead of being stretched. Exists because the justified variant
+ * structurally CANNOT give identical-aspect tiles equal areas in an uneven
+ * partition (row height is width / sum-of-aspects, so the row with fewer
+ * tiles is always taller), which made the ±30% fairness constraint reject
+ * every multi-row candidate for e.g. 3 or 5 equal cameras and collapse them
+ * into one sliver-height full-width row — found by the scenario script
+ * (3x16:9 on 1200x700: 31.5% fill justified-only vs ~70% as an equal-height
+ * 2+1).
+ *
+ * Flexible tiles resolve against the common height exactly as in the
+ * justified variant. Width overflow can't happen by construction: the
+ * common height never exceeds any row's own probe (justified) height, and a
+ * LOWER height means resolveFlexibleRowAspects asks flexible tiles to be
+ * WIDER than the probe did — so its MIN clamp can't engage any harder than
+ * it already did in the probe; an unclamped resolution lands the row at
+ * exactly availWidth, and the MAX clamp only makes it narrower. Vertically,
+ * rows * height + gaps <= availHeight because height <= availableForRows /
+ * rowCount — so no post-scaling pass is needed at all.
+ */
+function evaluateEqualRowsCandidate(descriptors, order, rowSizes, availWidth, availHeight, gapPx) {
+  const rows = buildRowGroups(order, rowSizes);
+  const rowGapTotal = gapPx * (rows.length - 1);
+  const availableForRows = availHeight - rowGapTotal;
+  if (availableForRows <= 0) return null;
+  const budget = availableForRows / rows.length;
+
+  const probe = rows.map((row) => resolveFlexibleRowAspects(row, descriptors, availWidth, gapPx, budget));
+  const probeHeights = probe.map((r) => r.height);
+  if (probeHeights.some((h) => !(h > 0))) return null;
+  const height = Math.min(budget, ...probeHeights);
+  if (!(height > 0)) return null;
+
+  const resolvedRows = rows.map((row) => resolveFlexibleRowAspects(row, descriptors, availWidth, gapPx, height));
+  const tiles = new Array(descriptors.length);
+  rows.forEach((rowIndices, j) => {
+    const { aspects } = resolvedRows[j];
+    for (const origIdx of rowIndices) {
+      const aspect = aspects.get(origIdx);
+      tiles[origIdx] = { width: height * aspect, height, aspect };
+    }
+  });
+
+  return { rows, rowHeights: rows.map(() => height), tiles, variant: 'equal-height' };
+}
+
+/**
+ * Turn a candidate's geometry into one comparable number (spec item 2).
+ * fillRatio (covering the stage) is the PRIMARY objective and lives in
+ * [0, 1]; every other term is a subtracted penalty, weighted so that,
+ * short of a pathological layout, they stay well under fillRatio's dynamic
+ * range — aesthetics are meant to break ties among comparably-filled
+ * candidates, not veto a large fill advantage. An earlier version of this
+ * scorer summed EVERY penalty (including the area-tolerance one) as a raw,
+ * unnormalized total with much larger weights, which — found by the
+ * throwaway node verification script this shipped with, on 6 tiles mixing
+ * very different aspects (16:9/9:16/4:3/1:1) — could make the search prefer
+ * a lopsided partition covering just ~13% of the stage over one covering
+ * ~93%, purely because the 13% one happened to dodge more of the aesthetic
+ * penalties; exactly backwards from "maximize coverage, then tidy it up."
+ *
+ * The ±30% mean-tile-area rule (areaExcess below) is handled DIFFERENTLY
+ * from the rest, because spec item 2 calls it out as a hard constraint
+ * rather than an aesthetic nice-to-have: it's driven by the WORST single
+ * tile's deviation, not an average across tiles — an average dilutes as n
+ * grows, which is the opposite of what a fairness constraint should do
+ * (one participant's tile ending up 2x+ another's for no reason other than
+ * incidental row grouping is exactly the "favoritism" it exists to
+ * prevent). Its weight (1.5) is the largest in the formula but deliberately
+ * NOT overwhelming, and both halves of that are scenario-script findings:
+ * - Large enough: unfair candidates must lose whenever a fair alternative
+ *   exists at comparable fill. Since the equal-height variant
+ *   (evaluateEqualRowsCandidate) was added, such an alternative exists
+ *   with ZERO deviation for the worst offenders (identical-aspect cameras
+ *   at odd counts, where every uneven JUSTIFIED partition deviates
+ *   50-140%), trailing the unfair candidates by well under 0.2 in
+ *   fillRatio — so even a modest weight settles those decisively.
+ * - Not overwhelming: when the aspect mix makes the constraint IMPOSSIBLE
+ *   to satisfy (a 9:16 sharing a row height with a 16:9 is a >3x area
+ *   ratio by construction; NO partition of 5 wildly-mixed tiles on a
+ *   phone stage stays within 30%), a RELATIVE penalty starts rewarding
+ *   layouts that simply shrink everyone: deviation is a ratio, so a
+ *   low-fill layout can be "fairer" while handing every participant —
+ *   including the worst-off one it's nominally protecting — a smaller
+ *   tile in absolute px. An earlier weight of 3 did exactly that on the
+ *   5-tiles-on-a-phone scenario: it chose 34.8% fill over 64% to shave
+ *   the worst relative deviation from 0.27 to 0.12, and the "protected"
+ *   portrait tile came out SMALLER (79px wide vs 91px). 1.5 keeps the
+ *   fair-when-possible behavior with a wide margin in the cases above,
+ *   without letting unavoidable violations starve the whole layout.
+ */
+function scorePackerCandidate(candidate, availWidth, availHeight, isOriginalOrder) {
+  const { rows, rowHeights, tiles } = candidate;
+  const n = tiles.length;
+  const stageArea = availWidth * availHeight;
+  const filledArea = tiles.reduce((sum, t) => sum + t.width * t.height, 0);
+  const fillRatio = stageArea > 0 ? filledArea / stageArea : 0;
+
+  const meanArea = filledArea / n;
+  let maxAreaDeviation = 0;
+  for (const t of tiles) {
+    const deviation = Math.abs((t.width * t.height) / meanArea - 1);
+    if (deviation > maxAreaDeviation) maxAreaDeviation = deviation;
+  }
+  const areaExcess = Math.max(0, maxAreaDeviation - TILE_AREA_TOLERANCE);
+
+  const meanRowHeight = rowHeights.reduce((a, b) => a + b, 0) / rowHeights.length;
+  const rowHeightVariance = rowHeights.reduce((sum, h) => sum + (h - meanRowHeight) ** 2, 0) / rowHeights.length;
+  const rowHeightCv = meanRowHeight > 0 ? Math.sqrt(rowHeightVariance) / meanRowHeight : 0;
+
+  // A last row noticeably SHORTER than the rest reads as "ran out of
+  // participants," which looks unfinished in a way that a merely
+  // taller-than-average row doesn't (that's already covered by the
+  // variance term above) — see spec item 2's "last row dramatically
+  // emptier" aesthetic penalty.
+  let lastRowEmptinessPenalty = 0;
+  if (rowHeights.length > 1) {
+    const last = rowHeights[rowHeights.length - 1];
+    const othersMean = rowHeights.slice(0, -1).reduce((a, b) => a + b, 0) / (rowHeights.length - 1);
+    if (othersMean > 0 && last < othersMean) lastRowEmptinessPenalty = 1 - last / othersMean;
+  }
+
+  let minSizePenalty = 0;
+  for (const t of tiles) {
+    if (t.width < MIN_READABLE_TILE_WIDTH_PX) minSizePenalty += (MIN_READABLE_TILE_WIDTH_PX - t.width) / MIN_READABLE_TILE_WIDTH_PX;
+    if (t.height < MIN_READABLE_TILE_HEIGHT_PX) minSizePenalty += (MIN_READABLE_TILE_HEIGHT_PX - t.height) / MIN_READABLE_TILE_HEIGHT_PX;
+  }
+  const minSizePenaltyMean = minSizePenalty / n;
+
+  // Within a row every tile shares the same height (justified rows), so the
+  // only per-tile size difference is WIDTH — a big width ratio between two
+  // tiles side by side is the "extreme neighbor contrast" spec item 2 warns
+  // about.
+  const CONTRAST_LIMIT = 2.2;
+  let contrastPenalty = 0;
+  let contrastRowCount = 0;
+  for (const row of rows) {
+    if (row.length < 2) continue;
+    contrastRowCount++;
+    let maxWidth = 0;
+    let minWidth = Infinity;
+    for (const i of row) {
+      const w = tiles[i].width;
+      if (w > maxWidth) maxWidth = w;
+      if (w < minWidth) minWidth = w;
+    }
+    if (minWidth > 0) {
+      const ratio = maxWidth / minWidth;
+      if (ratio > CONTRAST_LIMIT) contrastPenalty += ratio - CONTRAST_LIMIT;
+    }
+  }
+  const contrastPenaltyMean = contrastRowCount > 0 ? contrastPenalty / contrastRowCount : 0;
+
+  // Gallery convention: the emptier row sits at the BOTTOM (the way Meet
+  // parks the odd participant on the last row) — a fuller row hanging under
+  // a narrower one reads upside-down. Measured by row CONTENT width (the
+  // sum of tile widths; gaps omitted — this is a relative comparison, and
+  // the scorer deliberately isn't told gapPx), not by tile count: with
+  // mixed aspects a row of two 16:9s can genuinely be "fuller" than three
+  // portraits. In the justified variant every row spans (almost) the full
+  // width, so this stays ~0 there and matters mainly for the equal-height
+  // variant, where [1,2] and [2,1] splits otherwise score identically (same
+  // heights, same areas) and the tie would fall to enumeration order —
+  // which happens to emit [1,2], i.e. orphan on top, first.
+  let rowOrderPenalty = 0;
+  for (let j = 0; j + 1 < rows.length; j++) {
+    const upper = rows[j].reduce((sum, i) => sum + tiles[i].width, 0);
+    const lower = rows[j + 1].reduce((sum, i) => sum + tiles[i].width, 0);
+    if (lower > upper && lower > 0) rowOrderPenalty += (lower - upper) / lower;
+  }
+
+  const STABILITY_BONUS = 0.01; // spec item 2: "small tie-break bonus for the original tile order"
+  const score =
+    fillRatio -
+    areaExcess * 1.5 -
+    rowHeightCv * 0.3 -
+    lastRowEmptinessPenalty * 0.15 -
+    minSizePenaltyMean * 0.3 -
+    contrastPenaltyMean * 0.15 -
+    rowOrderPenalty * 0.05 +
+    (isOriginalOrder ? STABILITY_BONUS : 0);
+
+  return {
+    score,
+    fillRatio,
+    areaExcess,
+    rowHeightCv,
+    lastRowEmptinessPenalty,
+    minSizePenaltyMean,
+    contrastPenaltyMean,
+    rowOrderPenalty,
+  };
+}
+
+/**
+ * Best-of-search entry point: tries every (row count) x (contiguous
+ * partition) x (ordering) x (sizing variant: justified / equal-height, see
+ * evaluatePackerCandidate / evaluateEqualRowsCandidate) combination and
+ * keeps the highest-scoring one (scorePackerCandidate). The two variants
+ * coincide for single-row candidates and even partitions of identical
+ * aspects — evaluating the duplicate anyway is cheaper than detecting it,
+ * given the tiny candidate space (n<=6). Returns null only if NO
+ * combination produces a usable geometry (e.g. a degenerate zero-size
+ * stage).
+ */
+function packTiles(descriptors, availWidth, availHeight, gapPx) {
+  const n = descriptors.length;
+  if (n === 0 || availWidth <= 0 || availHeight <= 0) return null;
+  let best = null;
+  let bestScore = -Infinity;
+  for (const orderingName of PACKER_ORDERINGS) {
+    const order = orderPackerIndices(descriptors, orderingName);
+    const isOriginalOrder = orderingName === 'original';
+    for (let rows = 1; rows <= n; rows++) {
+      for (const rowSizes of partitionsIntoRows(n, rows)) {
+        const candidates = [
+          evaluatePackerCandidate(descriptors, order, rowSizes, availWidth, availHeight, gapPx),
+          evaluateEqualRowsCandidate(descriptors, order, rowSizes, availWidth, availHeight, gapPx),
+        ];
+        for (const candidate of candidates) {
+          if (!candidate) continue;
+          const { score } = scorePackerCandidate(candidate, availWidth, availHeight, isOriginalOrder);
+          if (score > bestScore) {
+            bestScore = score;
+            best = candidate;
+          }
+        }
+      }
+    }
+  }
+  return best;
+}
+
+/**
+ * Turn the winning candidate's float geometry into integer px boxes,
+ * indexed by ORIGINAL tile order (spec item 2: "round positions/sizes to
+ * integer px") — regardless of which internal ordering the search picked,
+ * the packer only ever decides WHERE each original tile lands; it never
+ * reorders DOM nodes (unnecessary given position:absolute, and it would
+ * restart any live <video> inside them).
+ *
+ * Rounding uses running-cumulative-sum rounding (round the cumulative edge;
+ * a box's size is the difference between two rounded edges), both across a
+ * row's tiles and across the stack of rows — this is what guarantees
+ * adjacent boxes never overlap NOR leave a stray sub-pixel gap purely from
+ * independently rounding each box.
+ *
+ * Both axes are centered: each row horizontally within availWidth (a row
+ * narrower than full width — the block scaled down in the justified
+ * variant, or a naturally narrow row in the equal-height variant, whose
+ * rows can each be a DIFFERENT width — leaves equal margin left/right), and
+ * the whole stack of rows vertically within availHeight. Deliberately NOT done by giving #tiles-grid a content-sized
+ * height and letting the surrounding flex .room-stage center it — that
+ * would make the grid's own box shrink/grow with the tile count, and a
+ * tile mid-CSS-transition toward a new position could momentarily poke
+ * outside a box that just shrank under it. Keeping #tiles-grid fixed at
+ * availHeight and centering the content INSIDE it means a tile's old and
+ * new boxes are always both within the SAME stable bounds — and since a
+ * transition interpolates left/top/width/height independently but linearly,
+ * it can never exit a rectangular region whose two endpoints are both
+ * inside it (the sum of two in-bounds linear interpolations, e.g. left(t) +
+ * width(t), is itself an in-bounds linear interpolation of the two edges).
+ *
+ * The centering offset (per row horizontally, and once vertically for the
+ * whole block) is folded INTO the same cumulative-rounding accumulator
+ * rather than rounded separately and added on top — rounding it separately
+ * and adding two already-rounded numbers can overshoot the stage by a
+ * stray px (found by the throwaway node verification script this engine
+ * shipped with: 5 same-aspect tiles in one row very nearly filled
+ * availWidth exactly, and rounding the centering offset and the row's
+ * content width independently pushed the last tile's right edge 2px past
+ * the stage). Feeding the unrounded offset as the accumulator's starting
+ * value keeps the whole row (or block) a single rounding problem, so its
+ * final edge lands EXACTLY on `Math.round(offset + content size)` — which,
+ * since content size never exceeds the available space (both variants
+ * guarantee every row is at most availWidth wide and the block at most
+ * availHeight tall — see evaluatePackerCandidate /
+ * evaluateEqualRowsCandidate), can only round down to it or below.
+ */
+function pixelizePackedLayout(candidate, availWidth, availHeight, gapPx) {
+  const { rows, rowHeights, tiles } = candidate;
+  const rowGapTotal = gapPx * (rows.length - 1);
+  const blockHeight = rowHeights.reduce((a, b) => a + b, 0) + rowGapTotal;
+  const verticalOffset = Math.max(0, (availHeight - blockHeight) / 2);
+
+  const boxes = new Array(tiles.length);
+  let topAcc = verticalOffset;
+  rows.forEach((rowIndices, j) => {
+    const top = Math.round(topAcc);
+    topAcc += rowHeights[j];
+    const bottom = Math.round(topAcc);
+    const rowHeightPx = bottom - top;
+    if (j < rows.length - 1) topAcc += gapPx;
+
+    // NOTE: widths here come from the tile's TRUE (unrounded) float height —
+    // NOT rowHeightPx — precisely so that content width stays exactly what
+    // evaluatePackerCandidate justified it to (see the constraint above).
+    // The tiny mismatch this leaves between rowHeightPx and the height used
+    // to derive each width is well under a pixel and is exactly the kind of
+    // "float rounding" slack the aspect is allowed to have.
+    const contentWidth = rowIndices.reduce((sum, i) => sum + tiles[i].width, 0) + gapPx * (rowIndices.length - 1);
+    const rowOffsetX = Math.max(0, (availWidth - contentWidth) / 2);
+
+    let leftAcc = rowOffsetX;
+    rowIndices.forEach((origIdx, k) => {
+      const left = Math.round(leftAcc);
+      leftAcc += tiles[origIdx].width;
+      const right = Math.round(leftAcc);
+      if (k < rowIndices.length - 1) leftAcc += gapPx;
+      boxes[origIdx] = { left, top, width: right - left, height: rowHeightPx };
+    });
+  });
+  return boxes;
+}
+
+/**
+ * Solo room (spec item 4): the packer above would happily stretch the
+ * single tile to fill the ENTIRE stage — maximal fill, technically, but one
+ * giant videocall tile edge-to-edge on a big desktop monitor reads as a bug,
+ * not a deliberate design (the OLD fixed layout capped solo at
+ * minmax(260px, 480px) regardless of stage size — see git history). Cap the
+ * tile's AREA at a fraction of the stage instead of a fixed px size, so it
+ * still scales up on bigger screens ("proportionally larger is fine" per
+ * spec) — then re-center within the stage box at the smaller size.
+ */
+function applySoloAreaCap(boxes, availWidth, availHeight) {
+  const box = boxes[0];
+  if (!box) return boxes;
+  const area = box.width * box.height;
+  const cap = SOLO_MAX_AREA_FRACTION * availWidth * availHeight;
+  if (area <= cap) return boxes;
+  const scale = Math.sqrt(cap / area);
+  const width = Math.round(box.width * scale);
+  const height = Math.round(box.height * scale);
+  const left = Math.round((availWidth - width) / 2);
+  const top = Math.round((availHeight - height) / 2);
+  return [{ left, top, width, height }];
 }
 
 /**
@@ -1099,55 +1640,200 @@ function computeAvailableGridBox() {
 }
 
 /**
- * Recompute and apply the fixed layout — called when the tile count
- * changes (see updateSoloState, called from updateParticipantCount), when
- * --compact is toggled (showScreenStageContainer/hideScreenStage — via the
- * same updateSoloState), and on window resize (see the listener below;
- * resize includes phone rotation, which is unrelated to isMobile here — the
- * breakpoint is by width, not orientation, but a recompute is still needed
- * since width changes too). Doesn't touch --compact (the filmstrip during
- * screen sharing has its own flex layout with a fixed tile width, see
- * static/style.css) or --spotlight (the maximized-tile filmstrip also has
- * its own CSS layout, see updateSpotlightMode) — a fixed grid would be out
- * of place there and would conflict with their own geometry.
+ * Per-tile aspect fed into the packer (spec item 1): a tile currently
+ * showing video contributes the VIDEO's own intrinsic aspect (falling back
+ * to 16:9 before the first loadedmetadata — see the listeners in createTile
+ * below) and is NOT adjustable by the packer; a tile still on its no-video
+ * placeholder (avatar circle + name, see createTile) has no aspect of its
+ * own — the placeholder content adapts to any reasonable box — so it's
+ * marked `flexible`, letting resolveFlexibleRowAspects pick whatever aspect
+ * in [FLEXIBLE_TILE_ASPECT_MIN, FLEXIBLE_TILE_ASPECT_MAX] helps its row.
+ */
+function tileAspectDescriptor(tileEl) {
+  const videoEl = tileEl.querySelector('.tile-video');
+  const hasVideo = !!videoEl && !videoEl.classList.contains('hidden');
+  if (hasVideo) {
+    const { videoWidth, videoHeight } = videoEl;
+    const aspect = videoWidth > 0 && videoHeight > 0 ? videoWidth / videoHeight : FALLBACK_VIDEO_ASPECT;
+    return { flexible: false, aspect };
+  }
+  return { flexible: true, aspect: FLEXIBLE_TILE_ASPECT_IDEAL };
+}
+
+// The geometry actually written to a tile by the last successful
+// layoutTilesGrid() call, keyed by element — lets applyPackedLayout (a) skip
+// the style write entirely when a recompute produces the SAME numbers (spec
+// item 5: "skip applying when the computed geometry didn't actually change,
+// avoid transition jitter from no-op writes") and (b) tell a tile's FIRST
+// placement (no entry yet) apart from a later reposition, which is how the
+// fly-in-from-the-corner transition gets suppressed on first placement (see
+// applyPackedLayout).
+const packedTileGeometry = new WeakMap();
+
+/**
+ * Strip every packer-applied inline style from one tile — used whenever a
+ * tile's geometry is about to be handed BACK to CSS: entering --compact (its
+ * own flex filmstrip), entering --spotlight (its own flex filmstrip), or the
+ * tile becoming .tile--maximized (position:fixed overlay). In every one of
+ * these cases a leftover inline `position: absolute` plus explicit px
+ * `left/top/width/height` would corrupt the CSS layout: position:absolute
+ * removes an element from flex flow entirely (breaking the compact/
+ * spotlight filmstrips), and — for .tile--maximized specifically — an
+ * inline style always outranks a CSS class selector regardless of
+ * specificity, so the tile would stay pinned at its small grid box instead
+ * of the CSS `position: fixed; inset: 0` rule taking over. See
+ * maximizeTile/showScreenStageContainer for the call sites, and the guards
+ * at the top of layoutTilesGrid that keep the packer from writing these
+ * styles again while any of these modes is active.
+ */
+function clearPackedTileStyle(tileEl) {
+  tileEl.style.position = '';
+  tileEl.style.left = '';
+  tileEl.style.top = '';
+  tileEl.style.width = '';
+  tileEl.style.height = '';
+  tileEl.style.aspectRatio = '';
+  tileEl.classList.remove('tile--placed');
+  packedTileGeometry.delete(tileEl);
+}
+
+/** clearPackedTileStyle for every current tile, plus #tiles-grid's own inline height/position (see layoutTilesGrid/applyPackedLayout). */
+function clearPackedTileLayout() {
+  for (const tileEl of tilesGridEl.children) clearPackedTileStyle(tileEl);
+  tilesGridEl.style.position = '';
+  tilesGridEl.style.height = '';
+}
+
+/**
+ * Write the packer's computed boxes to the DOM (spec item 3). `boxes` is
+ * indexed by #tiles-grid's CURRENT DOM child order (the same order
+ * layoutTilesGrid read tileAspectDescriptor in) — the packer decides WHERE
+ * each existing tile lands, it never reorders the DOM nodes themselves (see
+ * pixelizePackedLayout for why).
+ */
+function applyPackedLayout(boxes, gridHeightPx) {
+  tilesGridEl.style.position = 'relative';
+  tilesGridEl.style.height = `${gridHeightPx}px`;
+  const children = tilesGridEl.children;
+  for (let i = 0; i < children.length; i++) {
+    const tileEl = children[i];
+    const box = boxes[i];
+    if (!box) continue;
+    const previous = packedTileGeometry.get(tileEl);
+    if (
+      previous &&
+      previous.left === box.left &&
+      previous.top === box.top &&
+      previous.width === box.width &&
+      previous.height === box.height
+    ) {
+      continue; // identical geometry — skip the write (see packedTileGeometry)
+    }
+    const isFirstPlacement = !previous;
+    tileEl.style.position = 'absolute';
+    tileEl.style.left = `${box.left}px`;
+    tileEl.style.top = `${box.top}px`;
+    tileEl.style.width = `${box.width}px`;
+    tileEl.style.height = `${box.height}px`;
+    // Neutralize the base .tile { aspect-ratio: 16/9 } fallback (see
+    // static/style.css) — the inline width/height above already fully
+    // determine the box, but an explicit 'auto' here removes any doubt.
+    tileEl.style.aspectRatio = 'auto';
+    packedTileGeometry.set(tileEl, box);
+    if (isFirstPlacement) {
+      // No fly-in from the top-left corner for a tile that's only just
+      // appearing (a fresh join, or one returning from compact/spotlight/
+      // maximized — clearPackedTileStyle deletes the cache entry precisely
+      // so this branch is taken again on the way back): .tile--placed (see
+      // static/style.css) is what turns on the left/top/width/height
+      // transition, and adding it a frame AFTER the geometry above already
+      // landed means this specific change is a silent jump; only the NEXT
+      // geometry change for this tile will glide.
+      requestAnimationFrame(() => tileEl.classList.add('tile--placed'));
+    }
+  }
+}
+
+/**
+ * Recompute and apply the packed layout (see the big comment above
+ * partitionsIntoRows for the algorithm). Triggered — always through
+ * scheduleLayoutTilesGrid below, never called directly, so a burst of
+ * triggers within one frame collapses into a single recompute (spec item
+ * 5) — by: the tile count changing (updateSoloState, from
+ * updateParticipantCount); a tile's video/placeholder state flipping
+ * (setTileVideoVisible — its USEFUL aspect just changed, see
+ * tileAspectDescriptor); a video's intrinsic size arriving or changing
+ * (the loadedmetadata/resize listeners in createTile — dimensions can show
+ * up late, or change mid-call if the sender rotates their phone); window
+ * resize; and exiting --compact/--spotlight (hideScreenStage/
+ * unmaximizeTile).
+ *
+ * Does nothing in --compact (the screen-share filmstrip has its own fixed
+ * flex geometry, see static/style.css) or --spotlight (the maximized-tile
+ * filmstrip likewise). ALSO does nothing while any tile is maximized even
+ * WITHOUT spotlight — see maximizeTile: spotlight only turns on when
+ * there's at least one OTHER participant, so a solo maximized tile carries
+ * neither class, yet must still not be repositioned here: the packer's
+ * inline position:absolute would outrank the CSS `.tile--maximized {
+ * position: fixed }` rule that's supposed to blow it up to fill the page
+ * (see clearPackedTileStyle's comment for the general mechanism, and
+ * maximizeTile/unmaximizeTile for how packer control is handed off and
+ * back across this transition).
  */
 function layoutTilesGrid() {
   if (tilesGridEl.classList.contains('tiles-grid--compact')) return;
   if (tilesGridEl.classList.contains('tiles-grid--spotlight')) return;
+  if (maximizedTile) return;
   const tileCount = tilesGridEl.children.length;
   if (tileCount === 0) return;
-  const { width: stageWidth, height } = computeAvailableGridBox();
+
+  const { width: stageWidth, height: availHeight } = computeAvailableGridBox();
   // #tiles-grid itself is capped at `max-width: 1200px` in CSS (see
   // static/style.css) — on wide desktop screens the stage (.room-stage) is
   // wider than this limit, and without accounting for it the JS here would
-  // compute columns for the FULL stage width, while the grid itself would
-  // render narrower (max-width would clip its box), causing the explicitly
-  // set grid-template-columns to not fit within the grid's actual
-  // clientWidth — a horizontal scroll of EXACTLY this kind was found by
-  // smoke testing (see spec item 6: 1280×800, 6 tiles).
+  // pack tiles for the FULL stage width while the grid itself renders
+  // narrower (max-width clips its box) — a horizontal scroll of exactly
+  // this kind was found by smoke testing the old fixed grid (see spec item
+  // 6: 1280×800, 6 tiles).
   const cssMaxWidth = parseFloat(getComputedStyle(tilesGridEl).maxWidth);
-  const width = Number.isFinite(cssMaxWidth) ? Math.min(stageWidth, cssMaxWidth) : stageWidth;
+  const availWidth = Number.isFinite(cssMaxWidth) ? Math.min(stageWidth, cssMaxWidth) : stageWidth;
   const gapPx = parseFloat(getComputedStyle(tilesGridEl).columnGap) || 0;
-  const isMobile = window.matchMedia(MOBILE_TILES_MEDIA_QUERY).matches;
-  const isPortrait = window.matchMedia('(orientation: portrait)').matches;
-  const layout = computeFixedTileLayout(width, height, tileCount, gapPx, isMobile, isPortrait);
-  if (!layout) return;
-  const tileWidthPx = Math.floor(layout.tileWidth);
-  const tileHeightPx = Math.floor(layout.tileHeight);
-  tilesGridEl.style.gridTemplateColumns = `repeat(${layout.cols}, ${tileWidthPx}px)`;
-  // grid-template-rows (not auto-rows: minmax(0, 1fr) from the CSS
-  // fallback) — this specifically was missing before: without an explicit
-  // row height, the resulting grid height wasn't guaranteed to be bounded
-  // by the height-checked computation (see the comment above
-  // computeFixedTileLayout and the .room-page fix in static/style.css —
-  // the other half of the same desktop scrolling bug).
-  tilesGridEl.style.gridTemplateRows = `repeat(${layout.rows}, ${tileHeightPx}px)`;
+  if (availWidth <= 0 || availHeight <= 0) return;
+
+  const descriptors = Array.from(tilesGridEl.children, tileAspectDescriptor);
+  const candidate = packTiles(descriptors, availWidth, availHeight, gapPx);
+  if (!candidate) return;
+  let boxes = pixelizePackedLayout(candidate, availWidth, availHeight, gapPx);
+  // Solo cap (spec item 4) applies only to the single-tile case — see
+  // applySoloAreaCap.
+  if (tileCount === 1) boxes = applySoloAreaCap(boxes, availWidth, availHeight);
+  applyPackedLayout(boxes, Math.round(availHeight));
+}
+
+let layoutTilesGridRafPending = false;
+
+/**
+ * Coalescing wrapper (spec item 5) — every external trigger listed in the
+ * layoutTilesGrid comment calls THIS, never layoutTilesGrid() directly, so
+ * a burst of triggers landing within the same frame (e.g. several peers'
+ * videos all firing loadedmetadata within milliseconds of each other while
+ * a call is still connecting) collapses into a single recompute instead of
+ * one per event.
+ */
+function scheduleLayoutTilesGrid() {
+  if (layoutTilesGridRafPending) return;
+  layoutTilesGridRafPending = true;
+  requestAnimationFrame(() => {
+    layoutTilesGridRafPending = false;
+    layoutTilesGrid();
+  });
 }
 
 // Window resize (phone rotation, resizing the desktop browser window,
-// DevTools) — the only one of the three recompute triggers (see the
-// layoutTilesGrid comment) that doesn't already go through updateSoloState.
-window.addEventListener('resize', layoutTilesGrid);
+// DevTools) — the only one of the recompute triggers (see the
+// layoutTilesGrid comment) that doesn't already go through updateSoloState
+// or one of the per-tile video listeners.
+window.addEventListener('resize', scheduleLayoutTilesGrid);
 
 function createTile(peerId, name, isOwn) {
   const tile = document.createElement('div');
@@ -1163,6 +1849,15 @@ function createTile(peerId, name, isOwn) {
     video.muted = true;
     video.classList.add('tile-video--mirror');
   }
+  // The packer (see tileAspectDescriptor/layoutTilesGrid) needs the video's
+  // OWN intrinsic aspect, which isn't known yet at track-attach time —
+  // videoWidth/videoHeight only become available once the browser has
+  // decoded the first frame (loadedmetadata). 'resize' fires again later if
+  // those dimensions ever CHANGE mid-call (e.g. the sender rotates their
+  // phone, or switches cameras) — both go through the same coalesced
+  // scheduler as every other layout trigger (spec item 5).
+  video.addEventListener('loadedmetadata', scheduleLayoutTilesGrid);
+  video.addEventListener('resize', scheduleLayoutTilesGrid);
 
   // No-video placeholder: avatar circle (letter/emoji, now noticeably
   // larger and strictly round — see .tile-placeholder-avatar in
@@ -1190,14 +1885,30 @@ function createTile(peerId, name, isOwn) {
   placeholderCrown.className = 'tile-crown tile-crown--placeholder hidden';
   placeholderCrown.setAttribute('aria-hidden', 'true');
   placeholderCrown.innerHTML = CROWN_ICON_SVG; // static markup, not user data
-  avatar.appendChild(placeholderCrown);
+
+  // Circular clipping wrapper around the glyph (see static/style.css:
+  // .tile-placeholder-glyph-clip) — clips an oversized emoji glyph to the
+  // circle like a zoomed photo crop, letting it fill almost the whole
+  // circle instead of being capped by inscribed-square geometry. The crown
+  // is deliberately NOT inside this wrapper (it must overflow the top rim
+  // unclipped) and is appended AFTER it: both are positioned elements, so
+  // DOM order is paint order, and the crown's dip into the circle has to
+  // paint over the glyph.
+  const glyphClip = document.createElement('div');
+  glyphClip.className = 'tile-placeholder-glyph-clip';
 
   const letter = document.createElement('span');
   letter.className = 'tile-placeholder-letter';
   const trimmedName = (name || '').trim();
   const firstGrapheme = firstGraphemeOf(trimmedName);
   letter.textContent = firstGrapheme ? firstGrapheme.toUpperCase() : '?';
-  avatar.appendChild(letter);
+  // See static/style.css: .tile-placeholder-letter--emoji — an emoji glyph
+  // is sized much larger than a letter (and clipped by the wrapper above),
+  // see isEmojiGrapheme above.
+  letter.classList.toggle('tile-placeholder-letter--emoji', isEmojiGrapheme(firstGrapheme));
+  glyphClip.appendChild(letter);
+  avatar.appendChild(glyphClip);
+  avatar.appendChild(placeholderCrown);
   placeholder.appendChild(avatar);
 
   // Kept only as a text sink for backward-compatible name-writing code
@@ -1256,10 +1967,25 @@ function createTile(peerId, name, isOwn) {
   // first speed value is known (the poller needs two traffic snapshots for
   // this peer, see pollPeerStats). Pinned top-left (top-right is mic,
   // bottom-center is the name pill).
+  //
+  // Two children, not one text node — .tile-speed-rate (this same "…"/
+  // "↓ 320 KB/s"/"↑ …" text as before) and .tile-speed-rtt (the ping, e.g.
+  // "· 45 ms"; hidden below the LARGE size tier, see static/style.css).
+  // updateTileSpeedBadges writes into these two spans SEPARATELY on every
+  // poller tick — a single `speedEl.textContent = …` (the old approach)
+  // would wipe whichever of the two it didn't just set.
   const speed = document.createElement('span');
   speed.className = 'tile-speed';
-  speed.textContent = '…';
   speed.setAttribute('aria-hidden', 'true');
+
+  const speedRate = document.createElement('span');
+  speedRate.className = 'tile-speed-rate';
+  speedRate.textContent = '…';
+  speed.appendChild(speedRate);
+
+  const speedRtt = document.createElement('span');
+  speedRtt.className = 'tile-speed-rtt';
+  speed.appendChild(speedRtt);
 
   tile.appendChild(video);
   tile.appendChild(placeholder);
@@ -1284,7 +2010,9 @@ function createTile(peerId, name, isOwn) {
     crownEl: crown,
     placeholderCrownEl: placeholderCrown, // crown above the placeholder avatar circle (see spec item 4) — toggled in sync with crownEl in setLeaderIndicator
     micOffEl: micOff,
-    speedEl: speed,
+    speedEl: speed, // the outer .tile-speed badge (hidden/shown, size-tiered as a whole) — see rateEl/rttEl below for the two text children
+    rateEl: speedRate,
+    rttEl: speedRtt,
   };
 
   // Clicking a tile — toggles "full page" mode (see
@@ -1334,6 +2062,8 @@ function updatePeerTileName(peerId, name) {
   tile.labelTextEl.textContent = labelValue;
   tile.placeholderNameEl.textContent = labelValue;
   tile.letterEl.textContent = firstGrapheme ? firstGrapheme.toUpperCase() : '?';
+  // See createTile above / static/style.css: .tile-placeholder-letter--emoji.
+  tile.letterEl.classList.toggle('tile-placeholder-letter--emoji', isEmojiGrapheme(firstGrapheme));
 }
 
 /**
@@ -1363,6 +2093,18 @@ function maximizeTile(tile) {
   if (maximizedTile) unmaximizeTile(); // guard: only one tile can be maximized at a time
   maximizedTile = tile;
   tile.root.classList.add('tile--maximized');
+  // Hand geometry control from the packer back to CSS — see
+  // clearPackedTileLayout's comment for exactly why a leftover inline
+  // position:absolute + px left/top/width/height would break BOTH this
+  // tile (outranks the CSS `position: fixed` on .tile--maximized) and, if
+  // updateSpotlightMode below turns spotlight on, every OTHER tile too (they
+  // become flex items of the filmstrip, and position:absolute would drop
+  // them out of that flow entirely). Clearing all of them unconditionally
+  // here — rather than only when spotlight actually turns on — also covers
+  // the solo-maximize case (no other participants, spotlight never turns
+  // on): layoutTilesGrid's own `if (maximizedTile) return` guard means
+  // nothing will repack them until unmaximizeTile() explicitly asks for it.
+  clearPackedTileLayout();
   updateSpotlightMode();
   document.addEventListener('keydown', onMaximizedTileKeydown);
 }
@@ -1373,6 +2115,10 @@ function unmaximizeTile() {
   maximizedTile.root.classList.remove('tile--maximized');
   maximizedTile = null;
   updateSpotlightMode();
+  // Nothing repacked the grid while this tile was maximized (see
+  // layoutTilesGrid's `if (maximizedTile) return` guard) — ask for it
+  // explicitly now that the guard no longer applies.
+  scheduleLayoutTilesGrid();
   document.removeEventListener('keydown', onMaximizedTileKeydown);
 }
 
@@ -1434,9 +2180,10 @@ function updateSoloState() {
   tilesGridEl.classList.toggle('tiles-grid--solo', solo);
   inviteCtaEl.classList.toggle('hidden', !solo);
   // The tile count and/or --compact mode may have changed — recompute the
-  // grid layout (see layoutTilesGrid below; it does nothing itself in
-  // --compact/--spotlight, they have their own CSS logic).
-  layoutTilesGrid();
+  // packed grid layout (see layoutTilesGrid above; it does nothing itself in
+  // --compact/--spotlight/while a tile is maximized, they have their own CSS
+  // logic).
+  scheduleLayoutTilesGrid();
 }
 
 // ---------- Leader: crown on the tile, own tile caption, gear icon visibility ----------
@@ -1535,6 +2282,10 @@ function setTileVideoVisible(tile, show) {
   tile.placeholderEl.classList.toggle('hidden', show);
   tile.crownEl.style.display = show ? '' : 'none';
   exitMaximizeIfHidden(tile, show);
+  // The tile's USEFUL aspect just changed (see tileAspectDescriptor: video
+  // uses its own intrinsic aspect, a placeholder is flexible) — the packer
+  // needs to re-run to account for it (spec item 5).
+  scheduleLayoutTilesGrid();
 }
 
 function showTileVideo(peerId, show) {
@@ -1586,6 +2337,11 @@ function updateScreenButtonState() {
 function showScreenStageContainer() {
   screenStageEl.classList.remove('hidden');
   tilesGridEl.classList.add('tiles-grid--compact');
+  // Hand geometry control to the compact filmstrip's own CSS (flex, fixed
+  // tile width — see static/style.css) — see clearPackedTileLayout's
+  // comment for why leftover packer inline styles would corrupt it
+  // (position:absolute removes a tile from the flex flow entirely).
+  clearPackedTileLayout();
   updateSoloState();
 }
 
@@ -2220,14 +2976,30 @@ function updateTileSpeedBadges() {
     const cached = peerLastStats.get(peerId);
     const downRate = cached ? cached.downRate : null;
     // Always visible (see createTile) — "…" until the first rate is known.
-    entry.tile.speedEl.textContent = downRate == null ? '…' : formatSpeedBadge(downRate);
+    // Writes into the dedicated .tile-speed-rate span, NOT the outer
+    // .tile-speed container — see createTile: the container also holds the
+    // sibling .tile-speed-rtt span below, and a `speedEl.textContent = …`
+    // here would delete that sibling's text node along with its own.
+    entry.tile.rateEl.textContent = downRate == null ? '…' : formatSpeedBadge(downRate);
+    // Ping (see static/style.css: .tile-speed-rtt, hidden below the LARGE
+    // container-query size tier) — rtt is already computed by the shared
+    // poller and cached per peer (see peerLastStats/pollPeerStats above), no
+    // extra getStats() call needed here. Empty string (not a placeholder)
+    // when not yet known, same as formatPeerStatsLine's rttPart — an empty
+    // span simply renders nothing instead of a stray "…".
+    entry.tile.rttEl.textContent = cached && typeof cached.rtt === 'number' ? `· ${Math.round(cached.rtt)} ms` : '';
     if (cached && cached.upRate != null) {
       totalUpRate = (totalUpRate || 0) + cached.upRate;
     }
   }
 
   if (!ownTile) return;
-  ownTile.speedEl.textContent = totalUpRate == null ? '↑ …' : `↑ ${formatSpeedBadge(totalUpRate)}`;
+  // Own tile: the aggregate OUTGOING rate only (see the doc comment above) —
+  // a per-peer ping doesn't make sense for a SUM across peers, so the rtt
+  // span is simply left empty here rather than showing any one peer's
+  // number as if it applied to the aggregate.
+  ownTile.rateEl.textContent = totalUpRate == null ? '↑ …' : `↑ ${formatSpeedBadge(totalUpRate)}`;
+  ownTile.rttEl.textContent = '';
 }
 
 /**

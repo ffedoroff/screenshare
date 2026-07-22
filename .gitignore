@@ -3,3 +3,5 @@
 /screenshare.db
 /screenshare.db-shm
 /screenshare.db-wal
+# Screenshot-harness output (tests/e2e/screenshots.mjs) — visual QA artifacts, never committed.
+/tests/e2e/screenshots-out
