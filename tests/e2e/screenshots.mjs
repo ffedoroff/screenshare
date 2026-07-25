@@ -412,18 +412,55 @@ async function main() {
       // one-time `lt`) — see design decision #1 above; everyone else is a
       // plain guest via roomUrl, which carries the room name the creator is
       // about to set (see ROOM_NAME below) so their pre-join cards show it too.
-      const res = await fetch(`${server.baseUrl}/api/rooms`, { method: 'POST' });
-      if (!res.ok) throw new Error(`POST /api/rooms responded with status ${res.status}`);
-      const { roomId, leaderToken } = await res.json();
-      const roomToken = generateRoomToken();
-      const ROOM_NAME = 'Screenshot QA room';
-      const creatorRoomUrl = leaderUrlWithKey(server.baseUrl, roomId, leaderToken, roomToken);
-      const roomUrl = `${roomUrlWithKey(server.baseUrl, roomId, roomToken)}&n=${encodeURIComponent(ROOM_NAME)}`;
+      //
+      // MESH_SETTLE_ATTEMPTS (investigated separately — see the diagnostic
+      // harness scratchpad/mesh-probe.mjs this accompanies): "mesh did not
+      // settle" at --users 5 turned out to be NEITHER a signaling/protocol
+      // bug (a stuck pair's offer/answer/ICE credentials were always
+      // mutually consistent on both sides — getStats() showed the POLITE
+      // side's RTCPeerConnection had gathered ZERO local ICE candidates and
+      // just never tried again) NOR "just needs more time" (an extended
+      // wait of 2-3 more minutes past the 60s deadline never once recovered
+      // a stuck pair in ~8 hangs observed, and neither did an explicit
+      // pc.restartIce() retry loop prototyped directly in static/rtc.js
+      // during the investigation and then reverted — it made no measurable
+      // difference). It reproduced identically with cheap 320x180
+      // synthetic video for every participant, so it isn't an
+      // encoding-cost/CPU-starvation artifact either (~40% hang rate at 5
+      // participants with EITHER full-res or cheap video, over 10 runs
+      // each) — it scales with the NUMBER of participants instead (~10% of
+      // 3-participant runs vs ~40-50% of 5-participant runs hung, 10-20
+      // runs each), i.e. with how many RTCPeerConnections get constructed
+      // in the same synchronous burst when a participant joins a room that
+      // already has several people in it (static/room.js: createRemotePeer,
+      // called once per existing peer in a tight loop with no yield in
+      // between) — a browser/OS concurrency limit this harness's "N full
+      // Chrome contexts on one machine" pattern hits far more often than a
+      // real call between N separate physical devices ever would (each
+      // real participant's own browser only ever constructs ITS OWN
+      // handful of RTCPeerConnections, not everyone else's simultaneously
+      // too). Since a wedged RTCPeerConnection was never observed to
+      // recover on its own or via an explicit ICE restart, the only thing
+      // that reliably works is exactly what a human re-running this QA
+      // tool already does: start over with a brand new room, which hands
+      // everyone brand new RTCPeerConnection objects. Bounded (not
+      // infinite) at 3 attempts — keeps the EXPECTED failure rate low
+      // (~0.4³ ≈ 6%, roughly the ambient flakiness already tolerated
+      // elsewhere in this app's multi-participant e2e coverage, see
+      // resilience.spec.mjs) while keeping the worst case bounded (3 × 60s
+      // = 3 minutes); this is a visual QA tool, not a merge-blocking gate,
+      // so an occasional manual re-run on total exhaustion is acceptable.
+      // Simply raising the settle timeout instead (as before, 30s → 60s)
+      // would NOT have helped here — a wedged pair was never observed to
+      // unstick itself no matter how long the FIRST attempt was allowed to
+      // keep waiting, so a longer single wait just fails slower.
+      const MESH_SETTLE_ATTEMPTS = 3;
 
       // Per-participant plan: cycle through ASPECTS; the LAST participant
       // goes camera-less when there are enough participants for it to read
       // clearly as "one of several, but no camera" (task spec item 3: only
-      // when --users >= 4).
+      // when --users >= 4). Independent of which room attempt below we're
+      // on, so built once, outside the retry loop.
       const participants = [];
       for (let i = 0; i < users; i++) {
         const isLast = i === users - 1;
@@ -443,154 +480,186 @@ async function main() {
         });
       }
 
-      console.log(`[screenshots] room ${roomId}: ${participants.map((p) => p.displayName).join(', ')}`);
-
-      const allContexts = [];
+      let allContexts = [];
       let observerPage = null;
 
       try {
-        // Joined SEQUENTIALLY (matching basic.spec.mjs's multi-participant
-        // scenarios) — each join triggers new mesh connections to every
-        // already-joined peer, so this is also a gentler ramp-up than
-        // opening all N at once.
-        for (const p of participants) {
-          const context = p.isObserver
-            ? await browser.newContext({
-                viewport: { width: VIEWPORTS[0].width, height: VIEWPORTS[0].height },
-                deviceScaleFactor: DEVICE_SCALE_FACTOR,
-              })
-            : await browser.newContext();
-          allContexts.push(context);
+        for (let attempt = 1; attempt <= MESH_SETTLE_ATTEMPTS; attempt++) {
+          const res = await fetch(`${server.baseUrl}/api/rooms`, { method: 'POST' });
+          if (!res.ok) throw new Error(`POST /api/rooms responded with status ${res.status}`);
+          const { roomId, leaderToken } = await res.json();
+          const roomToken = generateRoomToken();
+          const ROOM_NAME = 'Screenshot QA room';
+          const creatorRoomUrl = leaderUrlWithKey(server.baseUrl, roomId, leaderToken, roomToken);
+          const roomUrl = `${roomUrlWithKey(server.baseUrl, roomId, roomToken)}&n=${encodeURIComponent(ROOM_NAME)}`;
 
-          await context.addInitScript(installSyntheticCamera(), {
-            width: p.width,
-            height: p.height,
-            label: p.displayName,
-            color: p.color,
-            noCamera: p.noVideo,
-          });
+          console.log(
+            `[screenshots] room ${roomId} (attempt ${attempt}/${MESH_SETTLE_ATTEMPTS}): ${participants.map((p) => p.displayName).join(', ')}`
+          );
 
-          const page = await context.newPage();
+          allContexts = [];
+          observerPage = null;
 
-          if (p.isObserver) {
-            // --- The creator (see design decision #1): sets the room name
-            //     on the pre-join card, mic/camera start OFF (no
-            //     getUserMedia at all on this screen) — turned on below,
-            //     via the toolbar, like every other video-having
-            //     participant. ---
-            await page.goto(creatorRoomUrl);
-            await joinRoom(page, p.displayName, { roomName: ROOM_NAME, closeSharePopup: false });
+          // Joined SEQUENTIALLY (matching basic.spec.mjs's multi-participant
+          // scenarios) — each join triggers new mesh connections to every
+          // already-joined peer, so this is also a gentler ramp-up than
+          // opening all N at once.
+          for (const p of participants) {
+            const context = p.isObserver
+              ? await browser.newContext({
+                  viewport: { width: VIEWPORTS[0].width, height: VIEWPORTS[0].height },
+                  deviceScaleFactor: DEVICE_SCALE_FACTOR,
+                })
+              : await browser.newContext();
+            allContexts.push(context);
 
-            // The Share popup auto-opens once, right here, for the creator
-            // (see static/room.js: signaling.on('joined'),
-            // shareAutoOpenedForCreator) — screenshot it (desktop + phone,
-            // per the task spec) before closing it: it's a modal that would
-            // otherwise swallow the clicks below.
-            await page.waitForSelector('#share-popup:not(.hidden)', { timeout: 8000 });
-            for (const sizeName of ['desktop', 'phone-portrait']) {
-              const size = VIEWPORTS.find((v) => v.name === sizeName);
-              await page.setViewportSize({ width: size.width, height: size.height });
-              await sleep(SETTLE_MS);
-              const file = path.join(out, `share-popup-${sizeName}.png`);
-              await page.screenshot({ path: file });
-              writtenFiles.push(file);
+            await context.addInitScript(installSyntheticCamera(), {
+              width: p.width,
+              height: p.height,
+              label: p.displayName,
+              color: p.color,
+              noCamera: p.noVideo,
+            });
+
+            const page = await context.newPage();
+
+            if (p.isObserver) {
+              // --- The creator (see design decision #1): sets the room name
+              //     on the pre-join card, mic/camera start OFF (no
+              //     getUserMedia at all on this screen) — turned on below,
+              //     via the toolbar, like every other video-having
+              //     participant. ---
+              await page.goto(creatorRoomUrl);
+              await joinRoom(page, p.displayName, { roomName: ROOM_NAME, closeSharePopup: false });
+
+              // The Share popup auto-opens once, right here, for the creator
+              // (see static/room.js: signaling.on('joined'),
+              // shareAutoOpenedForCreator) — screenshot it (desktop + phone,
+              // per the task spec) before closing it: it's a modal that would
+              // otherwise swallow the clicks below. Only screenshotted on the
+              // FIRST attempt — a retried room is an implementation detail of
+              // getting the mesh to settle, not something worth a second set
+              // of share-popup PNGs.
+              await page.waitForSelector('#share-popup:not(.hidden)', { timeout: 8000 });
+              if (attempt === 1) {
+                for (const sizeName of ['desktop', 'phone-portrait']) {
+                  const size = VIEWPORTS.find((v) => v.name === sizeName);
+                  await page.setViewportSize({ width: size.width, height: size.height });
+                  await sleep(SETTLE_MS);
+                  const file = path.join(out, `share-popup-${sizeName}.png`);
+                  await page.screenshot({ path: file });
+                  writtenFiles.push(file);
+                }
+                await page.setViewportSize({ width: VIEWPORTS[0].width, height: VIEWPORTS[0].height }); // back to desktop for the rest of the join sequence
+              }
+              await page.click('#share-popup-close');
+              await page.waitForFunction(
+                () => document.getElementById('share-popup')?.classList.contains('hidden'),
+                undefined,
+                { timeout: 3000 }
+              );
+              await waitForOverlayHidden(page);
+              // The creator's camera is still off at this point (see the
+              // comment above) — turn it on now, exactly like every other
+              // video-having participant.
+              await page.click('#camera-button');
+            } else if (p.noVideo) {
+              // --- The "no camera" guest (design decision #2): the guest
+              //     pre-join card auto-acquires a combined mic+camera stream
+              //     (see static/room.js: acquireGuestPrejoinMedia) — but
+              //     installSyntheticCamera's `noCamera` stub above makes
+              //     THAT SAME getUserMedia call reject outright, so there is
+              //     nothing to wait for (unlike a normal guest — see the
+              //     `else` branch below, which DOES wait via joinRoom's
+              //     `micOff`/`camOff` options): we go straight to flipping
+              //     the camera select to "Off" (the deliberate mechanism,
+              //     see design decision #2) and submit directly. ---
+              await page.goto(roomUrl);
+              await waitForPrejoinCard(page);
+              await setPrejoinDeviceOff(page, '#prejoin-cam-select');
+              await page.fill('#join-name-input', p.displayName);
+              await page.click('#join-modal-button');
+              await waitForOverlayHidden(page);
+            } else {
+              // --- A regular video-having guest: leave the pre-join card's
+              //     auto-acquired combined mic+camera stream live (task item
+              //     3) — camera is ALREADY on by the time this resolves, so
+              //     unlike the old flow we must NOT click #camera-button
+              //     here: with a track already enabled, that click would
+              //     TURN IT OFF (see static/room.js: cameraButton's click
+              //     handler, the "already have a track" branch just toggles
+              //     .enabled). ---
+              await page.goto(roomUrl);
+              await joinRoom(page, p.displayName, { micOff: false, camOff: false });
+              await waitForOverlayHidden(page);
             }
-            await page.setViewportSize({ width: VIEWPORTS[0].width, height: VIEWPORTS[0].height }); // back to desktop for the rest of the join sequence
-            await page.click('#share-popup-close');
-            await page.waitForFunction(
-              () => document.getElementById('share-popup')?.classList.contains('hidden'),
-              undefined,
-              { timeout: 3000 }
-            );
-            await waitForOverlayHidden(page);
-            // The creator's camera is still off at this point (see the
-            // comment above) — turn it on now, exactly like every other
-            // video-having participant.
-            await page.click('#camera-button');
-          } else if (p.noVideo) {
-            // --- The "no camera" guest (design decision #2): the guest
-            //     pre-join card auto-acquires a combined mic+camera stream
-            //     (see static/room.js: acquireGuestPrejoinMedia) — but
-            //     installSyntheticCamera's `noCamera` stub above makes
-            //     THAT SAME getUserMedia call reject outright, so there is
-            //     nothing to wait for (unlike a normal guest — see the
-            //     `else` branch below, which DOES wait via joinRoom's
-            //     `micOff`/`camOff` options): we go straight to flipping
-            //     the camera select to "Off" (the deliberate mechanism,
-            //     see design decision #2) and submit directly. ---
-            await page.goto(roomUrl);
-            await waitForPrejoinCard(page);
-            await setPrejoinDeviceOff(page, '#prejoin-cam-select');
-            await page.fill('#join-name-input', p.displayName);
-            await page.click('#join-modal-button');
-            await waitForOverlayHidden(page);
-          } else {
-            // --- A regular video-having guest: leave the pre-join card's
-            //     auto-acquired combined mic+camera stream live (task item
-            //     3) — camera is ALREADY on by the time this resolves, so
-            //     unlike the old flow we must NOT click #camera-button
-            //     here: with a track already enabled, that click would
-            //     TURN IT OFF (see static/room.js: cameraButton's click
-            //     handler, the "already have a track" branch just toggles
-            //     .enabled). ---
-            await page.goto(roomUrl);
-            await joinRoom(page, p.displayName, { micOff: false, camOff: false });
-            await waitForOverlayHidden(page);
+
+            if (p.isObserver) observerPage = page;
           }
 
-          if (p.isObserver) observerPage = page;
-        }
-
-        // ---------- Wait for the mesh to settle before screenshotting ----------
-        // Not a strict connectionState=='connected' check (this is a QA
-        // tool, not a correctness test — see waitForAllConnectionsSettled in
-        // helpers.mjs for that stricter variant) — just: all N tiles present
-        // on the observer's page, and every video-carrying participant's
-        // <video> element actually has decoded a frame (videoWidth > 0).
-        const videoNames = participants.filter((p) => !p.noVideo).map((p) => p.displayName);
-        // 60s (bumped from the pre-redesign 30s): with several GUESTS now
-        // arriving with an already-live combined mic+camera stream (see
-        // design decision #1/#2), createRemotePeer folds their tracks into
-        // the very first offer to every existing peer rather than a later
-        // renegotiation — functionally fine, but with N participants worth
-        // of synthetic canvases + a 2x-scaled observer all fighting for CPU
-        // on one machine, ICE/DTLS for the LAST pairs to settle can
-        // genuinely take longer than 30s under load (verified empirically:
-        // a single random participant's video would still be at
-        // videoWidth===0 right at the old deadline, then arrive fine soon
-        // after).
-        try {
-          await waitUntil(
-            () =>
-              observerPage.evaluate(
-                ({ count, names }) => {
-                  if (document.querySelectorAll('.tile').length < count) return false;
-                  return names.every((n) => {
-                    const v = document.querySelector(`.tile[data-name="${n}"] video`);
-                    return !!v && !v.classList.contains('hidden') && v.videoWidth > 0;
-                  });
-                },
-                { count: users, names: videoNames }
-              ),
-            {
-              timeoutMs: 60_000,
-              intervalMs: 300,
-              message: `mesh did not settle: expected ${users} tiles on the observer page, all video-carrying ones playing`,
+          // ---------- Wait for the mesh to settle before screenshotting ----------
+          // Not a strict connectionState=='connected' check (this is a QA
+          // tool, not a correctness test — see waitForAllConnectionsSettled in
+          // helpers.mjs for that stricter variant) — just: all N tiles present
+          // on the observer's page, and every video-carrying participant's
+          // <video> element actually has decoded a frame (videoWidth > 0).
+          const videoNames = participants.filter((p) => !p.noVideo).map((p) => p.displayName);
+          // 60s (bumped from the pre-redesign 30s): with several GUESTS now
+          // arriving with an already-live combined mic+camera stream (see
+          // design decision #1/#2), createRemotePeer folds their tracks into
+          // the very first offer to every existing peer rather than a later
+          // renegotiation — functionally fine, but with N participants worth
+          // of synthetic canvases + a 2x-scaled observer all fighting for CPU
+          // on one machine, ICE/DTLS for the LAST pairs to settle can
+          // genuinely take longer than 30s under load (verified empirically:
+          // a single random participant's video would still be at
+          // videoWidth===0 right at the old deadline, then arrive fine soon
+          // after). NOT raised further (see MESH_SETTLE_ATTEMPTS above) —
+          // past this point a stuck pair was proven to never recover within
+          // the SAME room, so the retry loop starts a fresh one instead.
+          let settled = false;
+          try {
+            await waitUntil(
+              () =>
+                observerPage.evaluate(
+                  ({ count, names }) => {
+                    if (document.querySelectorAll('.tile').length < count) return false;
+                    return names.every((n) => {
+                      const v = document.querySelector(`.tile[data-name="${n}"] video`);
+                      return !!v && !v.classList.contains('hidden') && v.videoWidth > 0;
+                    });
+                  },
+                  { count: users, names: videoNames }
+                ),
+              {
+                timeoutMs: 60_000,
+                intervalMs: 300,
+                message: `mesh did not settle: expected ${users} tiles on the observer page, all video-carrying ones playing`,
+              }
+            );
+            settled = true;
+          } catch (err) {
+            // A per-tile breakdown on failure — cheap and saves a re-run with
+            // manual devtools poking when this QA tool itself misbehaves.
+            const diag = await observerPage.evaluate((names) => ({
+              tileCount: document.querySelectorAll('.tile').length,
+              tileNames: Array.from(document.querySelectorAll('.tile')).map((t) => t.dataset.name),
+              perName: names.map((n) => {
+                const v = document.querySelector(`.tile[data-name="${n}"] video`);
+                return { n, exists: !!v, hidden: v?.classList.contains('hidden'), videoWidth: v?.videoWidth };
+              }),
+            }), videoNames);
+            console.error(`[screenshots] DIAGNOSTIC (attempt ${attempt}/${MESH_SETTLE_ATTEMPTS}):`, JSON.stringify(diag, null, 2));
+            if (attempt === MESH_SETTLE_ATTEMPTS) throw err;
+            console.log(
+              `[screenshots] mesh did not settle on attempt ${attempt}/${MESH_SETTLE_ATTEMPTS} — closing these ${allContexts.length} contexts and retrying with a fresh room`
+            );
+            for (const context of allContexts) {
+              await context.close();
             }
-          );
-        } catch (err) {
-          // A per-tile breakdown on failure — cheap and saves a re-run with
-          // manual devtools poking when this QA tool itself misbehaves.
-          const diag = await observerPage.evaluate((names) => ({
-            tileCount: document.querySelectorAll('.tile').length,
-            tileNames: Array.from(document.querySelectorAll('.tile')).map((t) => t.dataset.name),
-            perName: names.map((n) => {
-              const v = document.querySelector(`.tile[data-name="${n}"] video`);
-              return { n, exists: !!v, hidden: v?.classList.contains('hidden'), videoWidth: v?.videoWidth };
-            }),
-          }), videoNames);
-          console.error('[screenshots] DIAGNOSTIC:', JSON.stringify(diag, null, 2));
-          throw err;
+          }
+
+          if (settled) break;
         }
 
         const actualTileCount = await observerPage.evaluate(() => document.querySelectorAll('.tile').length);
