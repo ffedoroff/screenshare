@@ -5,41 +5,154 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="theme-color" content="#0f1114" />
   <title>Room — video call</title>
-  <link rel="stylesheet" href="/static/style.css?v=18" />
+  <link rel="stylesheet" href="/static/style.css?v=19" />
   <link rel="manifest" href="/static/manifest.webmanifest" />
   <link rel="apple-touch-icon" href="/static/icon-192.png" />
 </head>
 <body class="page-room">
   <div class="room-page">
-    <!-- Join modal: shown FIRST, before any connection to signaling — the
-         name is entered anew on every visit (anonymity, see
-         docs/privacy.md, "Anonymity"), join-room is only sent after
-         clicking "Join" (this also provides a user gesture for
-         AudioContext, see static/common.js). On auto-reconnect the modal is
-         not shown again — the name is already in the tab's memory. The
-         field is prefilled with a generated name (static/namegen.js:
-         NameGen.userName(), see static/room.js: showJoinModal) — you can
-         just click "Join" right away; clearing the field — stay anonymous,
-         as before. -->
+    <!-- Pre-join card: shown FIRST, before any connection to signaling —
+         ONE card, same structure for the creator ("Start the room") and a
+         guest ("Join the room"), differing only in the header/room-name
+         area and the mic/camera defaults (see static/room.js: the
+         "Pre-join card" section, roughly showPrejoinCard/onPrejoinSubmit).
+         The name is entered anew on every visit (anonymity, see
+         docs/privacy.md, "Anonymity"); join-room is only sent after
+         clicking Start/Join (this also provides a user gesture for
+         AudioContext, see static/common.js). On auto-reconnect the card is
+         not shown again — the name is already in the tab's memory.
+         IDs #join-modal/#join-name-input/#join-name-regen-button/
+         #join-modal-button are kept stable across this redesign (existing
+         e2e suite depends on them); everything else is new. -->
     <div id="join-modal" class="join-modal">
-      <div class="join-modal-card">
-        <h2>Join the room</h2>
-        <!-- Name input + "regenerate" button (see static/room.js:
-             showJoinModal/joinNameRegenButtonEl) — the same pair as the
-             room name on the landing page (static/index.html/landing.js),
-             just pulling from NameGen.userName(). -->
-        <div class="input-with-regen">
+      <div class="join-modal-card prejoin-card">
+        <!-- 1. Eyebrow (see static/room.js: showPrejoinCard). -->
+        <p id="prejoin-eyebrow" class="prejoin-eyebrow">Join the room</p>
+
+        <!-- 2. Room identity — creator: an editable, title-styled input
+             (prefilled with NameGen.roomName(), ↻ regen button, same
+             .input-with-regen/.regen-button pattern as "Your name" below);
+             guest: a static title (the room name from the invite link's
+             `n`, or "Room") + a live meta line filled in from GET
+             /api/rooms/<id> (see static/room.js: renderPrejoinRoomMeta). -->
+        <div id="prejoin-room-name-editable" class="input-with-regen prejoin-room-name-editable hidden">
           <input
-            id="join-name-input"
-            class="name-input"
+            id="prejoin-room-name-input"
+            class="prejoin-room-name-input"
             type="text"
-            placeholder="Your name (optional)"
             maxlength="40"
             autocomplete="off"
+            aria-label="Room name"
           />
-          <button id="join-name-regen-button" type="button" class="regen-button" aria-label="Generate new name" title="Generate new name">↻</button>
+          <button id="prejoin-room-name-regen" type="button" class="regen-button" aria-label="Generate new room name" title="Generate new room name">↻</button>
         </div>
+        <div id="prejoin-room-name-static" class="prejoin-room-name-static hidden">
+          <h2 id="prejoin-room-title" class="prejoin-room-title">Room</h2>
+          <div id="prejoin-room-meta" class="prejoin-room-meta hidden">
+            <span class="prejoin-live-dot" aria-hidden="true"></span>
+            <span id="prejoin-room-meta-text"></span>
+          </div>
+        </div>
+
+        <!-- 3. Preview — own camera (mirrored, muted, same look as the
+             in-call own tile) when it's on, otherwise the avatar
+             placeholder: SAME .tile-placeholder-avatar/-glyph-clip/-letter
+             markup and classes as static/room.js: createTile, so the glyph
+             fills the circle identically. Nothing else is drawn over it —
+             no mic/camera controls here (see the rows below instead). The
+             name pill reuses .tile-name/.tile-name-text verbatim. -->
+        <div id="prejoin-preview" class="prejoin-preview">
+          <video id="prejoin-preview-video" class="tile-video tile-video--mirror hidden" autoplay playsinline muted></video>
+          <div id="prejoin-preview-placeholder" class="tile-placeholder">
+            <div id="prejoin-avatar" class="tile-placeholder-avatar">
+              <div class="tile-placeholder-glyph-clip">
+                <span id="prejoin-avatar-letter" class="tile-placeholder-letter">?</span>
+              </div>
+            </div>
+          </div>
+          <div class="tile-name">
+            <span id="prejoin-preview-pill-text" class="tile-name-text"></span>
+          </div>
+        </div>
+
+        <!-- 4. Microphone: a leading icon (no text label — the icon speaks
+             for itself) + a native select with "Off" folded in as the
+             first option (see static/room.js: fillPrejoinDeviceSelect). -->
+        <div id="prejoin-mic-row" class="prejoin-device-row">
+          <span class="prejoin-device-icon" aria-hidden="true">
+            <svg class="icon icon-on" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="9" y="2" width="6" height="11" rx="3"></rect>
+              <path d="M5 10a7 7 0 0 0 14 0"></path>
+              <line x1="12" y1="19" x2="12" y2="22"></line>
+              <line x1="8" y1="22" x2="16" y2="22"></line>
+            </svg>
+            <svg class="icon icon-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="9" y="2" width="6" height="11" rx="3"></rect>
+              <path d="M5 10a7 7 0 0 0 14 0"></path>
+              <line x1="12" y1="19" x2="12" y2="22"></line>
+              <line x1="8" y1="22" x2="16" y2="22"></line>
+              <line x1="3" y1="3" x2="21" y2="21"></line>
+            </svg>
+          </span>
+          <select id="prejoin-mic-select" class="prejoin-select" aria-label="Microphone"></select>
+        </div>
+
+        <!-- 5. Camera: identical pattern. -->
+        <div id="prejoin-cam-row" class="prejoin-device-row">
+          <span class="prejoin-device-icon" aria-hidden="true">
+            <svg class="icon icon-on" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="2" y="6" width="14" height="12" rx="2.5"></rect>
+              <path d="M16 10.5l6-4v11l-6-4z"></path>
+            </svg>
+            <svg class="icon icon-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="2" y="6" width="14" height="12" rx="2.5"></rect>
+              <path d="M16 10.5l6-4v11l-6-4z"></path>
+              <line x1="1" y1="1" x2="23" y2="23"></line>
+            </svg>
+          </span>
+          <select id="prejoin-cam-select" class="prejoin-select" aria-label="Camera"></select>
+        </div>
+
+        <!-- 6. Your name — same #join-name-input/#join-name-regen-button
+             ids as before this redesign (e2e depends on them), now with an
+             explicit label (the room-name field above no longer needs one
+             of its own — the eyebrow already says "Start/Join the room"). -->
+        <div id="prejoin-name-field" class="prejoin-name-field">
+          <label for="join-name-input" class="prejoin-field-label">Your name</label>
+          <div class="input-with-regen">
+            <input
+              id="join-name-input"
+              class="name-input"
+              type="text"
+              placeholder="Your name (optional)"
+              maxlength="40"
+              autocomplete="off"
+            />
+            <button id="join-name-regen-button" type="button" class="regen-button" aria-label="Generate new name" title="Generate new name">↻</button>
+          </div>
+        </div>
+
+        <!-- 7. Primary action — "Start" for the creator, "Join" for a
+             guest (see static/room.js: showPrejoinCard). Kept as
+             #join-modal-button (e2e depends on it); focused on open, Enter
+             in either name field submits (see static/room.js). -->
         <button id="join-modal-button" class="start-button">Join</button>
+
+        <!-- 8. Lobby waiting state (see static/room.js: signaling.on('waiting')
+             and setPrejoinWaitingMode) — swapped in for items 4-7 (mic/cam
+             rows, name field, primary button) while a guest is waiting for
+             the leader's decision; the header (1-2) and the LIVE preview (3)
+             stay exactly as they were the whole time — the camera/mic keep
+             streaming underneath (nothing here re-acquires
+             micStream/camStream, see onPrejoinSubmit), so approval hands the
+             SAME tracks straight to the call, nothing is re-negotiated.
+             Hidden by default. -->
+        <div id="prejoin-waiting" class="prejoin-waiting hidden">
+          <div class="spinner prejoin-waiting-spinner" aria-hidden="true"></div>
+          <p class="prejoin-waiting-title">Waiting for approval…</p>
+          <p id="prejoin-waiting-text" class="prejoin-waiting-text"></p>
+          <button id="prejoin-waiting-cancel" type="button" class="retry-button prejoin-waiting-cancel">Cancel</button>
+        </div>
       </div>
     </div>
 
@@ -264,15 +377,28 @@
             <line x1="19" y1="5" x2="5" y2="19"></line>
           </svg>
         </button>
+        <!-- (a) Eyebrow — small/uppercase/muted (see static/style.css:
+             .share-popup-card h2). Still carries the dialog's accessible
+             name via aria-labelledby above; the room's own name (b, below)
+             is the card's actual visual headline now, see
+             static/room.js: renderShareRoomName. -->
         <h2 id="share-popup-title">Share the room</h2>
-        <!-- QR is rendered LOCALLY in the browser (see
+        <!-- (b) The room's own name, WITH its leading emoji exactly as
+             typed (currentRoomName — see the top-of-file comment on `n` in
+             static/room.js) — large/semibold. Hidden ENTIRELY (not a
+             placeholder like "Room") when the room doesn't have one yet
+             (a link shared before the creator ever set one) — see
+             static/room.js: renderShareRoomName. -->
+        <p id="share-popup-room-name" class="share-popup-room-name hidden"></p>
+        <!-- (c) QR is rendered LOCALLY in the browser (see
              static/vendor/qrcode.js, static/room.js: renderShareQr) — no
              trip to the server for the image: the room link (including the
              PSK token #t and expiry #e, see docs/e2e-encryption.md) must
              not leave the tab for the sake of a QR code. -->
         <div id="share-popup-qr" class="share-popup-qr" role="img" aria-label="QR code with the room link"></div>
+        <!-- (d) link text -->
         <div id="share-popup-link" class="share-popup-link"></div>
-        <!-- Hash of the published static assets — as a SEPARATE line of
+        <!-- (e) Hash of the published static assets — as a SEPARATE line of
              text, for verification (forensic anchor, see docs/security.md,
              "Published Build Hash"). NOT part of the link/QR above — those
              only carry `<origin>/r/<id>#t=<token>&e=<expiry>` (see
@@ -297,7 +423,20 @@
             >verify</a
           >
         </div>
-        <button id="share-popup-copy-button" class="share-popup-copy-button" type="button">Copy</button>
+        <!-- (f) Actions — Share (Web Share API) first/primary + Copy
+             secondary when navigator.share exists (see static/room.js:
+             shareApiSupported — feature-detected once at startup, same
+             pattern as screenShareSupported); Copy alone, full width and
+             primary, when it doesn't (a single flex:1 child in a flex row
+             fills it — see static/style.css: .share-popup-actions). The
+             --primary/--secondary modifier classes are applied once in JS
+             at startup (the capability doesn't change during the page's
+             life), not re-decided on every open. Share is hidden by default
+             in the markup here and only unhidden when supported. -->
+        <div class="share-popup-actions">
+          <button id="share-popup-share-button" class="share-popup-action-button hidden" type="button">Share</button>
+          <button id="share-popup-copy-button" class="share-popup-action-button" type="button">Copy</button>
+        </div>
       </div>
     </div>
 
@@ -432,14 +571,14 @@
     </div>
   </div>
 
-  <script src="/static/config.js?v=11"></script>
-  <script src="/static/crypto.js?v=11"></script>
-  <script src="/static/namegen.js?v=11"></script>
-  <script src="/static/vendor/qrcode.js?v=11"></script>
-  <script src="/static/common.js?v=11"></script>
-  <script src="/static/bus.js?v=11"></script>
-  <script src="/static/rtc.js?v=11"></script>
-  <script src="/static/chat.js?v=11"></script>
-  <script src="/static/room.js?v=18"></script>
+  <script src="/static/config.js?v=12"></script>
+  <script src="/static/crypto.js?v=12"></script>
+  <script src="/static/namegen.js?v=12"></script>
+  <script src="/static/vendor/qrcode.js?v=12"></script>
+  <script src="/static/common.js?v=12"></script>
+  <script src="/static/bus.js?v=12"></script>
+  <script src="/static/rtc.js?v=12"></script>
+  <script src="/static/chat.js?v=12"></script>
+  <script src="/static/room.js?v=19"></script>
 </body>
 </html>

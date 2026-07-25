@@ -1,15 +1,17 @@
 // landing.js — logic of the main page: room creation.
 //
+// The landing page no longer knows the room's name at all — it only creates
+// the room and hands over the credentials to reach it. The name is chosen on
+// the pre-join screen INSIDE the room (see static/room.js), freshly on EVERY
+// visit, not just once here, and it never travels through this page.
+//
 // Anonymity: no localStorage/sessionStorage/cookies anywhere on this
-// page. The participant's name is no longer asked here at all — it will be
-// asked by the join modal in the room itself (see static/room.js), freshly
-// on EVERY visit, not just once here. `POST /api/rooms` returns {roomId,
-// leaderToken} — we put leaderToken in the link fragment (#lt=...), not in
-// the path and not in the query: the fragment never goes to the server
-// either during normal browser navigation or in the Referer — the token
-// only reaches room.js on this same page (see there — it's read and
-// immediately wiped from the address bar via history.replaceState, before
-// anything else is shown).
+// page. `POST /api/rooms` returns {roomId, leaderToken} — we put
+// leaderToken in the link fragment (#lt=...), not in the path and not in
+// the query: the fragment never goes to the server either during normal
+// browser navigation or in the Referer — the token only reaches room.js on
+// this same page (see there — it's read and immediately wiped from the
+// address bar via history.replaceState, before anything else is shown).
 //
 // E2E v2 ("variant E", see docs/research-p2p-key-handoff.md §6.5-6.6 and
 // static/crypto.js): right here, next to leaderToken, TWO parameters of the
@@ -31,21 +33,11 @@
 //     deriveAuthKey) — it cannot be forged/extended without `t`.
 // The `k` key no longer exists — the whole room now has no single shared
 // encryption secret at all, only PSK authentication + PFS (see
-// static/crypto.js). room.js parses `t`/`e` (and `n` below) together from
-// the fragment.
-//
-// The fourth (optional) fragment parameter — `n` — is the room name entered
-// into #room-name-input (prefilled with NameGen.roomName(), see
-// static/namegen.js; freely editable). This name is seen by ALL room
-// participants, not just the creator: it is placed as the LAST parameter of
-// the same fragment (#lt=...&t=...&e=...&n=...), but unlike the one-time
-// `lt`, `n` is NOT wiped from the address bar — room.js reassembles the
-// fragment as `#t=...&e=...&n=...` (see there) and puts `n` into
-// buildShareLink() the same way, so the invite link carries the room name
-// and any guest who joins via it sees it in the top bar/tab title — and it
-// survives F5. The server never sees `n` either, just like `t`/`e`: the
-// fragment never goes to the server, neither during normal navigation nor
-// in the Referer.
+// static/crypto.js). room.js parses `t`/`e` together from the fragment; the
+// room NAME (`n`) is added to the fragment later, from room.js itself, once
+// it's been chosen on the pre-join screen — this file never sees it.
+// The fragment never goes to the server either way, neither during normal
+// navigation nor in the Referer.
 
 'use strict';
 
@@ -54,21 +46,6 @@ const messageEl = document.getElementById('landing-message');
 const buildFooterEl = document.getElementById('landing-build-footer');
 const buildShortEl = document.getElementById('landing-build-short');
 const buildFullEl = document.getElementById('landing-build-full');
-const roomNameInputEl = document.getElementById('room-name-input');
-const roomNameRegenButtonEl = document.getElementById('room-name-regen-button');
-
-// Prefill with a nice generated name (see static/namegen.js) — the user can
-// just stick with it (simply click Create room), or erase/edit it before
-// creating the room.
-roomNameInputEl.value = NameGen.roomName();
-
-// The "regenerate" button next to the input just rerolls a new room name
-// (see static/namegen.js: roomName()). type="button" in the markup — the
-// click doesn't submit anything (there's no form here anyway, but explicit
-// just in case).
-roomNameRegenButtonEl.addEventListener('click', () => {
-  roomNameInputEl.value = NameGen.roomName();
-});
 
 function showMessage(text, isError = true) {
   messageEl.textContent = text;
@@ -107,25 +84,7 @@ createButton.addEventListener('click', async () => {
       typeof data.lifetimeSeconds === 'number' && data.lifetimeSeconds > 0 ? data.lifetimeSeconds : 10800;
     const expiryB36 = (Math.floor(Date.now() / 1000) + lifetimeSeconds + 300).toString(36);
 
-    // maxlength=40 truncates by UTF-16 code units, not by code point —
-    // pasting/autocorrect can split an emoji surrogate pair in half and
-    // leave a lone surrogate. toWellFormed() (where available) fixes this
-    // properly; on engines without it — a manual regex cleanup of lone
-    // surrogates (a high surrogate not followed by a low one / a low
-    // surrogate not preceded by a high one).
-    const rawRoomName = roomNameInputEl.value.trim();
-    const roomName = rawRoomName
-      ? (typeof rawRoomName.toWellFormed === 'function'
-          ? rawRoomName.toWellFormed()
-          : rawRoomName.replace(
-              /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/g,
-              '$1',
-            ))
-      : '';
-
-    location.href =
-      `/r/${data.roomId}#lt=${encodeURIComponent(data.leaderToken)}&t=${tokenB64}&e=${expiryB36}` +
-      (roomName ? `&n=${encodeURIComponent(roomName)}` : '');
+    location.href = `/r/${data.roomId}#lt=${encodeURIComponent(data.leaderToken)}&t=${tokenB64}&e=${expiryB36}`;
   } catch (err) {
     console.error('Failed to create room:', err);
     showMessage('Failed to create room. Check your connection and try again.');

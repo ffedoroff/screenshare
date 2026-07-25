@@ -144,6 +144,31 @@ pub const PENDING_JOIN_IP_WINDOW: Duration = Duration::from_secs(60);
 pub const DEFAULT_JOIN_ROOM_IP_LIMIT: usize = 20;
 pub const JOIN_ROOM_IP_WINDOW: Duration = Duration::from_secs(60);
 
+/// Per-IP limit on `GET /api/rooms/{id}` (the pre-join room preview — see
+/// `main.rs::room_status`): its own map and budget, separate from all three
+/// limits above, for the same reason they're separate from each other — this
+/// is an action of a different nature again. Unlike room creation/joining,
+/// this is a READ with no side effects, and the frontend is expected to poll
+/// it roughly every 5 seconds while someone sits on the pre-join screen
+/// deciding whether to enter (see docs on the pre-join UI) — reusing
+/// `ROOM_CREATION_IP_LIMIT`'s budget (3/60s in production) would exhaust it
+/// after a single poll or two and lock the same IP out of actually creating a
+/// room. 240/60s (4/s) was picked as deliberately generous: it comfortably
+/// covers 5s polling from several tabs/devices behind the same NAT at once
+/// (a dozen tabs polling every 5s is still only ~144/60s), while still being
+/// bounded enough that this endpoint can't be turned into an unthrottled
+/// room-id probe (it reveals only occupancy/capacity/age, not anything
+/// sensitive — see `room_status`'s doc comment — but even a yes/no
+/// "does this room exist" oracle is worth rate-limiting).
+///
+/// The value is read from the env var `ROOM_STATUS_IP_LIMIT` in `main.rs`
+/// (`crate::ROOM_STATUS_IP_LIMIT`, the same `LazyLock` trick as
+/// `crate::JOIN_ROOM_IP_LIMIT`/`crate::ROOM_CREATION_IP_LIMIT`) —
+/// configurability exists for the same testability reason as its neighbors.
+/// `ROOM_STATUS_IP_WINDOW`, unlike the limit, is not configurable.
+pub const DEFAULT_ROOM_STATUS_IP_LIMIT: usize = 240;
+pub const ROOM_STATUS_IP_WINDOW: Duration = Duration::from_secs(60);
+
 /// Channel for sending messages to a specific WebSocket connection. The
 /// socket's writer reads from the paired `UnboundedReceiver`.
 pub type PeerTx = mpsc::UnboundedSender<ServerMessage>;
@@ -269,6 +294,28 @@ impl Room {
     pub fn effective_max_participants(&self) -> usize {
         self.settings.max_participants.unwrap_or(*crate::MAX_PARTICIPANTS)
     }
+
+    /// Seconds since this room was created (or last restored via `PUT
+    /// /api/rooms/{id}`) — i.e. `created_at.elapsed()`. Used by `GET
+    /// /api/rooms/{id}` (`main.rs::room_status`, the pre-join preview) as the
+    /// room's "age" shown to someone who hasn't joined yet.
+    ///
+    /// Deliberately NOT the same notion of age as
+    /// `crate::ws::room_age_seconds` (which backs `Joined::room_age_seconds`,
+    /// the in-room count-up timer): that one counts from `first_joined_at`
+    /// and reads `0` for as long as nobody has ever joined — exactly wrong
+    /// for a pre-join preview, whose whole point is to show something
+    /// meaningful (and ticking) for a room that's sitting empty right after
+    /// `POST /api/rooms`, before anyone has joined at all. This method uses
+    /// `created_at` instead, which is set the moment the room record itself
+    /// is created/restored, so it starts advancing immediately. Once someone
+    /// has actually joined, the two numbers are close (they diverge only by
+    /// however long the room sat empty before its first participant showed
+    /// up) but are still answering different questions on purpose — this one
+    /// intentionally is NOT merged with `room_age_seconds` in ws.rs.
+    pub fn age_seconds(&self) -> u64 {
+        self.created_at.elapsed().as_secs()
+    }
 }
 
 /// Shared state of all rooms.
@@ -300,6 +347,12 @@ pub struct AppState {
     /// separate from both `room_creation_ips` and `pending_join_ips` (see
     /// `DEFAULT_JOIN_ROOM_IP_LIMIT` above).
     pub join_room_ips: IpRateLimitMap,
+    /// Per-IP limit on `GET /api/rooms/{id}` (the pre-join room preview) —
+    /// its own map, a deliberately generous budget separate from all three
+    /// above (see `DEFAULT_ROOM_STATUS_IP_LIMIT` for why this endpoint can't
+    /// share any of their budgets: it's polled every few seconds from the
+    /// pre-join screen, before the visitor has done anything else).
+    pub room_status_ips: IpRateLimitMap,
     /// Channel for the active shutdown broadcast notification (SIGTERM/
     /// SIGINT, see `crate::shutdown_signal`) — every `ws::handle_socket`
     /// subscribes to it at startup (`subscribe()`) and, upon receiving the

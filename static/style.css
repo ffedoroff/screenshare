@@ -120,6 +120,17 @@ body {
   color: var(--danger);
 }
 
+/* On the landing page this message is empty in the normal case, and the line
+   reserved by .status-message above (min-height: 1.4em, there so the layout
+   doesn't jump when a message appears) read as a hole between "Create room"
+   and the "How it works" row. Collapse it while empty: the only message this
+   page can show is a room-creation failure, and a small shift at that moment
+   is better than a permanent gap on every visit. Scoped to .landing-card, so
+   the reserved line stays as-is everywhere else (the room page relies on it). */
+.landing-card .status-message:empty {
+  min-height: 0;
+}
+
 .hidden {
   display: none !important;
 }
@@ -166,6 +177,18 @@ body {
   }
 }
 
+/* Every spinner in the app (the fullscreen #overlay-spinner, the lobby
+   waiting block's — see .prejoin-waiting-spinner below) respects
+   prefers-reduced-motion: a static ring instead of a spin — it still reads
+   as "something's in progress" via the accent-colored top border, without
+   the continuous motion some users have explicitly asked their system to
+   avoid. */
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation: none;
+  }
+}
+
 /* ---------- Landing page: always dark, same fixed palette as the room
    (see the :root vars above) — it does not respect prefers-color-scheme. ---------- */
 
@@ -198,6 +221,26 @@ body {
   margin: 0;
 }
 
+/* The promise paragraph (see static/index.html): two sentences, one
+   punchy ("goes straight to the other person, never through a server",
+   kept full-strength text color + <strong>) and one supporting/reassuring
+   ("End-to-end encrypted. No account, nothing stored.") — the latter is
+   pushed down in visual weight via .landing-promise-muted so it reads as
+   a footnote to the first, not a competing headline. */
+.landing-promise {
+  margin: 0;
+  font-size: 0.95rem;
+  line-height: 1.5;
+  color: var(--text);
+}
+
+.landing-promise-muted {
+  display: block;
+  margin-top: var(--space-1);
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
 .name-input {
   width: 100%;
   height: 48px;
@@ -216,11 +259,10 @@ body {
   border-color: var(--accent);
 }
 
-/* The "name input + regenerate button" row (see task item 1) —
-   reused both on the landing page (#room-name-input, static/index.html) and in
-   the join-room modal (#join-name-input, static/room.html). The input
-   takes up all available space, the button is a compact square icon
-   next to it, at the same height. */
+/* The "name input + regenerate button" row — used by the join-room modal
+   (#join-name-input, static/room.html; the room name is chosen there, not
+   on the landing page anymore). The input takes up all available space,
+   the button is a compact square icon next to it, at the same height. */
 .input-with-regen {
   width: 100%;
   display: flex;
@@ -252,8 +294,103 @@ body {
   background: var(--bg-elevated);
 }
 
+/* ---------- Landing: "How it works" disclosure (see static/index.html) ----------
+   A native <details>/<summary> — no JS needed to open/close it, the chevron
+   rotation below hooks purely into the [open] attribute. Collapsed by
+   default: the landing's job is to get out of the way; this is only for a
+   visitor who wants the "why should I trust this" details. The build-hash
+   line (.build-footer just below this block) now lives at the end of this
+   disclosure's body instead of being its own footer at the bottom of the
+   card. */
+.landing-more {
+  width: 100%;
+  text-align: left;
+}
+
+.landing-more-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-2) 0;
+  cursor: pointer;
+  list-style: none;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.landing-more-summary::-webkit-details-marker {
+  display: none;
+}
+
+.landing-more-summary::marker {
+  content: '';
+}
+
+.landing-more-summary:hover {
+  color: var(--text);
+}
+
+/* Keyboard-operable control (a native <summary> is focusable and toggles on
+   Enter/Space) — needs its own visible focus state, same accent ring used
+   elsewhere in the app. */
+.landing-more-summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius);
+}
+
+.landing-more-chevron {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  transition: transform 0.2s ease;
+}
+
+.landing-more[open] .landing-more-chevron {
+  transform: rotate(180deg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .landing-more-chevron {
+    transition: none;
+  }
+}
+
+.landing-more-body {
+  padding-bottom: var(--space-1);
+}
+
+.landing-more-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  font-size: 0.85rem;
+  line-height: 1.45;
+  color: var(--text-muted);
+}
+
+.landing-more-list b {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.landing-more-list a {
+  color: var(--accent);
+}
+
+.landing-more-list a:hover {
+  color: var(--accent-hover);
+}
+
 /* ---------- Build hash (forensic anchor, see docs/security.md,
-   "Published Build Hash") — an unobtrusive landing-page footer. The room reuses
+   "Published Build Hash") — now nested at the end of the landing page's
+   "How it works" disclosure body above (see #landing-build-footer in
+   static/index.html), instead of a standalone footer. The room reuses
    .build-verify-link/.build-full below for the "Share" popup and settings,
    with their own containers (.share-popup-build/.settings-build-row). ---------- */
 
@@ -1398,9 +1535,29 @@ body {
   padding: var(--space-8) var(--space-6) var(--space-6);
 }
 
+/* Now a small uppercase/muted eyebrow (task item 1: "Share the room") — the
+   room's own name (.share-popup-room-name below) is the card's actual
+   visual headline now; this h2 still carries the dialog's accessible name
+   via aria-labelledby (see static/room.html), it's just no longer styled
+   like a heading. Same look as .prejoin-eyebrow on the pre-join card. */
 .share-popup-card h2 {
   margin: 0;
-  font-size: 1.1rem;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+/* The room's own name (currentRoomName, see static/room.js:
+   renderShareRoomName) — large/semibold, WITH its leading emoji exactly as
+   typed. Hidden entirely (via .hidden, toggled in JS) rather than showing a
+   placeholder when the room doesn't have one yet. */
+.share-popup-room-name {
+  margin: 0;
+  font-size: 1.3rem;
+  font-weight: 600;
+  word-break: break-word;
 }
 
 .share-popup-close {
@@ -1478,22 +1635,50 @@ body {
   color: var(--text-muted);
 }
 
-.share-popup-copy-button {
-  min-height: 44px;
+/* Share + Copy (task item 1) — one or two equal-width buttons in a row.
+   Share is rendered only when navigator.share exists (see static/room.js:
+   shareApiSupported, feature-detected once at startup) and, where it does,
+   is the PRIMARY (accent) action with Copy secondary next to it; where it
+   doesn't, Copy alone stretches to fill the row (a single flex:1 child in a
+   flex row takes the full width) and becomes primary itself. Which
+   modifier each button gets is decided ONCE in JS at startup — the
+   capability can't change during the page's life — not re-decided on every open. */
+.share-popup-actions {
   width: 100%;
-  border: none;
+  display: flex;
+  gap: var(--space-3);
+}
+
+.share-popup-action-button {
+  flex: 1;
+  min-width: 0;
+  min-height: 44px;
   border-radius: var(--radius);
-  background: var(--accent);
-  color: #fff;
-  padding: var(--space-2) var(--space-6);
+  padding: var(--space-2) var(--space-4);
   font-weight: 600;
   font-family: inherit;
   cursor: pointer;
   touch-action: manipulation;
 }
 
-.share-popup-copy-button:hover {
+.share-popup-action-button--primary {
+  border: none;
+  background: var(--accent);
+  color: #fff;
+}
+
+.share-popup-action-button--primary:hover {
   background: var(--accent-hover);
+}
+
+.share-popup-action-button--secondary {
+  border: 1px solid var(--border);
+  background: var(--bg-elevated-2);
+  color: var(--text);
+}
+
+.share-popup-action-button--secondary:hover {
+  border-color: var(--accent);
 }
 
 /* ---------- Chat ----------
@@ -2841,9 +3026,15 @@ body {
   }
 }
 
-/* ---------- Join-room modal (anonymity — see static/room.js) ----------
+/* ---------- Pre-join card (anonymity — see static/room.js, the "Pre-join
+   card" section) ----------
    Shown first, before connecting to signaling; z-index above .overlay
-   (50), so it doesn't end up beneath it if both are somehow visible at the same time. */
+   (50), so it doesn't end up beneath it if both are somehow visible at the
+   same time. #join-modal/.join-modal-card are the pre-existing
+   backdrop/card (id/class kept stable across the pre-join redesign — the
+   e2e suite targets #join-modal); .prejoin-card below narrows/adapts it to
+   the new, taller one-screen layout (task: fits 390x844 without page
+   scroll). */
 .join-modal {
   position: fixed;
   inset: 0;
@@ -2874,6 +3065,262 @@ body {
 .join-modal-card h2 {
   margin: 0;
   font-size: 1.25rem;
+}
+
+/* Narrower than the base .join-modal-card (400px) and left-aligned (the
+   base card is centered/text-align:center, right for a single short
+   message — wrong for a form-like card with several rows). max-height +
+   overflow-y: auto lets the card scroll INTERNALLY on a very short
+   viewport instead of clipping/pushing content off-screen — the modal
+   backdrop (.join-modal above) centers it with vertical padding
+   (var(--space-6) on each side), so 100% of the backdrop's own (definite,
+   position:fixed) height is the right ceiling. */
+.prejoin-card {
+  max-width: 360px;
+  max-height: 100%;
+  overflow-y: auto;
+  text-align: left;
+}
+
+@media (max-height: 700px) {
+  /* A short viewport (e.g. a phone in landscape, or a small laptop window
+     with the browser chrome eating into it) — shrink the card's own outer
+     padding/gap so more of the actual content fits before internal scroll
+     kicks in. */
+  .prejoin-card {
+    padding: var(--space-6) var(--space-4);
+    gap: var(--space-3);
+  }
+}
+
+.prejoin-eyebrow {
+  margin: 0;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+/* Creator: the room name IS the card's title — an editable input styled to
+   read like a heading rather than a form field (transparent, no border of
+   its own; see .prejoin-room-name-editable:focus-within below for the
+   focus treatment, since a bare `outline`/border would look like a regular
+   text field and break that illusion). Shares .input-with-regen/
+   .regen-button with the "Your name" field further down (see
+   static/style.css above) and the pre-redesign join-room modal. */
+.prejoin-room-name-input {
+  width: 100%;
+  height: auto;
+  padding: var(--space-1) 0;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 1.3rem;
+  font-weight: 600;
+  text-align: left;
+}
+
+.prejoin-room-name-input:focus {
+  outline: none;
+}
+
+/* Visible focus indicator for the whole row (task: ":focus-visible on
+   every control") — a box-shadow ring rather than the input's own outline,
+   since the input has no border/background to draw an outline against
+   without breaking the "looks like a heading" illusion above. Fires for
+   either the input OR the regen button next to it. */
+.prejoin-room-name-editable:focus-within {
+  box-shadow: 0 0 0 2px var(--accent);
+  border-radius: var(--radius);
+}
+
+.prejoin-room-name-editable .regen-button {
+  width: 40px;
+  height: 40px;
+  align-self: center;
+}
+
+/* #id (not a .class) — deliberately outweighs the generic ".join-modal-card
+   h2 { font-size: 1.25rem }" rule above (this IS an h2, for semantics/a11y)
+   so the intended 1.3rem actually wins regardless of source order. */
+#prejoin-room-title {
+  margin: 0;
+  font-size: 1.3rem;
+  font-weight: 600;
+}
+
+.prejoin-room-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-1);
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+.prejoin-live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--success);
+  flex-shrink: 0;
+  box-shadow: 0 0 0 3px rgba(51, 181, 108, 0.2);
+}
+
+/* Preview: 16:9, rounded, dark — own camera (mirrored, muted — see
+   .tile-video--mirror above) or the avatar placeholder (.tile-placeholder*
+   reused verbatim from a real tile, see static/room.js: createTile/
+   updatePrejoinPreviewMode), with a name pill at the bottom (.tile-name,
+   also reused verbatim). Nothing else is drawn over it (task: no
+   mic/camera controls here — see the rows below instead). position:
+   relative anchors the absolutely-positioned .tile-name pill exactly like
+   it's anchored inside a real .tile. */
+.prejoin-preview {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--bg);
+  border: 1px solid var(--border);
+}
+
+/* ---------- Mic/camera rows: a leading icon (no text label) + a native,
+   dark-styled select with "Off" folded into the option list itself (see
+   static/room.js: fillPrejoinDeviceSelect) ---------- */
+
+.prejoin-device-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.prejoin-device-icon {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+}
+
+.prejoin-device-icon .icon-off {
+  display: none;
+}
+
+/* Off: the icon swaps to its crossed-out variant, in red, and the select's
+   own text de-emphasizes to match (task: "icon is red/crossed-out and the
+   value text is muted") — unlike the in-call toolbar (.control-button--on/
+   off, where the OFF state is just neutral, see above) this screen
+   deliberately makes "you're about to enter the room silent/invisible"
+   hard to miss. Toggled from static/room.js: updatePrejoinMicRowUi/
+   updatePrejoinCamRowUi, driven by the select's OWN current value (see
+   fillPrejoinDeviceSelect/PREJOIN_DEVICE_OFF there), not a separate on/off
+   flag — there's no separate button on this screen. */
+.prejoin-device-row--off .prejoin-device-icon .icon-on {
+  display: none;
+}
+
+.prejoin-device-row--off .prejoin-device-icon .icon-off {
+  display: block;
+}
+
+.prejoin-device-row--off .prejoin-device-icon {
+  color: var(--danger-hover);
+}
+
+.prejoin-device-row--off .prejoin-select {
+  color: var(--text-muted);
+}
+
+.prejoin-select {
+  flex: 1;
+  min-width: 0;
+  height: 44px;
+  padding: 0 var(--space-6) 0 var(--space-3);
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background-color: var(--bg-elevated-2);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.9rem;
+  cursor: pointer;
+  /* appearance: none is what makes the background-image chevron/padding
+     below reliable across browsers — a default <select> mostly ignores
+     box styling otherwise. The chevron's stroke color (#9aa0a8) is
+     --text-muted's value spelled out in hex: custom properties can't be
+     referenced from inside a data: URI. */
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%239aa0a8' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right var(--space-2) center;
+  background-size: 20px;
+}
+
+.prejoin-select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.prejoin-name-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.prejoin-field-label {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+/* Visible focus indicator for the remaining controls on this card — same
+   accent ring used elsewhere in the app (see .landing-more-summary:focus-visible). */
+.regen-button:focus-visible,
+.name-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ---------- Pre-join card, lobby "waiting for approval" (task item 3) ----------
+   Swapped in for the device rows/name field/primary button (see
+   static/room.js: setPrejoinWaitingMode/signaling.on('waiting')) — the
+   header and the live preview above stay exactly as they were, untouched
+   by this block. */
+.prejoin-waiting {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) 0;
+  text-align: center;
+}
+
+.prejoin-waiting-spinner {
+  width: 32px;
+  height: 32px;
+}
+
+.prejoin-waiting-title {
+  margin: 0;
+  font-weight: 600;
+}
+
+.prejoin-waiting-text {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.9rem;
+}
+
+/* Same ghost/secondary look as .retry-button (reused as-is, see
+   static/room.html), just sized to match the primary button it replaces
+   (.start-button: full width, 52px tall). */
+.prejoin-waiting-cancel {
+  width: 100%;
+  height: 52px;
 }
 
 /* ---------- Toast (leader change, etc.) ---------- */
@@ -3136,23 +3583,69 @@ body {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
-  width: min(360px, calc(100vw - var(--space-4) * 2));
+  /* Widened from 360px (task item 4: avatar + two-line info now share the
+     row with Accept/Reject) — on a real desktop viewport this gives the
+     container query below (see .join-request-card) enough room to keep the
+     two buttons side by side; the max-width:640px override further down
+     (unchanged formula, no cap) naturally stays much narrower on real phone
+     widths, which is what drives that same query into its stacked branch. */
+  width: min(440px, calc(100vw - var(--space-4) * 2));
 }
 
 .join-request-card {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: var(--space-3);
   padding: var(--space-3);
   border-radius: var(--radius-lg);
   background: var(--bg-elevated);
   border: 1px solid var(--border);
   box-shadow: var(--shadow);
+  /* Container query for the Accept/Reject layout below — keyed off this
+     CARD's own rendered width (not a viewport media query), so it stays
+     correct regardless of which breakpoint currently governs
+     #join-requests' own width (see above). */
+  container-type: inline-size;
+}
+
+/* Avatar — same gradient derivation as a real tile (avatarGradientCss(peerId),
+   see static/room.js: buildJoinRequestCardEl) and the same letter-vs-emoji
+   sizing idea as .tile-placeholder-letter/--emoji, just at this card's
+   smaller badge scale. Before a name-announce arrives the card still reads
+   "Guest" (see addPendingRequest) and the circle shows a neutral "?"
+   instead of "G" — a placeholder word doesn't deserve a highlighted initial. */
+.join-request-avatar {
+  flex-shrink: 0;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.join-request-avatar-letter {
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: #fff;
+  line-height: 1;
+}
+
+.join-request-avatar-letter--emoji {
+  font-size: 1.35rem;
+}
+
+.join-request-info {
+  flex: 1 1 auto;
+  min-width: 120px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 
 .join-request-name {
-  flex: 1;
-  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -3160,10 +3653,31 @@ body {
   font-size: 0.9rem;
 }
 
+.join-request-wants {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
 .join-request-actions {
   display: flex;
   gap: var(--space-2);
   flex-shrink: 0;
+}
+
+/* Narrow card (task item 4: "on a narrow panel... the two buttons must be
+   on SEPARATE lines") — below this width, Accept/Reject don't have room
+   next to the avatar+name without cramming: drop them to their own
+   full-width row (flex-wrap on the card above) and stack the two buttons
+   vertically instead of keeping them side by side. */
+@container (max-width: 400px) {
+  .join-request-actions {
+    flex-direction: column;
+    flex: 1 0 100%;
+  }
+
+  .join-request-actions .join-request-button {
+    width: 100%;
+  }
 }
 
 .join-request-button {

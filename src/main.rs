@@ -54,7 +54,7 @@ use axum::extract::{ConnectInfo, Path, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Json, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{get, post};
 use axum::Router;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use hmac::{Hmac, KeyInit, Mac};
@@ -68,7 +68,8 @@ use crate::protocol::RoomSettings;
 use crate::state::{
     check_ip_rate_limit, extract_client_ip, AppState, Room, DEFAULT_JOIN_ROOM_IP_LIMIT,
     DEFAULT_MAX_PARTICIPANTS, DEFAULT_MAX_ROOMS, DEFAULT_MAX_ROOM_LIFETIME_SECONDS,
-    DEFAULT_ROOM_CREATION_IP_LIMIT, ROOM_CREATION_IP_WINDOW,
+    DEFAULT_ROOM_CREATION_IP_LIMIT, DEFAULT_ROOM_STATUS_IP_LIMIT, ROOM_CREATION_IP_WINDOW,
+    ROOM_STATUS_IP_WINDOW,
 };
 
 /// Directory with frontend static assets. Configurable via env `STATIC_DIR`
@@ -159,6 +160,20 @@ pub(crate) static ROOM_CREATION_IP_LIMIT: LazyLock<usize> = LazyLock::new(|| {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_ROOM_CREATION_IP_LIMIT)
+});
+
+/// Per-IP limit on `GET /api/rooms/{id}` (the pre-join room preview, see
+/// `room_status`) — its own budget, deliberately generous (see the detailed
+/// rationale at `state::DEFAULT_ROOM_STATUS_IP_LIMIT`: this endpoint is
+/// polled every few seconds from the pre-join screen, unlike the rare,
+/// tightly-limited `ROOM_CREATION_IP_LIMIT`). Configurable via env
+/// `ROOM_STATUS_IP_LIMIT` for the same testability reason as its neighbors.
+/// `LazyLock` — the same trick as `ROOM_CREATION_IP_LIMIT` above.
+pub(crate) static ROOM_STATUS_IP_LIMIT: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("ROOM_STATUS_IP_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_ROOM_STATUS_IP_LIMIT)
 });
 
 /// CORS by hand, without tower-http: we only have three cross-origin HTTP
@@ -303,6 +318,7 @@ async fn main() {
         room_creation_ips: Arc::new(Mutex::new(HashMap::new())),
         pending_join_ips: Arc::new(Mutex::new(HashMap::new())),
         join_room_ips: Arc::new(Mutex::new(HashMap::new())),
+        room_status_ips: Arc::new(Mutex::new(HashMap::new())),
         shutdown: shutdown_tx.clone(),
     };
 
@@ -324,7 +340,8 @@ async fn main() {
         )
         .route(
             "/api/rooms/{room_id}",
-            put(restore_room)
+            get(room_status)
+                .put(restore_room)
                 .options(options_stub)
                 .route_layer(cors.clone()),
         )
@@ -719,6 +736,74 @@ async fn restore_room(
         Json(json!({ "roomId": room_id, "lifetimeSeconds": MAX_ROOM_LIFETIME.as_secs() })),
     )
         .into_response()
+}
+
+/// `GET /api/rooms/{room_id}`: an unauthenticated, read-only preview of a
+/// room, meant to be polled from the pre-join screen (see the frontend)
+/// BEFORE the visitor actually joins over `/ws` — "how many people are in
+/// here, is it full, how old is this call". No `join-room` round-trip (and
+/// no WS connection at all) is needed just to answer that.
+///
+/// SECURITY INVARIANT — this handler exposes EXACTLY three numbers and
+/// nothing else: `participants` (a count, not a list), `capacity` (a limit,
+/// the same one `join-room` itself enforces), `ageSeconds` (see
+/// `Room::age_seconds`). It must NEVER grow a `peerId`/name/settings/token
+/// field: participant names in this project are never known to the server
+/// in the first place (E2E-encrypted `name-announce`, see the module
+/// comment in `state.rs`), and peer ids/settings/tokens are exactly the kind
+/// of thing a pre-join, unauthenticated, publicly-linkable endpoint must not
+/// leak — knowing a `roomId` (the only "secret" a call link carries, see
+/// docs/privacy.md) should tell an onlooker only whether it's worth
+/// bothering to join, not who's already there.
+///
+/// `participants` counts ONLY `Room::participants` (people actually
+/// admitted) — NOT `Room::pending` (peers currently waiting in the lobby for
+/// the leader's approval, see `RoomSettings::lobby_enabled`): they are not
+/// room participants either from the room's own point of view (see the
+/// doc comment on `PendingParticipant`) or from this preview's point of
+/// view — "how many people are already in the call" shouldn't count someone
+/// who may yet be rejected.
+///
+/// `capacity` is `Room::effective_max_participants()` — the SAME effective
+/// ceiling `join-room`/`approve` enforce (the leader's own limit if they set
+/// one, otherwise the server-wide `crate::MAX_PARTICIPANTS`), so the
+/// pre-join screen can show "this room is full" using the identical notion
+/// of "full" the server will actually apply on the real join attempt.
+///
+/// 404 (plain-text body, the same shape every other error in this file
+/// uses — see e.g. `static_file`'s 404) if no such room exists: never
+/// created, not yet created, or already removed by the reaper — the same
+/// three cases `ServerMessage::RoomNotFound` covers on the WS join path.
+async fn room_status(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(room_id): Path<String>,
+) -> Response {
+    // Its own budget, deliberately generous and SEPARATE from
+    // ROOM_CREATION_IP_LIMIT — see state::DEFAULT_ROOM_STATUS_IP_LIMIT for
+    // why reusing the room-creation budget here would be wrong (this
+    // endpoint is polled every few seconds from the pre-join screen, the
+    // creation budget would be exhausted almost immediately).
+    let ip = extract_client_ip(&headers, Some(peer_addr));
+    if !check_ip_rate_limit(&state.room_status_ips, &ip, *ROOM_STATUS_IP_LIMIT, ROOM_STATUS_IP_WINDOW) {
+        warn!(%ip, "per-IP room status limit exceeded — 429");
+        return (StatusCode::TOO_MANY_REQUESTS, "too many requests, slow down").into_response();
+    }
+
+    let rooms_guard = state.rooms.lock().unwrap();
+    let Some(room) = rooms_guard.get(&room_id) else {
+        drop(rooms_guard);
+        return (StatusCode::NOT_FOUND, "room not found").into_response();
+    };
+    let body = json!({
+        "participants": room.participants.len() as u32,
+        "capacity": room.effective_max_participants() as u32,
+        "ageSeconds": room.age_seconds(),
+    });
+    drop(rooms_guard);
+
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 /// Readiness/liveness probe for k8s: if the process responds over HTTP, it's

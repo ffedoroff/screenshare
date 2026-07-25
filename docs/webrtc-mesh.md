@@ -162,7 +162,7 @@ the bootstrap window before a pair's channel opens.
 
 - **STUN** is always available — a public STUN server is included in every
   `/config` response with no configuration required (see
-  [`signaling-protocol.md` §2.4](signaling-protocol.md#24-get-config)).
+  [`signaling-protocol.md` §2.5](signaling-protocol.md#25-get-config)).
 - **TURN** is optional and configured per deployment (see
   [`self-hosting.md`](self-hosting.md)) — needed when two participants
   cannot establish a direct path (for example, both behind symmetric NAT).

@@ -6,26 +6,38 @@
 // `npm install` first). Requires a system Chrome (playwright-core does not
 // download browsers, uses channel: 'chrome').
 //
-// Scenario: home page -> name "Vasya" -> "Create room" -> wait for the
-// transition to /r/<id>; two more participants ("Petya", "Olya") open the
-// same link; all three have 3 tiles each. Vasya turns on camera and
-// microphone — the others get live video in his tile and speaking
+// Scenario: home page -> "Create room" -> wait for the transition to
+// /r/<id> -> pre-join card (creator: sets the room name, mic/camera default
+// OFF) -> name "Vasya" -> becomes leader (crown); two more participants
+// ("Petya", "Olya") open the same invite link, land on a GUEST pre-join card
+// (mic/camera default ON via a combined getUserMedia — turned back Off here
+// to reproduce the classic "starts muted, no video" baseline the rest of
+// this scenario is built around, see helpers.mjs: joinRoom's micOff/camOff
+// defaults) and all three end up with 3 tiles each. Vasya turns on camera
+// and microphone — the others get live video in his tile and speaking
 // indication. Petya shares his screen — Vasya's and Olya's main area shows
 // the stream, Olya's "Screen" button is disabled (screen is busy). Petya
 // stops sharing — the main area clears for everyone, the room stays alive
 // (chat, tiles in place), and now Olya can start her own share. At the end —
 // Vasya toggles microphone and camera back off, we check that the
-// indication turns off and the placeholder appears.
+// indication turns off and the placeholder appears. Separate, dedicated
+// steps further down cover the new pre-join behavior on its own terms: a
+// guest arriving with LIVE media reaching the creator, the room name's
+// journey to the top bar/invite link, the Share popup auto-opening once for
+// the creator only, the lobby wait keeping a live preview, and the new
+// terminal-state wording (see "Pre-join redesign" below).
 //
-// About getDisplayMedia/getUserMedia in automation — see helpers.mjs
-// (installCaptureStub/installMicStub/installCamStub) and README.md: real
-// screen/camera capture is unavailable on this macOS machine (no TCC
-// permissions, can't grant them non-interactively), so by default the test
-// harness immediately swaps the sources for synthetic ones
-// (canvas.captureStream / Web Audio oscillator) — the WebRTC transport
-// (SDP/ICE/media) is still verified for real. Attempting real capture is
-// enabled by the same env vars as before: E2E_TRY_REAL_CAPTURE=1,
-// E2E_TRY_REAL_MIC=1, E2E_TRY_REAL_CAM=1.
+// About getDisplayMedia in automation — see helpers.mjs (installCaptureStub)
+// and README.md: real screen capture is unavailable on this macOS machine
+// (no TCC permissions, can't grant them non-interactively), so by default
+// the test harness immediately swaps the source for a synthetic one
+// (canvas.captureStream) — the WebRTC transport (SDP/ICE/media) is still
+// verified for real. Attempting real capture is enabled by the same env var
+// as before: E2E_TRY_REAL_CAPTURE=1. getUserMedia (mic/camera) no longer
+// needs a JS-level stub at all — CAPTURE_FLAGS' own
+// --use-fake-device-for-media-stream (below) already covers it, including
+// the pre-join card's combined audio+video request (see
+// installMediaStubs below for the full story).
 
 import { chromium } from 'playwright-core';
 import assert from 'node:assert/strict';
@@ -36,16 +48,16 @@ import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import {
   REAL_CAPTURE_TIMEOUT_MS,
-  REAL_MIC_TIMEOUT_MS,
-  REAL_CAM_TIMEOUT_MS,
   CAPTURE_FLAGS,
   createRunner,
   buildServer,
   createServerController,
   installCaptureStub,
-  installMicStub,
-  installCamStub,
   joinRoom,
+  waitForPrejoinCard,
+  waitForGuestPrejoinMediaReady,
+  setPrejoinDeviceOff,
+  waitPrejoinWaiting,
   installPcRegistry,
   waitForMeshSettled,
   waitForOverlayHidden,
@@ -130,16 +142,27 @@ const { step, skip, printSummary, bumpFailedForUnexpectedError, counts } = creat
 // limit itself.
 const server = createServerController(PORT, { JOIN_ROOM_IP_LIMIT: '100000' });
 
-// Common stubs for a participant's context: mic first (otherwise the
-// camera stub can't delegate audio requests to it, see the comment on
-// installCamStub in helpers.mjs), then camera, then screen (a separate API
-// — its order relative to the other two doesn't matter).
+// Screen-share capture only (see helpers.mjs: installCaptureStub) — real
+// getDisplayMedia can hang indefinitely on this macOS test machine (no TCC
+// screen-recording permission, can't be granted non-interactively), so we
+// fall back to a synthetic canvas source there.
+//
+// Camera/microphone no longer go through any JS-level stub at all (this
+// function used to also install installMicStub/installCamStub) — CAPTURE_FLAGS'
+// own --use-fake-device-for-media-stream (passed once, at chromium.launch()
+// below, so it already applies to every context/page spawned from this
+// browser) gives every getUserMedia call — single-kind AND the pre-join
+// card's COMBINED {audio:true,video:true} request the guest flow now always
+// makes (see static/room.js: acquireGuestPrejoinMedia) — a real (fake)
+// audio+video device with no JS wrapping needed. This matters specifically
+// because installMicStub/installCamStub do NOT cooperate with a combined
+// request: installCamStub's own getUserMedia wrapper sees constraints.video
+// and returns a video-only canvas stream, silently DROPPING the audio track
+// — which used to make every guest join hang forever waiting for a
+// microphone that would never arrive (see waitForGuestPrejoinMediaReady in
+// helpers.mjs, which waits for both camTrack and micTrack).
 async function installMediaStubs(context) {
-  const micArg = { tryReal: process.env.E2E_TRY_REAL_MIC === '1', timeoutMs: REAL_MIC_TIMEOUT_MS };
-  const camArg = { tryReal: process.env.E2E_TRY_REAL_CAM === '1', timeoutMs: REAL_CAM_TIMEOUT_MS };
   const captureArg = { tryReal: process.env.E2E_TRY_REAL_CAPTURE === '1', timeoutMs: REAL_CAPTURE_TIMEOUT_MS };
-  await context.addInitScript(installMicStub(), micArg);
-  await context.addInitScript(installCamStub(), camArg);
   await context.addInitScript(installCaptureStub(), captureArg);
 }
 
@@ -332,40 +355,20 @@ async function main() {
     const vasyaPage = await vasyaContext.newPage();
 
     let roomId = null;
-    // Room name (see static/index.html/landing.js: #room-name-input,
-    // static/namegen.js: NameGen.roomName()) — now seen by ALL participants
-    // who join via the invite link (it carries `&n=`, see buildShareLink in
-    // static/room.js), not just the creator (Vasya); used below and in the
-    // step about the "Share" popup/privacy.
+    // Room name — no longer asked for on the landing page at all (see
+    // static/index.html/landing.js): the creator now chooses it on the
+    // PRE-JOIN CARD, inside the room itself, once roomId already exists (see
+    // static/room.js: showPrejoinCard/onPrejoinSubmit, static/namegen.js:
+    // NameGen.roomName()). Seen by ALL participants who join via the invite
+    // link (it carries `&n=`, see buildShareLink in static/room.js), not
+    // just the creator (Vasya); used below and in the step about the
+    // "Share" popup/privacy.
     const ROOM_NAME = 'My room';
-    const roomCreatedOk = await step('Vasya: home page -> edits the prefilled room name -> creates the room -> enters name in the room join modal -> becomes leader (crown)', async () => {
+    const roomCreatedOk = await step('Vasya: home page -> creates the room -> pre-join card (edits the prefilled room name, mic/camera default OFF) -> enters name -> becomes leader (crown)', async () => {
       await vasyaPage.goto(server.baseUrl);
 
-      // The room name input is prefilled with a generated name (emoji + 2
-      // English words, see NameGen.roomName()) — before overwriting it with
-      // our own value, check that it's actually prefilled and that it fits
-      // within maxlength=40 (otherwise the browser would truncate the value
-      // on fill, and the later check against the header would diverge from
-      // what was actually entered).
-      const prefilledRoomName = await vasyaPage.inputValue('#room-name-input');
-      assert.ok(prefilledRoomName, 'the #room-name-input on the landing page should be prefilled with a generated name');
-      assert.ok(
-        prefilledRoomName.length > 0 && prefilledRoomName.length <= 40,
-        `the prefilled room name should be non-empty and no longer than 40 characters, got (${prefilledRoomName.length}): "${prefilledRoomName}"`
-      );
-
-      // The ↻ button next to the field (see static/index.html: .input-with-regen,
-      // static/landing.js: roomNameRegenButtonEl click) — rolls a new
-      // generated name without submitting the form.
-      await vasyaPage.click('#room-name-regen-button');
-      const regeneratedRoomName = await vasyaPage.inputValue('#room-name-input');
-      assert.ok(
-        regeneratedRoomName && regeneratedRoomName !== prefilledRoomName,
-        `clicking ↻ should generate a new room name, was "${prefilledRoomName}", became "${regeneratedRoomName}"`
-      );
-
-      await vasyaPage.fill('#room-name-input', ROOM_NAME);
-
+      // The landing page itself is now just the brand/promise/button — no
+      // room-name field, no participant-name field (see static/index.html).
       await vasyaPage.click('#create-room-button');
       await vasyaPage.waitForURL(/\/r\/[^/]+/, { timeout: 10_000 });
       // The landing page no longer asks for the participant's name
@@ -373,20 +376,93 @@ async function main() {
       // /r/<id>#lt=<token>. We don't match the fragment against "$": it may
       // already have been cleaned up by this point via history.replaceState
       // (see static/room.js), or it may not — the regex doesn't care either
-      // way.
+      // way. There is deliberately no `&n=` in this redirect at all (see
+      // static/landing.js) — the room has no name yet.
       const match = vasyaPage.url().match(/\/r\/([^/#]+)/);
       assert.ok(match, `couldn't extract roomId from URL: ${vasyaPage.url()}`);
       roomId = match[1];
-      await joinRoom(vasyaPage, 'Vasya');
+      const hashRightAfterCreate = await vasyaPage.evaluate(() => location.hash);
+      assert.ok(
+        !hashRightAfterCreate.includes('n='),
+        `the redirect from "Create room" should not carry &n= (no room name chosen yet), got: "${hashRightAfterCreate}"`
+      );
+
+      // --- Pre-join card: creator personality ---
+      await waitForPrejoinCard(vasyaPage);
+      assert.equal(
+        await vasyaPage.locator('#join-modal-button').textContent(),
+        'Start',
+        'the primary button should read "Start" for the room creator'
+      );
+      assert.equal(
+        await vasyaPage.locator('#prejoin-eyebrow').textContent(),
+        'Start the room',
+        'the eyebrow should read "Start the room" for the creator'
+      );
+      const creatorCardVisibility = await vasyaPage.evaluate(() => ({
+        editableHidden: document.getElementById('prejoin-room-name-editable')?.classList.contains('hidden'),
+        staticHidden: document.getElementById('prejoin-room-name-static')?.classList.contains('hidden'),
+      }));
+      assert.equal(creatorCardVisibility.editableHidden, false, 'the EDITABLE room-name field should be visible for the creator');
+      assert.equal(creatorCardVisibility.staticHidden, true, 'the STATIC room-name display should stay hidden for the creator');
+
+      // Device defaults (task item 3): the creator's mic/camera start OFF —
+      // showPrejoinCard never calls getUserMedia at all for the creator (see
+      // the "Device defaults" comment there) — both pre-join selects should
+      // show "Off", and the preview should be the avatar placeholder, not a
+      // live <video>. refreshDeviceLists() (which populates these selects)
+      // is async (enumerateDevices() is a Promise) — wait for the options to
+      // actually land before reading the checked one.
+      await vasyaPage.waitForFunction(
+        () => document.querySelectorAll('#prejoin-mic-select option').length > 0,
+        undefined,
+        { polling: 100, timeout: 3000 }
+      );
+      const creatorDeviceDefaults = await vasyaPage.evaluate(() => ({
+        micLabel: document.querySelector('#prejoin-mic-select option:checked')?.textContent,
+        camLabel: document.querySelector('#prejoin-cam-select option:checked')?.textContent,
+        previewVideoHidden: document.getElementById('prejoin-preview-video')?.classList.contains('hidden'),
+        previewPlaceholderHidden: document.getElementById('prejoin-preview-placeholder')?.classList.contains('hidden'),
+      }));
+      assert.equal(creatorDeviceDefaults.micLabel, 'Off', `the creator's microphone select should default to "Off", got: "${creatorDeviceDefaults.micLabel}"`);
+      assert.equal(creatorDeviceDefaults.camLabel, 'Off', `the creator's camera select should default to "Off", got: "${creatorDeviceDefaults.camLabel}"`);
+      assert.equal(creatorDeviceDefaults.previewVideoHidden, true, 'the creator\'s pre-join preview video should stay hidden (no camera acquired)');
+      assert.equal(creatorDeviceDefaults.previewPlaceholderHidden, false, 'the creator\'s pre-join preview should show the avatar placeholder');
+
+      // The room name input is prefilled with a generated name (emoji + 2
+      // English words, see NameGen.roomName()) — before overwriting it with
+      // our own value, check that it's actually prefilled and that it fits
+      // within maxlength=40 (otherwise the browser would truncate the value
+      // on fill, and the later check against the header would diverge from
+      // what was actually entered).
+      const prefilledRoomName = await vasyaPage.inputValue('#prejoin-room-name-input');
+      assert.ok(prefilledRoomName, 'the #prejoin-room-name-input should be prefilled with a generated name');
+      assert.ok(
+        prefilledRoomName.length > 0 && prefilledRoomName.length <= 40,
+        `the prefilled room name should be non-empty and no longer than 40 characters, got (${prefilledRoomName.length}): "${prefilledRoomName}"`
+      );
+
+      // The ↻ button next to the field (see static/room.html:
+      // #prejoin-room-name-regen, static/room.js: prejoinRoomNameRegenEl
+      // click) — rolls a new generated name without submitting the card.
+      await vasyaPage.click('#prejoin-room-name-regen');
+      const regeneratedRoomName = await vasyaPage.inputValue('#prejoin-room-name-input');
+      assert.ok(
+        regeneratedRoomName && regeneratedRoomName !== prefilledRoomName,
+        `clicking ↻ should generate a new room name, was "${prefilledRoomName}", became "${regeneratedRoomName}"`
+      );
+
+      await vasyaPage.fill('#prejoin-room-name-input', ROOM_NAME);
+
+      await joinRoom(vasyaPage, 'Vasya', { closeSharePopup: true });
       await waitForOverlayHidden(vasyaPage);
 
       // The creator's room name — in the tab title and in the header's
-      // .room-logo (see static/room.js: initialRoomName, rendered
-      // synchronously even before init()); by this point the fragment has
-      // been rebuilt to `#t=...&e=...&n=...` — only the one-time lt is
-      // cleaned out, t/e/n remain in the address bar (that's the whole
-      // point of v2 — see docs/research-p2p-key-handoff.md §6.5–6.6: the
-      // link must survive an F5).
+      // .room-logo (see static/room.js: renderRoomNameChrome); by this point
+      // the fragment has been rebuilt to `#t=...&e=...&n=...` — only the
+      // one-time lt is cleaned out, t/e/n remain in the address bar (that's
+      // the whole point of v2 — see docs/research-p2p-key-handoff.md
+      // §6.5–6.6: the link must survive an F5).
       const title = await vasyaPage.title();
       assert.ok(
         title.includes(ROOM_NAME),
@@ -476,7 +552,7 @@ async function main() {
       // (see static/landing.js/room.js): guestRoomUrl carries `&n=`
       // (modeled as a real invite link from buildShareLink) — the tab title
       // and .room-logo for the guests should show "My room", which Vasya
-      // entered on the landing page, exactly like for Vasya himself.
+      // entered on the pre-join card, exactly like for Vasya himself.
       for (const [label, page] of [['Petya', petyaPage], ['Olya', olyaPage]]) {
         const guestTitle = await page.title();
         assert.ok(
@@ -2539,34 +2615,43 @@ async function main() {
               `# [honestly skipped] Chromium did not compute the duration for the test WebM within the allotted time — the video duration check was skipped (the <video> element/src=blob/size/"Download" button were already verified above): ${err.message}`
             );
           }
-          // --- Join-modal name prefill (see static/room.js:
-          //     showJoinModal, static/namegen.js: NameGen.userName()) —
-          //     a new participant (Klava) joins the SAME room and clicks
-          //     "Join" WITHOUT touching the field at all: joinRoom() won't
-          //     work here — it unconditionally clears the field with an
-          //     empty string (see helpers.mjs), and we specifically need to
-          //     verify the prefill, so we click #join-modal-button directly.
-          //     While at it, we also check the ↻ button next to the field.
-          //     The tile label should carry the prefilled name WITHOUT the
-          //     leading emoji (it duplicates the circular avatar, see
-          //     static/room.js: tileDisplayName/stripLeadingAvatarEmoji),
-          //     and the avatar letter must not be "�" (see static/room.js:
-          //     createTile, grapheme-cluster fix). ---
+          // --- Pre-join name prefill (see static/room.js: showPrejoinCard,
+          //     static/namegen.js: NameGen.userName()) — a new participant
+          //     (Klava) joins the SAME room and clicks "Join" WITHOUT
+          //     touching the name field at all: joinRoom() won't work here —
+          //     it unconditionally clears the field with an empty string
+          //     (see helpers.mjs), and we specifically need to verify the
+          //     prefill, so we drive the pre-join card directly. While at
+          //     it, we also check the ↻ button next to the field. She's a
+          //     GUEST, so her camera/mic would otherwise start ON (the
+          //     combined getUserMedia, see static/room.js:
+          //     acquireGuestPrejoinMedia) — we explicitly turn both Off
+          //     before submitting (waiting for that one-shot acquisition to
+          //     land FIRST, see helpers.mjs: waitForGuestPrejoinMediaReady —
+          //     otherwise it would silently turn them back on right after),
+          //     so the tile label starts in its "no video" form: the
+          //     prefilled name WITHOUT the leading emoji (it duplicates the
+          //     circular avatar, see static/room.js: tileDisplayName/
+          //     stripLeadingAvatarEmoji), avatar letter not "�" (see
+          //     static/room.js: createTile, grapheme-cluster fix). Task item
+          //     6: turning her camera ON afterward (mid-call, via the
+          //     toolbar) should flip the pill back to the FULL name,
+          //     leading emoji included — the other half of the same rule. ---
           const klavaContext = await browser.newContext();
           try {
             await installPcRegistry(klavaContext);
             const klavaPage = await klavaContext.newPage();
             await klavaPage.goto(fileRoomUrl);
-            await klavaPage.waitForSelector('#join-modal:not(.hidden)', { timeout: 10_000 });
+            await waitForPrejoinCard(klavaPage);
             const prefilledUserName = await klavaPage.inputValue('#join-name-input');
-            assert.ok(prefilledUserName, 'the join modal should be prefilled with a generated name');
+            assert.ok(prefilledUserName, 'the pre-join card should be prefilled with a generated name');
             assert.match(
               prefilledUserName,
               /^\p{Extended_Pictographic}/u,
               `the prefilled name should start with an emoji, got: "${prefilledUserName}"`
             );
 
-            // The ↻ button next to the join-modal field (see static/room.html:
+            // The ↻ button next to the name field (see static/room.html:
             // .input-with-regen, static/room.js: joinNameRegenButtonEl click)
             // — rolls a new NameGen.userName(); we restore the field to its
             // previous value right after checking, so we don't lose
@@ -2580,6 +2665,9 @@ async function main() {
             );
             await klavaPage.fill('#join-name-input', prefilledUserName);
 
+            await waitForGuestPrejoinMediaReady(klavaPage);
+            await setPrejoinDeviceOff(klavaPage, '#prejoin-mic-select');
+            await setPrejoinDeviceOff(klavaPage, '#prejoin-cam-select');
             await klavaPage.click('#join-modal-button');
             await waitForOverlayHidden(klavaPage);
 
@@ -2609,6 +2697,17 @@ async function main() {
               avatarLetter,
               expectedLetter,
               `avatar letter should be the first grapheme cluster of the name ("${expectedLetter}"), got: "${avatarLetter}" (not "�")`
+            );
+
+            // --- Task item 6, the other half of the rule: with video ON,
+            //     the pill carries the FULL name, leading emoji included. ---
+            await klavaPage.click('#camera-button');
+            await assertVideoPlaying(klavaPage, { selector: '.tile--own video' });
+            const ownLabelWithVideo = await klavaPage.locator('.tile--own .tile-name').textContent();
+            assert.equal(
+              ownLabelWithVideo,
+              prefilledUserName,
+              `with video ON, the own tile label should include the leading emoji (the full name), expected "${prefilledUserName}", got "${ownLabelWithVideo}"`
             );
           } finally {
             await klavaContext.close();
@@ -2745,13 +2844,33 @@ async function main() {
 
           // A third participant via a direct link (lobby still off, before
           // step (b)) — "Room is full" (the same overflow pattern as in
-          // tests/e2e/resilience.spec.mjs about the server default).
+          // tests/e2e/resilience.spec.mjs about the server default). NOT
+          // joinRoom() here: with the room already at 2/2, the pre-join
+          // card's own GET /api/rooms/<id> check (see static/room.js:
+          // initGuestPrejoin/showPrejoinRoomFullOverlay) reports full and
+          // shows this SAME terminal overlay BEFORE the card is ever shown —
+          // joinRoom() would just hang waiting for a #join-modal that never appears.
           const extraContext = await browser.newContext();
           try {
             const extraPage = await extraContext.newPage();
             await extraPage.goto(permRoomUrl);
-            await joinRoom(extraPage, 'Extra');
             await waitOverlayTitle(extraPage, 'Room is full', 10_000);
+            // Task item 3: this pre-join "Room is full" wording deliberately
+            // carries no numbers (unlike the older, WS-level rejection text
+            // — see static/room.js: showPrejoinRoomFullOverlay vs.
+            // signaling.on('room-full')), and the pre-join card itself
+            // should never have been shown.
+            const extraOverlay = await extraPage.evaluate(() => ({
+              text: document.getElementById('overlay-text')?.textContent,
+              modalVisible: !document.getElementById('join-modal')?.classList.contains('hidden'),
+            }));
+            assert.equal(
+              extraOverlay.text,
+              'Try again in a minute.',
+              `the "Room is full" pre-join text should read "Try again in a minute.", got: "${extraOverlay.text}"`
+            );
+            assert.ok(!/\d/.test(extraOverlay.text), `the "Room is full" pre-join text should not contain any numbers, got: "${extraOverlay.text}"`);
+            assert.equal(extraOverlay.modalVisible, false, 'the pre-join card should never have been shown for a full room');
           } finally {
             await extraContext.close();
           }
@@ -2804,7 +2923,11 @@ async function main() {
           const tonyaPage = await tonyaContext.newPage();
           await tonyaPage.goto(permRoomUrl);
           await joinRoom(tonyaPage, 'Tonya');
-          await waitOverlayTitle(tonyaPage, 'Waiting for approval…');
+          // Task item 3: the lobby wait no longer shows the full-screen
+          // #overlay — the guest stays on the pre-join card itself, in its
+          // "waiting for approval" sub-state (see helpers.mjs:
+          // waitPrejoinWaiting/static/room.js: signaling.on('waiting')).
+          await waitPrejoinWaiting(tonyaPage);
 
           const tonyaRequestCard = lidaPage.locator('.join-request-card', { hasText: 'Tonya' });
           await tonyaRequestCard.waitFor({ state: 'visible', timeout: 8000 });
@@ -2827,7 +2950,7 @@ async function main() {
           try {
             await yuraPage.goto(permRoomUrl);
             await joinRoom(yuraPage, 'Yura');
-            await waitOverlayTitle(yuraPage, 'Waiting for approval…');
+            await waitPrejoinWaiting(yuraPage);
 
             const yuraRequestCard = lidaPage.locator('.join-request-card', { hasText: 'Yura' });
             await yuraRequestCard.waitFor({ state: 'visible', timeout: 8000 });
@@ -2955,6 +3078,246 @@ async function main() {
         } finally {
           await lidaContext.close();
           await goshaContext.close();
+        }
+      }
+    );
+
+    // === Pre-join redesign (task item 3): the new behavior end to end ===
+
+    await step(
+      'Pre-join redesign: creator starts muted with camera off (avatar placeholder), the room name they type propagates to the top bar/tab title/fragment (`n=`) and therefore the invite link, a guest who follows that link sees the name + a live "N people · started..." line and arrives with BOTH mic and camera already on (the creator actually receives their video — proving the pre-join stream was reused, not re-acquired), and the auto-opened Share popup fires exactly once, for the creator only',
+      async () => {
+        const res = await fetch(`${server.baseUrl}/api/rooms`, { method: 'POST' });
+        assert.ok(res.ok, `POST /api/rooms responded with status ${res.status}`);
+        const { roomId: prRoomId, leaderToken: prLeaderToken } = await res.json();
+        const prRoomToken = generateRoomToken();
+        const prCreatorUrl = leaderUrlWithKey(server.baseUrl, prRoomId, prLeaderToken, prRoomToken);
+        const PR_ROOM_NAME = 'Design Team Sync';
+
+        const creatorContext = await browser.newContext();
+        const guestContext = await browser.newContext();
+        try {
+          const creatorPage = await creatorContext.newPage();
+          const guestPage = await guestContext.newPage();
+
+          await creatorPage.goto(prCreatorUrl);
+          await waitForPrejoinCard(creatorPage);
+          await creatorPage.fill('#prejoin-room-name-input', PR_ROOM_NAME);
+          // closeSharePopup:false — we want to inspect the auto-opened
+          // popup ourselves (below) before deciding what to do with it.
+          await joinRoom(creatorPage, 'Creator', { closeSharePopup: false });
+
+          // --- The Share popup auto-opens ONCE, right here, for the creator ---
+          await creatorPage.waitForSelector('#share-popup:not(.hidden)', { timeout: 8000 });
+          const sharePopupRoomNameInfo = await creatorPage.evaluate(() => ({
+            hidden: document.getElementById('share-popup-room-name')?.classList.contains('hidden'),
+            text: document.getElementById('share-popup-room-name')?.textContent,
+          }));
+          assert.equal(sharePopupRoomNameInfo.hidden, false, 'the auto-opened Share popup should show the room name (not hidden)');
+          assert.equal(
+            sharePopupRoomNameInfo.text,
+            PR_ROOM_NAME,
+            `the auto-opened Share popup's room name should be "${PR_ROOM_NAME}", got: "${sharePopupRoomNameInfo.text}"`
+          );
+          const autoOpenedOnce = await creatorPage.evaluate(() => shareAutoOpenedForCreator === true);
+          assert.ok(autoOpenedOnce, 'shareAutoOpenedForCreator should be true after the auto-open (a single-shot latch)');
+
+          // The invite link, straight from the auto-opened popup — exactly
+          // what a real creator would copy/share.
+          const inviteLink = (await creatorPage.locator('#share-popup-link').textContent()).trim();
+          assert.ok(
+            inviteLink.includes(`n=${encodeURIComponent(PR_ROOM_NAME)}`),
+            `the invite link should carry the room name: ${inviteLink}`
+          );
+
+          await creatorPage.click('#share-popup-close');
+          await creatorPage.waitForFunction(
+            () => document.getElementById('share-popup')?.classList.contains('hidden'),
+            undefined,
+            { timeout: 3000 }
+          );
+          // "Never re-opens after being closed" — a brief negative check: it
+          // stays hidden with no further action from us.
+          await sleep(500);
+          const stillClosed = await creatorPage.evaluate(
+            () => document.getElementById('share-popup')?.classList.contains('hidden')
+          );
+          assert.equal(stillClosed, true, 'the Share popup should not re-open on its own after being closed');
+
+          await waitForOverlayHidden(creatorPage);
+
+          // --- The creator's own tile is the avatar placeholder (muted, camera off) ---
+          const creatorOwnTileState = await creatorPage.evaluate(() => ({
+            videoHidden: document.querySelector('.tile--own video')?.classList.contains('hidden'),
+            placeholderHidden: document.querySelector('.tile--own .tile-placeholder')?.classList.contains('hidden'),
+          }));
+          assert.equal(creatorOwnTileState.videoHidden, true, "the creator's own tile video should stay hidden (camera off)");
+          assert.equal(creatorOwnTileState.placeholderHidden, false, "the creator's own tile should show the avatar placeholder");
+
+          // --- The room name propagates to the top bar/tab title/fragment ---
+          const creatorChrome = await creatorPage.evaluate(() => ({
+            title: document.title,
+            roomLogo: document.querySelector('.room-logo')?.textContent,
+            hash: location.hash,
+          }));
+          assert.ok(
+            creatorChrome.title.includes(PR_ROOM_NAME),
+            `the creator's tab title should contain the room name: "${creatorChrome.title}"`
+          );
+          assert.equal(
+            creatorChrome.roomLogo,
+            PR_ROOM_NAME,
+            `.room-logo should show the room name, got: "${creatorChrome.roomLogo}"`
+          );
+          assert.ok(
+            creatorChrome.hash.includes(`n=${encodeURIComponent(PR_ROOM_NAME)}`),
+            `the fragment should carry n=, got: "${creatorChrome.hash}"`
+          );
+
+          // --- A guest follows the invite link: sees the room name + a live "N people · started ..." line ---
+          await guestPage.goto(inviteLink);
+          await waitForPrejoinCard(guestPage);
+          assert.equal(
+            await guestPage.locator('#join-modal-button').textContent(),
+            'Join',
+            'the primary button should read "Join" for a guest'
+          );
+          const guestStaticNameState = await guestPage.evaluate(() => ({
+            staticHidden: document.getElementById('prejoin-room-name-static')?.classList.contains('hidden'),
+            title: document.getElementById('prejoin-room-title')?.textContent,
+          }));
+          assert.equal(guestStaticNameState.staticHidden, false, 'the guest should see the STATIC room-name display');
+          assert.equal(
+            guestStaticNameState.title,
+            PR_ROOM_NAME,
+            `the guest's pre-join title should show "${PR_ROOM_NAME}", got: "${guestStaticNameState.title}"`
+          );
+
+          await guestPage.waitForFunction(
+            () => !document.getElementById('prejoin-room-meta')?.classList.contains('hidden'),
+            undefined,
+            { polling: 100, timeout: 6000 }
+          );
+          const metaText = await guestPage.locator('#prejoin-room-meta-text').textContent();
+          assert.match(
+            metaText,
+            /^1 person · started .+/,
+            `the guest's meta line should read "1 person · started ...", got: "${metaText}"`
+          );
+
+          // --- The guest arrives with BOTH mic and camera already on — leave them live ---
+          await joinRoom(guestPage, 'Guest', { micOff: false, camOff: false });
+
+          // A guest never gets the auto-opened Share popup.
+          const guestSharePopupHidden = await guestPage.evaluate(
+            () => document.getElementById('share-popup')?.classList.contains('hidden')
+          );
+          assert.equal(guestSharePopupHidden, true, 'the Share popup should never auto-open for a guest');
+
+          await waitForOverlayHidden(guestPage);
+
+          // The creator actually receives the guest's video — proof that the
+          // pre-join preview's stream was REUSED for the call, not
+          // re-acquired (a second getUserMedia here would simply mean the
+          // video takes much longer, or a fresh permission prompt, to arrive).
+          const guestTileSel = await tileSelector('Guest');
+          await assertVideoPlaying(creatorPage, { selector: `${guestTileSel} video` });
+          // And the guest's own tile, locally, is live too.
+          await assertVideoPlaying(guestPage, { selector: '.tile--own video' });
+        } finally {
+          await creatorContext.close();
+          await guestContext.close();
+        }
+      }
+    );
+
+    await step(
+      'Pre-join redesign: a guest waiting in the lobby keeps a LIVE preview (not torn down/re-acquired while waiting) and arrives with that same video still flowing once approved; a "Room not found" link never shows the pre-join card at all, going straight to the new terminal wording',
+      async () => {
+        // --- (a) lobby wait keeps the guest's live preview ---
+        const res = await fetch(`${server.baseUrl}/api/rooms`, { method: 'POST' });
+        assert.ok(res.ok, `POST /api/rooms responded with status ${res.status}`);
+        const { roomId: lobbyRoomId, leaderToken: lobbyLeaderToken } = await res.json();
+        const lobbyRoomToken = generateRoomToken();
+        const lobbyCreatorUrl = leaderUrlWithKey(server.baseUrl, lobbyRoomId, lobbyLeaderToken, lobbyRoomToken);
+        const lobbyGuestUrl = roomUrlWithKey(server.baseUrl, lobbyRoomId, lobbyRoomToken);
+
+        const leaderContext = await browser.newContext();
+        const waiterContext = await browser.newContext();
+        try {
+          const leaderPage = await leaderContext.newPage();
+          const waiterPage = await waiterContext.newPage();
+
+          await leaderPage.goto(lobbyCreatorUrl);
+          await joinRoom(leaderPage, 'Leader');
+          await waitForOverlayHidden(leaderPage);
+
+          await leaderPage.click('#settings-button');
+          await leaderPage.locator('#setting-lobby').check();
+          await waitUntil(
+            async () => await leaderPage.evaluate(() => roomSettings && roomSettings.lobbyEnabled === true),
+            { timeoutMs: 5000, message: 'lobbyEnabled did not apply for the leader after the toggle' }
+          );
+          await leaderPage.click('#settings-panel-close');
+
+          await waiterPage.goto(lobbyGuestUrl);
+          await waitForPrejoinCard(waiterPage);
+          // Leave BOTH live (micOff:false, camOff:false) — the guest's
+          // combined pre-join stream must keep flowing to the SAME preview
+          // element while waiting, per task item 3.
+          await joinRoom(waiterPage, 'Waiter', { micOff: false, camOff: false });
+          await waitPrejoinWaiting(waiterPage);
+
+          const waitingText = await waiterPage.locator('#prejoin-waiting-text').textContent();
+          assert.equal(
+            waitingText,
+            'You joined as “Waiter”.',
+            `the waiting text for a named guest should read You joined as "Waiter". (curly quotes), got: "${waitingText}"`
+          );
+
+          // The live preview keeps flowing WHILE waiting (not re-acquired, not torn down).
+          await assertVideoPlaying(waiterPage, { selector: '#prejoin-preview-video' });
+
+          const waiterRequestCard = leaderPage.locator('.join-request-card', { hasText: 'Waiter' });
+          await waiterRequestCard.waitFor({ state: 'visible', timeout: 8000 });
+          await waiterRequestCard.locator('.join-request-button--accept').click();
+
+          await waitForOverlayHidden(waiterPage);
+          // Once approved, the SAME stream keeps flowing straight into the
+          // call — the own tile's video, not a fresh acquisition.
+          await assertVideoPlaying(waiterPage, { selector: '.tile--own video' });
+        } finally {
+          await leaderContext.close();
+          await waiterContext.close();
+        }
+
+        // --- (b) "Room not found": a guest link to a room that never
+        //     existed never even shows the pre-join card (see
+        //     static/room.js: initGuestPrejoin/showPrejoinRoomGoneOverlay) ---
+        const goneRoomId = Array.from({ length: 8 }, () => 'abcdefghijklmnopqrstuvwxyz0123456789'[Math.floor(Math.random() * 36)]).join('');
+        const goneContext = await browser.newContext();
+        try {
+          const gonePage = await goneContext.newPage();
+          await gonePage.goto(roomUrlWithKey(server.baseUrl, goneRoomId, generateRoomToken()));
+          await waitOverlayTitle(gonePage, 'Room not found', 10_000);
+          const goneOverlay = await gonePage.evaluate(() => ({
+            text: document.getElementById('overlay-text')?.textContent,
+            actionLabel: document.getElementById('overlay-action-button')?.textContent,
+            modalVisible: !document.getElementById('join-modal')?.classList.contains('hidden'),
+          }));
+          assert.equal(
+            goneOverlay.text,
+            'This room has already ended.',
+            `the "Room not found" pre-join text should read "This room has already ended.", got: "${goneOverlay.text}"`
+          );
+          assert.equal(
+            goneOverlay.actionLabel,
+            'Create a new one',
+            `the action button should read "Create a new one", got: "${goneOverlay.actionLabel}"`
+          );
+          assert.equal(goneOverlay.modalVisible, false, 'the pre-join card should never have been shown for a room that does not exist');
+        } finally {
+          await goneContext.close();
         }
       }
     );
@@ -3541,6 +3904,17 @@ async function main() {
           () => !document.getElementById('join-modal')?.classList.contains('hidden')
         );
         assert.equal(modalVisible, false, 'the join modal should not be shown for an expired link');
+
+        // Task item 3 (pre-join redesign): the expired-link overlay's body
+        // text is now "Ask for a fresh link." (see static/room.js:
+        // showLinkExpiredOverlay) — distinct from the older, more generic
+        // wording this overlay used to carry.
+        const expiredOverlayText = await expiredPage.locator('#overlay-text').textContent();
+        assert.equal(
+          expiredOverlayText,
+          'Ask for a fresh link.',
+          `the expired-link overlay text should read "Ask for a fresh link.", got: "${expiredOverlayText}"`
+        );
       } finally {
         await expiredContext.close();
       }
@@ -3832,6 +4206,12 @@ async function main() {
           );
           const page = await context.newPage();
           await page.goto(server.baseUrl);
+          // The build-hash footer now lives INSIDE the "How it works"
+          // <details> disclosure (see static/index.html) — collapsed by
+          // default, which hides its content (including the footer, even
+          // once its own .hidden class is removed by loadBuildHash()) via
+          // the browser's native <details> mechanism. Open it first.
+          await page.click('.landing-more-summary');
           await page.waitForSelector('#landing-build-footer:not(.hidden)', { timeout: 5000 });
 
           const shortText = await page.locator('#landing-build-short').textContent();

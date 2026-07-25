@@ -5,8 +5,13 @@
 // it's empty + EMPTY_ROOM_TTL_SECONDS for an empty room). The same
 // self-contained style as basic.spec.mjs/the old resilience.spec.mjs: its own
 // mini runner, its own server (port 3333, state entirely in the process's
-// memory), a real Chrome via playwright-core, synthetic media stubs by
-// default (see helpers.mjs).
+// memory), a real Chrome via playwright-core. Screen-share capture uses a
+// synthetic stub by default (installCaptureOnly, see helpers.mjs:
+// installCaptureStub) — real getDisplayMedia can hang on this macOS test
+// machine (no TCC screen-recording permission). Mic/camera need no JS-level
+// stub at all anymore — CAPTURE_FLAGS' own --use-fake-device-for-media-stream
+// already covers every getUserMedia call, including the pre-join card's
+// combined audio+video request (see joinRoom in helpers.mjs).
 //
 // This file's server is started with EMPTY_ROOM_TTL_SECONDS=5 (not 3 — see
 // scenario (e): five seconds is enough to deterministically check both
@@ -38,16 +43,12 @@
 import { chromium } from 'playwright-core';
 import assert from 'node:assert/strict';
 import {
-  REAL_MIC_TIMEOUT_MS,
-  REAL_CAM_TIMEOUT_MS,
   REAL_CAPTURE_TIMEOUT_MS,
   CAPTURE_FLAGS,
   createRunner,
   buildServer,
   createServerController,
   installCaptureStub,
-  installMicStub,
-  installCamStub,
   joinRoom,
   installPcRegistry,
   waitForMeshSettled,
@@ -70,16 +71,7 @@ const EMPTY_ROOM_TTL_SECONDS = 5;
 const { step, skip, printSummary, bumpFailedForUnexpectedError, counts } = createRunner();
 const server = createServerController(PORT, { EMPTY_ROOM_TTL_SECONDS: String(EMPTY_ROOM_TTL_SECONDS) });
 
-const micStubArg = { tryReal: process.env.E2E_TRY_REAL_MIC === '1', timeoutMs: REAL_MIC_TIMEOUT_MS };
-const camStubArg = { tryReal: process.env.E2E_TRY_REAL_CAM === '1', timeoutMs: REAL_CAM_TIMEOUT_MS };
 const captureStubArg = { tryReal: process.env.E2E_TRY_REAL_CAPTURE === '1', timeoutMs: REAL_CAPTURE_TIMEOUT_MS };
-
-// Mic + camera (in this order — see the comment on installCamStub in
-// helpers.mjs about delegating requests without video).
-async function installMicAndCamStubs(context) {
-  await context.addInitScript(installMicStub(), micStubArg);
-  await context.addInitScript(installCamStub(), camStubArg);
-}
 
 async function installCaptureOnly(context) {
   await context.addInitScript(installCaptureStub(), captureStubArg);
@@ -232,7 +224,18 @@ async function main() {
     const petyaContext = await browser.newContext();
     const olyaContext = await browser.newContext();
     allContexts.push(vasyaContext, petyaContext, olyaContext);
-    await installMicAndCamStubs(vasyaContext);
+    // Vasya's mic/camera no longer need a JS-level stub at all (see the
+    // comment on installCaptureOnly above and helpers.mjs: CAPTURE_FLAGS'
+    // --use-fake-device-for-media-stream, passed once at chromium.launch()
+    // below, already covers every getUserMedia call on every context/page
+    // spawned from this browser) — Vasya joins via a plain guest link here
+    // (createRoomViaApiWithKey never issues a leaderToken), so his pre-join
+    // card ALSO fires the guest flow's combined getUserMedia (see
+    // static/room.js: acquireGuestPrejoinMedia) the instant it's shown;
+    // joinRoom() below defaults to waiting for that and then flipping both
+    // pre-join selects to "Off", reproducing the muted/videoless baseline
+    // scenario (a) needs (it turns the camera/mic on itself, via the
+    // toolbar, expecting them to start off).
     await installCaptureOnly(petyaContext); // Petya shares their screen in scenario (b)
     await installCaptureOnly(olyaContext); // Olya shares their screen in scenarios (b)/(c)
     await installPcRegistry(vasyaContext);
@@ -531,7 +534,11 @@ async function main() {
       const seventhContext = await browser.newContext();
       const seventhPage = await seventhContext.newPage();
       await seventhPage.goto(roomUrl);
-      await joinRoom(seventhPage);
+      // NOT joinRoom() here: the pre-join card's own GET /api/rooms/<id>
+      // check (see static/room.js: initGuestPrejoin/showPrejoinRoomFullOverlay)
+      // sees the room already at capacity and shows this terminal overlay
+      // BEFORE the card itself is ever shown — joinRoom() would just hang
+      // waiting for a #join-modal that never appears.
       await waitOverlayTitle(seventhPage, 'Room is full', 10_000);
       roomFullOk = true;
       await seventhContext.close(); // did not get into the room, not needed further
@@ -583,7 +590,10 @@ async function main() {
       const test2Page = await test2Context.newPage();
       await step('(f) joining the same room after the TTL has expired — "Room not found"', async () => {
         await test2Page.goto(roomUrl);
-        await joinRoom(test2Page);
+        // NOT joinRoom(): the pre-join card's GET /api/rooms/<id> check gets
+        // a 404 (the room was reaped) and shows this terminal overlay
+        // directly (see static/room.js: initGuestPrejoin/
+        // showPrejoinRoomGoneOverlay) — the card itself never appears.
         await waitOverlayTitle(test2Page, 'Room not found', 10_000);
       });
     } else {
@@ -679,7 +689,8 @@ async function main() {
         const petya2Context = await browser.newContext();
         const olya2Context = await browser.newContext();
         allContexts.push(vasya2Context, petya2Context, olya2Context);
-        await installMicAndCamStubs(vasya2Context);
+        // See the comment on Vasya's context in the setup above — no
+        // JS-level mic/camera stub needed anymore.
         await installCaptureOnly(petya2Context);
         await installPcRegistry(vasya2Context);
         await installPcRegistry(petya2Context);

@@ -536,30 +536,181 @@ export function installFakeVisualViewport(context) {
   });
 }
 
-// --- Join modal (anonymity — see static/room.js) ---
+// --- Pre-join card (anonymity — see static/room.js) ---
 //
-// There is no more localStorage at all: the name is entered in the "Join"
-// modal on EVERY entry into the room (the first join and any page.reload()
-// — a reconnect after a signaling drop WITHOUT reloading the page does not
-// show the modal again, see static/room.js). This function is the single
-// entry point for ALL test scenarios: wait for the modal, (optionally) enter
-// a name, click "Join". The room creator also goes through it — the landing
-// page no longer asks for a name, it only creates the room and redirects to
-// /r/<id>#lt=<token>.
+// There is no more localStorage at all: the name is entered on the pre-join
+// card on EVERY entry into the room (the first join and any page.reload() —
+// a reconnect after a signaling drop WITHOUT reloading the page does not
+// show the card again, see static/room.js). The room creator also goes
+// through it — the landing page no longer asks for a name OR a room name at
+// all, it only creates the room and redirects to /r/<id>#lt=<token>&t=...&e=...
+// (no `&n=`) — the room's name is now chosen HERE, on this same card, once
+// the roomId already exists (see static/room.js: showPrejoinCard/
+// onPrejoinSubmit).
 //
-// The #join-name-input field is now pre-filled with a generated name (see
-// static/room.js: showJoinModal, NameGen.userName()) — without an explicit
+// ONE card, two personalities (kept ids #join-modal/#join-name-input/
+// #join-name-regen-button/#join-modal-button are the same for both — the
+// e2e suite has always depended on them, this redesign kept them stable):
+//   - CREATOR (the URL carries the one-time `lt`, see static/room.js —
+//     `isCreator`): eyebrow "Start the room", button "Start", an EDITABLE
+//     #prejoin-room-name-input (prefilled with a generated name). Mic/camera
+//     start OFF — showPrejoinCard never calls getUserMedia for the creator
+//     at all (see the "Device defaults" comment there), so the creator's own
+//     tile shows the avatar placeholder until a toolbar click.
+//   - GUEST (no `lt`): eyebrow "Join the room", button "Join", a STATIC
+//     #prejoin-room-name-static (the name from the invite link's `n`, or the
+//     word "Room"). Mic AND camera start ON — the guest branch fires ONE
+//     combined getUserMedia({audio:true,video:true}) the instant the card is
+//     shown (see static/room.js: acquireGuestPrejoinMedia) — the exact
+//     OPPOSITE of the old "everyone starts muted" default. That single
+//     acquisition is fire-and-forget from the app's own perspective (nothing
+//     in showPrejoinCard awaits it) and, once it resolves, unconditionally
+//     turns both tracks on — see waitForGuestPrejoinMediaReady/
+//     setPrejoinDeviceOff below for why a test that wants a muted/videoless
+//     guest MUST wait for that resolution before touching the selects,
+//     rather than racing it.
+//
+// `opts`:
+//   - `roomName` — CREATOR ONLY: types this into #prejoin-room-name-input
+//     before submitting (leaving it untouched keeps the generated default —
+//     see static/room.js: NameGen.roomName()). Throws if passed for a guest
+//     card — that field doesn't exist for a guest (the room name arrives
+//     from the invite link's `n` instead, read-only).
+//   - `micOff`/`camOff` (default `true` for BOTH) — GUEST ONLY, no-op for
+//     the creator (whose mic/camera have nothing to wait for — see above).
+//     The overwhelming majority of existing scenarios were written for the
+//     OLD "fresh participant is muted, no video, must click the toolbar"
+//     baseline (no crown/no "speaking"/clicking a video-less tile is a
+//     no-op/etc.) — defaulting both to `true` reproduces exactly that
+//     baseline against the new combined-acquisition guest flow: we wait for
+//     the one-shot acquisition to land (waitForGuestPrejoinMediaReady) and
+//     then flip the corresponding select(s) to "Off" (setPrejoinDeviceOff).
+//     Pass `{ micOff: false }`/`{ camOff: false }` for a scenario that
+//     specifically wants to exercise the new "guest arrives with live media"
+//     behavior instead (see the dedicated coverage in basic.spec.mjs).
+//   - `closeSharePopup` (default `true`) — CREATOR ONLY, no-op for a guest
+//     (whose Share popup never auto-opens at all — see static/room.js:
+//     `isCreator &&` guard in signaling.on('joined')). Task item 2: the
+//     Share popup now auto-opens ONCE for the creator right after this very
+//     join — it's a modal (backdrop + aria-modal) that would otherwise
+//     swallow whatever click a scenario makes next, so by default we wait
+//     for it and close it here, transparently, for every one of this file's
+//     ~40 existing call sites. Pass `{ closeSharePopup: false }` for a
+//     scenario that wants to inspect the auto-opened popup itself before
+//     deciding what to do with it.
+//
+// The #join-name-input field is pre-filled with a generated name (see
+// static/room.js: showPrejoinCard, NameGen.userName()) — without an explicit
 // `name` the test wants to join anonymously, as before, rather than carry a
 // random generated name into the room. That's why the fill is
 // unconditional: `name ?? ''` overwrites the pre-fill with an empty string
 // when no name is passed, and types `name` when it is passed — this
 // preserves the previous deterministic semantics of joinRoom(page) across
-// all ~40 existing call sites (including the filler pages in
+// this file's many existing call sites (including the filler pages in
 // resilience.spec.mjs and the retry path in waitForMeshSettled below).
-export async function joinRoom(page, name) {
-  await page.waitForSelector('#join-modal:not(.hidden)', { timeout: 10_000 });
+export async function joinRoom(page, name, opts = {}) {
+  const { roomName, micOff = true, camOff = true, closeSharePopup = true } = opts;
+  await waitForPrejoinCard(page);
+
+  const isCreatorCard = await page.evaluate(
+    () => !document.getElementById('prejoin-room-name-editable')?.classList.contains('hidden')
+  );
+
+  if (isCreatorCard) {
+    if (roomName !== undefined) {
+      await page.fill('#prejoin-room-name-input', roomName);
+    }
+  } else {
+    if (roomName !== undefined) {
+      throw new Error('joinRoom: the `roomName` option only applies to a CREATOR card (the room name field is read-only for a guest)');
+    }
+    if (micOff || camOff) {
+      // MUST happen before flipping the selects — see the file-header
+      // comment on waitForGuestPrejoinMediaReady below: acquireGuestPrejoinMedia
+      // turns both tracks on unconditionally the moment its getUserMedia
+      // resolves, clobbering an "Off" set any earlier.
+      await waitForGuestPrejoinMediaReady(page);
+      if (micOff) await setPrejoinDeviceOff(page, '#prejoin-mic-select');
+      if (camOff) await setPrejoinDeviceOff(page, '#prejoin-cam-select');
+    }
+  }
+
   await page.fill('#join-name-input', name ?? '');
   await page.click('#join-modal-button');
+
+  if (isCreatorCard && closeSharePopup) {
+    await page.waitForSelector('#share-popup:not(.hidden)', { timeout: 8000 });
+    await page.click('#share-popup-close');
+    await page.waitForFunction(
+      () => document.getElementById('share-popup')?.classList.contains('hidden'),
+      undefined,
+      { timeout: 3000 }
+    );
+  }
+}
+
+/** Wait for the pre-join card (creator "Start the room" or guest "Join the room" — see static/room.js: showPrejoinCard) to become visible. Shared by joinRoom above and any scenario that wants to inspect the card BEFORE calling joinRoom (e.g. checking the dynamic button label or the mic/camera defaults). */
+export async function waitForPrejoinCard(page, timeoutMs = 10_000) {
+  await page.waitForSelector('#join-modal:not(.hidden)', { timeout: timeoutMs });
+}
+
+/**
+ * GUEST ONLY: wait until the pre-join card's one-shot combined
+ * getUserMedia({audio:true,video:true}) (see static/room.js:
+ * acquireGuestPrejoinMedia) has actually been applied — i.e. both camTrack
+ * and micTrack (top-level `let`s in room.js, a classic script — the same
+ * trick already used elsewhere in this file to read linkTokenBase64url/
+ * linkExpiry directly via page.evaluate) are non-null.
+ *
+ * MUST be awaited before calling setPrejoinDeviceOff on either select:
+ * acquireGuestPrejoinMedia calls applyMicStream/applyCameraStream (turning
+ * both tracks on) the moment its getUserMedia call resolves, REGARDLESS of
+ * anything a test did to the selects in the meantime — flipping a select to
+ * "Off" before this resolves would just get silently clobbered back to "on"
+ * a moment later. Both tracks become non-null in the same synchronous
+ * block (no `await` between extracting the audio/video tracks of the one
+ * combined MediaStream and applying each), so there is no further race
+ * between the two — waiting for either is equivalent to waiting for both,
+ * but we check both for clarity/robustness against that implementation
+ * detail changing.
+ *
+ * Not meaningful for the creator (whose mic/camera are never acquired on
+ * this screen at all — see showPrejoinCard's "Device defaults" comment) —
+ * calling this on a creator card would simply hang until timeoutMs.
+ */
+export async function waitForGuestPrejoinMediaReady(page, timeoutMs = 8000) {
+  await page.waitForFunction(
+    () => typeof camTrack !== 'undefined' && !!camTrack && typeof micTrack !== 'undefined' && !!micTrack,
+    undefined,
+    { polling: 100, timeout: timeoutMs }
+  );
+}
+
+/**
+ * Flip a pre-join device select (#prejoin-mic-select or #prejoin-cam-select)
+ * to "Off" — selecting by the visible option LABEL ("Off") rather than the
+ * internal sentinel value (see static/room.js: PREJOIN_DEVICE_OFF —
+ * `'__off__'`), so the test doesn't depend on that implementation detail.
+ * Playwright's selectOption dispatches a real 'change' event itself, the
+ * same one static/room.js's prejoinMicSelectEl/prejoinCamSelectEl 'change'
+ * listeners react to (stopPrejoinMic/stopPrejoinCamera).
+ */
+export async function setPrejoinDeviceOff(page, selector) {
+  await page.selectOption(selector, { label: 'Off' });
+}
+
+/**
+ * Lobby "waiting for approval" sub-state of the pre-join card (see
+ * static/room.js: signaling.on('waiting')/setPrejoinWaitingMode) — task item
+ * 3: this NO LONGER shows the full-screen #overlay (that's what the OLD
+ * waitOverlayTitle(page, 'Waiting for approval…') checked, and it now hangs
+ * forever). The guest stays on the SAME pre-join card, just with its
+ * interactive controls (mic/cam rows, name field, Start/Join button) swapped
+ * for the waiting block (#prejoin-waiting) — the header and the live
+ * preview underneath are untouched, see static/room.js for why.
+ */
+export async function waitPrejoinWaiting(page, timeoutMs = 10_000) {
+  await page.waitForSelector('#prejoin-waiting:not(.hidden)', { timeout: timeoutMs });
 }
 
 // --- S1 (E2E encryption): spy on ALL frames of the server WebSocket ---

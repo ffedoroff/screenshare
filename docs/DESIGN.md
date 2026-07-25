@@ -5,6 +5,7 @@
 - [1. Architecture Overview](#1-architecture-overview)
   - [1.1 Architectural Vision](#11-architectural-vision)
   - [1.2 Trust Split](#12-trust-split)
+  - [1.3 Entry Flow: Landing → Pre-Join → Room](#13-entry-flow-landing--pre-join--room)
 - [2. Principles & Constraints](#2-principles--constraints)
   - [2.1 Design Principles](#21-design-principles)
   - [2.2 Constraints](#22-constraints)
@@ -64,6 +65,94 @@ is optional: the same backend can also serve the static files itself for a
 single-origin, single-binary deployment — see
 [`self-hosting.md`](self-hosting.md).
 
+### 1.3 Entry Flow: Landing → Pre-Join → Room
+
+This is the narrative walkthrough of getting from "nothing" to "in a call";
+the linked documents below own the actual field-level/protocol detail, this
+section just ties them into one story.
+
+**Landing page.** No form fields, and in particular no room name: the page is
+brand, a two-sentence promise ("never through a server… end-to-end
+encrypted… nothing stored"), a single "Create room" button, and a collapsed
+"How it works" disclosure (P2P/E2E/no-storage, a link to the GitHub README).
+That disclosure now also carries the published build-hash line — see
+[`security.md` §10](security.md#10-published-build-hash--verifying-served-static)
+— which used to be its own footer at the bottom of the landing card; it moved
+inside the disclosure so the landing page itself stays down to one visible
+action. Clicking "Create room" calls `POST /api/rooms` and redirects straight
+into `/r/<roomId>#lt=<leaderToken>&t=<token>&e=<expiry>` — deliberately
+**no** `&n=` at this point. The room's name isn't decided yet; see below.
+
+**One pre-join screen** — replacing an earlier design where a separate,
+smaller modal asked only for the participant's display name — greets
+*everyone*, creator and guest alike, before they connect: an eyebrow ("Start
+the room" for the creator, "Join the room" for a guest), the room's identity,
+a live 16:9 self-preview, a microphone row, a camera row, a "Your name" field
+(pre-filled by the built-in name generator), and one primary button.
+
+- **The creator** gets an editable, generator-prefilled room-name field.
+  Submitting writes that name into the address bar as
+  `#t=...&e=...&n=...` via `history.replaceState` — the server still never
+  sees it (the fragment never leaves the browser, see
+  [`privacy.md` §4](privacy.md#4-anonymity)) — and from that moment on it
+  travels in the invite link exactly like `t`/`e` always did, surviving a
+  reload.
+- **A guest** instead sees the name carried in the link's `n` (or the plain
+  word "Room" for a link shared before the creator ever set one), plus a live
+  "N people · started X ago" line fed by
+  [`GET /api/rooms/{roomId}`](signaling-protocol.md#23-get-apiroomsroomid),
+  re-polled every 5 seconds while this screen stays open.
+- **Device defaults are asymmetric, by design.** The creator starts
+  microphone and camera **off** — no permission prompt at all on this screen.
+  A guest starts **both on**, acquired via one combined
+  `getUserMedia({audio, video})` call (a single permission prompt rather than
+  two); a kind that fails — denied, no device, or a browser that refuses
+  without a prior gesture — silently falls back to Off instead of blocking
+  entry. Device names in the two pickers only become real once permission is
+  granted (browsers hide labels before that); until then they show "Off" plus
+  one generic entry.
+- Whatever stream this screen ends up with is handed to the call **as-is** —
+  `getUserMedia` is never called a second time on submit. This is a
+  correctness property, not just an optimization: a second acquisition would
+  re-prompt, and on iOS can kill the stream already granted.
+- Terminal states — room not found (with a "Create a new one" action), room
+  full, and an expired link — surface on this same screen, before anyone has
+  typed a name, worded deliberately short (no participant counts, no
+  explanation of the lifetime limit).
+
+**Share popup.** A small "Share the room" label, the room's name with its
+emoji, a locally-rendered QR code, the link, the build-hash line, then the
+actions — a native `navigator.share` button where the browser implements it
+(primary action there, "Copy" secondary), or just "Copy" (primary) where it
+doesn't. It now **opens automatically, exactly once, for the room's
+creator**, right after they enter — triggered by the one-time `lt` leader
+token in the fragment, not by "the room currently has one participant," so a
+guest never sees it pop up on its own and a reload never re-triggers it.
+
+**Waiting room (lobby), on the frontend.** A guest awaiting the leader's
+approval is no longer sent to a full-screen overlay: they stay on the same
+pre-join card — the room header and their own **live** preview keep running
+— while the interactive controls (device pickers, name field, the
+Start/Join button) are replaced by a spinner, "Waiting for approval…", the
+name they joined as, and a Cancel button. Because the preview never stops,
+nothing is re-acquired once they're admitted. On the leader's side, each
+pending request renders as a card — round avatar, the guest's name, a "wants
+to join" line, Accept/Reject buttons (stacking on a narrow mobile panel). See
+[`permissions-and-leader.md` §6](permissions-and-leader.md#6-the-waiting-room-lobby)
+for the wire-level mechanics (`waiting`/`join-request`/`approve`/`reject`)
+this UI reflects.
+
+**Avatar/name rule**, applied identically by in-call tiles, the pre-join
+preview, and lobby request cards: the avatar circle always shows the first
+grapheme of the person's name — an emoji fills the circle (cropped to it,
+like a photo avatar); anything else renders as a capital letter. The name
+label next to/under it carries that same leading emoji **only when the
+circle is off screen** (video on) — with the circle visible (video off, or
+either of the states above) the label drops it, so the emoji is never shown
+twice. A name that doesn't start with an emoji is shown in full either way.
+The built-in name generator's suggestions always start with an emoji, by
+construction (see [`../static/namegen.js`](../static/namegen.js)).
+
 ## 2. Principles & Constraints
 
 ### 2.1 Design Principles
@@ -92,9 +181,10 @@ a single mutex; a server restart or a reaper sweep erases it completely. See
 
 The product MUST NOT use cookies, `localStorage`, or any other
 cross-session identifier. A display name is supplied fresh per join — the
-join modal pre-fills a locally generated suggestion, but nothing is
+pre-join screen's name field pre-fills a locally generated suggestion (and,
+for the room's creator, an equally generated room-name field), but nothing is
 persisted or remembered between visits — and lives only in the tab's memory.
-See [`privacy.md`](privacy.md).
+See [`privacy.md`](privacy.md) and [§1.3](#13-entry-flow-landing--pre-join--room).
 
 #### Encrypted Signaling, Not Just Encrypted Media
 
@@ -138,7 +228,7 @@ The backend exposes Prometheus metrics on a separate management port
 (`GET /metrics`, `MGMT_PORT`, default `8081` — deliberately **not** the main
 signaling port, so the scrape endpoint never shares a listener with
 user-facing traffic; see [`self-hosting.md` §6](self-hosting.md#6-environment-variables)
-and [`signaling-protocol.md` §2.8](signaling-protocol.md#28-get-metrics-management-port)).
+and [`signaling-protocol.md` §2.9](signaling-protocol.md#29-get-metrics-management-port)).
 The metrics are aggregate gauges/counters only — current room/participant/
 pending-lobby counts and a lifetime room-creation counter (see
 [`../src/metrics.rs`](../src/metrics.rs)) — never a room id, peer id, or any
@@ -177,6 +267,7 @@ recorder and appear on this same `/metrics`, never a second endpoint.
 | Topic | Document |
 |-------|----------|
 | Every HTTP endpoint and WebSocket message, field by field | [`signaling-protocol.md`](signaling-protocol.md) |
+| The entry flow: landing page, the pre-join screen, device defaults, the Share popup, waiting-room UX, the avatar/name rule | [§1.3](#13-entry-flow-landing--pre-join--room) |
 | Mesh topology, perfect negotiation, the data-channel bus, ICE/TURN | [`webrtc-mesh.md`](webrtc-mesh.md) |
 | Key derivation, what is encrypted vs. visible to the server, threat model | [`e2e-encryption.md`](e2e-encryption.md) |
 | Chat envelope format, ordering, reactions/replies/edit/delete, file transfer | [`chat.md`](chat.md) |
@@ -185,15 +276,15 @@ recorder and appear on this same `/metrics`, never a second endpoint.
 | Human-checkable MITM protection: the commit-before-reveal SAS (emoji) protocol | [`sas-verification.md`](sas-verification.md) |
 | Running your own instance: single-binary vs. split deployment, reverse proxy/TLS, TURN, environment variables | [`self-hosting.md`](self-hosting.md) |
 | What the server can and cannot see, retention/TTL behavior | [`privacy.md`](privacy.md) |
-| Prometheus metrics, management port, Grafana dashboard | [`self-hosting.md` §7.4](self-hosting.md#74-metrics--dashboard), [`signaling-protocol.md` §2.8](signaling-protocol.md#28-get-metrics-management-port) |
+| Prometheus metrics, management port, Grafana dashboard | [`self-hosting.md` §7.4](self-hosting.md#74-metrics--dashboard), [`signaling-protocol.md` §2.9](signaling-protocol.md#29-get-metrics-management-port) |
 
 ## 6. Traceability
 
 | PRD Requirement | Implemented In | Tech Doc |
 |------------------|-----------------|----------|
 | `cpt-chat-fr-create-meeting` | `POST /api/rooms` | [`signaling-protocol.md`](signaling-protocol.md) |
-| `cpt-chat-fr-share-link` | Client-generated auth token + expiry in the URL fragment; QR rendered locally | [`e2e-encryption.md`](e2e-encryption.md) |
-| `cpt-chat-fr-join-meeting` | `join-room` WebSocket message, room size cap | [`signaling-protocol.md`](signaling-protocol.md) |
+| `cpt-chat-fr-share-link` | Client-generated auth token + expiry in the URL fragment; QR rendered locally; Share popup auto-opened once for the creator via the one-time leader token | [`e2e-encryption.md`](e2e-encryption.md), [§1.3](#13-entry-flow-landing--pre-join--room) |
+| `cpt-chat-fr-join-meeting` | Pre-join screen (device preview, `GET /api/rooms/{id}` occupancy preview) + `join-room` WebSocket message, room size cap | [§1.3](#13-entry-flow-landing--pre-join--room), [`signaling-protocol.md`](signaling-protocol.md) |
 | `cpt-chat-fr-av-mute` | Local track enable/disable, no renegotiation | [`webrtc-mesh.md`](webrtc-mesh.md) |
 | `cpt-chat-fr-screen-share` | `share-start`/`share-stop`/`share-started`/`share-rejected`, server-held single-owner lock, last-wins preemption on conflict | [`signaling-protocol.md`](signaling-protocol.md), [`permissions-and-leader.md`](permissions-and-leader.md) |
 | `cpt-chat-fr-chat` | Mesh `RTCDataChannel` chat bus, message envelope, lamport ordering | [`chat.md`](chat.md) |

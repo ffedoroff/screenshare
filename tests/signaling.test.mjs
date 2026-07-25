@@ -217,6 +217,27 @@ async function restoreRoom(roomId, ip = undefined, roomsUrl = ROOMS_URL) {
   return { status: res.status, roomId: json && json.roomId, lifetimeSeconds: json && json.lifetimeSeconds };
 }
 
+// GET /api/rooms/<roomId> — unauthenticated pre-join preview (see
+// src/main.rs::room_status). `ip` (optional, like restoreRoom()) — its own
+// rate-limit budget (ROOM_STATUS_IP_LIMIT), separate from room creation, so
+// tests that hammer this endpoint don't need to touch ROOM_CREATION_IP_LIMIT
+// at all. Returns the raw Response too, so callers can inspect headers
+// (see section 34's headers check, mirroring section 24).
+async function roomStatus(roomId, ip = undefined, roomsUrl = ROOMS_URL) {
+  const opts = { headers: {} };
+  if (ip !== undefined) opts.headers['CF-Connecting-IP'] = ip;
+  const res = await fetch(`${roomsUrl}/${encodeURIComponent(roomId)}`, opts);
+  let json = null;
+  try { json = await res.json(); } catch { /* not JSON — status is checked below */ }
+  return {
+    status: res.status,
+    participants: json && json.participants,
+    capacity: json && json.capacity,
+    ageSeconds: json && json.ageSeconds,
+    headers: res.headers,
+  };
+}
+
 // E2E v2: stub ephemeral public key (`epub`) for the test — the server
 // doesn't parse it at all (opaque, like sdp/candidate), so real
 // ECDH math isn't needed here, only the fact of transparent delivery
@@ -1547,6 +1568,63 @@ async function runTests() {
       `chat_rooms_created_total is noticeably greater than zero by this point in the run (${gaugeValue(after, 'chat_rooms_created_total')})`);
 
     metricsPeer.ws.close();
+  }
+
+  // --- 34. GET /api/rooms/{room_id}: unauthenticated pre-join preview ---
+  console.log('34. GET /api/rooms/{roomId} — pre-join preview (participants/capacity/ageSeconds)');
+  {
+    // 404 for a room id that was never created.
+    const missing = await roomStatus('nope5678');
+    ok(missing.status === 404, `GET of a non-existent room -> 404 (status=${missing.status})`);
+
+    // Freshly created, nobody has joined yet: participants=0, capacity is
+    // the configured max (default 6, DEFAULT_MAX_PARTICIPANTS — this test
+    // server has no MAX_PARTICIPANTS override), ageSeconds small.
+    const { roomId: statusRoomId, leaderToken: statusLeaderToken } = await createRoom();
+    const fresh = await roomStatus(statusRoomId);
+    ok(fresh.status === 200, `GET of a freshly created room -> 200 (status=${fresh.status})`);
+    ok(fresh.participants === 0, `participants === 0 before anyone joins (got ${fresh.participants})`);
+    ok(fresh.capacity === 6, `capacity === 6 (DEFAULT_MAX_PARTICIPANTS, no env override) (got ${fresh.capacity})`);
+    ok(typeof fresh.ageSeconds === 'number' && fresh.ageSeconds >= 0 && fresh.ageSeconds < 3,
+      `ageSeconds is small right after creation (got ${fresh.ageSeconds})`);
+
+    // ageSeconds grows with wall-clock time even though nobody has joined —
+    // it's measured from Room::created_at (see src/state.rs::Room::age_seconds),
+    // deliberately NOT from first_joined_at (which would stay 0 with no
+    // participants at all — see the doc comment on age_seconds for why this
+    // preview needs a different basis than the in-room roomAgeSeconds timer).
+    await sleep(1200);
+    const later = await roomStatus(statusRoomId);
+    ok(later.ageSeconds >= 1 && later.ageSeconds >= fresh.ageSeconds,
+      `ageSeconds advanced after waiting ~1.2s (before=${fresh.ageSeconds}, after=${later.ageSeconds})`);
+
+    // A real participant joins over /ws -> participants becomes 1.
+    const { peer: statusLeader } = await join(statusRoomId, 'Leader', URL, undefined, statusLeaderToken);
+    const withOneJoined = await roomStatus(statusRoomId);
+    ok(withOneJoined.participants === 1, `participants === 1 after a real WS participant joins (got ${withOneJoined.participants})`);
+
+    // A peer waiting in the lobby (lobbyEnabled=true) is NOT a room
+    // participant (see Room::pending vs Room::participants) and must NOT be
+    // counted here.
+    updateSettings(statusLeader, defaultSettings({ lobbyEnabled: true }));
+    await statusLeader.next(); // settings-changed
+    const statusGuest = await connect();
+    statusGuest.send({ type: 'join-room', roomId: statusRoomId, name: 'Waiting' });
+    const waitMsg = await statusGuest.next();
+    ok(waitMsg.type === 'waiting', 'guest enters the lobby (waiting), not the room, while lobbyEnabled=true');
+    const withPending = await roomStatus(statusRoomId);
+    ok(withPending.participants === 1,
+      `a peer waiting in the lobby does NOT increase participants (still got ${withPending.participants})`);
+
+    statusGuest.ws.close();
+    statusLeader.ws.close();
+
+    // Security headers (M2) — same assertions as section 24's /config check,
+    // applied to this endpoint (route_layer(cors) covers it the same way).
+    ok(fresh.headers.get('x-content-type-options') === 'nosniff',
+      'X-Content-Type-Options: nosniff on GET /api/rooms/{roomId}');
+    ok(fresh.headers.get('referrer-policy') === 'no-referrer',
+      'Referrer-Policy: no-referrer on GET /api/rooms/{roomId}');
   }
 }
 

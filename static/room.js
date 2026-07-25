@@ -38,19 +38,30 @@
 // and static/crypto.js. `t`/`e` are parsed RIGHT HERE — before the page has
 // had a chance to show anything, and before any contact with signaling.
 //
-// `n` — the room name that the CREATOR entered on the landing page (see
-// static/landing.js, static/namegen.js). It used to live only in the
-// one-time #lt fragment and would disappear for the creator after the first
-// F5, while guests never saw it at all. Now `n` is PART of the invite link
-// (buildShareLink puts it there) and stays in the address bar
-// (`#t=...&e=...&n=...`) for EVERYONE who joined via the link — all
-// participants see the room name, and it survives F5. The key invariant is
+// `n` — the room name. Unlike `t`/`e` this one is NOT chosen once and
+// frozen at creation time: it's chosen by the CREATOR on the pre-join
+// screen INSIDE the room itself (see showPrejoinCard/onPrejoinSubmit,
+// static/namegen.js) — landing.js no longer asks for it at all, and on the
+// very first load the creator's own fragment never carries an `n` (there's
+// nothing to parse yet). Once the creator submits the pre-join card we set
+// `currentRoomName` ourselves and push `#t=...&e=...&n=...` via
+// history.replaceState (see writeRoomNameToFragment) — from that moment on
+// it behaves exactly like it always did for a GUEST: PART of the invite
+// link (buildShareLink puts it there) and stays in the address bar for
+// everyone who joins via that link, surviving F5. The key invariant is
 // unchanged: the server never sees the fragment (it never travels over the
 // network), so the room name remains unknown to the server too. Malformed
 // percent-encoding (e.g. from manually editing the URL) must not crash the
 // page — decodeURIComponent is wrapped in try/catch, and on error the name
 // is simply absent (null).
-const { initialLeaderToken, linkTokenBase64url, linkExpiry, initialRoomName } = (() => {
+//
+// `currentRoomName` is deliberately a mutable `let`, assigned from inside
+// the IIFE below (closure) rather than being one of the IIFE's returned,
+// `const`-bound fields like the other three — it's the one piece of this
+// bundle that legitimately changes later in the tab's life (see
+// writeRoomNameToFragment).
+let currentRoomName;
+const { initialLeaderToken, linkTokenBase64url, linkExpiry } = (() => {
   const hash = location.hash;
   const ltMatch = hash.match(/(?:^|[&#])lt=([^&]+)/);
   const tMatch = hash.match(/(?:^|[&#])t=([^&]+)/);
@@ -83,25 +94,59 @@ const { initialLeaderToken, linkTokenBase64url, linkExpiry, initialRoomName } = 
     if (n) parts.push(`n=${encodeURIComponent(n)}`);
     history.replaceState(null, '', location.pathname + location.search + (parts.length ? `#${parts.join('&')}` : ''));
   }
-  return { initialLeaderToken: lt, linkTokenBase64url: t, linkExpiry: e, initialRoomName: n };
+  currentRoomName = n;
+  return { initialLeaderToken: lt, linkTokenBase64url: t, linkExpiry: e };
 })();
 
 // --- Local render of the room name (visible to ALL participants who joined
-// via an invite link with `n` — see comment above) — done IMMEDIATELY,
-// before init(), so the tab title and header don't flash the default text.
-// If the link had no `n` (e.g. a link without a room name), .room-logo/title
-// stay at their defaults.
-if (initialRoomName) {
-  document.title = `${initialRoomName} — video call`;
+// via an invite link with `n`, and to the creator right after they submit
+// the pre-join card — see comment above) — the initial call below happens
+// IMMEDIATELY, before init(), so the tab title and header don't flash the
+// default text; onPrejoinSubmit calls it again once the creator has chosen
+// a name. If there's no name yet (a fresh creator load, or a link with no
+// `n`), .room-logo/title just stay at their defaults.
+function renderRoomNameChrome() {
+  if (!currentRoomName) return;
+  document.title = `${currentRoomName} — video call`;
   const roomLogoEl = document.querySelector('.room-logo');
-  if (roomLogoEl) roomLogoEl.textContent = initialRoomName;
+  if (roomLogoEl) roomLogoEl.textContent = currentRoomName;
 }
+renderRoomNameChrome();
 
 // --- DOM ---
 const joinModalEl = document.getElementById('join-modal');
 const joinNameInputEl = document.getElementById('join-name-input');
 const joinNameRegenButtonEl = document.getElementById('join-name-regen-button');
 const joinModalButtonEl = document.getElementById('join-modal-button');
+
+// --- DOM: pre-join card (see the "Pre-join card" section far below —
+// showPrejoinCard/onPrejoinSubmit) — one card, shared markup for both the
+// creator ("Start the room") and a guest ("Join the room"), see
+// static/room.html for the full structure. ---
+const prejoinEyebrowEl = document.getElementById('prejoin-eyebrow');
+const prejoinRoomNameEditableEl = document.getElementById('prejoin-room-name-editable');
+const prejoinRoomNameInputEl = document.getElementById('prejoin-room-name-input');
+const prejoinRoomNameRegenEl = document.getElementById('prejoin-room-name-regen');
+const prejoinRoomNameStaticEl = document.getElementById('prejoin-room-name-static');
+const prejoinRoomTitleEl = document.getElementById('prejoin-room-title');
+const prejoinRoomMetaEl = document.getElementById('prejoin-room-meta');
+const prejoinRoomMetaTextEl = document.getElementById('prejoin-room-meta-text');
+const prejoinPreviewVideoEl = document.getElementById('prejoin-preview-video');
+const prejoinPreviewPlaceholderEl = document.getElementById('prejoin-preview-placeholder');
+const prejoinAvatarEl = document.getElementById('prejoin-avatar');
+const prejoinAvatarLetterEl = document.getElementById('prejoin-avatar-letter');
+const prejoinPreviewPillTextEl = document.getElementById('prejoin-preview-pill-text');
+const prejoinMicRowEl = document.getElementById('prejoin-mic-row');
+const prejoinMicSelectEl = document.getElementById('prejoin-mic-select');
+const prejoinCamRowEl = document.getElementById('prejoin-cam-row');
+const prejoinCamSelectEl = document.getElementById('prejoin-cam-select');
+const prejoinNameFieldEl = document.getElementById('prejoin-name-field');
+// --- DOM: pre-join card, lobby "waiting for approval" sub-state (see
+// setPrejoinWaitingMode/signaling.on('waiting') in the "Pre-join card"
+// section far below) ---
+const prejoinWaitingEl = document.getElementById('prejoin-waiting');
+const prejoinWaitingTextEl = document.getElementById('prejoin-waiting-text');
+const prejoinWaitingCancelEl = document.getElementById('prejoin-waiting-cancel');
 const toastEl = document.getElementById('toast');
 const overlayEl = document.getElementById('overlay');
 const overlaySpinnerEl = document.getElementById('overlay-spinner');
@@ -138,7 +183,9 @@ const sharePopupLinkEl = document.getElementById('share-popup-link');
 const sharePopupBuildEl = document.getElementById('share-popup-build');
 const sharePopupBuildShortEl = document.getElementById('share-popup-build-short');
 const sharePopupBuildFullEl = document.getElementById('share-popup-build-full');
+const sharePopupRoomNameEl = document.getElementById('share-popup-room-name');
 const sharePopupCopyButtonEl = document.getElementById('share-popup-copy-button');
+const sharePopupShareButtonEl = document.getElementById('share-popup-share-button');
 const reconnectBannerEl = document.getElementById('reconnect-banner');
 const versionBannerEl = document.getElementById('version-banner');
 const versionBannerReloadButtonEl = document.getElementById('version-banner-reload-button');
@@ -203,6 +250,27 @@ const screenShareSupported = !!(
 );
 if (!screenShareSupported) {
   screenButton.classList.add('hidden');
+}
+
+// Web Share API (see openSharePopup/the "Share" click handler far below) —
+// present on most mobile browsers and Safari, absent on most desktop
+// Chromium/Firefox as of this writing. Same reasoning as screenShareSupported
+// above: feature-detected ONCE at startup (the capability can't change
+// during a page's lifetime) and gated on the button's very EXISTENCE in the
+// DOM (hidden via a class), not just left enabled-but-broken — there's
+// nothing to explain to the user about a button that isn't there. Where it
+// exists, Share is the PRIMARY (accent) action in the popup and Copy
+// becomes secondary next to it — a native share sheet (Messages/WhatsApp/
+// AirDrop/...) is usually the fastest way to actually reach someone; where
+// it doesn't, Copy alone remains the (full-width) primary action. See
+// static/style.css: .share-popup-action-button(--primary|--secondary).
+const shareApiSupported = typeof navigator.share === 'function';
+if (shareApiSupported) {
+  sharePopupShareButtonEl.classList.remove('hidden');
+  sharePopupShareButtonEl.classList.add('share-popup-action-button--primary');
+  sharePopupCopyButtonEl.classList.add('share-popup-action-button--secondary');
+} else {
+  sharePopupCopyButtonEl.classList.add('share-popup-action-button--primary');
 }
 
 // --- E2E v2: cryptographic identity of the tab (see static/crypto.js) ---
@@ -618,13 +686,14 @@ async function initCryptoIdentity() {
 /** "Incomplete link" overlay — entering without valid `t`/`e` OR the first failed decryption of incoming data (see handleCryptoFailureOnce) are treated the same way: with this token (or without one), nothing in the room will work anyway. */
 function showInvalidLinkOverlay() {
   terminalState = true;
-  // join-modal is visible BY DEFAULT (in room.html markup it has no
-  // .hidden class — only JS hides/shows it, see showJoinModal/hideJoinModal
-  // below) and its z-index is HIGHER than #overlay's (see static/style.css)
-  // — if it isn't explicitly hidden here, it would stay on top of this
-  // overlay (and technically clickable) in the "token is invalid even
-  // before entry" scenario, when showJoinModal() never had a chance to run.
-  hideJoinModal();
+  // #join-modal (the pre-join card) is visible BY DEFAULT (in room.html
+  // markup it has no .hidden class — only JS hides/shows it, see
+  // showPrejoinCard/hidePrejoinCard below) and its z-index is HIGHER than
+  // #overlay's (see static/style.css) — if it isn't explicitly hidden
+  // here, it would stay on top of this overlay (and technically clickable)
+  // in the "token is invalid even before entry" scenario, when
+  // showPrejoinCard() never had a chance to run.
+  hidePrejoinCard();
   showOverlay({
     title: 'Link is invalid',
     text: 'Ask a room participant for a new link.',
@@ -635,10 +704,10 @@ function showInvalidLinkOverlay() {
 /** Terminal "link expired" overlay — `e` from the fragment is in the past (with the LINK_EXPIRY_GRACE_SECONDS margin), see initCryptoIdentity. Kept separate from showInvalidLinkOverlay: the message is more honest ("this link WAS working, but has expired", rather than "the link is broken"). */
 function showLinkExpiredOverlay() {
   terminalState = true;
-  hideJoinModal();
+  hidePrejoinCard();
   showOverlay({
     title: 'Link expired',
-    text: 'Ask a participant for a fresh link.',
+    text: 'Ask for a fresh link.',
     actionLabel: 'Go home',
   });
 }
@@ -946,6 +1015,22 @@ function hueFromPeerId(peerId) {
 }
 
 /**
+ * The avatar circle's gradient CSS, derived from a peerId (see
+ * hueFromPeerId above) — factored out of createTile so the pre-join
+ * preview (see showPrejoinCard in the "Pre-join card" section) can paint
+ * the EXACT same gradient for our own avatar before we've even joined:
+ * myPeerId is generated in initCryptoIdentity, before the pre-join card is
+ * shown, and (per the comment on signaling.on('joined')) is "almost
+ * always" the very peerId createTile later receives — so the preview and
+ * the real own tile end up visually identical without coordinating on
+ * anything beyond sharing this one function.
+ */
+function avatarGradientCss(peerId) {
+  const hue = hueFromPeerId(peerId);
+  return `linear-gradient(135deg, hsl(${hue}, 70%, 45%), hsl(${(hue + 45) % 360}, 70%, 32%))`;
+}
+
+/**
  * First grapheme cluster of a string — the avatar letter takes the cluster
  * specifically, not charAt(0)/[0]: for a name starting with an emoji (see
  * static/namegen.js: userName()), charAt(0) would return half of a
@@ -997,9 +1082,23 @@ function isEmojiGrapheme(grapheme) {
   return !!grapheme && /\p{Extended_Pictographic}/u.test(grapheme);
 }
 
-/** Name to display under the avatar/in the tile corner — just the name, without the "Guest" placeholder if there already is one. */
-function tileDisplayName(trimmedName, grapheme) {
-  return trimmedName ? stripLeadingAvatarEmoji(trimmedName, grapheme) : 'Guest';
+/**
+ * Name to display in the tile's name pill (the SAME pill element visible
+ * both during video and over the avatar placeholder, see createTile) — the
+ * avatar/name rule: while `videoVisible` is true the avatar circle (which
+ * carries the name's first grapheme as its big glyph, see createTile/
+ * updatePeerTileName) is off screen, so the pill shows the FULL name,
+ * leading emoji included; while it's false the circle IS on screen, so the
+ * pill strips that same leading emoji (via stripLeadingAvatarEmoji) to avoid
+ * showing it twice. Falls back to the "Guest" placeholder for an empty name
+ * regardless of videoVisible. Recomputed whenever either input changes —
+ * see setTileVideoVisible (video visibility flips), updatePeerTileName/
+ * updateOwnTileLabel (the name itself changes), and, on the pre-join card,
+ * updatePrejoinNamePill (camera toggles) — this function itself is stateless.
+ */
+function tileDisplayName(trimmedName, grapheme, videoVisible) {
+  if (!trimmedName) return 'Guest';
+  return videoVisible ? trimmedName : stripLeadingAvatarEmoji(trimmedName, grapheme);
 }
 
 // ---------- Tile grid layout: aspect-ratio-aware packing ("justified rows") ----------
@@ -1869,8 +1968,7 @@ function createTile(peerId, name, isOwn) {
 
   const avatar = document.createElement('div');
   avatar.className = 'tile-placeholder-avatar';
-  const hue = hueFromPeerId(peerId);
-  avatar.style.background = `linear-gradient(135deg, hsl(${hue}, 70%, 45%), hsl(${(hue + 45) % 360}, 70%, 32%))`;
+  avatar.style.background = avatarGradientCss(peerId);
 
   // Leader crown ABOVE the avatar circle (see spec item 4) — absolutely
   // positioned relative to the circle itself (avatar: position: relative,
@@ -1946,12 +2044,13 @@ function createTile(peerId, name, isOwn) {
 
   // Just the name, BIGGER (see spec item 5) — without a "You (...)" wrapper
   // and without a "leader" role word (leadership is already visible via the
-  // crown); our own name isn't distinguished from others' by text. A
-  // leading emoji that duplicates the avatar circle is stripped (see
-  // tileDisplayName/stripLeadingAvatarEmoji above).
-  const labelValue = tileDisplayName(trimmedName, firstGrapheme);
-  labelText.textContent = labelValue;
-  placeholderName.textContent = labelValue;
+  // crown); our own name isn't distinguished from others' by text. No video
+  // at creation time (see video.className above), so the pill starts in its
+  // "avatar circle visible" form — leading emoji stripped, see
+  // tileDisplayName — corrected a moment later by the first
+  // setTileVideoVisible call once the real enabled/track state is known.
+  labelText.textContent = tileDisplayName(trimmedName, firstGrapheme, false);
+  placeholderName.textContent = tileDisplayName(trimmedName, firstGrapheme, false);
 
   // "Mic off/absent" indicator (see static/style.css: .tile-mic-off) —
   // visible BY DEFAULT (not .hidden): before the first enable/stream-info,
@@ -2048,7 +2147,11 @@ function createTile(peerId, name, isOwn) {
  * a separate message from epub/peerId). Updates the corner caption, the
  * caption under the placeholder avatar, and the avatar's first letter —
  * i.e. all three places where createTile initially sets
- * `labelValue`/the first grapheme.
+ * `labelValue`/the first grapheme. The pill's videoVisible form is taken
+ * from the tile's CURRENT state (video.classList) rather than assumed — the
+ * name can change (a late name-announce) while video is already on, and the
+ * pill must reflect whichever form is on screen right now (see
+ * tileDisplayName/task item 4).
  */
 function updatePeerTileName(peerId, name) {
   const entry = peers.get(peerId);
@@ -2057,10 +2160,10 @@ function updatePeerTileName(peerId, name) {
   const tile = entry.tile;
   const trimmedName = (name || '').trim();
   const firstGrapheme = firstGraphemeOf(trimmedName);
-  const labelValue = tileDisplayName(trimmedName, firstGrapheme);
+  const videoVisible = !tile.videoEl.classList.contains('hidden');
   tile.root.dataset.name = name || '';
-  tile.labelTextEl.textContent = labelValue;
-  tile.placeholderNameEl.textContent = labelValue;
+  tile.labelTextEl.textContent = tileDisplayName(trimmedName, firstGrapheme, videoVisible);
+  tile.placeholderNameEl.textContent = tileDisplayName(trimmedName, firstGrapheme, false);
   tile.letterEl.textContent = firstGrapheme ? firstGrapheme.toUpperCase() : '?';
   // See createTile above / static/style.css: .tile-placeholder-letter--emoji.
   tile.letterEl.classList.toggle('tile-placeholder-letter--emoji', isEmojiGrapheme(firstGrapheme));
@@ -2223,17 +2326,20 @@ function setLeaderIndicator(newLeaderId) {
 /**
  * Just the name (see spec item 5) — without a "You (...)" wrapper and
  * without a "leader" role word (leadership is shown by the crown, see
- * setLeaderIndicator, not by text). Recomputed on any name/leaderId
- * change. Written both into the corner caption and into the caption under
- * the placeholder avatar — both carry the same text (see createTile).
+ * setLeaderIndicator, not by text). Recomputed on any name/leaderId change.
+ * The pill (labelTextEl) reflects the tile's CURRENT video-visibility state
+ * (see tileDisplayName/task item 4: full name incl. emoji while video is on,
+ * emoji stripped once the avatar circle is on screen instead); the
+ * placeholder caption (placeholderNameEl) always uses the latter form —
+ * it's only ever rendered together with the circle.
  */
 function updateOwnTileLabel() {
   if (!ownTile) return;
   const trimmedName = (myName || '').trim();
   const firstGrapheme = firstGraphemeOf(trimmedName);
-  const text = tileDisplayName(trimmedName, firstGrapheme);
-  ownTile.labelTextEl.textContent = text;
-  ownTile.placeholderNameEl.textContent = text;
+  const videoVisible = !ownTile.videoEl.classList.contains('hidden');
+  ownTile.labelTextEl.textContent = tileDisplayName(trimmedName, firstGrapheme, videoVisible);
+  ownTile.placeholderNameEl.textContent = tileDisplayName(trimmedName, firstGrapheme, false);
 }
 
 /**
@@ -2276,11 +2382,26 @@ function setTileSpeaking(peerId, speaking) {
  * setLeaderIndicator: whichever of the two runs last still leaves exactly
  * one crown on screen, with no ordering dependency between the two
  * functions.
+ *
+ * Also recomputes the pill's TEXT (tile.labelTextEl) for the new visibility
+ * — task item 4's avatar/name rule: the pill shows the full name (leading
+ * emoji included) while video is on, and the emoji stripped once video
+ * hides and the avatar circle (which already shows that same emoji as its
+ * big glyph) takes its place, see tileDisplayName. The name itself is read
+ * from tile.root.dataset.name (the single source of truth kept in sync by
+ * createTile/updatePeerTileName), not passed in — this function only ever
+ * gets a tile + a visibility flag. Since the maximized tile, the spotlight
+ * filmstrip and the screen-share compact strip are all pure CSS
+ * repositioning of this SAME tile (see maximizeTile/updateSpotlightMode/
+ * showScreenStageContainer — no separate DOM/pill for any of them), fixing
+ * the pill text here once keeps all of them correct.
  */
 function setTileVideoVisible(tile, show) {
   tile.videoEl.classList.toggle('hidden', !show);
   tile.placeholderEl.classList.toggle('hidden', show);
   tile.crownEl.style.display = show ? '' : 'none';
+  const trimmedName = (tile.root.dataset.name || '').trim();
+  tile.labelTextEl.textContent = tileDisplayName(trimmedName, firstGraphemeOf(trimmedName), show);
   exitMaximizeIfHidden(tile, show);
   // The tile's USEFUL aspect just changed (see tileAspectDescriptor: video
   // uses its own intrinsic aspect, a placeholder is flexible) — the packer
@@ -2491,14 +2612,50 @@ function renderJoinRequests() {
   updateSettingsBadge();
 }
 
+/**
+ * Task item 4's avatar/name rule applied to a lobby request card: a round
+ * avatar with the guest's first grapheme — the SAME gradient derivation as
+ * a real tile (avatarGradientCss(peerId), see createTile) so the circle
+ * already matches the one they'll have once admitted — next to the name
+ * WITHOUT its leading emoji (the circle already carries it, see
+ * tileDisplayName — this card's avatar is ALWAYS on screen, so it's always
+ * the videoVisible=false form). Before the encrypted name-announce arrives
+ * (see signaling.on('name-announce')) req.name is null and the card still
+ * reads "Guest" (tileDisplayName's own empty-name fallback), with a neutral
+ * "?" in the circle rather than "G" — a placeholder word doesn't deserve a
+ * highlighted initial.
+ */
 function buildJoinRequestCardEl(req) {
   const card = document.createElement('div');
   card.className = 'join-request-card';
   card.dataset.peerId = req.peerId;
 
+  const trimmedName = (req.name || '').trim();
+  const firstGrapheme = firstGraphemeOf(trimmedName);
+
+  const avatar = document.createElement('div');
+  avatar.className = 'join-request-avatar';
+  avatar.style.background = avatarGradientCss(req.peerId);
+
+  const avatarLetter = document.createElement('span');
+  avatarLetter.className = 'join-request-avatar-letter';
+  avatarLetter.textContent = firstGrapheme ? firstGrapheme.toUpperCase() : '?';
+  avatarLetter.classList.toggle('join-request-avatar-letter--emoji', isEmojiGrapheme(firstGrapheme));
+  avatar.appendChild(avatarLetter);
+
+  const info = document.createElement('div');
+  info.className = 'join-request-info';
+
   const name = document.createElement('span');
   name.className = 'join-request-name';
-  name.textContent = req.name || 'Guest';
+  name.textContent = tileDisplayName(trimmedName, firstGrapheme, false);
+
+  const wantsLine = document.createElement('span');
+  wantsLine.className = 'join-request-wants';
+  wantsLine.textContent = 'wants to join';
+
+  info.appendChild(name);
+  info.appendChild(wantsLine);
 
   const actions = document.createElement('div');
   actions.className = 'join-request-actions';
@@ -2524,7 +2681,8 @@ function buildJoinRequestCardEl(req) {
 
   actions.appendChild(acceptButton);
   actions.appendChild(rejectButton);
-  card.appendChild(name);
+  card.appendChild(avatar);
+  card.appendChild(info);
   card.appendChild(actions);
   return card;
 }
@@ -3347,16 +3505,20 @@ async function refreshDeviceLists() {
     console.warn('enumerateDevices failed:', err);
     return;
   }
-  fillDeviceSelect(
-    settingMicDeviceSelect,
-    devices.filter((d) => d.kind === 'audioinput'),
-    'Microphone'
-  );
-  fillDeviceSelect(
-    settingCameraDeviceSelect,
-    devices.filter((d) => d.kind === 'videoinput'),
-    'Camera'
-  );
+  const mics = devices.filter((d) => d.kind === 'audioinput');
+  const cams = devices.filter((d) => d.kind === 'videoinput');
+  fillDeviceSelect(settingMicDeviceSelect, mics, 'Microphone');
+  fillDeviceSelect(settingCameraDeviceSelect, cams, 'Camera');
+  // Pre-join card (see the "Pre-join card" section far below) — same
+  // enumerateDevices() call, just a different populate function (Off is
+  // baked into the list itself there, see fillPrejoinDeviceSelect), so a
+  // device plugged in/out (devicechange, below) or a permission grant
+  // (acquireGuestPrejoinMedia/switchPrejoinMic/switchPrejoinCamera) keeps
+  // every select in the page in sync from this one enumeration.
+  fillPrejoinDeviceSelect(prejoinMicSelectEl, mics, 'Microphone');
+  fillPrejoinDeviceSelect(prejoinCamSelectEl, cams, 'Camera');
+  updatePrejoinMicRowUi();
+  updatePrejoinCamRowUi();
 }
 
 function fillDeviceSelect(selectEl, list, labelPrefix) {
@@ -3375,6 +3537,79 @@ function fillDeviceSelect(selectEl, list, labelPrefix) {
   if (wantId && list.some((d) => d.deviceId === wantId)) {
     selectEl.value = wantId;
   }
+}
+
+// ---------- Pre-join device selects: "Off" folded into the list itself ----------
+//
+// Unlike the in-call settings selects above (real devices only — off/on
+// there is the mic/camera TOOLBAR BUTTON's job, not the select), the
+// pre-join card has no separate on/off control (see the pre-join card
+// spec): "Off" is just the first option of the select itself. This
+// sentinel can never collide with a real deviceId (an opaque string handed
+// out by the browser) — used as the select's value when no device is
+// active.
+const PREJOIN_DEVICE_OFF = '__off__';
+
+/**
+ * Populate a pre-join select: "Off" first, then either the real device list
+ * (once labels are available — see hasLabels below) or ONE generic "Default
+ * microphone"/"Default camera" entry standing in for "whatever device the
+ * browser/OS picks" (deviceId '', same as omitting deviceId from the
+ * getUserMedia constraints).
+ *
+ * Why collapse to a single generic entry rather than listing whatever
+ * enumerateDevices() returns pre-permission: per spec (see
+ * navigator.mediaDevices.enumerateDevices(), and the comment on
+ * refreshDeviceLists above), before this tab's first mic/camera permission
+ * grant EVERY device comes back with an empty label — and in practice often
+ * with indistinguishable deviceIds too. Rendering one blank "Microphone
+ * 1"/"Microphone 2" per hidden device would just be several options that
+ * don't actually let you choose a real device; a single "Default …" entry
+ * is honest about what we actually know at that point. The instant ANY
+ * entry in `list` has a real label (permission granted, by this or an
+ * earlier acquisition), we switch to showing the real list instead.
+ */
+function fillPrejoinDeviceSelect(selectEl, list, labelPrefix) {
+  // Unlike fillDeviceSelect above, a stored empty string ('' — "Default")
+  // is a legitimate selection, not "nothing selected yet" — so this reads
+  // the dataset with an explicit `!== undefined` check instead of `||`
+  // (which would treat '' the same as "unset" and wrongly fall back to Off).
+  const storedId = selectEl.dataset.selectedDeviceId;
+  const wantId = storedId !== undefined ? storedId : selectEl.value || PREJOIN_DEVICE_OFF;
+
+  selectEl.textContent = '';
+  const offOpt = document.createElement('option');
+  offOpt.value = PREJOIN_DEVICE_OFF;
+  offOpt.textContent = 'Off';
+  selectEl.appendChild(offOpt);
+
+  const hasLabels = list.some((d) => d.label);
+  if (!hasLabels) {
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = `Default ${labelPrefix.toLowerCase()}`;
+    selectEl.appendChild(opt);
+  } else {
+    list.forEach((d, i) => {
+      const opt = document.createElement('option');
+      opt.value = d.deviceId;
+      opt.textContent = d.label || `${labelPrefix} ${i + 1}`;
+      selectEl.appendChild(opt);
+    });
+  }
+
+  const hasWantId = Array.from(selectEl.options).some((o) => o.value === wantId);
+  selectEl.value = hasWantId ? wantId : PREJOIN_DEVICE_OFF;
+}
+
+/** Icon/text styling for the mic row (see static/style.css: .prejoin-device-row--off) — kept in sync with the select's CURRENT value from every call site that might change it (onchange, a failed switch falling back to Off, the initial guest acquisition, a plain refreshDeviceLists rebuild). */
+function updatePrejoinMicRowUi() {
+  prejoinMicRowEl.classList.toggle('prejoin-device-row--off', prejoinMicSelectEl.value === PREJOIN_DEVICE_OFF);
+}
+
+/** Camera counterpart of updatePrejoinMicRowUi above. */
+function updatePrejoinCamRowUi() {
+  prejoinCamRowEl.classList.toggle('prejoin-device-row--off', prejoinCamSelectEl.value === PREJOIN_DEVICE_OFF);
 }
 
 if (navigator.mediaDevices && typeof navigator.mediaDevices.addEventListener === 'function') {
@@ -3924,31 +4159,530 @@ function cancelScreenOwnerGrace() {
 
 // ---------- Signaling ----------
 
-// ---------- Join modal: shown FIRST, join-room is only sent after the click ----------
+// ---------- Pre-join card: shown FIRST, join-room is only sent after
+// Start/Join is clicked ----------
+//
+// One card, same #join-modal/#join-modal-button markup for both roles (see
+// static/room.html) — only the header/meta and the mic/camera DEFAULTS
+// differ:
+//   - Creator (isCreator === true, i.e. we hold a one-time #lt leaderToken —
+//     see the fragment-parsing IIFE at the top of the file): "Start the
+//     room", an EDITABLE room-name title, mic/camera OFF (no getUserMedia
+//     call happens here at all — no permission prompt of any kind).
+//   - Guest (no #lt): "Join the room", a STATIC room-name title + a live
+//     "N people · started X ago" line from GET /api/rooms/<id> (see
+//     initGuestPrejoin below), mic/camera ON by default via a SINGLE
+//     combined getUserMedia call (see acquireGuestPrejoinMedia).
+//
+// The centerpiece is a live 16:9 preview (own camera, mirrored, or the
+// avatar placeholder) with a name pill — built from the SAME
+// tile-placeholder-*/tile-name markup and classes as an in-call tile (see
+// createTile) so it looks and sizes identically. Whatever mic/camera state
+// this screen leaves us in is handed to the call AS-IS on submit — see
+// onPrejoinSubmit, applyMicStream/applyCameraStream above, and the
+// "reflect pre-join media" block in signaling.on('joined') below — nothing
+// here ever calls getUserMedia a second time for the same kind.
 
-function showJoinModal() {
+let isCreator = false; // set once in init(), from initialLeaderToken (see the fragment-parsing IIFE)
+let prejoinCardOpen = false; // guards the guest's room-status poll (see startRoomStatusPolling/stopRoomStatusPolling)
+// Task item 2: auto-open the "Share" popup for the room's CREATOR right
+// after their very first entry (see signaling.on('joined') below) — a
+// single-shot latch. Belt-and-suspenders alongside the `!joinedOnce` guard
+// already around that whole branch (which by itself already only runs once
+// per tab): this makes the "exactly once, ever" invariant obvious locally
+// without relying on that outer guard's unrelated purpose.
+let shareAutoOpenedForCreator = false;
+
+/**
+ * Trim + repair the room-name input before it becomes `currentRoomName`/the
+ * `n` fragment param (see onPrejoinSubmit/writeRoomNameToFragment). This
+ * logic used to live in static/landing.js, back when the ROOM NAME was
+ * chosen there rather than here — moved verbatim (comment included) now
+ * that the pre-join redesign moved room-name entry onto this screen.
+ *
+ * Why the lone-surrogate repair is needed at all: the input has
+ * maxlength="40", enforced by the BROWSER in UTF-16 CODE UNITS, not Unicode
+ * code points. A name ending in an emoji outside the BMP (astronomical
+ * plane — most of NameGen's ROOM_EMOJI) is encoded as a surrogate PAIR (2
+ * UTF-16 units); if the 40-unit cutoff lands between the two halves of that
+ * pair, the string ends in a lone, unpaired surrogate. A lone surrogate is
+ * a technically valid JS string element but not valid Unicode text — left
+ * alone it throws a URIError out of encodeURIComponent the moment we put
+ * the name into the `n` fragment param / the invite link.
+ * String.prototype.toWellFormed() (Baseline 2024) replaces every lone
+ * surrogate with U+FFFD; toWellFormedFallback below is a manual equivalent
+ * for engines without it (older Safari/Firefox) — a plain scan rather than
+ * a clever regex, deliberately, since off-by-one errors in surrogate-pair
+ * regexes are exactly the kind of bug that's easy to write and hard to spot
+ * in review.
+ */
+function toWellFormedFallback(str) {
+  if (typeof str.toWellFormed === 'function') return str.toWellFormed();
+  let result = '';
+  for (let i = 0; i < str.length; i++) {
+    const code = str.charCodeAt(i);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      // High surrogate — valid only if immediately followed by a low one.
+      const next = str.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        result += str[i] + str[i + 1];
+        i++;
+      } else {
+        result += '�';
+      }
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      result += '�'; // a lone low surrogate — its high half was never here to begin with
+    } else {
+      result += str[i];
+    }
+  }
+  return result;
+}
+
+function cleanRoomNameInput(rawValue) {
+  return toWellFormedFallback(rawValue).trim() || null;
+}
+
+/**
+ * Creator-only, called once on submit (see onPrejoinSubmit): pushes the
+ * chosen room name into the address bar as `#t=...&e=...&n=...`. There's
+ * nothing but t/e in the creator's fragment before this point (see the
+ * fragment-parsing IIFE at the top of the file — `n` is never present on
+ * the very first load anymore). From here on the creator's own fragment
+ * behaves exactly like a guest's: buildShareLink reads currentRoomName as
+ * part of the invite link, and an F5 rehydrates the same name via that same
+ * top-of-file parsing.
+ */
+function writeRoomNameToFragment() {
+  const parts = [`t=${linkTokenBase64url}`, `e=${linkExpiry}`];
+  if (currentRoomName) parts.push(`n=${encodeURIComponent(currentRoomName)}`);
+  history.replaceState(null, '', location.pathname + location.search + `#${parts.join('&')}`);
+}
+
+/**
+ * Swap the preview between live camera video and the avatar placeholder,
+ * and refresh the name pill to match (see updatePrejoinNamePill) — called
+ * whenever the camera track's existence/enabled state changes (device
+ * select, a failed switch falling back to Off) and once up front when the
+ * card is first shown.
+ */
+function updatePrejoinPreviewMode() {
+  const camOn = !!(camTrack && camTrack.enabled);
+  prejoinPreviewVideoEl.classList.toggle('hidden', !camOn);
+  prejoinPreviewPlaceholderEl.classList.toggle('hidden', camOn);
+  if (camOn) {
+    prejoinPreviewVideoEl.srcObject = camStream;
+    safePlay(prejoinPreviewVideoEl);
+  }
+  updatePrejoinNamePill();
+}
+
+/**
+ * The avatar glyph + name pill, kept in sync with the "Your name" field on
+ * every keystroke (spec: "typing in the name field updates the avatar
+ * glyph and the pill immediately") and with the camera on/off state (see
+ * updatePrejoinPreviewMode). Same firstGraphemeOf/isEmojiGrapheme/
+ * tileDisplayName helpers as createTile/updatePeerTileName use for the
+ * in-call tile — see the "Name pill rule" in the pre-join card spec: with
+ * the camera OFF (avatar circle visible) the pill omits a leading emoji
+ * (it's already the big glyph in the circle); with the camera ON (no
+ * circle) the pill carries the FULL name, emoji included.
+ */
+function updatePrejoinNamePill() {
+  const trimmedName = joinNameInputEl.value.trim();
+  const firstGrapheme = firstGraphemeOf(trimmedName);
+  const camOn = !!(camTrack && camTrack.enabled);
+  prejoinPreviewPillTextEl.textContent = tileDisplayName(trimmedName, firstGrapheme, camOn);
+  prejoinAvatarLetterEl.textContent = firstGrapheme ? firstGrapheme.toUpperCase() : '?';
+  prejoinAvatarLetterEl.classList.toggle('tile-placeholder-letter--emoji', isEmojiGrapheme(firstGrapheme));
+}
+
+// ---------- Pre-join mic/camera: "Off" folded into the select itself ----------
+//
+// No separate on/off button here (see the pre-join card spec) — picking a
+// real device switches the preview live (stop the old track, acquire the
+// new one, apply); picking "Off" just stops whatever's currently active.
+// Both reuse acquireMicStream/applyMicStream (acquireCameraStream/
+// applyCameraStream) — the SAME split the mic/camera toolbar buttons use
+// (see above) — so the stream handed to the call on submit (see
+// onPrejoinSubmit) is never re-acquired.
+
+async function switchPrejoinMic(deviceId) {
+  if (micTrack) micTrack.stop();
+  micStream = null;
+  micTrack = null;
+  let stream;
+  try {
+    stream = await acquireMicStream(deviceId);
+  } catch (err) {
+    console.warn('Pre-join: could not switch microphone, falling back to Off:', err);
+    prejoinMicSelectEl.value = PREJOIN_DEVICE_OFF;
+    prejoinMicSelectEl.dataset.selectedDeviceId = PREJOIN_DEVICE_OFF;
+    setMicButtonOn(false);
+    updateOwnMicIndicator();
+    updatePrejoinMicRowUi();
+    return;
+  }
+  applyMicStream(stream, true);
+  // The RESOLVED deviceId (not necessarily `deviceId` itself — that was
+  // null/'' for "Default microphone") is what the selects should remember
+  // from now on: the instant permission is granted, fillPrejoinDeviceSelect
+  // switches from the single generic '' entry to the real device list (see
+  // its hasLabels check) — a stale '' selection would then match nothing
+  // and strand the UI back on "Off" even though the mic is actually live.
+  const resolvedId = micTrack.getSettings().deviceId || null;
+  selectedMicDeviceId = resolvedId;
+  prejoinMicSelectEl.dataset.selectedDeviceId = resolvedId || '';
+  settingMicDeviceSelect.dataset.selectedDeviceId = resolvedId || '';
+  refreshDeviceLists(); // permission may have JUST been granted — pick up real labels if so
+}
+
+function stopPrejoinMic() {
+  if (micTrack) micTrack.stop();
+  micStream = null;
+  micTrack = null;
+  setMicButtonOn(false);
+  updateOwnMicIndicator();
+}
+
+async function switchPrejoinCamera(deviceId) {
+  if (camTrack) camTrack.stop();
+  camStream = null;
+  camTrack = null;
+  let stream;
+  try {
+    stream = await acquireCameraStream(deviceId);
+  } catch (err) {
+    console.warn('Pre-join: could not switch camera, falling back to Off:', err);
+    prejoinCamSelectEl.value = PREJOIN_DEVICE_OFF;
+    prejoinCamSelectEl.dataset.selectedDeviceId = PREJOIN_DEVICE_OFF;
+    setCameraButtonOn(false);
+    updatePrejoinPreviewMode();
+    updatePrejoinCamRowUi();
+    return;
+  }
+  applyCameraStream(stream, true);
+  updatePrejoinPreviewMode();
+  // See the matching comment in switchPrejoinMic above — remember the
+  // RESOLVED deviceId, not the possibly-empty one that was requested.
+  const resolvedId = camTrack.getSettings().deviceId || null;
+  selectedCamDeviceId = resolvedId;
+  prejoinCamSelectEl.dataset.selectedDeviceId = resolvedId || '';
+  settingCameraDeviceSelect.dataset.selectedDeviceId = resolvedId || '';
+  refreshDeviceLists(); // permission may have JUST been granted — pick up real labels if so
+}
+
+function stopPrejoinCamera() {
+  if (camTrack) camTrack.stop();
+  camStream = null;
+  camTrack = null;
+  setCameraButtonOn(false);
+  updatePrejoinPreviewMode();
+}
+
+prejoinMicSelectEl.addEventListener('change', () => {
+  const val = prejoinMicSelectEl.value;
+  prejoinMicSelectEl.dataset.selectedDeviceId = val;
+  updatePrejoinMicRowUi();
+  if (val === PREJOIN_DEVICE_OFF) {
+    stopPrejoinMic();
+    return;
+  }
+  const deviceId = val || null; // '' ("Default microphone") -> null, unconstrained
+  selectedMicDeviceId = deviceId;
+  settingMicDeviceSelect.dataset.selectedDeviceId = val;
+  switchPrejoinMic(deviceId);
+});
+
+prejoinCamSelectEl.addEventListener('change', () => {
+  const val = prejoinCamSelectEl.value;
+  prejoinCamSelectEl.dataset.selectedDeviceId = val;
+  updatePrejoinCamRowUi();
+  if (val === PREJOIN_DEVICE_OFF) {
+    stopPrejoinCamera();
+    return;
+  }
+  const deviceId = val || null;
+  selectedCamDeviceId = deviceId;
+  settingCameraDeviceSelect.dataset.selectedDeviceId = val;
+  switchPrejoinCamera(deviceId);
+});
+
+/**
+ * Guest device defaults (spec: "microphone On, camera On, using the first
+ * available device of each kind"): ONE combined getUserMedia call so there
+ * is only a SINGLE permission prompt (not two) — see cameraButton/micButton
+ * above for why a separate call per kind is the norm mid-call (there it's
+ * fine, no prompt is showing at the same time as another). If the combined
+ * call rejects outright (denied, no device at all, or a browser that
+ * refuses getUserMedia without a user gesture — e.g. some iOS versions,
+ * where this initial auto-run has none), we fall back SILENTLY to Off for
+ * BOTH kinds with a console.warn and stop there: getUserMedia is
+ * all-or-nothing for a single call (the spec doesn't do partial success),
+ * so there's no finer-grained failure to report. Recovery is the device
+ * select itself — picking a real entry there is a fresh user gesture and
+ * goes through switchPrejoinMic/switchPrejoinCamera above, which can
+ * succeed even if this initial attempt couldn't.
+ */
+async function acquireGuestPrejoinMedia() {
+  let combined;
+  try {
+    combined = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+  } catch (err) {
+    console.warn('Guest pre-join: combined mic+camera request failed — leaving both Off (pick a device below to retry with a fresh user gesture):', err);
+    return;
+  }
+
+  const audioTrack = combined.getAudioTracks()[0] || null;
+  const videoTrack = combined.getVideoTracks()[0] || null;
+
+  if (audioTrack) {
+    const deviceId = audioTrack.getSettings().deviceId || null;
+    selectedMicDeviceId = deviceId;
+    settingMicDeviceSelect.dataset.selectedDeviceId = deviceId || '';
+    prejoinMicSelectEl.dataset.selectedDeviceId = deviceId || '';
+    applyMicStream(new MediaStream([audioTrack]), true);
+  } else {
+    console.warn('Guest pre-join: the combined stream came back without an audio track — leaving the microphone Off.');
+  }
+
+  if (videoTrack) {
+    const deviceId = videoTrack.getSettings().deviceId || null;
+    selectedCamDeviceId = deviceId;
+    settingCameraDeviceSelect.dataset.selectedDeviceId = deviceId || '';
+    prejoinCamSelectEl.dataset.selectedDeviceId = deviceId || '';
+    applyCameraStream(new MediaStream([videoTrack]), true);
+  } else {
+    console.warn('Guest pre-join: the combined stream came back without a video track — leaving the camera Off.');
+  }
+
+  updatePrejoinPreviewMode();
+  refreshDeviceLists(); // permission granted — re-enumerate for real labels, rebuilding every select from the dataset selections just set above
+}
+
+/** Release any live pre-join mic/camera tracks without proceeding into the call — see showPrejoinRoomGoneOverlay/showPrejoinRoomFullOverlay: a guest whose combined getUserMedia already succeeded shouldn't keep the camera/mic hardware open behind a terminal "room is gone/full" overlay they can't get past. */
+function stopPrejoinMediaOnAbort() {
+  if (micTrack) micTrack.stop();
+  micStream = null;
+  micTrack = null;
+  if (camTrack) camTrack.stop();
+  camStream = null;
+  camTrack = null;
+}
+
+// ---------- Guest-only: room status before joining (GET /api/rooms/<id>) ----------
+//
+// Only a GUEST calls this — the creator just created the room via POST
+// /api/rooms and already knows it's empty; hitting the read endpoint right
+// after create would race the server's own write for no reason and
+// couldn't tell the creator anything they don't already know. Server: see
+// src/main.rs — 200 {participants, capacity, ageSeconds}, 404 (plain text,
+// room gone), 429 (per-IP limit, 240/min).
+let roomStatusPollTimer = null;
+
+/**
+ * One GET /api/rooms/<id>. Returns:
+ *   - {ok:true, participants, capacity, ageSeconds} on a well-formed 200
+ *   - {ok:false, reason:'not-found'} on 404
+ *   - {ok:false, reason:'other'} for anything else (429, 5xx, a network
+ *     error, malformed JSON) — deliberately NOT terminal (see
+ *     startRoomStatusPolling/initGuestPrejoin below): a rate-limited or
+ *     momentarily-flaky read must never be confused with "the room doesn't
+ *     exist" and tear down the screen.
+ */
+async function fetchRoomStatus() {
+  try {
+    // Via window.API_BASE (see static/config.js) — same split-origin
+    // reasoning as fetchVersion/restoreRoomViaPut above.
+    const res = await fetch(`${window.API_BASE}/api/rooms/${encodeURIComponent(roomId)}`);
+    if (res.status === 404) return { ok: false, reason: 'not-found' };
+    if (!res.ok) return { ok: false, reason: 'other' };
+    const data = await res.json();
+    if (
+      !data ||
+      typeof data.participants !== 'number' ||
+      typeof data.capacity !== 'number' ||
+      typeof data.ageSeconds !== 'number'
+    ) {
+      return { ok: false, reason: 'other' };
+    }
+    return { ok: true, participants: data.participants, capacity: data.capacity, ageSeconds: data.ageSeconds };
+  } catch (err) {
+    return { ok: false, reason: 'other' };
+  }
+}
+
+/** `just now` / `1 minute ago` / `7 minutes ago` / `1 hour ago` / `2 hours ago` — see the pre-join card spec, "Guest-only: room status". */
+function humanizeRoomAge(ageSeconds) {
+  if (ageSeconds < 60) return 'just now';
+  const minutes = Math.floor(ageSeconds / 60);
+  if (minutes < 60) return minutes === 1 ? '1 minute ago' : `${minutes} minutes ago`;
+  const hours = Math.floor(minutes / 60);
+  return hours === 1 ? '1 hour ago' : `${hours} hours ago`;
+}
+
+function renderPrejoinRoomMeta(participants, ageSeconds) {
+  const peopleText = participants === 1 ? '1 person' : `${participants} people`;
+  prejoinRoomMetaTextEl.textContent = `${peopleText} · started ${humanizeRoomAge(ageSeconds)}`;
+  prejoinRoomMetaEl.classList.remove('hidden');
+}
+
+/** Guest pre-join, GET /api/rooms/<id> came back 404 — the room is gone (deleted/reaped) before the guest ever got to join. A DIFFERENT check from signaling.on('room-not-found') below (that one fires from a real join-room attempt, after this screen); reuses the same overlay/terminalState machinery, just with wording that doesn't presuppose a join was ever attempted. */
+function showPrejoinRoomGoneOverlay() {
+  stopPrejoinMediaOnAbort();
+  hidePrejoinCard();
+  terminalState = true;
+  showOverlay({
+    title: 'Room not found',
+    text: 'This room has already ended.',
+    actionLabel: 'Create a new one',
+  });
+}
+
+/** Guest pre-join, GET /api/rooms/<id> reports participants >= capacity — deliberately no numbers in the text (spec), unlike signaling.on('room-full') below (a different, later check, once an actual join-room was rejected). */
+function showPrejoinRoomFullOverlay() {
+  stopPrejoinMediaOnAbort();
+  hidePrejoinCard();
+  terminalState = true;
+  showOverlay({
+    title: 'Room is full',
+    text: 'Try again in a minute.',
+  });
+}
+
+/** Every 5s while the guest's pre-join card is open — stopped on submit or when the card is hidden (see hidePrejoinCard). A failed/rate-limited tick keeps the last known numbers on screen and just tries again next time (see fetchRoomStatus). */
+function startRoomStatusPolling() {
+  stopRoomStatusPolling();
+  roomStatusPollTimer = setInterval(async () => {
+    const status = await fetchRoomStatus();
+    if (!prejoinCardOpen) return; // the card was hidden/submitted while this fetch was in flight
+    if (!status.ok) {
+      if (status.reason === 'not-found') showPrejoinRoomGoneOverlay();
+      return; // 'other' (429/network/etc.) — never break the screen, just skip this tick
+    }
+    if (status.participants >= status.capacity) {
+      showPrejoinRoomFullOverlay();
+      return;
+    }
+    renderPrejoinRoomMeta(status.participants, status.ageSeconds);
+  }, 5000);
+}
+
+function stopRoomStatusPolling() {
+  if (roomStatusPollTimer) {
+    clearInterval(roomStatusPollTimer);
+    roomStatusPollTimer = null;
+  }
+}
+
+/** Guest entry point (see init below): the FIRST status check gates whether the card is even shown — 404/full replace it outright (see showPrejoinRoomGoneOverlay/showPrejoinRoomFullOverlay); anything else (including a flaky first read) shows the card anyway, with the meta line simply staying hidden until the next successful poll tick. */
+async function initGuestPrejoin() {
+  const status = await fetchRoomStatus();
+  if (!status.ok && status.reason === 'not-found') {
+    showPrejoinRoomGoneOverlay();
+    return;
+  }
+  if (status.ok && status.participants >= status.capacity) {
+    showPrejoinRoomFullOverlay();
+    return;
+  }
+  showPrejoinCard();
+  if (status.ok) renderPrejoinRoomMeta(status.participants, status.ageSeconds);
+  startRoomStatusPolling();
+}
+
+function showPrejoinCard() {
+  prejoinCardOpen = true;
   joinModalEl.classList.remove('hidden');
-  // Pre-filled with a generated name (see static/namegen.js: userName()) —
-  // click "Join" and that's it, no need to ask. The user can clear the
-  // field → as before, they stay anonymous (onJoinModalSubmit: trim() + `||
-  // null`). !value — in case the field already contains something (it
-  // shouldn't at this point, but we don't overwrite it just in case).
+  prejoinEyebrowEl.textContent = isCreator ? 'Start the room' : 'Join the room';
+  joinModalButtonEl.textContent = isCreator ? 'Start' : 'Join';
+
+  prejoinRoomNameEditableEl.classList.toggle('hidden', !isCreator);
+  prejoinRoomNameStaticEl.classList.toggle('hidden', isCreator);
+  if (isCreator) {
+    // Prefilled with a generated name (see static/namegen.js: roomName()) —
+    // click "Start" and that's it, no need to type; the regen button (see
+    // prejoinRoomNameRegenEl below) rolls a new one on demand.
+    if (!prejoinRoomNameInputEl.value) prejoinRoomNameInputEl.value = NameGen.roomName();
+  } else {
+    // currentRoomName comes from the invite link's `n` (see the
+    // fragment-parsing IIFE at the top of the file) — absent only for a
+    // link shared before the creator ever set a name, which per this
+    // redesign shouldn't normally happen, but a manually-edited/older link
+    // is still handled gracefully with the plain word "Room".
+    prejoinRoomTitleEl.textContent = currentRoomName || 'Room';
+    prejoinRoomMetaEl.classList.add('hidden'); // shown once the first status fetch resolves (see renderPrejoinRoomMeta)
+  }
+
+  // Avatar gradient: derived from OUR OWN peerId, already generated in
+  // initCryptoIdentity before this screen is ever shown — see
+  // avatarGradientCss for why this ends up matching the real own tile.
+  prejoinAvatarEl.style.background = avatarGradientCss(myPeerId);
+
+  // Pre-filled with a generated name (see static/namegen.js: userName()),
+  // same as the old join-modal (kept: click "Start"/"Join" and that's it).
+  // The user can clear the field → stays anonymous, as before
+  // (onPrejoinSubmit: trim() + `|| null`).
   if (!joinNameInputEl.value) joinNameInputEl.value = NameGen.userName();
-  // The name field is NOT focused or selected by default — the generated name
-  // shouldn't come up active/highlighted, and on a phone we don't want the
-  // keyboard popping up on open. Focus the Join button instead so it's the
-  // default action (Enter/tap joins immediately); the user taps the field only
-  // if they want to edit the name.
+  updatePrejoinPreviewMode(); // mic/camera are still Off for everyone at this point — sets the initial avatar+pill
+
+  // Device defaults (spec, "Device defaults and permissions"): the creator
+  // gets Off/Off with NO getUserMedia call on this screen at all (just
+  // enumerateDevices() below, which never prompts); the guest gets a
+  // single combined getUserMedia (see acquireGuestPrejoinMedia).
+  refreshDeviceLists();
+  if (!isCreator) acquireGuestPrejoinMedia();
+
+  // The name field is NOT focused/selected by default (same reasoning as
+  // the old join-modal: the generated name shouldn't come up
+  // active/highlighted, and a phone shouldn't pop the keyboard on open) —
+  // the Start/Join button is the default action instead (Enter on the name
+  // field submits, see joinNameInputEl's keydown listener below).
   joinModalButtonEl.focus();
 }
 
-function hideJoinModal() {
+/**
+ * Swap the pre-join card between its normal interactive state (mic/camera
+ * rows, the name field, the Start/Join button) and the lobby "waiting for
+ * approval" state (see signaling.on('waiting') below and task item 3) —
+ * the header (eyebrow/room name/meta) and the live preview are deliberately
+ * untouched by either state: they're the whole reason the guest stays on
+ * this SAME card instead of being sent to a full-screen overlay while
+ * waiting (their camera/mic keep streaming underneath, see
+ * onPrejoinSubmit — nothing here re-acquires micStream/camStream).
+ */
+function setPrejoinWaitingMode(waiting) {
+  prejoinMicRowEl.classList.toggle('hidden', waiting);
+  prejoinCamRowEl.classList.toggle('hidden', waiting);
+  prejoinNameFieldEl.classList.toggle('hidden', waiting);
+  joinModalButtonEl.classList.toggle('hidden', waiting);
+  prejoinWaitingEl.classList.toggle('hidden', !waiting);
+}
+
+function hidePrejoinCard() {
+  prejoinCardOpen = false;
+  stopRoomStatusPolling();
+  // Undo the lobby waiting state (see setPrejoinWaitingMode/
+  // signaling.on('waiting')) in case we're leaving FROM there (the leader
+  // just approved us) — a harmless no-op on the direct-join path, where it
+  // was never turned on to begin with.
+  setPrejoinWaitingMode(false);
   joinModalEl.classList.add('hidden');
 }
 
+// Lobby "Cancel" (see signaling.on('waiting') below) — leave + go home, the
+// same trick as leaveButton far below: set intentionalDisconnect BEFORE
+// sending 'leave' so the resulting signaling close doesn't trigger
+// auto-reconnect (see connectAndJoin/signaling.onClose).
+prejoinWaitingCancelEl.addEventListener('click', () => {
+  intentionalDisconnect = true;
+  if (signaling) signaling.send('leave');
+  location.href = '/';
+});
+
 let joinSubmitInProgress = false;
 
-async function onJoinModalSubmit() {
+async function onPrejoinSubmit() {
   if (joinSubmitInProgress) return;
   joinSubmitInProgress = true;
   // A click is a user gesture, also useful for AudioContext (see
@@ -3956,24 +4690,51 @@ async function onJoinModalSubmit() {
   // on click/keydown).
   const raw = joinNameInputEl.value.trim();
   myName = raw || null;
-  hideJoinModal();
+
+  if (isCreator) {
+    currentRoomName = cleanRoomNameInput(prejoinRoomNameInputEl.value);
+    renderRoomNameChrome();
+    writeRoomNameToFragment();
+  }
+
+  hidePrejoinCard();
+  // NOTE: mic/camera are NOT (re-)acquired here — whatever this screen left
+  // us with (micStream/micTrack/camStream/camTrack, applied live via
+  // applyMicStream/applyCameraStream as the user interacted with the
+  // selects above) is handed to the call as-is; see the "reflect pre-join
+  // media" block in signaling.on('joined') below for how the toolbar/tile
+  // pick up that state on the very first frame.
   await connectAndJoin();
 }
 
-joinModalButtonEl.addEventListener('click', onJoinModalSubmit);
+joinModalButtonEl.addEventListener('click', onPrejoinSubmit);
 joinNameInputEl.addEventListener('keydown', (event) => {
   if (event.key === 'Enter') {
     event.preventDefault();
-    onJoinModalSubmit();
+    onPrejoinSubmit();
   }
 });
+joinNameInputEl.addEventListener('input', updatePrejoinNamePill);
 
-// The "regenerate" button next to the name field (see showJoinModal) —
-// rolls a new NameGen.userName(). It does NOT focus or select the field: the
-// name stays inactive/unhighlighted and the Join button remains the default
-// (consistent with showJoinModal not activating the field).
+// The "regenerate" button next to the name field — rolls a new
+// NameGen.userName(). Does NOT focus/select the field, consistent with
+// showPrejoinCard not activating it either.
 joinNameRegenButtonEl.addEventListener('click', () => {
   joinNameInputEl.value = NameGen.userName();
+  updatePrejoinNamePill();
+});
+
+// Creator only (hidden for a guest, see showPrejoinCard) — same pattern as
+// the "Your name" field/regen button above, one level up: a fresh
+// NameGen.roomName(), and Enter here submits the card too.
+prejoinRoomNameRegenEl.addEventListener('click', () => {
+  prejoinRoomNameInputEl.value = NameGen.roomName();
+});
+prejoinRoomNameInputEl.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    onPrejoinSubmit();
+  }
 });
 
 async function init() {
@@ -3993,15 +4754,25 @@ async function init() {
     return;
   }
 
+  // Creator vs guest (see the pre-join card spec): a one-time leaderToken
+  // (#lt, see the fragment-parsing IIFE at the top of the file) is only
+  // ever present for the tab that just created the room via POST
+  // /api/rooms — everyone else arrived through a plain invite link.
+  isCreator = !!initialLeaderToken;
+
   // Anonymity (see docs/privacy.md, "Anonymity"): the name is asked again
-  // on EVERY visit via this modal — no localStorage at all. The field is
-  // pre-filled with a generated name (see showJoinModal: NameGen.userName())
-  // so you can simply click "Join" without typing, but the user can clear
-  // it — then they stay anonymous, as before. join-room is only sent after
-  // clicking "Join" (see onJoinModalSubmit). On auto-reconnect the modal
-  // isn't shown again — the name is already in the tab's memory (myName),
-  // see attemptReconnectOnce/sendJoinAndWait below.
-  showJoinModal();
+  // on EVERY visit via this card — no localStorage at all. join-room is
+  // only sent after clicking Start/Join (see onPrejoinSubmit). On
+  // auto-reconnect the card isn't shown again — the name is already in the
+  // tab's memory (myName), see attemptReconnectOnce/sendJoinAndWait below.
+  if (isCreator) {
+    showPrejoinCard();
+  } else {
+    // The guest path additionally gates on room status BEFORE showing
+    // anything (see initGuestPrejoin) — the creator skips this entirely
+    // (see the comment on the guest-only room-status section above).
+    await initGuestPrejoin();
+  }
 }
 
 async function connectAndJoin() {
@@ -4094,8 +4865,32 @@ function registerSignalingHandlers(iceServers) {
       joinedOnce = true;
       myPeerId = peerId; // almost always the same as what we generated ourselves (see initCryptoIdentity) — reassigned in case of an extremely rare UUID collision
       hideOverlay();
+      // The pre-join card may currently be showing the lobby "waiting for
+      // approval" sub-state (see signaling.on('waiting') below) if we just
+      // got approved — tear it down the same way the direct-join path
+      // already does in onPrejoinSubmit (hidePrejoinCard is idempotent, so
+      // this is a harmless no-op there).
+      hidePrejoinCard();
 
       ownTile = createTile(peerId, myName, true);
+
+      // Reflect whatever the pre-join card already turned on (see
+      // onPrejoinSubmit/acquireGuestPrejoinMedia/switchPrejoinMic/
+      // switchPrejoinCamera) — by this point micTrack/camTrack, if set at
+      // all, are the SAME stream/track objects the preview was already
+      // using: never re-acquired here (a second getUserMedia would
+      // re-prompt, be slow, and on iOS can even kill the first stream —
+      // see applyMicStream/applyCameraStream above). The toolbar buttons
+      // are already correct (applyMicStream/applyCameraStream set them the
+      // moment the stream was applied, before we even got here) — what
+      // COULDN'T happen yet is anything that needed ownTile, which comes
+      // into existence only right above.
+      if (micTrack) updateOwnMicIndicator();
+      if (camTrack) {
+        ownTile.videoEl.srcObject = camStream;
+        safePlay(ownTile.videoEl);
+        setTileVideoVisible(ownTile, camTrack.enabled);
+      }
 
       // E2E v2: other participants' names no longer arrive in this message
       // (PeerInfo.name is always null for v2 clients, see src/protocol.rs)
@@ -4147,6 +4942,20 @@ function registerSignalingHandlers(iceServers) {
       // starts on entering the room and keeps ticking for the whole
       // session, regardless of peer count and whether the settings panel is open.
       startPeerStatsPolling();
+
+      // Task item 2: auto-open the invite popup for the CREATOR's very
+      // first entry into their own (necessarily empty) room — gated on
+      // isCreator (set in init() from the one-time #lt fragment token, see
+      // initialLeaderToken at the top of the file), NOT on room occupancy —
+      // a guest who happens to be alone must not get this, and isCreator
+      // can only be true here on THIS exact first `joined` anyway: `lt` is
+      // wiped from the address bar after the very first parse, so a later
+      // reload of the same room never sets it again. shareAutoOpenedForCreator
+      // (see its declaration) is a single-shot latch on top of that.
+      if (isCreator && !shareAutoOpenedForCreator) {
+        shareAutoOpenedForCreator = true;
+        openSharePopup();
+      }
       return;
     }
 
@@ -4185,26 +4994,31 @@ function registerSignalingHandlers(iceServers) {
   signaling.on('waiting', ({ leaderPeerId, leaderEpub }) => {
     // Lobby (see docs/permissions-and-leader.md, "The Waiting Room
     // (Lobby)"): instead of joined, this arrives first — we wait for the
-    // leader's decision. "Cancel" = leave + go home (the same trick as
-    // leaveButton below — intentionalDisconnect before leave). E2E v2: as
-    // soon as the leader's epub is known, we announce our own name to them
-    // (if it's not empty), see sendNameAnnounceTo. The server sends a FRESH
-    // `waiting` when the leader changes while we're waiting (see
-    // src/ws.rs) — this handler fires again and resends the announcement
-    // to the new leader.
+    // leader's decision. E2E v2: as soon as the leader's epub is known, we
+    // announce our own name to them (if it's not empty), see
+    // sendNameAnnounceTo. The server sends a FRESH `waiting` when the leader
+    // changes while we're waiting (see src/ws.rs) — this handler fires again
+    // and resends the announcement to the new leader; it's otherwise
+    // idempotent (see setPrejoinWaitingMode — just toggling classes/text, no
+    // duplicate side effects beyond cachePairKeys/sendNameAnnounceTo, which
+    // are themselves idempotent).
+    //
+    // Task item 3: unlike before, we do NOT show the full-screen #overlay
+    // here — the guest stays on the SAME pre-join card they just submitted
+    // (hidden a moment ago by hidePrejoinCard() in onPrejoinSubmit), header
+    // and LIVE camera/mic preview untouched underneath (nothing here
+    // re-acquires micStream/camStream — see onPrejoinSubmit/
+    // updatePrejoinPreviewMode), with only the interactive controls swapped
+    // for a waiting block (see setPrejoinWaitingMode). hideOverlay() clears
+    // the brief "Connecting…" overlay connectAndJoin showed a moment ago —
+    // a harmless no-op if it's already hidden (e.g. on a second `waiting`
+    // for the same still-pending guest).
     cachePairKeys(leaderPeerId, leaderEpub);
     sendNameAnnounceTo(leaderPeerId);
-    showOverlay({
-      title: 'Waiting for approval…',
-      text: myName ? `You joined as "${myName}"` : 'Waiting for the room leader to respond.',
-      spinner: true,
-      actionLabel: 'Cancel',
-      onAction: () => {
-        intentionalDisconnect = true;
-        if (signaling) signaling.send('leave');
-        location.href = '/';
-      },
-    });
+    hideOverlay();
+    joinModalEl.classList.remove('hidden');
+    prejoinWaitingTextEl.textContent = myName ? `You joined as “${myName}”.` : 'The room leader will let you in.';
+    setPrejoinWaitingMode(true);
   });
 
   signaling.on('join-request', ({ peerId, epub }) => {
@@ -4250,6 +5064,17 @@ function registerSignalingHandlers(iceServers) {
 
   signaling.on('join-rejected', () => {
     terminalState = true;
+    // The guest was almost certainly on the pre-join card's lobby waiting
+    // sub-state when this arrives (see signaling.on('waiting') above) —
+    // #join-modal sits ABOVE #overlay (z-index 55 vs. 50, see
+    // static/style.css), so showOverlay() below would otherwise render
+    // completely hidden behind it. stopPrejoinMediaOnAbort releases the
+    // waiting preview's camera/mic — the call never proceeds past a
+    // rejection, so there's no reason to keep the hardware open behind this
+    // terminal overlay (same reasoning as showPrejoinRoomGoneOverlay/
+    // showPrejoinRoomFullOverlay above).
+    stopPrejoinMediaOnAbort();
+    hidePrejoinCard();
     showOverlay({
       title: 'Access denied',
       text: 'The room leader declined your join request.',
@@ -4339,6 +5164,15 @@ function registerSignalingHandlers(iceServers) {
     if (terminalState) return; // the overlay is already shown (double delivery/race) — don't overwrite it
     terminalState = true;
     stopRoomTimer();
+    // As the comment above notes, this can arrive while a guest is still on
+    // the pre-join card's lobby waiting sub-state (see signaling.on('waiting'))
+    // — #join-modal sits ABOVE #overlay (z-index 55 vs. 50, see
+    // static/style.css), so showOverlay() below would otherwise be
+    // completely hidden behind it. A harmless no-op if we're past that
+    // point already (hidePrejoinCard is idempotent, teardownMeshMediaChat
+    // below stops micTrack/camTrack regardless of whether the card is
+    // still open).
+    hidePrejoinCard();
     showOverlay({
       title: 'Meeting time is up (3 hours)',
       text: 'The room is closed — the meeting duration limit was reached.',
@@ -4753,6 +5587,50 @@ async function applyMicDeviceChange(deviceId) {
   updateOwnMicIndicator();
 }
 
+/**
+ * Acquire a fresh microphone-only stream for `deviceId` (null = whatever
+ * the browser/OS treats as the default device) — no side effects beyond
+ * the permission prompt itself. Throws on failure (NotAllowedError,
+ * NotFoundError, …) — every caller decides for itself how loudly to react:
+ * micButton's click (below) shows a room message, the pre-join card's
+ * device select (see switchPrejoinMic in the "Pre-join card" section) just
+ * logs a warning and falls back to Off.
+ */
+async function acquireMicStream(deviceId) {
+  return navigator.mediaDevices.getUserMedia({
+    audio: deviceId ? { deviceId: { exact: deviceId } } : true,
+  });
+}
+
+/**
+ * Make `stream` our own outgoing microphone: remembers stream/track/
+ * deviceId, sets the enabled flag, and updates the toolbar button + our own
+ * tile's mic-off indicator (a no-op via updateOwnMicIndicator/
+ * setTileMicOffIndicator if ownTile doesn't exist yet — see the pre-join
+ * card, where there's no tile at all until 'joined' arrives). Adding the
+ * track to already-connected peers (broadcastLocalStream) only matters
+ * mid-call (turning the mic on for the first time after already having
+ * joined, when `peers` is non-empty); called from the pre-join card
+ * (`peers` is always empty there) it's a harmless no-op — createRemotePeer
+ * picks up micStream/micTrack on its own the moment we actually join (see
+ * there).
+ *
+ * Split out of micButton's click handler (which used to both acquire AND
+ * apply in one go) precisely so the pre-join card can hand over the SAME
+ * stream it already acquired for the live preview instead of calling
+ * getUserMedia a SECOND time (see onPrejoinSubmit) — a second prompt would
+ * be slow/jarring, and on iOS can even kill the first stream outright.
+ */
+function applyMicStream(stream, enabledValue) {
+  micStream = stream;
+  micTrack = stream.getAudioTracks()[0];
+  micTrack.enabled = enabledValue;
+  currentMicDeviceId = selectedMicDeviceId;
+  broadcastLocalStream(stream, 'mic');
+  setMicButtonOn(enabledValue);
+  updateOwnMicIndicator();
+}
+
 micButton.addEventListener('click', async () => {
   if (micRequestInProgress) return;
 
@@ -4760,9 +5638,7 @@ micButton.addEventListener('click', async () => {
     micRequestInProgress = true;
     let stream;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: selectedMicDeviceId ? { deviceId: { exact: selectedMicDeviceId } } : true,
-      });
+      stream = await acquireMicStream(selectedMicDeviceId);
     } catch (err) {
       console.warn('Microphone access denied:', err);
       showRoomMessage('Could not access the microphone.');
@@ -4770,13 +5646,7 @@ micButton.addEventListener('click', async () => {
       return;
     }
     micRequestInProgress = false;
-
-    micStream = stream;
-    micTrack = stream.getAudioTracks()[0];
-    currentMicDeviceId = selectedMicDeviceId;
-    broadcastLocalStream(stream, 'mic');
-    setMicButtonOn(true);
-    updateOwnMicIndicator();
+    applyMicStream(stream, true);
     refreshDeviceLists(); // permission granted — enumerateDevices now has labels
   } else {
     const turningOn = !micTrack.enabled;
@@ -4854,6 +5724,34 @@ async function applyCameraDeviceChange(deviceId) {
   await liveSwitchCamTrack(selectedCamDeviceId, true);
 }
 
+/** Acquire a fresh camera-only stream for `deviceId` — see acquireMicStream above, the same split and the same reasoning, just for video. */
+async function acquireCameraStream(deviceId) {
+  return navigator.mediaDevices.getUserMedia({ video: cameraConstraintsFor(deviceId) });
+}
+
+/**
+ * Make `stream` our own outgoing camera — see applyMicStream above for the
+ * full reasoning (split out of cameraButton's click handler so the
+ * pre-join card can hand over the stream it already acquired for the live
+ * preview, see onPrejoinSubmit). `ownTile` doesn't exist yet on the
+ * pre-join card (created only once 'joined' arrives) — the video-element
+ * wiring below is skipped in that case and instead applied retroactively
+ * right after createTile (see signaling.on('joined')).
+ */
+function applyCameraStream(stream, enabledValue) {
+  camStream = stream;
+  camTrack = stream.getVideoTracks()[0];
+  camTrack.enabled = enabledValue;
+  currentCamDeviceId = selectedCamDeviceId;
+  broadcastLocalStream(stream, 'camera');
+  if (ownTile) {
+    ownTile.videoEl.srcObject = stream;
+    safePlay(ownTile.videoEl);
+    setTileVideoVisible(ownTile, enabledValue);
+  }
+  setCameraButtonOn(enabledValue);
+}
+
 cameraButton.addEventListener('click', async () => {
   if (camRequestInProgress) return;
 
@@ -4861,7 +5759,7 @@ cameraButton.addEventListener('click', async () => {
     camRequestInProgress = true;
     let stream;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ video: cameraConstraintsFor(selectedCamDeviceId) });
+      stream = await acquireCameraStream(selectedCamDeviceId);
     } catch (err) {
       console.warn('Camera access denied:', err);
       showRoomMessage('Could not access the camera.');
@@ -4869,18 +5767,7 @@ cameraButton.addEventListener('click', async () => {
       return;
     }
     camRequestInProgress = false;
-
-    camStream = stream;
-    camTrack = stream.getVideoTracks()[0];
-    currentCamDeviceId = selectedCamDeviceId;
-    broadcastLocalStream(stream, 'camera');
-
-    if (ownTile) {
-      ownTile.videoEl.srcObject = stream;
-      safePlay(ownTile.videoEl);
-      setTileVideoVisible(ownTile, true);
-    }
-    setCameraButtonOn(true);
+    applyCameraStream(stream, true);
     refreshDeviceLists(); // permission granted — enumerateDevices now has labels
   } else {
     const turningOn = !camTrack.enabled;
@@ -5088,16 +5975,18 @@ function onSharePopupKeydown(event) {
  * linkExpiry, see top of file) — NOT from location.href, because
  * leaderToken would never be there anyway (it's one-time and only for the
  * creator). Shape: `<origin>/r/<id>#t=<token>&e=<expiry>&n=<name>` — WITHOUT
- * lt. `n` is added only if the room name is known (initialRoomName) — this
- * way the room name travels in the invite link and becomes visible to
- * everyone who follows it (see the initialRoomName render and the fragment
- * parsing above); the server still won't see this name — the fragment
- * never goes to the server. Everyone who joins via this link authenticates
- * with the SAME `t`/`e` (as before with `k`), but each derives THEIR OWN
- * pairwise keys (see static/crypto.js).
+ * lt. `n` is added only if the room name is known (currentRoomName — for
+ * the creator this is only set once they've submitted the pre-join card,
+ * see onPrejoinSubmit/writeRoomNameToFragment; a guest already has it from
+ * the invite link they followed) — this way the room name travels in the
+ * invite link and becomes visible to everyone who follows it (see
+ * renderRoomNameChrome and the fragment parsing above); the server still
+ * won't see this name — the fragment never goes to the server. Everyone who
+ * joins via this link authenticates with the SAME `t`/`e` (as before with
+ * `k`), but each derives THEIR OWN pairwise keys (see static/crypto.js).
  */
 function buildShareLink() {
-  const namePart = initialRoomName ? `&n=${encodeURIComponent(initialRoomName)}` : '';
+  const namePart = currentRoomName ? `&n=${encodeURIComponent(currentRoomName)}` : '';
   return `${location.origin}${location.pathname}#t=${linkTokenBase64url}&e=${linkExpiry}${namePart}`;
 }
 
@@ -5122,8 +6011,28 @@ function renderShareQr(text) {
   }
 }
 
+/**
+ * The room's own name (task item 1), WITH its leading emoji exactly as
+ * currentRoomName carries it — never re-derived/stripped here, this is a
+ * headline next to the eyebrow, not an avatar-adjacent pill (compare
+ * tileDisplayName, which DOES strip it, for the tiles/pre-join preview).
+ * Hidden ENTIRELY (not a placeholder like "Room") when the room doesn't
+ * have a name yet — a link shared before the creator ever set one, or a
+ * malformed `n` (see the fragment-parsing IIFE at the top of the file).
+ */
+function renderShareRoomName() {
+  if (!currentRoomName) {
+    sharePopupRoomNameEl.classList.add('hidden');
+    sharePopupRoomNameEl.textContent = '';
+    return;
+  }
+  sharePopupRoomNameEl.textContent = currentRoomName;
+  sharePopupRoomNameEl.classList.remove('hidden');
+}
+
 function openSharePopup() {
   const link = buildShareLink();
+  renderShareRoomName();
   renderShareQr(link);
   sharePopupLinkEl.textContent = link;
   renderShareBuildLine(); // doesn't block opening — if the hash hasn't arrived yet, fetchBuildHashOnce().then() above will update the line itself once it does
@@ -5149,6 +6058,25 @@ sharePopupCopyButtonEl.addEventListener('click', async () => {
     setTimeout(() => {
       sharePopupCopyButtonEl.textContent = original;
     }, 1500);
+  }
+});
+
+// The native Web Share API (see shareApiSupported above — the button is
+// hidden entirely when it's absent, so this listener is harmless dead code
+// in that case, never actually reachable by a click). Same link as
+// Copy/the QR — nothing beyond it is shared (no room name-as-text, no extra
+// metadata) other than `title`, which only appears in the OS share sheet
+// UI, never in the room link itself. A user dismissing the native sheet
+// rejects the promise with an AbortError — that's a normal cancel, not a
+// failure, and is swallowed silently; anything else is logged for
+// debugging but doesn't surface in the UI (there's no good terminal state
+// to show for "the OS share sheet failed").
+sharePopupShareButtonEl.addEventListener('click', async () => {
+  try {
+    await navigator.share({ title: currentRoomName || 'Video call', url: buildShareLink() });
+  } catch (err) {
+    if (err && err.name === 'AbortError') return;
+    console.warn('navigator.share failed:', err);
   }
 });
 

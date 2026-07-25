@@ -44,6 +44,8 @@ and states known gaps plainly rather than implying full coverage.
 | Exhausting server memory with unbounded rooms | Mitigated | Global room-count ceiling, checked under the same lock as room insertion (H2, [§4](#4-h2--denial-of-service-limits)) |
 | One source hammering room creation | Mitigated | Per-IP sliding-window rate limit on `POST /api/rooms` (H2, [§4](#4-h2--denial-of-service-limits)) |
 | Flooding a room's waiting list from one source | Mitigated | Separate per-IP sliding-window rate limit on lobby joins, plus a per-room pending cap (M3, [§7](#7-m3--waiting-room-flood-protection)) |
+| Hammering the unauthenticated pre-join room-status preview (`GET /api/rooms/{id}`) | Mitigated | Its own, separate per-IP sliding-window rate limit, deliberately more generous than room creation (H2, [§4](#4-h2--denial-of-service-limits)) |
+| Learning who's in a room, or its settings/tokens, from the room-status preview | Mitigated by design | The endpoint returns only a participant count, a capacity, and an age — never names, peer ids, settings, or tokens ([§9](#9-known-boundaries), [`privacy.md` §2](privacy.md#2-what-the-server-does-see)) |
 | Silently dead connections accumulating server-side | Mitigated | Active ping/pong heartbeat tears down unresponsive connections in seconds-to-tens-of-seconds rather than waiting on an OS-level TCP timeout |
 | Impersonating another participant in chat (identity spoofing) | Mitigated | `envelope.from` normalized to the true transport sender before any processing (H3, [§5](#5-h3--chat-identity-binding)) |
 | Clickjacking / framing the app in a hostile page | Mitigated | `frame-ancestors 'none'` (CSP) + `X-Frame-Options: DENY` (M2, [§6](#6-m2--security-headers--csp)) |
@@ -144,6 +146,15 @@ non-blocking by construction.
   unanswered pings (nothing at all back from the client) and the server
   tears the connection down itself, rather than accumulating dead sockets
   until an OS-level TCP timeout (which can take minutes) catches them.
+- **Per-IP room-status rate limit**: a separate sliding window, deliberately
+  more generous than room creation (`ROOM_STATUS_IP_LIMIT`, default
+  240/60s), on the unauthenticated `GET /api/rooms/{id}` preview a pre-join
+  screen polls every few seconds (see
+  [`signaling-protocol.md` §2.3](signaling-protocol.md#23-get-apiroomsroomid)).
+  Kept apart from `ROOM_CREATION_IP_LIMIT` for the same reason as the
+  waiting-room limit in [§7](#7-m3--waiting-room-flood-protection): a
+  legitimate caller can hammer this endpoint far more often, per session,
+  than it will ever call `POST /api/rooms`.
 
 ## 5. H3 — Chat Identity Binding
 
@@ -230,6 +241,18 @@ Stated plainly, not buried:
   attacker behind a spoofable or absent proxy chain could evade it. The goal
   is blunting casual flooding, not withstanding a targeted, sophisticated
   attacker.
+- **`GET /api/rooms/{id}` confirms existence and occupancy to anyone holding
+  the id, without joining.** This is by design, not an oversight (see
+  [`privacy.md` §2](privacy.md#2-what-the-server-does-see)) — it's what lets
+  a pre-join screen show "N people · started X ago" before the visitor grants
+  camera/microphone permission. What it does **not** do: leak names (the
+  server never learns them regardless — see
+  [`privacy.md` §1](privacy.md#1-what-the-server-never-sees)), peer ids, room
+  settings, or tokens. And it doesn't turn a room id into something worth
+  scanning for — room ids are drawn from a large enough space, and the
+  endpoint's own rate limit ([§4](#4-h2--denial-of-service-limits)) bounds
+  how fast one source could try, that brute-forcing occupancy across
+  unknown ids isn't a practical concern.
 - **The room link is the entire access control.** Anyone who has it can
   join (subject to the waiting room, if the leader has enabled it) and can
   derive the same encryption keys as any other participant (see
@@ -304,11 +327,14 @@ Cloudflare Pages serves) and before it's pushed to Cloudflare:
    not anything the Cloudflare Pages host can touch.
 4. The frontend fetches `/build-hash.json` itself (same-origin, once per
    tab, never persisted to `localStorage`) and shows the hash in three
-   places: the landing page footer, the "Share" popup inside a room, and
-   (best-effort) the "Connection & Privacy" settings panel. In a
-   dev/self-hosted build — where no such route or file exists (see
-   [`self-hosting.md`](self-hosting.md)) — the fetch simply 404s and all
-   three stay hidden; nothing breaks.
+   places: inside the landing page's collapsed "How it works" disclosure (it
+   used to be a standalone footer at the bottom of the landing card; it now
+   lives at the end of that disclosure's body instead — see
+   [`DESIGN.md` §1.3](DESIGN.md#13-entry-flow-landing--pre-join--room)), the
+   "Share" popup inside a room, and (best-effort) the "Connection & Privacy"
+   settings panel. In a dev/self-hosted build — where no such route or file
+   exists (see [`self-hosting.md`](self-hosting.md)) — the fetch simply 404s
+   and all three stay hidden; nothing breaks.
 
 ### 10.2 Recomputing the Hash Yourself
 

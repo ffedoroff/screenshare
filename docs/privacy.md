@@ -92,6 +92,19 @@ The server does see, and cannot avoid seeing:
   server's in-memory state below; it's the same minimal bookkeeping,
   surfaced as numbers for capacity/health monitoring rather than kept
   invisible.
+- **A specific room's occupancy, capacity, and age — to anyone holding that
+  room's id, not only the operator.** The pre-join screen previews a room
+  before joining it via a public, unauthenticated endpoint (see
+  [`signaling-protocol.md` §2.3](signaling-protocol.md#23-get-apiroomsroomid))
+  that answers "how many people, what's the limit, how old" for one named
+  room. This is a deliberate, narrow exception to "only the operator sees
+  room-level facts," scoped tightly: it confirms a room's existence and
+  occupancy to whoever already has its id, and nothing more — no names
+  (impossible regardless, see [§1](#1-what-the-server-never-sees)), no peer
+  ids, no settings, no tokens. Room ids are drawn from a large enough space
+  that this isn't a practical way to go discover rooms a caller doesn't
+  already have a link to; it only helps someone who was already going to
+  join anyway decide whether it's worth doing so right now.
 
 None of this reveals what was said, shown, or shared — but it is genuine
 metadata the architecture cannot hide, since the server has to route
@@ -191,31 +204,39 @@ same access it always did (see [`security.md` §9](security.md#9-known-boundarie
 - **No accounts, no login, ever.** There is nothing to register for and
   nothing to authenticate against beyond possessing the meeting link.
 - **No cookies, no `localStorage`, no cross-session identifier of any
-  kind**, anywhere in the frontend. The join modal's name field comes
-  pre-filled with a randomly generated pseudonym (e.g. `🦊 Brave Fox`) —
-  picked entirely client-side, via `crypto.getRandomValues`, before Join is
-  even clicked, so the suggestion itself never touches the network. A
-  participant is free to keep it, edit it, or clear the field back to
-  anonymous, exactly as before; whatever is finally submitted still lives
-  only in that tab's memory for the meeting's duration — it is never
+  kind**, anywhere in the frontend. The pre-join screen's "Your name" field
+  comes pre-filled with a randomly generated pseudonym (e.g. `🦊 Brave Fox`)
+  — picked entirely client-side, via `crypto.getRandomValues`, before
+  Start/Join is even clicked, so the suggestion itself never touches the
+  network. A participant is free to keep it, edit it, or clear the field
+  back to anonymous, exactly as before; whatever is finally submitted still
+  lives only in that tab's memory for the meeting's duration — it is never
   remembered between visits, and it never leaves the browser except as
   ciphertext, addressed to one specific recipient at a time (see
   [`e2e-encryption.md`](e2e-encryption.md)).
 - **A room's name is visible to every participant, but never becomes
-  server-side state.** The creator's own link carries an optional, locally
-  generated name (the same kind of client-side suggestion as above, e.g.
-  `🌿 Quiet Meadow`) in the URL fragment alongside the link token and expiry,
-  and it is carried forward into the invite link the creator shares, so
-  every guest who follows that link sees the same name in their own tab's
-  title and header. The one-time leader token (`lt`) is still stripped from
+  server-side state.** This used to be decided at creation time, on the
+  landing page, and travel in the very first redirect into the room; it is
+  now decided one step later — by the creator, on the pre-join screen
+  *inside* the room itself, prefilled with the same kind of client-side
+  suggestion as above (e.g. `🌿 Quiet Meadow`) — so the landing page's
+  redirect carries no room name at all any more. Once the creator submits
+  that screen, the chosen name is written into the address bar as part of
+  the fragment (`#t=...&e=...&n=...`) via `history.replaceState`, and from
+  that point on it behaves exactly like `t`/`e` always did: it rides along
+  in the invite link the creator shares, so every guest who follows that
+  link sees the same name in their own tab's title/header and their own
+  pre-join screen. The one-time leader token (`lt`) is still stripped from
   the address bar immediately after being read — it's a single-use secret
   and has nothing to gain from lingering — but the rest of the fragment is
-  not: the link token `t`, the expiry `e`, and the room name `n` all stay in
-  the fragment (`#t=...&e=...&n=...`) for everyone, which means they also
-  survive a reload for every participant, not just the creator. None of this
-  changes what the server sees: the fragment never leaves the browser on its
-  own, so the server has no access to the room's name regardless of how many
-  participants' tabs carry it.
+  not: the link token `t`, the expiry `e`, and (once set) the room name `n`
+  all stay in the fragment for everyone, which means they also survive a
+  reload for every participant, not just the creator. None of this changes
+  what the server sees: the fragment never leaves the browser on its own, so
+  the server has no access to the room's name regardless of how many
+  participants' tabs carry it, or when it was set (see
+  [`DESIGN.md` §1.3](DESIGN.md#13-entry-flow-landing--pre-join--room) for the
+  full entry-flow walkthrough).
 - Every identifier a client has during a meeting (its peer id and ephemeral
   public key, in particular) is generated fresh for that session and held
   only in memory — it is not derived from, or correlatable with, anything

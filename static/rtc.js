@@ -148,6 +148,52 @@ class RtcPeer {
     this.ignoreOffer = false;
     this.isSettingRemoteAnswerPending = false;
 
+    // BUGFIX (see _serialize below): pc.onnegotiationneeded's offer flow and
+    // _applyRemoteDescription's collision-check+answer flow both end up
+    // calling pc.setLocalDescription()/pc.setRemoteDescription() on this
+    // same pc, but they are kicked off independently — one by the browser's
+    // 'negotiationneeded' event, one by an incoming offer/answer arriving
+    // over signaling/the bus — so without an explicit guard they can be IN
+    // FLIGHT AT THE SAME TIME. Observed empirically (see the repro that
+    // accompanies this fix): our own onnegotiationneeded can still be
+    // awaiting setLocalDescription() when the remote side's offer arrives
+    // and _applyRemoteDescription starts running concurrently; the
+    // browser's internal operation queue still serializes the actual
+    // setLocalDescription/setRemoteDescription calls on this ONE
+    // RTCPeerConnection (spec-guaranteed), but WHICH of our two JS
+    // continuations reads pc.localDescription/pc.signalingState right
+    // after ITS OWN await resolves is not ordered relative to the other —
+    // an implicit rollback triggered by the incoming offer re-dirties the
+    // negotiation-needed flag and can cause onnegotiationneeded to fire
+    // AGAIN before _applyRemoteDescription's own answer-generating
+    // setLocalDescription() call has run, so the two race for "what
+    // setLocalDescription() actually produces right now" (an offer or an
+    // answer — decided by pc.signalingState at the moment each call is
+    // actually processed) while each still labels/sends its result
+    // according to its OWN hardcoded assumption ('offer' from
+    // onnegotiationneeded, 'answer' from _applyRemoteDescription) — so the
+    // loser of the race ships a description under the WRONG label. This
+    // doesn't necessarily throw (the receiver still reads the real type
+    // from the payload's own `type` field, not the wire label) but it can
+    // leave the two sides with a mutually INCONSISTENT view of what was
+    // actually negotiated last (each side's own local signalingState
+    // settles back to 'stable', so nothing looks wrong locally, but the
+    // negotiated ICE ufrag/pwd pairing between the two peers doesn't
+    // correspond to a single consistent offer/answer round) — connectivity
+    // checks then never succeed and connectionState sits at 'new'/
+    // 'checking' forever, with NO exception anywhere (ICE failure is
+    // silent, not thrown). `_chain` below serializes every entry point
+    // that can call setLocalDescription/setRemoteDescription for this pair
+    // — onnegotiationneeded and _applyRemoteDescription (offer, answer, or
+    // collision-ignore) never run concurrently; whichever was triggered
+    // second simply waits for the first to fully finish (including
+    // sending its message) before it even reads pc.signalingState. This
+    // does NOT change the perfect-negotiation logic itself (polite/
+    // impolite, makingOffer, ignoreOffer, the implicit rollback) — it only
+    // guarantees those checks run against a settled state instead of a
+    // racy one.
+    this._chain = Promise.resolve();
+
     // Candidates that arrive before remoteDescription has been applied —
     // just like in the previous manual implementation, we queue them and
     // flush after setRemoteDescription.
@@ -226,27 +272,34 @@ class RtcPeer {
       }
     };
 
-    pc.onnegotiationneeded = async () => {
-      try {
-        this.makingOffer = true;
-        await pc.setLocalDescription();
-        const offer = { type: pc.localDescription.type, sdp: pc.localDescription.sdp };
-        // F3: if the bus to this peer is already open and pc is fine -> send
-        // the offer directly over it (see the file header); otherwise — the
-        // old server path with encryption under this pair's pairwise
-        // K_pair_sig (the server only sees the opaque {v,iv,ct} instead of
-        // the real SDP and its DTLS fingerprints, see the header of
-        // static/crypto.js).
-        if (!this._trySendBusSignal('offer', offer)) {
-          const encSdp = await this.sigCrypto.encrypt(offer);
-          signaling.send('offer', { targetPeerId, sdp: encSdp });
-          ConnStats.incSignalingRelay();
+    // Wrapped in _serialize (see the constructor comment on this._chain) so
+    // this can never run concurrently with _applyRemoteDescription for the
+    // same pc — if a remote offer/answer is already being processed, this
+    // firing simply waits its turn instead of racing setLocalDescription()
+    // against it.
+    pc.onnegotiationneeded = () => {
+      this._serialize(async () => {
+        try {
+          this.makingOffer = true;
+          await pc.setLocalDescription();
+          const offer = { type: pc.localDescription.type, sdp: pc.localDescription.sdp };
+          // F3: if the bus to this peer is already open and pc is fine -> send
+          // the offer directly over it (see the file header); otherwise — the
+          // old server path with encryption under this pair's pairwise
+          // K_pair_sig (the server only sees the opaque {v,iv,ct} instead of
+          // the real SDP and its DTLS fingerprints, see the header of
+          // static/crypto.js).
+          if (!this._trySendBusSignal('offer', offer)) {
+            const encSdp = await this.sigCrypto.encrypt(offer);
+            signaling.send('offer', { targetPeerId, sdp: encSdp });
+            ConnStats.incSignalingRelay();
+          }
+        } catch (err) {
+          console.error(`[peer ${targetPeerId}] onnegotiationneeded error:`, err);
+        } finally {
+          this.makingOffer = false;
         }
-      } catch (err) {
-        console.error(`[peer ${targetPeerId}] onnegotiationneeded error:`, err);
-      } finally {
-        this.makingOffer = false;
-      }
+      });
     };
 
     pc.onicecandidate = (event) => {
@@ -278,6 +331,26 @@ class RtcPeer {
   }
 
   /**
+   * Run `fn` only after every previously enqueued call to _serialize() for
+   * this peer has fully settled — see the constructor's comment on
+   * this._chain for WHY this exists (onnegotiationneeded vs
+   * _applyRemoteDescription/_applyRemoteCandidate racing on the same pc).
+   * `fn`'s rejection is NOT swallowed for the caller (the promise this
+   * method returns still rejects, so existing try/catch around each call
+   * site keeps working exactly as before) — but it must never poison
+   * this._chain itself, or every operation queued after a failing one
+   * would silently never run.
+   */
+  _serialize(fn) {
+    const run = this._chain.then(fn, fn);
+    this._chain = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
+  }
+
+  /**
    * Receiving an SDP description from the remote peer THROUGH THE SERVER
    * RELAY — offer OR answer, distinguished by description.type.
    * `encryptedDescription` — an encrypted blob {v,iv,ct} under this pair's
@@ -297,7 +370,11 @@ class RtcPeer {
       if (this.onCryptoFailure) this.onCryptoFailure(err);
       return;
     }
-    await this._applyRemoteDescription(description);
+    // Wrapped in _serialize (see the constructor comment on this._chain) —
+    // never runs concurrently with pc.onnegotiationneeded's offer flow (or
+    // another _applyRemoteDescription/_applyRemoteCandidate call already in
+    // progress for this same peer).
+    await this._serialize(() => this._applyRemoteDescription(description));
   }
 
   /** Receiving an ICE candidate from the remote peer THROUGH THE SERVER RELAY (trickle). `encryptedCandidate` — a blob {v,iv,ct}, decrypted first (see handleDescription regarding onCryptoFailure). */
@@ -310,7 +387,7 @@ class RtcPeer {
       if (this.onCryptoFailure) this.onCryptoFailure(err);
       return;
     }
-    await this._applyRemoteCandidate(candidate);
+    await this._serialize(() => this._applyRemoteCandidate(candidate));
   }
 
   /**
@@ -325,9 +402,9 @@ class RtcPeer {
   async handleBusSignal(payload) {
     if (!payload || typeof payload !== 'object') return;
     if (payload.type === 'ice') {
-      await this._applyRemoteCandidate(payload.data);
+      await this._serialize(() => this._applyRemoteCandidate(payload.data));
     } else {
-      await this._applyRemoteDescription(payload.data);
+      await this._serialize(() => this._applyRemoteDescription(payload.data));
     }
   }
 

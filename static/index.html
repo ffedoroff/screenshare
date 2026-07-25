@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="theme-color" content="#0f1114" />
   <title>Video call — create room</title>
-  <link rel="stylesheet" href="/static/style.css?v=16" />
+  <link rel="stylesheet" href="/static/style.css?v=18" />
   <link rel="manifest" href="/static/manifest.webmanifest" />
   <link rel="apple-touch-icon" href="/static/icon-192.png" />
 </head>
@@ -14,46 +14,72 @@
     <div class="landing-card">
       <h1>Video call</h1>
 
-      <!-- Room name input + "regenerate" button (see static/landing.js) in
-           a single row — a compact control, no form submission (button
-           type="button"). -->
-      <div class="input-with-regen">
-        <input id="room-name-input" class="name-input" type="text" maxlength="40"
-               autocomplete="off" aria-label="Room name (shared with everyone who has the link)" />
-        <button id="room-name-regen-button" type="button" class="regen-button" aria-label="Generate new name" title="Generate new name">↻</button>
-      </div>
+      <!-- The promise, in two sentences: the first is the actual pitch
+           (kept full-strength, "never through a server" bolded), the
+           second is supporting detail and visually muted (see
+           .landing-promise-muted in style.css) so it doesn't compete with
+           the first for attention. No room name is asked here at all
+           anymore — that now happens on the pre-join screen inside the
+           room itself (see static/room.js), once the roomId already
+           exists. -->
+      <p class="landing-promise">
+        Voice, video, chat and files go straight to the other person — <strong>never through a server</strong>.
+        <span class="landing-promise-muted">End-to-end encrypted. No account, nothing stored.</span>
+      </p>
 
       <button id="create-room-button" class="start-button">Create room</button>
 
       <div id="landing-message" class="status-message"></div>
 
-      <!-- Forensic anchor against tampering with the static assets by the
-           host (Step 2, see docs/security.md, "Published Build Hash") — NOT
-           a cryptographic guarantee, just a verification point against an
-           independent channel (GitHub Release). Hidden until
-           /build-hash.json has loaded (see static/landing.js:
-           loadBuildHash) — in the dev/self-hosted build the file doesn't
-           exist at all, and that's expected. -->
-      <footer id="landing-build-footer" class="build-footer hidden">
-        <details class="build-details">
-          <summary class="build-summary">build: <span id="landing-build-short"></span></summary>
-          <div id="landing-build-full" class="build-full"></div>
-        </details>
-        <a
-          id="landing-build-verify-link"
-          class="build-verify-link"
-          href="https://github.com/ffedoroff/screenshare/releases"
-          target="_blank"
-          rel="noopener noreferrer"
-          >verify</a
-        >
-      </footer>
+      <!-- "How it works" — a native <details>/<summary> disclosure, no JS
+           needed to toggle it (the chevron rotation in style.css hooks into
+           the [open] attribute alone). Collapsed by default: the landing's
+           job is to get out of the way, this is just for the curious/
+           skeptical visitor. The build-hash line (previously a standalone
+           footer at the bottom of the card) now lives at the end of this
+           disclosure's body instead — see the comment on
+           #landing-build-footer below. -->
+      <details class="landing-more">
+        <summary class="landing-more-summary">
+          How it works
+          <svg class="landing-more-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"></polyline></svg>
+        </summary>
+        <div class="landing-more-body">
+          <ul class="landing-more-list">
+            <li><b>Nothing flows through us.</b> Our server only helps two browsers find each other. After that the call runs directly between you.</li>
+            <li><b>Encrypted end to end.</b> Nobody in the middle can read or hear anything — not even us.</li>
+            <li><b>Nothing is stored.</b> No accounts, no recordings, no history. Close the tab and the room is gone.</li>
+            <li><b>Open source.</b> <a href="https://github.com/ffedoroff/screenshare#readme" target="_blank" rel="noopener noreferrer">Read the docs on GitHub →</a></li>
+          </ul>
+
+          <!-- Forensic anchor against tampering with the static assets by the
+               host (Step 2, see docs/security.md, "Published Build Hash") — NOT
+               a cryptographic guarantee, just a verification point against an
+               independent channel (GitHub Release). Hidden until
+               /build-hash.json has loaded (see static/landing.js:
+               loadBuildHash) — in the dev/self-hosted build the file doesn't
+               exist at all, and that's expected. -->
+          <footer id="landing-build-footer" class="build-footer hidden">
+            <details class="build-details">
+              <summary class="build-summary">build: <span id="landing-build-short"></span></summary>
+              <div id="landing-build-full" class="build-full"></div>
+            </details>
+            <a
+              id="landing-build-verify-link"
+              class="build-verify-link"
+              href="https://github.com/ffedoroff/screenshare/releases"
+              target="_blank"
+              rel="noopener noreferrer"
+              >verify</a
+            >
+          </footer>
+        </div>
+      </details>
     </div>
   </div>
 
-  <script src="/static/config.js?v=9"></script>
-  <script src="/static/crypto.js?v=9"></script>
-  <script src="/static/namegen.js?v=9"></script>
-  <script src="/static/landing.js?v=9"></script>
+  <script src="/static/config.js?v=11"></script>
+  <script src="/static/crypto.js?v=11"></script>
+  <script src="/static/landing.js?v=11"></script>
 </body>
 </html>

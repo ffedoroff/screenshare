@@ -6,12 +6,13 @@
 - [2. HTTP Endpoints](#2-http-endpoints)
   - [2.1 `POST /api/rooms`](#21-post-apirooms)
   - [2.2 `PUT /api/rooms/{roomId}`](#22-put-apiroomsroomid)
-  - [2.3 `GET /r/{roomId}`](#23-get-rroomid)
-  - [2.4 `GET /config`](#24-get-config)
-  - [2.5 `GET /healthz`](#25-get-healthz)
-  - [2.6 `GET /version.json`](#26-get-versionjson)
-  - [2.7 `GET /ws` (WebSocket upgrade)](#27-get-ws-websocket-upgrade)
-  - [2.8 `GET /metrics` (management port)](#28-get-metrics-management-port)
+  - [2.3 `GET /api/rooms/{roomId}`](#23-get-apiroomsroomid)
+  - [2.4 `GET /r/{roomId}`](#24-get-rroomid)
+  - [2.5 `GET /config`](#25-get-config)
+  - [2.6 `GET /healthz`](#26-get-healthz)
+  - [2.7 `GET /version.json`](#27-get-versionjson)
+  - [2.8 `GET /ws` (WebSocket upgrade)](#28-get-ws-websocket-upgrade)
+  - [2.9 `GET /metrics` (management port)](#29-get-metrics-management-port)
 - [3. WebSocket: Client → Server](#3-websocket-client--server)
 - [4. WebSocket: Server → Client](#4-websocket-server--client)
 - [5. Relay Semantics](#5-relay-semantics)
@@ -71,11 +72,12 @@ to see (see [`privacy.md` §2](privacy.md#2-what-the-server-does-see)).
 |---|---|---|---|
 | `POST /api/rooms` | none (an optional `{"name": "..."}` is accepted and ignored) | `201 {"roomId": "<8 chars>", "leaderToken": "<uuid>", "lifetimeSeconds": <u64>}`, or `429` (per-IP room-creation rate limit), or `503` (room count ceiling) | Create a new, empty room. Participants join it separately via `join-room` over WebSocket. |
 | `PUT /api/rooms/{roomId}` | none | `201 {"roomId": ..., "lifetimeSeconds": <u64>}` (didn't exist — created), `200 {"roomId": ..., "lifetimeSeconds": <u64>}` (already existed), `400` (malformed id), `429` (per-IP room-creation rate limit — shared with `POST /api/rooms`, see [§2.2](#22-put-apiroomsroomid)), `503` (room count ceiling) | Idempotent restore of a room after a server restart (see [`self-hosting.md`](self-hosting.md)). Issues no `leaderToken` — the restored room's leader is whoever joins first. |
+| `GET /api/rooms/{roomId}` | — | `200 {"participants": <u32>, "capacity": <u32>, "ageSeconds": <u64>}`, `404` (plain text — no such room), or `429` (its own, separate per-IP rate limit) | Public, unauthenticated preview of a room for the frontend's pre-join screen (see [§2.3](#23-get-apiroomsroomid)) — no `join-room`/WebSocket round trip needed just to answer "how many people, how full, how old." |
 | `GET /r/{roomId}` | — | `200` HTML (`room.html`) | Short link that serves the room page; the frontend reads `roomId` from the URL itself. |
 | `GET /config` | — | `200 {"iceServers": [...]}` | ICE server list for the frontend: a public STUN server always, plus a TURN server if configured (with short-lived HMAC credentials — see [`webrtc-mesh.md`](webrtc-mesh.md) and [`self-hosting.md`](self-hosting.md)). |
 | `GET /healthz` | — | `200 "ok"` | Liveness/readiness probe. |
 | `GET /version.json` | — | `200 {"version", "commit", "buildDate"}` | Deployed build identity, used by the frontend to detect a version skew after reconnecting. |
-| `GET /ws` | — | WebSocket upgrade | The signaling connection — see [§2.7](#27-get-ws-websocket-upgrade) and §3/§4 below. |
+| `GET /ws` | — | WebSocket upgrade | The signaling connection — see [§2.8](#28-get-ws-websocket-upgrade) and §3/§4 below. |
 
 A room's QR code is **not** a server endpoint: it is rendered locally in the
 browser from the room link (which carries the secret key in its URL
@@ -118,11 +120,57 @@ as `POST /api/rooms` (it's the other "create-a-room-record" path — the limit
 cares about how many room records one IP mints total, not which of the two
 routes it used), not a separate one.
 
-### 2.3 `GET /r/{roomId}`
+### 2.3 `GET /api/rooms/{roomId}`
+
+A public, unauthenticated, read-only preview of a room, meant to be polled
+from the frontend's pre-join screen (see [`DESIGN.md` §1.3](DESIGN.md#13-entry-flow-landing--pre-join--room))
+*before* the visitor actually joins over `/ws` — "how many people are in
+here, is it full, how old is this call" — without a `join-room` round trip,
+or a WebSocket connection at all.
+
+Returns `200 {"participants": <u32>, "capacity": <u32>, "ageSeconds": <u64>}`:
+
+- `participants` counts only people **currently admitted** to the room — a
+  peer waiting in the lobby for the leader's approval is never counted (see
+  [`permissions-and-leader.md` §6](permissions-and-leader.md#6-the-waiting-room-lobby)),
+  matching how the pre-join screen wants to answer "how many people are
+  already in the call," not "how many are trying to be."
+- `capacity` is the room's *effective* participant ceiling — the exact same
+  number `join-room`/`approve` enforce (the leader's own `maxParticipants` if
+  set, otherwise the server-wide default — see
+  [`permissions-and-leader.md` §5](permissions-and-leader.md#5-room-settings)) —
+  so a pre-join "this room is full" check uses the identical notion of "full"
+  the server will actually apply on the real join attempt.
+- `ageSeconds` is how long the room has existed since it was created (or last
+  restored via `PUT /api/rooms/{roomId}`) — a simpler, independent clock from
+  `roomAgeSeconds` on the WS `joined` message, which instead measures from the
+  room's *first participant* rather than its creation (see
+  [§4](#4-websocket-server--client)).
+
+`404` (plain-text body, like every other error in this API) if no such room
+exists — never created, not yet created, or already removed by the reaper —
+the same three cases `room-not-found` covers on the WS join path.
+
+This endpoint deliberately exposes **nothing else**: no participant names
+(impossible regardless — the server never learns them, see
+[`privacy.md`](privacy.md)), no peer ids, no room settings, no tokens.
+Knowing a `roomId` should tell an onlooker only whether it's worth bothering
+to join, not who's already there — see
+[`privacy.md` §2](privacy.md#2-what-the-server-does-see) for the privacy
+framing of that trade-off.
+
+Rate-limited per source IP on its **own**, separate budget (240 requests/60s
+by default, `ROOM_STATUS_IP_LIMIT` — see
+[`self-hosting.md` §6](self-hosting.md#6-environment-variables)), deliberately
+more generous than the room-creation limit above: this endpoint is meant to
+be polled every few seconds for as long as a pre-join screen stays open,
+which the tight room-creation budget was never sized for.
+
+### 2.4 `GET /r/{roomId}`
 
 Serves the room page directly; the room id is read from the URL client-side.
 
-### 2.4 `GET /config`
+### 2.5 `GET /config`
 
 Always includes a public STUN server. If a TURN server is configured, its
 credentials are computed per-request with a short TTL rather than being a
@@ -130,18 +178,18 @@ static, indefinitely valid pair — see [`webrtc-mesh.md`](webrtc-mesh.md) for
 the ICE mechanics and [`security.md`](security.md) for why static TURN
 credentials were a vulnerability.
 
-### 2.5 `GET /healthz`
+### 2.6 `GET /healthz`
 
 Trivial liveness check: if the process answers HTTP, it is up.
 
-### 2.6 `GET /version.json`
+### 2.7 `GET /version.json`
 
 Returns the build's version/commit/build-date. The frontend records this
 value on load and re-checks it after every successful reconnect; a mismatch
 triggers a non-intrusive "a new version is available" banner rather than a
 forced reload.
 
-### 2.7 `GET /ws` (WebSocket upgrade)
+### 2.8 `GET /ws` (WebSocket upgrade)
 
 Upgrades to the signaling WebSocket. The upgrade enforces frame/message size
 caps (see [§5](#5-relay-semantics)) and, when the deployment is configured
@@ -150,7 +198,7 @@ see [`self-hosting.md`](self-hosting.md) for when that matters (a
 single-origin deployment does not need it and leaves the check disabled by
 default).
 
-### 2.8 `GET /metrics` (management port)
+### 2.9 `GET /metrics` (management port)
 
 Prometheus text-format exposition (`text/plain; version=0.0.4`), served on a
 **separate** management port (`MGMT_PORT`, default `8081`) — not on the main
@@ -302,5 +350,5 @@ without a forced reload. This is what makes the reconnect-after-restart flow
 safe (see [`self-hosting.md`](self-hosting.md)) — a client can reconnect
 mid-session against a server that has since gained new message types it
 simply never uses. The frontend surfaces an informational "a new version is
-available" banner (via `/version.json`, see [§2.6](#26-get-versionjson)) but
+available" banner (via `/version.json`, see [§2.7](#27-get-versionjson)) but
 never forces a reload on its own.

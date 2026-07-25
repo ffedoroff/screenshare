@@ -95,7 +95,7 @@ Without any `--build-arg`s, the image reports `version: "dev"` from
 `/version.json` — the build only needs `APP_VERSION`/`GIT_COMMIT`/
 `BUILD_DATE` build args if you want a real version string surfaced to
 clients for the version-skew banner (see
-[`signaling-protocol.md` §2.6](signaling-protocol.md#26-get-versionjson)).
+[`signaling-protocol.md` §2.7](signaling-protocol.md#27-get-versionjson)).
 
 ## 3. Reverse Proxy & TLS
 
@@ -372,6 +372,7 @@ deploy scripts do for you today).
 | `MAX_PARTICIPANTS` | no | `6` | Ceiling on participants in one room. Not a protocol limit or a server cost — it's a recommended default for the mesh topology: every participant sends media directly to every other one, so raising this only grows *each client's* own outgoing bandwidth/CPU (n-1 copies to send), never the server's — the server only ever relays signaling either way |
 | `JOIN_ROOM_IP_LIMIT` | no | `20` (per 60s) | Per-IP rate limit on direct `join-room` (anti-DoS: without it, one IP could open `MAX_PARTICIPANTS` connections and fill a room it doesn't own, locking out legitimate guests who have the link) — see [`security.md` §4](security.md#4-h2--denial-of-service-limits) |
 | `ROOM_CREATION_IP_LIMIT` | no | `3` (per 60s) | Per-IP rate limit on `POST /api/rooms` and `PUT /api/rooms/{roomId}` (they share the same budget) — deliberately tight: creating a room is a rare action for a legitimate user, unlike joining one — see [`security.md` §4](security.md#4-h2--denial-of-service-limits) |
+| `ROOM_STATUS_IP_LIMIT` | no | `240` (per 60s) | Per-IP rate limit on `GET /api/rooms/{roomId}` (the pre-join room-status preview) — its own, separate and deliberately generous budget: a pre-join screen polls this every few seconds for as long as it's open, which the tight `ROOM_CREATION_IP_LIMIT` budget above would never tolerate — see [`signaling-protocol.md` §2.3](signaling-protocol.md#23-get-apiroomsroomid) |
 | `MGMT_PORT` | no | `8081` | Port for the **separate** management server that serves `GET /metrics` (Prometheus text exposition) — never the main `PORT`/signaling listener, and not meant to be reachable through the same public path; see [§7.4](#74-metrics--dashboard) |
 | `CORS_ORIGIN` | no | unset (CORS off entirely) | The frontend's origin, if running the split topology ([§1.2](#12-split-origin-frontend--signaling-separated)); also enables `Origin` validation on the WebSocket upgrade |
 | `TURN_URL` | no | unset | TURN server address, e.g. `turn:your-server:3478`. With embedded TURN ([§5.2](#52-embedded-turn-single-binary)), point this at this same host's own public IP on port `3478` |

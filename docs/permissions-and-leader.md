@@ -100,6 +100,13 @@ from the operator's env var or the leader's own choice.
 
 ## 6. The Waiting Room (Lobby)
 
+This section is the wire-level mechanics; for how the frontend actually
+presents waiting/pending on screen (a guest stays on the pre-join card with
+their live preview still running rather than a full-screen overlay; the
+leader sees each pending request as a card with an avatar, name, and
+Accept/Reject) see
+[`DESIGN.md` §1.3](DESIGN.md#13-entry-flow-landing--pre-join--room).
+
 While `lobbyEnabled` is `true`, any **non-leader** joining the room is not
 admitted immediately: the server places them in a separate pending list
 (distinct from the room's participant list — the participant ceiling

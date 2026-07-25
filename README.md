@@ -10,8 +10,9 @@ fully ephemeral — nothing is stored anywhere once the meeting ends.
 
 ## Key features
 
-- **Meeting rooms up to 6 people** — create a room in one click, share a short
-  link (or QR code), others join instantly. No registration.
+- **Meeting rooms up to 6 people** — create a room in one click, name it,
+  share a short link (or QR code); everyone previews their own camera/mic
+  and picks a name on a single screen before joining. No registration.
 - **Screen sharing, camera, and microphone** for every participant, with
   instant mute/unmute; one screen share at a time.
 - **Peer-to-peer text chat** with formatting, replies, reactions, message

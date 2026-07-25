@@ -174,26 +174,33 @@ long-lived credentials.
 A typical meeting follows five steps:
 
 ```
-Step 1 ─ Create   →   Step 2 ─ Share   →   Step 3 ─ Join   →   Step 4 ─ Meet   →   Step 5 ─ End
-(one click)            (link / QR)          (name only)         (video/audio/       (leave / limit
-                                                                  screen/chat)        reached)
+Step 1 ─ Create      →   Step 2 ─ Share   →   Step 3 ─ Join      →   Step 4 ─ Meet    →   Step 5 ─ End
+(one click, then a        (link / QR)          (preview + name)      (video/audio/        (leave / limit
+ name/preview screen)                                                 screen/chat)          reached)
 ```
 
 **Step 1 — Create**: The meeting creator opens the product and creates a
 meeting with a single click. No form, no title, no settings are required up
-front. The meeting is created empty; the creator is redirected straight into
-it and automatically becomes its leader.
+front. The meeting is created empty and the creator is taken straight into
+it, where one screen lets them preview their own camera/microphone, give the
+meeting a name (pre-filled with a friendly generated suggestion), and choose
+a display name — starting the meeting from there makes them its leader
+automatically.
 
 **Step 2 — Share**: The creator shares the meeting's link (copy/paste, or a
 QR code shown in-app for scanning on another device) with the people they
-want to invite. No separate invitation flow, email, or calendar integration
-exists or is needed.
+want to invite; this sharing view opens on its own the first time the
+creator starts a meeting, so sharing is the obvious next action rather than
+something they have to go looking for. No separate invitation flow, email,
+or calendar integration exists or is needed.
 
-**Step 3 — Join**: Anyone who opens the link is asked for a display name (and
-nothing else) and joins the meeting — the field is pre-filled with a friendly
-generated suggestion, which they may keep, edit, or clear. If the leader has
-turned on the waiting room, the new arrival instead waits until the leader
-admits or declines them.
+**Step 3 — Join**: Anyone who opens the link lands on that same kind of
+screen — a live preview of their own camera/microphone (already on, granted
+through a single permission prompt), the meeting's name and a sense of who's
+already there, and a display name field pre-filled with a friendly generated
+suggestion, which they may keep, edit, or clear — before joining. If the
+leader has turned on the waiting room, the new arrival instead waits, still
+seeing their own live preview, until the leader admits or declines them.
 
 **Step 4 — Meet**: All participants see and hear each other. Any participant
 can mute/unmute their own audio or video at will. Any participant (subject to
@@ -268,19 +275,23 @@ someone; a QR code covers the common case of inviting a nearby device.
 
 **Actors**: `cpt-chat-actor-leader`, `cpt-chat-actor-guest`
 
-#### Join by Link, Name Only
+#### Join by Link, With a Live Preview
 
 - [x] `p1` - **ID**: `cpt-chat-fr-join-meeting`
 
-Anyone opening a meeting link MUST be asked only for a display name
-(pre-filled with a locally generated suggestion, freely editable, not
-validated against any identity) before joining. No other
-information, account, or credential MUST be required. If the meeting has
-already reached its participant limit, the arrival MUST be told the meeting
-is full rather than silently failing.
+Anyone opening a meeting link MUST be shown a live preview of their own
+camera and microphone before joining, and MUST be asked for nothing beyond
+that but a display name (pre-filled with a locally generated suggestion,
+freely editable, not validated against any identity). No account,
+credential, or other identifying information MUST be required. If the
+meeting has already reached its participant limit, the arrival MUST be told
+the meeting is full rather than silently failing — surfaced as early as
+possible, ideally before they even reach the preview.
 
 **Rationale**: The link itself is the only credential; a display name is a
-courtesy to other participants, not an identity claim.
+courtesy to other participants, not an identity claim. Letting someone see
+and adjust their own camera/microphone before they are visible to anyone
+else removes the awkwardness of arriving unprepared.
 
 **Actors**: `cpt-chat-actor-guest`
 
@@ -511,10 +522,13 @@ must not assume a desktop.
 **Main Flow**:
 
 1. Creator opens the product and creates a meeting with one click
-2. Creator is taken straight into the meeting and becomes its leader
+2. Creator is taken straight into the (still empty) meeting, previews their
+   own camera/microphone, optionally renames the meeting, and starts it,
+   becoming its leader
 3. Creator copies the meeting link and sends it to a guest by whatever
    channel they prefer (chat app, email, verbally)
-4. Guest opens the link, enters a display name, and joins
+4. Guest opens the link, previews their own camera/microphone, enters a
+   display name, and joins
 5. Both participants see and hear each other; either can mute/unmute at will
 
 **Postconditions**: A live call is in progress with no account or
@@ -614,8 +628,9 @@ devices; the service operator never had access to its bytes.
 - [x] A new meeting can be created and entered in one action, with a
   shareable link and an in-app QR code produced immediately
   (`cpt-chat-fr-create-meeting`, `cpt-chat-fr-share-link`)
-- [x] Joining a meeting requires only opening the link and entering a
-  display name (`cpt-chat-fr-join-meeting`)
+- [x] Joining a meeting requires only opening the link, previewing your own
+  camera/microphone, and entering a display name — no account or credential
+  (`cpt-chat-fr-join-meeting`)
 - [x] Every participant can independently mute/unmute audio and video with
   no perceptible delay (`cpt-chat-fr-av-mute`)
 - [x] Exactly one participant can share their screen at a time, with a clear

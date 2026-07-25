@@ -27,25 +27,35 @@
 //    N participants" QA tool and complicates the N-tiles sanity check run
 //    while developing this harness). Concretely: participant index 0 (the
 //    first name, e.g. "Anna 16:9") *is* the observer — its own BrowserContext
-//    is the one that gets resized across viewports and screenshotted. It
-//    still turns its own camera on like everyone else, so its own tile shows
-//    live synthetic video, not a placeholder.
+//    is the one that gets resized across viewports and screenshotted.
+//
+//    Pre-join redesign: the observer is now ALSO the room's CREATOR (goes in
+//    through a `leaderUrlWithKey` link, presenting the one-time `lt` —
+//    see static/room.js) rather than just another guest link — it's the one
+//    that sets/keeps the room's name on the pre-join card and, right after
+//    joining, gets the auto-opened "Share" popup (see static/room.js:
+//    signaling.on('joined'), shareAutoOpenedForCreator) — screenshotted
+//    (see share-popup-{size}.png below) and then closed, since it would
+//    otherwise swallow the clicks below. The creator's mic/camera start OFF
+//    (no getUserMedia at all on this screen, see static/room.js:
+//    showPrejoinCard) — it still turns its own camera on like everyone
+//    else afterward, via the toolbar, so its own tile shows live synthetic
+//    video, not a placeholder.
 //
 // 2) The "no camera" participant (last one, only when --users >= 4, per the
-//    task spec) is achieved by simply NEVER clicking that participant's
-//    #camera-button — NOT by making getUserMedia() reject. We verified in
-//    static/room.js that the app never calls getUserMedia() on its own: both
-//    the mic and the camera are requested lazily, only from the
-//    #mic-button/#camera-button click handlers (see cameraButton/micButton
-//    addEventListener('click', ...) in room.js). A tile is created up front
-//    with its video element hidden and the avatar placeholder shown (see
-//    createTile in room.js) — that placeholder IS the "no camera" visual,
-//    and it's already there before any getUserMedia call happens. So the
-//    simplest, most realistic way to get a "no camera" tile is to just not
-//    press the button. We still install a getUserMedia stub on that
-//    participant's page for defense in depth (rejecting with NotFoundError,
-//    the same DOMException name a real "no camera hardware" browser would
-//    throw) — in case some future code path calls it automatically, the
+//    task spec) is now achieved by setting that participant's pre-join
+//    #prejoin-cam-select to "Off" before submitting the card — NOT by
+//    simply never clicking #camera-button afterward, the way this harness
+//    used to. Why the old trick alone no longer works: this participant is
+//    a GUEST, and the guest pre-join card now acquires a COMBINED
+//    mic+camera stream automatically the instant it's shown (see
+//    static/room.js: acquireGuestPrejoinMedia) — by the time a mid-call
+//    "never click the button" choice would matter, the camera is already
+//    live. installSyntheticCamera's own `noCamera` stub (see below) is kept
+//    too, as defense in depth (getUserMedia rejects outright with
+//    NotFoundError, the same DOMException name a real "no camera hardware"
+//    browser would throw, regardless of what the select is set to) — in
+//    case some future code path acquires media some other way, the
 //    placeholder must still be what ends up on screen, not a broken page.
 //
 // 3) Each participant gets its OWN BrowserContext (matching basic.spec.mjs,
@@ -77,6 +87,18 @@
 //    "camera" broadcast — harmless in practice, but not what a real camera
 //    device would do, and needless surface area for this QA tool. Splitting
 //    the two keeps the stub behaviorally honest.
+//
+//    Pre-join redesign: a GUEST's pre-join card now also asks for BOTH at
+//    once (getUserMedia({audio:true,video:true}), see static/room.js:
+//    acquireGuestPrejoinMedia) — this stub answers that combined request
+//    with a SINGLE MediaStream carrying both tracks (wantVideo && wantAudio
+//    both true), which sounds like it contradicts the paragraph above, but
+//    doesn't in practice: acquireGuestPrejoinMedia immediately pulls the
+//    audio/video tracks apart into their OWN per-kind MediaStream wrappers
+//    before hand-off (see applyMicStream/applyCameraStream in
+//    static/room.js) — by the time anything gets broadcast, the split has
+//    already happened on the app side, regardless of how bundled the
+//    original getUserMedia() response was.
 
 import { chromium } from 'playwright-core';
 import fs from 'node:fs';
@@ -87,9 +109,12 @@ import {
   buildServer,
   createServerController,
   joinRoom,
+  waitForPrejoinCard,
+  setPrejoinDeviceOff,
   waitForOverlayHidden,
   generateRoomToken,
   roomUrlWithKey,
+  leaderUrlWithKey,
   sleep,
   waitUntil,
 } from './helpers.mjs';
@@ -323,18 +348,77 @@ async function main() {
         }
       })();
 
+      // ---------- (a2) Pre-join screenshots ----------
+      //
+      // A dedicated, EPHEMERAL room (its own POST /api/rooms) — separate
+      // from the N-participant room built below — used ONLY to screenshot
+      // the pre-join card itself, for both personalities, before anyone
+      // ever actually submits it: the creator's card (editable room-name
+      // field, mic/camera defaulting to "Off") and a guest's card (static
+      // room-name display + the "N people · started..." meta line, both
+      // mic+camera defaulting to live). Neither page ever clicks
+      // "Start"/"Join" — the room is torn down (context closed) right after.
+      await (async () => {
+        const preRes = await fetch(`${server.baseUrl}/api/rooms`, { method: 'POST' });
+        if (!preRes.ok) throw new Error(`POST /api/rooms responded with status ${preRes.status}`);
+        const { roomId: preRoomId, leaderToken: preLeaderToken } = await preRes.json();
+        const preRoomToken = generateRoomToken();
+        const PREJOIN_DEMO_NAME = 'Design Team Sync';
+        const creatorPrejoinUrl = leaderUrlWithKey(server.baseUrl, preRoomId, preLeaderToken, preRoomToken);
+        const guestPrejoinUrl = `${roomUrlWithKey(server.baseUrl, preRoomId, preRoomToken)}&n=${encodeURIComponent(PREJOIN_DEMO_NAME)}`;
+
+        const prejoinContext = await browser.newContext({ deviceScaleFactor: DEVICE_SCALE_FACTOR });
+        try {
+          const creatorPage = await prejoinContext.newPage();
+          for (const sizeName of ['desktop', 'phone-portrait']) {
+            const size = VIEWPORTS.find((v) => v.name === sizeName);
+            await creatorPage.setViewportSize({ width: size.width, height: size.height });
+            await creatorPage.goto(creatorPrejoinUrl);
+            await waitForPrejoinCard(creatorPage);
+            // A recognizable, stable name (rather than the random
+            // NameGen.roomName() default) — nicer for QA, less run-to-run
+            // visual diffing.
+            await creatorPage.fill('#prejoin-room-name-input', PREJOIN_DEMO_NAME);
+            await sleep(SETTLE_MS);
+            const file = path.join(out, `prejoin-creator-${sizeName}.png`);
+            await creatorPage.screenshot({ path: file });
+            writtenFiles.push(file);
+          }
+
+          const guestPage = await prejoinContext.newPage();
+          for (const sizeName of ['desktop', 'phone-portrait']) {
+            const size = VIEWPORTS.find((v) => v.name === sizeName);
+            await guestPage.setViewportSize({ width: size.width, height: size.height });
+            await guestPage.goto(guestPrejoinUrl);
+            await waitForPrejoinCard(guestPage);
+            await sleep(SETTLE_MS);
+            const file = path.join(out, `prejoin-guest-${sizeName}.png`);
+            await guestPage.screenshot({ path: file });
+            writtenFiles.push(file);
+          }
+        } finally {
+          await prejoinContext.close();
+        }
+      })();
+
       // ---------- Build the room: N participants, one of them the observer ----------
       //
       // Room created directly via POST /api/rooms (bypassing the landing
       // page's UI, exactly like basic.spec.mjs's "Chat history" and several
       // other scenarios do — see roomUrlWithKey/generateRoomToken in
       // helpers.mjs) — the link token (`t`) is generated test-side, the way
-      // a real creator's browser would.
+      // a real creator's browser would. The OBSERVER (participant 0) becomes
+      // the room's CREATOR (goes in via leaderUrlWithKey, presenting the
+      // one-time `lt`) — see design decision #1 above; everyone else is a
+      // plain guest via roomUrl, which carries the room name the creator is
+      // about to set (see ROOM_NAME below) so their pre-join cards show it too.
       const res = await fetch(`${server.baseUrl}/api/rooms`, { method: 'POST' });
       if (!res.ok) throw new Error(`POST /api/rooms responded with status ${res.status}`);
-      const { roomId } = await res.json();
+      const { roomId, leaderToken } = await res.json();
       const roomToken = generateRoomToken();
-      const roomUrl = `${roomUrlWithKey(server.baseUrl, roomId, roomToken)}&n=${encodeURIComponent('Screenshot QA room')}`;
+      const ROOM_NAME = 'Screenshot QA room';
+      const creatorRoomUrl = leaderUrlWithKey(server.baseUrl, roomId, leaderToken, roomToken);
+      const roomUrl = `${roomUrlWithKey(server.baseUrl, roomId, roomToken)}&n=${encodeURIComponent(ROOM_NAME)}`;
 
       // Per-participant plan: cycle through ASPECTS; the LAST participant
       // goes camera-less when there are enough participants for it to read
@@ -387,12 +471,71 @@ async function main() {
           });
 
           const page = await context.newPage();
-          await page.goto(roomUrl);
-          await joinRoom(page, p.displayName);
-          await waitForOverlayHidden(page);
 
-          if (!p.noVideo) {
+          if (p.isObserver) {
+            // --- The creator (see design decision #1): sets the room name
+            //     on the pre-join card, mic/camera start OFF (no
+            //     getUserMedia at all on this screen) — turned on below,
+            //     via the toolbar, like every other video-having
+            //     participant. ---
+            await page.goto(creatorRoomUrl);
+            await joinRoom(page, p.displayName, { roomName: ROOM_NAME, closeSharePopup: false });
+
+            // The Share popup auto-opens once, right here, for the creator
+            // (see static/room.js: signaling.on('joined'),
+            // shareAutoOpenedForCreator) — screenshot it (desktop + phone,
+            // per the task spec) before closing it: it's a modal that would
+            // otherwise swallow the clicks below.
+            await page.waitForSelector('#share-popup:not(.hidden)', { timeout: 8000 });
+            for (const sizeName of ['desktop', 'phone-portrait']) {
+              const size = VIEWPORTS.find((v) => v.name === sizeName);
+              await page.setViewportSize({ width: size.width, height: size.height });
+              await sleep(SETTLE_MS);
+              const file = path.join(out, `share-popup-${sizeName}.png`);
+              await page.screenshot({ path: file });
+              writtenFiles.push(file);
+            }
+            await page.setViewportSize({ width: VIEWPORTS[0].width, height: VIEWPORTS[0].height }); // back to desktop for the rest of the join sequence
+            await page.click('#share-popup-close');
+            await page.waitForFunction(
+              () => document.getElementById('share-popup')?.classList.contains('hidden'),
+              undefined,
+              { timeout: 3000 }
+            );
+            await waitForOverlayHidden(page);
+            // The creator's camera is still off at this point (see the
+            // comment above) — turn it on now, exactly like every other
+            // video-having participant.
             await page.click('#camera-button');
+          } else if (p.noVideo) {
+            // --- The "no camera" guest (design decision #2): the guest
+            //     pre-join card auto-acquires a combined mic+camera stream
+            //     (see static/room.js: acquireGuestPrejoinMedia) — but
+            //     installSyntheticCamera's `noCamera` stub above makes
+            //     THAT SAME getUserMedia call reject outright, so there is
+            //     nothing to wait for (unlike a normal guest — see the
+            //     `else` branch below, which DOES wait via joinRoom's
+            //     `micOff`/`camOff` options): we go straight to flipping
+            //     the camera select to "Off" (the deliberate mechanism,
+            //     see design decision #2) and submit directly. ---
+            await page.goto(roomUrl);
+            await waitForPrejoinCard(page);
+            await setPrejoinDeviceOff(page, '#prejoin-cam-select');
+            await page.fill('#join-name-input', p.displayName);
+            await page.click('#join-modal-button');
+            await waitForOverlayHidden(page);
+          } else {
+            // --- A regular video-having guest: leave the pre-join card's
+            //     auto-acquired combined mic+camera stream live (task item
+            //     3) — camera is ALREADY on by the time this resolves, so
+            //     unlike the old flow we must NOT click #camera-button
+            //     here: with a track already enabled, that click would
+            //     TURN IT OFF (see static/room.js: cameraButton's click
+            //     handler, the "already have a track" branch just toggles
+            //     .enabled). ---
+            await page.goto(roomUrl);
+            await joinRoom(page, p.displayName, { micOff: false, camOff: false });
+            await waitForOverlayHidden(page);
           }
 
           if (p.isObserver) observerPage = page;
@@ -405,24 +548,50 @@ async function main() {
         // on the observer's page, and every video-carrying participant's
         // <video> element actually has decoded a frame (videoWidth > 0).
         const videoNames = participants.filter((p) => !p.noVideo).map((p) => p.displayName);
-        await waitUntil(
-          () =>
-            observerPage.evaluate(
-              ({ count, names }) => {
-                if (document.querySelectorAll('.tile').length < count) return false;
-                return names.every((n) => {
-                  const v = document.querySelector(`.tile[data-name="${n}"] video`);
-                  return !!v && !v.classList.contains('hidden') && v.videoWidth > 0;
-                });
-              },
-              { count: users, names: videoNames }
-            ),
-          {
-            timeoutMs: 30_000,
-            intervalMs: 300,
-            message: `mesh did not settle: expected ${users} tiles on the observer page, all video-carrying ones playing`,
-          }
-        );
+        // 60s (bumped from the pre-redesign 30s): with several GUESTS now
+        // arriving with an already-live combined mic+camera stream (see
+        // design decision #1/#2), createRemotePeer folds their tracks into
+        // the very first offer to every existing peer rather than a later
+        // renegotiation — functionally fine, but with N participants worth
+        // of synthetic canvases + a 2x-scaled observer all fighting for CPU
+        // on one machine, ICE/DTLS for the LAST pairs to settle can
+        // genuinely take longer than 30s under load (verified empirically:
+        // a single random participant's video would still be at
+        // videoWidth===0 right at the old deadline, then arrive fine soon
+        // after).
+        try {
+          await waitUntil(
+            () =>
+              observerPage.evaluate(
+                ({ count, names }) => {
+                  if (document.querySelectorAll('.tile').length < count) return false;
+                  return names.every((n) => {
+                    const v = document.querySelector(`.tile[data-name="${n}"] video`);
+                    return !!v && !v.classList.contains('hidden') && v.videoWidth > 0;
+                  });
+                },
+                { count: users, names: videoNames }
+              ),
+            {
+              timeoutMs: 60_000,
+              intervalMs: 300,
+              message: `mesh did not settle: expected ${users} tiles on the observer page, all video-carrying ones playing`,
+            }
+          );
+        } catch (err) {
+          // A per-tile breakdown on failure — cheap and saves a re-run with
+          // manual devtools poking when this QA tool itself misbehaves.
+          const diag = await observerPage.evaluate((names) => ({
+            tileCount: document.querySelectorAll('.tile').length,
+            tileNames: Array.from(document.querySelectorAll('.tile')).map((t) => t.dataset.name),
+            perName: names.map((n) => {
+              const v = document.querySelector(`.tile[data-name="${n}"] video`);
+              return { n, exists: !!v, hidden: v?.classList.contains('hidden'), videoWidth: v?.videoWidth };
+            }),
+          }), videoNames);
+          console.error('[screenshots] DIAGNOSTIC:', JSON.stringify(diag, null, 2));
+          throw err;
+        }
 
         const actualTileCount = await observerPage.evaluate(() => document.querySelectorAll('.tile').length);
         console.log(`[screenshots] observer sees ${actualTileCount} tiles (expected ${users})`);
