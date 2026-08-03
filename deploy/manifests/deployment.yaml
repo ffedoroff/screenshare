@@ -81,5 +81,5 @@ spec:
         resources:
           # The Rust signaling server is lightweight (small working set in memory,
           # no media traffic ever passes through the backend) — modest limits.
-          requests: { memory: 32Mi, cpu: 50m }
+          requests: { memory: 100Mi, cpu: 10m }
           limits:   { memory: 128Mi, cpu: 250m }
