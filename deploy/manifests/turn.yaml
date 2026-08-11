@@ -14,15 +14,15 @@
 # turn-config, below) needs a SECOND `[[server.interfaces]]` block:
 #   [[server.interfaces]]
 #   transport = "tcp"
-#   listen = "0.0.0.0:443"
-#   external = "<public IP>:443"
-#   [server.interfaces.ssl]
-#   private-key = "/etc/turn-tls/tls.key"
-#   certificate-chain = "/etc/turn-tls/tls.crt"
-# TCP 443 must ALSO be opened in Contabo's cloud firewall (hosting panel) —
-# the same place UDP 3478 + the relay range were opened above; it is a
-# separate rule from whatever already allows 443 for the chat/signaling
-# ingress on this host, since this is the TURN pod's own hostNetwork port.
+#   listen = "127.0.0.1:5443"        # since 2026-08-10: public 443 is owned by
+#   external = "<public IP>:443"     # the host-nginx SNI multiplexer (testhelp
+#   [server.interfaces.ssl]          # direct entry); it routes our SNI
+#   private-key = "/etc/turn-tls/tls.key"   # (chat-udp hostname + anything
+#   certificate-chain = "/etc/turn-tls/tls.crt"  # without SNI) to 5443.
+# History: originally listen=0.0.0.0:443, but host nftables (policy drop) never
+# actually allowed tcp/443 in, so TURNS/443 first became reachable from outside
+# on 2026-08-10, when the testhelp direct entry opened 443 + put the SNI
+# multiplexer in front (see testhelp-private/deploy/kubesolo/direct-entry/).
 #
 # H1 (ephemeral TURN credentials, see README.md "TURN Server" and
 # src/main.rs::ice_config, 2026-07-13): previously `config.toml` held
@@ -43,11 +43,13 @@
 #     now also holds the second, TCP/TLS 443 `[[server.interfaces]]` block described above).
 #   - Secret turn/turn-tls: the TLS cert/key for the TURNS/443 listener —
 #     `tls.crt` (full certificate chain, PEM) and `tls.key` (private key, PEM),
-#     for the hostname clients reach the TURN server at. NOT in git; created
-#     and renewed BY HAND by an admin (no cert-manager in this cluster) — e.g.
-#     Let's Encrypt via a DNS-01 challenge (Cloudflare DNS, since TCP 443 on
-#     this host is TURN, not a webserver ACME could HTTP-01 against), copied
-#     in roughly every ~90 days. See docs/self-hosting.md TURNS/443 section.
+#     for the hostname clients reach the TURN server at. NOT in git.
+#     Since 2026-08-11 renewed AUTOMATICALLY: acme.sh on the host (HTTP-01 via
+#     the testhelp ACME webroot on port 80) + /usr/local/sbin/deploy-turn-cert
+#     reloadcmd, which re-creates this Secret and restarts the deployment.
+#     Watched by the central cert-watch (registry: services/cert-watch.md).
+#     (Originally issued by hand 2026-07-18 — DNS-01, ~90-day manual copies —
+#     because 443 was TURN-only back then and HTTP-01 had nothing to answer.)
 #   - Secret chat-prod/turn-creds: TURN_URL/TURN_STATIC_SECRET (the
 #     TURN_STATIC_SECRET key — that same value from turn/turn-config above) —
 #     picked up by the chat Deployment (envFrom), which uses them to hand clients
